@@ -1,4 +1,3 @@
-// Whatsapp tests cover auto reply.web auto reply.connection and logging plugin behavior.
 import "./test-helpers.js";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
@@ -66,26 +65,13 @@ function requireOnMessage(
 }
 
 function expectErrorContaining(errorFn: unknown, text: string): void {
-  const messages = ((errorFn as { mock?: { calls?: unknown[][] } }).mock?.calls ?? []).map(
-    (call) =>
-      typeof call[0] === "string" ? call[0] : call[0] instanceof Error ? call[0].message : "",
-  );
-  expect(messages.join("\n")).toContain(text);
+  expect(mockStringMessages(errorFn).join("\n")).toContain(text);
 }
 
 function mockStringMessages(mocked: unknown): string[] {
   return ((mocked as { mock?: { calls?: unknown[][] } }).mock?.calls ?? []).map((call) =>
     typeof call[0] === "string" ? call[0] : call[0] instanceof Error ? call[0].message : "",
   );
-}
-
-function mockCallArg(mocked: unknown, callIndex: number, argIndex: number): unknown {
-  const calls = (mocked as { mock?: { calls?: unknown[][] } }).mock?.calls;
-  const call = calls?.[callIndex];
-  if (!call) {
-    throw new Error(`Expected mock call at index ${callIndex}`);
-  }
-  return call[argIndex];
 }
 
 async function waitForScriptedListeners(
@@ -141,6 +127,52 @@ describe("web auto-reply connection", () => {
     ({ monitorWebChannel } = await import("./auto-reply/monitor.js"));
   });
 
+  function startMonitor(
+    options: Omit<
+      Parameters<typeof startWebAutoReplyMonitor>[0],
+      "monitorWebChannelFn" | "sleep"
+    > & {
+      sleep?: Parameters<typeof startWebAutoReplyMonitor>[0]["sleep"];
+    },
+  ) {
+    return startWebAutoReplyMonitor({
+      monitorWebChannelFn: monitorWebChannel as never,
+      sleep: vi.fn(async () => {}),
+      ...options,
+    });
+  }
+
+  function droppedMessage(id: string) {
+    return createTestWebInboundMessage({
+      event: { id },
+      payload: { body: "ignored" },
+      admission: {
+        conversation: { kind: "direct", id: "+1" },
+        ingress: {
+          admission: "drop",
+          decision: "block",
+          decisiveGateId: "sender",
+          reasonCode: "no_policy_match",
+        },
+      },
+    });
+  }
+
+  function appendWindowAt(
+    scripted: ReturnType<typeof createScriptedWebListenerFactory>,
+    index: number,
+  ) {
+    const options = scripted.listenerFactory.mock.calls[index]?.[0] as
+      | {
+          appendReplyWindow?: { afterMs: number; untilMs: number; maxAgeMs: number };
+        }
+      | undefined;
+    if (!options) {
+      throw new Error(`Expected listener options at index ${index}`);
+    }
+    return options.appendReplyWindow;
+  }
+
   it("handles helper envelope timestamps with trimmed timezones (regression)", () => {
     const d = new Date("2025-01-01T00:00:00.000Z");
     expect(formatEnvelopeTimestamp(d, " America/Los_Angeles ")).toBe("Tue 2024-12-31 16:00:00 PST");
@@ -153,10 +185,8 @@ describe("web auto-reply connection", () => {
 
     const statuses: Array<{ running?: boolean }> = [];
     const listenerFactory = vi.fn(async () => createMockWebListener());
-    const { run } = startWebAutoReplyMonitor({
-      monitorWebChannelFn: monitorWebChannel as never,
+    const { run } = startMonitor({
       listenerFactory,
-      sleep: vi.fn(async () => {}),
       statusSink: (next) => statuses.push({ ...next }),
     });
 
@@ -183,27 +213,16 @@ describe("web auto-reply connection", () => {
     ]) {
       const sleep = vi.fn(async () => {});
       const scripted = createScriptedWebListenerFactory();
-      const { runtime, controller, run } = startWebAutoReplyMonitor({
-        monitorWebChannelFn: monitorWebChannel as never,
+      const { runtime, controller, run } = startMonitor({
         listenerFactory: scripted.listenerFactory,
         sleep,
         reconnect: scenario.reconnect,
       });
 
-      await vi.waitFor(
-        () => {
-          expect(scripted.getListenerCount()).toBe(1);
-        },
-        { timeout: 250, interval: 2 },
-      );
+      await waitForScriptedListeners(scripted, 1);
 
       scripted.resolveClose(0);
-      await vi.waitFor(
-        () => {
-          expect(scripted.getListenerCount()).toBe(scenario.expectedCallsAfterFirstClose);
-        },
-        { timeout: 250, interval: 2 },
-      );
+      await waitForScriptedListeners(scripted, scenario.expectedCallsAfterFirstClose);
 
       if (scenario.closeTwiceAndFinish) {
         scripted.resolveClose(1);
@@ -221,49 +240,23 @@ describe("web auto-reply connection", () => {
 
   it("widens append catch-up only after reconnecting a recently active listener", async () => {
     const scripted = createScriptedWebListenerFactory();
-    const { controller, run } = startWebAutoReplyMonitor({
-      monitorWebChannelFn: monitorWebChannel as never,
+    const { controller, run } = startMonitor({
       listenerFactory: scripted.listenerFactory,
-      sleep: vi.fn(async () => {}),
       messageTimeoutMs: 30 * 60_000,
     });
 
     await vi.waitFor(() => expect(scripted.getListenerCount()).toBe(1));
-    expect(
-      (
-        mockCallArg(scripted.listenerFactory, 0, 0) as {
-          appendReplyWindow?: { afterMs: number; untilMs: number; maxAgeMs: number };
-        }
-      ).appendReplyWindow,
-    ).toBeUndefined();
+    expect(appendWindowAt(scripted, 0)).toBeUndefined();
 
     // The controller records inbound activity before admission; this test only needs that
     // lifecycle fact and must not start unrelated delivery/session work.
-    await requireOnMessage(scripted.getOnMessage())(
-      createTestWebInboundMessage({
-        event: { id: "active-before-reconnect" },
-        payload: { body: "ignored" },
-        admission: {
-          conversation: { kind: "direct", id: "+1" },
-          ingress: {
-            admission: "drop",
-            decision: "block",
-            decisiveGateId: "sender",
-            reasonCode: "no_policy_match",
-          },
-        },
-      }),
-    );
+    await requireOnMessage(scripted.getOnMessage())(droppedMessage("active-before-reconnect"));
 
     const reconnectStartedAt = Date.now();
     scripted.resolveClose(0, { status: 408, isLoggedOut: false, error: new Error("timeout") });
     await vi.waitFor(() => expect(scripted.getListenerCount()).toBe(2));
 
-    const appendReplyWindow = (
-      mockCallArg(scripted.listenerFactory, 1, 0) as {
-        appendReplyWindow?: { afterMs: number; untilMs: number; maxAgeMs: number };
-      }
-    ).appendReplyWindow;
+    const appendReplyWindow = appendWindowAt(scripted, 1);
     expect(appendReplyWindow?.afterMs).toBeGreaterThanOrEqual(reconnectStartedAt - 20 * 60_000);
     expect(appendReplyWindow?.afterMs).toBeLessThanOrEqual(Date.now() - 20 * 60_000);
     expect(appendReplyWindow?.untilMs).toBeGreaterThanOrEqual(reconnectStartedAt + 20 * 60_000);
@@ -286,8 +279,7 @@ describe("web auto-reply connection", () => {
     });
 
     const sleep = vi.fn(async () => {});
-    const { runtime, run } = startWebAutoReplyMonitor({
-      monitorWebChannelFn: monitorWebChannel as never,
+    const { runtime, run } = startMonitor({
       listenerFactory,
       sleep,
       reconnect: { initialMs: 10, maxMs: 10, maxAttempts: 2, factor: 1.1 },
@@ -306,19 +298,16 @@ describe("web auto-reply connection", () => {
     vi.mocked(waitForWaConnection).mockRejectedValueOnce({ output: { statusCode: 408 } });
     const listenerFactory = vi.fn(async () => createMockWebListener());
     const sleep = vi.fn(async () => {});
-    const { runtime, controller, run } = startWebAutoReplyMonitor({
-      monitorWebChannelFn: monitorWebChannel as never,
+    const { runtime, controller, run } = startMonitor({
       listenerFactory,
       sleep,
       reconnect: { initialMs: 10, maxMs: 10, maxAttempts: 2, factor: 1.1 },
     });
 
-    await vi.waitFor(
-      () => {
-        expect(listenerFactory).toHaveBeenCalledTimes(1);
-      },
-      { timeout: 250, interval: 2 },
-    );
+    await vi.waitFor(() => expect(listenerFactory).toHaveBeenCalledTimes(1), {
+      timeout: 250,
+      interval: 2,
+    });
     controller.abort();
     await run;
 
@@ -330,14 +319,11 @@ describe("web auto-reply connection", () => {
   });
 
   it("marks an opening-phase remote logout as a terminal disconnect", async () => {
-    vi.mocked(waitForWaConnection).mockRejectedValueOnce({
-      output: { statusCode: 401 },
-    });
+    vi.mocked(waitForWaConnection).mockRejectedValueOnce({ output: { statusCode: 401 } });
     const listenerFactory = vi.fn(async () => createMockWebListener());
     const sleep = vi.fn(async () => {});
     const statuses: Array<Partial<WebChannelStatus>> = [];
-    const { runtime, run } = startWebAutoReplyMonitor({
-      monitorWebChannelFn: monitorWebChannel as never,
+    const { runtime, run } = startMonitor({
       listenerFactory,
       sleep,
       statusSink: (next) => statuses.push({ ...next }),
@@ -363,19 +349,13 @@ describe("web auto-reply connection", () => {
     try {
       const sleep = vi.fn(async () => {});
       const scripted = createScriptedWebListenerFactory();
-      const { controller, run } = startWebAutoReplyMonitor({
-        monitorWebChannelFn: monitorWebChannel as never,
+      const { controller, run } = startMonitor({
         listenerFactory: scripted.listenerFactory,
         sleep,
         accountId: "work",
       });
 
-      await vi.waitFor(
-        () => {
-          expect(scripted.getListenerCount()).toBe(1);
-        },
-        { timeout: 250, interval: 2 },
-      );
+      await waitForScriptedListeners(scripted, 1);
       expect(deliveryQueueMocks.drainPendingDeliveries).toHaveBeenCalledWith(
         expect.objectContaining({
           drainKey: "whatsapp:work",
@@ -396,26 +376,15 @@ describe("web auto-reply connection", () => {
       if (!periodicCall) {
         throw new Error("Expected WhatsApp periodic drain call");
       }
-      expect(periodicCall.drainKey).toBe("whatsapp:work");
-      expect(periodicCall.logLabel).toBe("WhatsApp periodic drain");
-      expect(
-        periodicCall.selectEntry({
-          channel: "whatsapp",
-          accountId: "work",
-        }),
-      ).toEqual({ match: true, bypassBackoff: false });
-      expect(
-        periodicCall.selectEntry({
-          channel: "whatsapp",
-          accountId: "default",
-        }),
-      ).toEqual({ match: false, bypassBackoff: false });
-      expect(
-        periodicCall.selectEntry({
-          channel: "telegram",
-          accountId: "work",
-        }),
-      ).toEqual({ match: false, bypassBackoff: false });
+      expect(periodicCall).toMatchObject({
+        drainKey: "whatsapp:work",
+        logLabel: "WhatsApp periodic drain",
+      });
+      const select = (channel: string, accountId: string) =>
+        periodicCall.selectEntry({ channel, accountId });
+      expect(select("whatsapp", "work")).toEqual({ match: true, bypassBackoff: false });
+      expect(select("whatsapp", "default")).toEqual({ match: false, bypassBackoff: false });
+      expect(select("telegram", "work")).toEqual({ match: false, bypassBackoff: false });
 
       controller.abort();
       scripted.resolveClose(0, { status: 499, isLoggedOut: false, error: "aborted" });
@@ -456,24 +425,16 @@ describe("web auto-reply connection", () => {
         channels: {
           whatsapp: {
             allowFrom: ["*"],
-            accounts: {
-              [accountId]: {
-                authDir,
-              },
-            },
+            accounts: { [accountId]: { authDir } },
           },
         },
-        messages: {
-          messagePrefix: undefined,
-          responsePrefix: undefined,
-        },
+        messages: { messagePrefix: undefined, responsePrefix: undefined },
       });
 
       const sleep = vi.fn(async () => {});
       const statuses: Array<Partial<WebChannelStatus>> = [];
       const scripted = createScriptedWebListenerFactory();
-      const { run } = startWebAutoReplyMonitor({
-        monitorWebChannelFn: monitorWebChannel as never,
+      const { run } = startMonitor({
         listenerFactory: scripted.listenerFactory,
         sleep,
         accountId,
@@ -502,11 +463,12 @@ describe("web auto-reply connection", () => {
       expect(
         statuses.filter((entry) => entry.connected === false && entry.healthState === healthState),
       ).not.toEqual([]);
-      const finalStatus = statuses.at(-1);
-      expect(finalStatus?.running).toBe(false);
-      expect(finalStatus?.connected).toBe(false);
-      expect(finalStatus?.healthState).toBe(healthState);
-      expect(finalStatus?.lifecycle).toBe("blocked");
+      expect(statuses.at(-1)).toMatchObject({
+        running: false,
+        connected: false,
+        healthState,
+        lifecycle: "blocked",
+      });
     },
   );
 
@@ -517,8 +479,7 @@ describe("web auto-reply connection", () => {
         "WhatsApp auth state is still stabilizing; retrying inbox attach.",
       );
     });
-    const { runtime, run } = startWebAutoReplyMonitor({
-      monitorWebChannelFn: monitorWebChannel as never,
+    const { runtime, run } = startMonitor({
       listenerFactory,
       sleep,
       reconnect: { initialMs: 5, maxMs: 5, maxAttempts: 2, factor: 1.1 },
@@ -660,8 +621,7 @@ describe("web auto-reply connection", () => {
     const sleep = vi.fn(async () => {});
     const statuses: Array<Record<string, unknown>> = [];
     const scripted = createScriptedWebListenerFactory();
-    const { controller, run, runtime } = startWebAutoReplyMonitor({
-      monitorWebChannelFn: monitorWebChannel as never,
+    const { controller, run, runtime } = startMonitor({
       listenerFactory: scripted.listenerFactory,
       sleep,
       heartbeatSeconds: 60,
@@ -675,27 +635,11 @@ describe("web auto-reply connection", () => {
     try {
       await waitForScriptedListeners(scripted, 1);
       if (scenario.seedInbound) {
-        await vi.waitFor(
-          () => {
-            expect(scripted.getOnMessage()).toBeTypeOf("function");
-          },
-          { timeout: 250, interval: 2 },
-        );
-        await requireOnMessage(scripted.getOnMessage())(
-          createTestWebInboundMessage({
-            event: { id: "m1" },
-            payload: { body: "ignored" },
-            admission: {
-              conversation: { kind: "direct", id: "+1" },
-              ingress: {
-                admission: "drop",
-                decision: "block",
-                decisiveGateId: "sender",
-                reasonCode: "no_policy_match",
-              },
-            },
-          }),
-        );
+        await vi.waitFor(() => expect(scripted.getOnMessage()).toBeTypeOf("function"), {
+          timeout: 250,
+          interval: 2,
+        });
+        await requireOnMessage(scripted.getOnMessage())(droppedMessage("m1"));
       }
 
       await scenario.exercise(context);
@@ -721,20 +665,8 @@ describe("web auto-reply connection", () => {
     const capture = createWebListenerFactoryCapture();
 
     setLoadConfigMock({
-      messages: {
-        inbound: {
-          debounceMs: 250,
-        },
-      },
-      channels: {
-        whatsapp: {
-          accounts: {
-            work: {
-              authDir: "/tmp/work",
-            },
-          },
-        },
-      },
+      messages: { inbound: { debounceMs: 250 } },
+      channels: { whatsapp: { accounts: { work: { authDir: "/tmp/work" } } } },
     } as OpenClawConfig);
     await monitorWebChannel(
       false,
@@ -743,9 +675,7 @@ describe("web auto-reply connection", () => {
       async () => ({ text: "ok" }),
       undefined,
       undefined,
-      {
-        accountId: "work",
-      },
+      { accountId: "work" },
     );
 
     resetLoadConfigMock();

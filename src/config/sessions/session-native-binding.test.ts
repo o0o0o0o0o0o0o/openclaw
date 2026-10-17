@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
@@ -9,223 +10,168 @@ import { capturePluginStateNativeBindingFacts } from "../../plugin-state/plugin-
 import { createPluginStateKeyedStoreV2 } from "../../plugin-state/plugin-state-store.js";
 import { capturePluginStateNativeBindingStore } from "../../plugin-state/plugin-state-store.native-binding.js";
 import { onSessionIdentityMutation } from "../../sessions/session-lifecycle-events.js";
+import * as execution from "../../state/openclaw-agent-execution.js";
 import { readSessionArchiveContentSync } from "./archive-compression.js";
-import {
-  bindingWrites,
-  observeNativeCommit,
-  observeNativeGrants as observeGrants,
-} from "./session-native-binding.execution.test-support.js";
+import * as native from "./session-native-binding.execution.test-support.js";
 import { withNativeBindingFixture } from "./session-native-binding.test-support.js";
 
-const delivery = vi.hoisted(() => ({ afterExecution: undefined as (() => void) | undefined }));
-vi.mock("../../state/openclaw-agent-execution.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../state/openclaw-agent-execution.js")>();
-  const { instrumentAgentExecutions } =
-    await import("./session-native-binding.execution.test-support.js");
-  return instrumentAgentExecutions(actual, (worker) => ({
-    execute: async (command, options) => {
-      try {
-        return await worker.execute(command, options);
-      } finally {
-        if (command.type === "session.nativeBindings.delete") {
-          delivery.afterExecution?.();
-        }
-      }
-    },
-  }));
-});
-
-afterEach(() => {
-  delivery.afterExecution = undefined;
-  vi.restoreAllMocks();
-});
-
-const observeNativeGrants = (observe: Parameters<typeof observeGrants>[1]) =>
-  observeGrants(admission, observe);
+afterEach(() => vi.restoreAllMocks());
+type Fixture = Parameters<Parameters<typeof withNativeBindingFixture>[1]>[0];
+const withCodex = (run: (fixture: Fixture) => Promise<void>, mode?: "worker" | "legacy") =>
+  withNativeBindingFixture("codex", run, mode);
 
 it.each(["sibling", "retired", "absent", "stale"] as const)(
   "handles a %s Codex binding through the host worker",
-  async (condition) => {
-    await withNativeBindingFixture(
-      "codex",
-      async ({ bindingKey, bindingStore, readEntry, readBinding, remove, scope }) => {
-        const entry = readEntry();
-        const binding = readBinding();
-        const successor = { ...binding, sessionId: "new-generation" };
-        const siblingKey = `${bindingKey}:sibling`;
-        if (condition === "retired") {
-          bindingStore.register(bindingKey, {
-            version: 1,
-            state: "cleared",
-            sessionId: scope.sessionId,
-            retired: true,
-          });
-        } else if (condition === "absent") {
-          bindingStore.delete(bindingKey);
-        } else if (condition === "stale") {
-          bindingStore.register(bindingKey, successor);
-        } else {
-          bindingStore.register(siblingKey, binding!);
-        }
-        if (condition === "stale") {
-          await expect(remove()).rejects.toThrow("generation changed");
-        } else {
-          await expect(remove()).resolves.toMatchObject({ deleted: true });
-        }
-        expect([readEntry(), readBinding()]).toEqual(
-          condition === "stale" ? [entry, successor] : [undefined, undefined],
-        );
-        if (condition === "sibling") {
-          expect(bindingStore.lookup(siblingKey)).toEqual(binding);
-        }
-      },
-    );
-  },
+  (condition) =>
+    withCodex(async ({ bindingKey, bindingStore, readEntry, readBinding, remove, scope }) => {
+      const [entry, binding] = [readEntry(), readBinding()] as const;
+      const successor = { ...binding, sessionId: "new-generation" };
+      const siblingKey = `${bindingKey}:sibling`;
+      if (condition === "absent") {
+        bindingStore.delete(bindingKey);
+      } else {
+        const value = {
+          retired: { version: 1, state: "cleared", sessionId: scope.sessionId, retired: true },
+          stale: successor,
+          sibling: binding!,
+        }[condition];
+        bindingStore.register(condition === "sibling" ? siblingKey : bindingKey, value);
+      }
+      if (condition === "stale") {
+        await expect(remove()).rejects.toThrow("generation changed");
+      } else {
+        await expect(remove()).resolves.toMatchObject({ deleted: true });
+      }
+      expect([readEntry(), readBinding()]).toEqual(
+        condition === "stale" ? [entry, successor] : [undefined, undefined],
+      );
+      if (condition === "sibling") {
+        expect(bindingStore.lookup(siblingKey)).toEqual(binding);
+      }
+    }),
 );
 
-it("uses each installed plugin owner's packaged codec during real binding deletion", async () => {
-  await withNativeBindingFixture(
-    "codex",
-    async ({ registry, database, readEntry, readBinding, remove }) => {
-      const entry = readEntry();
-      const binding = readBinding();
-      for (const generation of ["first", "second"]) {
-        const rootDir = path.join(path.dirname(database.path), `installed-${generation}`);
-        mkdirSync(path.join(rootDir, "dist"), { recursive: true });
-        writeFileSync(path.join(rootDir, "package.json"), '{"type":"module"}');
-        const message = `synthetic installed ${generation} codec refusal`;
-        writeFileSync(
-          path.join(rootDir, "dist", "native-session-binding-api.js"),
-          `export function readNativeSessionBindingRecord() { throw new Error(${JSON.stringify(message)}); }`,
-        );
-        Object.assign(registry.plugins[0]!, {
-          rootDir,
-          source: path.join(rootDir, "dist", "index.js"),
-          origin: "global",
-        });
-        await expect(remove()).rejects.toMatchObject({
-          code: "PLUGIN_STATE_WRITE_FAILED",
-          cause: { message },
-        });
-        expect([readEntry(), readBinding()]).toEqual([entry, binding]);
-      }
-    },
-  );
-});
+it("uses each installed plugin owner's packaged codec during real binding deletion", () =>
+  withCodex(async ({ registry, database, readEntry, readBinding, remove }) => {
+    const before = [readEntry(), readBinding()];
+    for (const generation of ["first", "second"]) {
+      const rootDir = path.join(path.dirname(database.path), `installed-${generation}`);
+      mkdirSync(path.join(rootDir, "dist"), { recursive: true });
+      writeFileSync(path.join(rootDir, "package.json"), '{"type":"module"}');
+      const message = `synthetic installed ${generation} codec refusal`;
+      writeFileSync(
+        path.join(rootDir, "dist", "native-session-binding-api.js"),
+        `export function readNativeSessionBindingRecord() { throw new Error(${JSON.stringify(message)}); }`,
+      );
+      Object.assign(registry.plugins[0]!, {
+        rootDir,
+        source: path.join(rootDir, "dist", "index.js"),
+        origin: "global",
+      });
+      await expect(remove()).rejects.toMatchObject({
+        code: "PLUGIN_STATE_WRITE_FAILED",
+        cause: { message },
+      });
+      expect([readEntry(), readBinding()]).toEqual(before);
+    }
+  }));
 
 it("keeps archive bytes and identity publication equivalent with a legacy cleanup companion", async () => {
   const outcomes: unknown[] = [];
   for (const mode of ["legacy", "worker"] as const) {
-    await withNativeBindingFixture(
-      "codex",
-      async ({ scope, readEntry, readBinding, remove, events }) => {
-        const notifications: unknown[] = [];
-        const unsubscribe = onSessionIdentityMutation((event) => {
-          if (event.kind === "delete" && event.previous.sessionKeys.includes(scope.sessionKey)) {
-            notifications.push({ kind: event.kind, previous: event.previous });
-          }
-        });
-        const sql = observeHostDataSql();
-        try {
-          const result = await remove({ archiveTranscript: true });
-          expect(bindingWrites(sql.queries)).toEqual([]);
-          expect(result.deleted).toBe(true);
-          expect(result.archivedTranscripts).toHaveLength(1);
-          const bytes = readSessionArchiveContentSync(result.archivedTranscripts[0]!.archivedPath);
-          expect(
-            bytes
-              .trim()
-              .split("\n")
-              .map((line) => JSON.parse(line)),
-          ).toEqual(events);
-          outcomes.push({
-            bytes,
-            notifications,
-            entry: readEntry(),
-            binding: readBinding(),
-          });
-        } finally {
-          sql.restore();
-          unsubscribe();
+    await withCodex(async ({ scope, readEntry, readBinding, remove, events }) => {
+      const notifications: unknown[] = [];
+      const unsubscribe = onSessionIdentityMutation((event) => {
+        if (event.kind === "delete" && event.previous.sessionKeys.includes(scope.sessionKey)) {
+          notifications.push({ kind: event.kind, previous: event.previous });
         }
-      },
-      mode,
-    );
+      });
+      const sql = observeHostDataSql();
+      try {
+        const result = await remove({ archiveTranscript: true });
+        expect(native.bindingWrites(sql.queries)).toEqual([]);
+        expect(result.deleted).toBe(true);
+        expect(result.archivedTranscripts).toHaveLength(1);
+        const bytes = readSessionArchiveContentSync(result.archivedTranscripts[0]!.archivedPath);
+        const transcript = bytes
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        expect(transcript).toEqual(events);
+        outcomes.push({ bytes, notifications, entry: readEntry(), binding: readBinding() });
+      } finally {
+        sql.restore();
+        unsubscribe();
+      }
+    }, mode);
   }
   expect(outcomes[1]).toEqual(outcomes[0]);
 });
 
-it("restores the exact removed Codex row after A fails", async () => {
-  await withNativeBindingFixture(
-    "codex",
-    async ({ bindingStore, bindingKey, readEntry, readBinding, remove }) => {
-      const before = readEntry();
-      const failure = new Error("synthetic agent COMMIT refusal");
-      let removed: Record<string, unknown> | undefined;
-      let restored: Record<string, unknown> | undefined;
-      let agentCommit = false;
-      let fixtureWrite = false;
-      observeNativeGrants((request, facts) => {
-        if (facts.kind === "native-binding-ready") {
-          removed = { ...readBinding(), ignoredByCodec: { keep: ["exact", 7] } };
-          fixtureWrite = true;
-          try {
-            bindingStore.register(bindingKey, removed);
-          } finally {
-            fixtureWrite = false;
+it("restores the exact removed Codex row after A fails", () =>
+  withCodex(async ({ bindingStore, bindingKey, readEntry, readBinding, remove }) => {
+    const before = readEntry();
+    const failure = new Error("synthetic agent COMMIT refusal");
+    let removed: Record<string, unknown> | undefined;
+    let restored: Record<string, unknown> | undefined;
+    let agentCommit = false;
+    let fixtureWrite = false;
+    native.observeNativeGrants(admission, (request, facts) => {
+      if (facts.kind === "native-binding-ready") {
+        removed = { ...readBinding(), ignoredByCodec: { keep: ["exact", 7] } };
+        fixtureWrite = true;
+        try {
+          bindingStore.register(bindingKey, removed);
+        } finally {
+          fixtureWrite = false;
+        }
+      }
+      if (request.stage === "commit" && facts.kind === "session-native-binding") {
+        agentCommit = true;
+        expect(readBinding()).toBeUndefined();
+        throw failure;
+      }
+    });
+    native.spyAgentExecutions(execution, (worker) => ({
+      execute: async (command, options) => {
+        try {
+          return await worker.execute(command, options);
+        } finally {
+          if (command.type === "session.nativeBindings.delete") {
+            restored = readBinding();
           }
         }
-        if (request.stage === "commit" && facts.kind === "session-native-binding") {
-          agentCommit = true;
-          expect(readBinding()).toBeUndefined();
-          throw failure;
-        }
-      });
-      delivery.afterExecution = () => {
-        restored = readBinding();
-      };
-      const measured: string[] = [];
-      const sql = observeHostDataSql((query) => {
+      },
+    }));
+    const measured: string[] = [];
+    await native.withHostDataSql(
+      async () => {
+        await expect(remove()).rejects.toBe(failure);
+        expect(agentCommit).toBe(true);
+        // Exclude only this test's explicit before-image write, not the owner's restoration.
+        expect(native.bindingWrites(measured)).toEqual([]);
+      },
+      (query) => {
         if (!fixtureWrite) {
           measured.push(query);
         }
-      });
-      try {
-        const rejected = remove();
-        await expect(rejected).rejects.toBe(failure);
-        expect(agentCommit).toBe(true);
-        // Exclude only this test's explicit before-image write, not the owner's restoration.
-        expect(bindingWrites(measured)).toEqual([]);
-      } finally {
-        sql.restore();
-      }
-      expect(readEntry()).toEqual(before);
-      expect(removed).toBeDefined();
-      expect(restored).toMatchObject({
-        ...removed,
-        lease: {
-          token: isRecord(removed?.lease) ? removed.lease.token : undefined,
-          expiresAt: expect.any(Number),
-        },
-      });
-      const { lease: originalLease, ...originalValue } = removed!;
-      const { lease: restoredLease, ...restoredValue } = restored!;
-      expect(restoredValue).toEqual(originalValue);
-      expect(
-        isRecord(restoredLease) &&
-          isRecord(originalLease) &&
-          typeof restoredLease.expiresAt === "number" &&
-          typeof originalLease.expiresAt === "number" &&
-          restoredLease.expiresAt >= originalLease.expiresAt,
-      ).toBe(true);
-    },
-  );
-});
+      },
+    );
+    expect(readEntry()).toEqual(before);
+    assert(removed && restored);
+    const { lease: originalLease, ...originalValue } = removed;
+    const { lease: restoredLease, ...restoredValue } = restored;
+    expect(restoredValue).toEqual(originalValue);
+    assert(isRecord(originalLease) && typeof originalLease.expiresAt === "number");
+    assert(isRecord(restoredLease) && typeof restoredLease.expiresAt === "number");
+    expect(restoredLease).toMatchObject({ token: originalLease.token });
+    expect(restoredLease.expiresAt).toBeGreaterThanOrEqual(originalLease.expiresAt);
+  }));
 
 it.each(["absent", "expired lease"] as const)(
   "rechecks the %s predicate inside the executing worker before deleting the binding",
-  async (condition) => {
-    await withNativeBindingFixture(
+  (condition) =>
+    withNativeBindingFixture(
       "agentsapi",
       async ({ bindingStore, bindingKey, readEntry, readBinding, remove }) => {
         const before = readEntry();
@@ -236,7 +182,7 @@ it.each(["absent", "expired lease"] as const)(
         }
         let checked = false;
         let current: Record<string, unknown> | undefined;
-        observeNativeGrants((_request, facts) => {
+        native.observeNativeGrants(admission, (_request, facts) => {
           if (facts.kind !== "native-binding-ready" || checked) {
             return;
           }
@@ -249,8 +195,7 @@ it.each(["absent", "expired lease"] as const)(
           bindingStore.register(bindingKey, current);
         });
         await expect(remove()).rejects.toThrow("binding changed before session deletion");
-        expect(checked).toBe(true);
-        expect(readEntry()).toEqual(before);
+        expect({ checked, entry: readEntry() }).toEqual({ checked: true, entry: before });
         if (condition === "absent") {
           expect(readBinding()).toEqual(current);
         } else {
@@ -258,8 +203,7 @@ it.each(["absent", "expired lease"] as const)(
           expect(readBinding()).toMatchObject(binding!);
         }
       },
-    );
-  },
+    ),
 );
 
 it.each([
@@ -267,8 +211,8 @@ it.each([
   { acp: true, rollback: true },
   { acp: false, rollback: false },
   { acp: false, rollback: true },
-])("settles acknowledged deletion (ACP: $acp, rollback: $rollback)", async ({ acp, rollback }) => {
-  await withNativeBindingFixture(
+])("settles acknowledged deletion (ACP: $acp, rollback: $rollback)", ({ acp, rollback }) =>
+  withNativeBindingFixture(
     "agentsapi",
     async ({ scope, bindingStore, bindingKey, harness, readEntry, readBinding, remove }) => {
       const legacy = {
@@ -303,7 +247,7 @@ it.each([
       }
       const before = readEntry();
       const failure = new Error("synthetic deletion COMMIT refusal");
-      const commitSeen = observeNativeCommit(admission, () => {
+      const commitSeen = native.observeNativeCommit(admission, () => {
         if (acp) {
           expect(finalized).not.toHaveBeenCalled();
         } else {
@@ -322,7 +266,7 @@ it.each([
           await expect(remove()).resolves.toMatchObject({ deleted: true });
         }
         expect(commitSeen).toHaveBeenCalled();
-        expect(bindingWrites(sql.queries)).toEqual([]);
+        expect(native.bindingWrites(sql.queries)).toEqual([]);
         expect(readEntry()).toEqual(rollback ? before : undefined);
         if (acp) {
           expect(finalized).toHaveBeenCalledTimes(rollback ? 0 : 1);
@@ -337,5 +281,5 @@ it.each([
         sql.restore();
       }
     },
-  );
-});
+  ),
+);

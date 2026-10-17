@@ -79,7 +79,13 @@ function makeRecorder(runId: string, storePath?: string, trackInputCompletion?: 
   });
 }
 
-it("accepts supplied legacy completion callbacks without falling back from async completion", async () => {
+async function stageRecorder(runId: string, storePath?: string, tracked?: boolean) {
+  const recorder = makeRecorder(runId, storePath, tracked);
+  expect(await recorder.stageApproved!({ runId, assertCurrent() {} })).toBe(true);
+  return recorder;
+}
+
+it("uses legacy completion only when async completion is absent", async () => {
   setRuntimeConfigSnapshot({});
   const outcome = ok();
   const legacy = vi.fn(() => outcome);
@@ -109,9 +115,7 @@ it("accepts supplied legacy completion callbacks without falling back from async
       completeUserTurnProcessing(
         {
           ...recorder,
-          completeProcessingAsync: async () => {
-            throw new Error("Async completion failed");
-          },
+          completeProcessingAsync: () => Promise.reject(new Error("Async completion failed")),
         },
         outcome,
       ),
@@ -127,6 +131,8 @@ function createFixture() {
   setRuntimeConfigSnapshot({});
   const database = openOpenClawAgentDatabase({ agentId: scope.agentId });
   writeSessionEntry(database, scope.sessionKey, sessionEntry());
+  const rows = (table: string, columns = "*") =>
+    database.db.prepare(`SELECT ${columns} FROM ${table}`).all();
   return {
     database,
     stage: async (runId: string, assertCurrent = () => {}, trackCompletion = false) =>
@@ -139,11 +145,9 @@ function createFixture() {
         }),
         "Expected accepted input custody",
       ),
-    pending: () =>
-      database.db
-        .prepare("SELECT run_id, state, request_hash FROM session_pending_inputs ORDER BY seq")
-        .all(),
-    completions: () => database.db.prepare("SELECT * FROM session_input_completions").all(),
+    pending: () => rows("session_pending_inputs ORDER BY seq", "run_id, state, request_hash"),
+    completions: () => rows("session_input_completions"),
+    rows,
   };
 }
 
@@ -151,26 +155,22 @@ function withFixture(run: (fixture: ReturnType<typeof createFixture>) => Promise
   return withOpenClawTestState({ scenario: "minimal" }, () => run(createFixture()));
 }
 
-it("keeps synchronous recorder completion usable through the compatibility window", async () => {
-  await withFixture(async ({ database, pending }) => {
-    const recorder = makeRecorder("host-legacy", undefined, true);
-    expect(await recorder.stageApproved!({ runId: "host-legacy", assertCurrent: () => {} })).toBe(
-      true,
-    );
+it("supports synchronous recorder completion during compatibility", () =>
+  withFixture(async ({ pending, rows }) => {
+    const recorder = await stageRecorder("host-legacy", undefined, true);
     const outcome = ok();
     expect(recorder.completeProcessing!(outcome)).toEqual(outcome);
     expect(recorder.getProcessingCompletion!()).toEqual(outcome);
-    expect(database.db.prepare("SELECT outcome_json FROM session_input_completions").get()).toEqual(
+    expect(rows("session_input_completions", "outcome_json")).toEqual([
       { outcome_json: JSON.stringify(outcome) },
-    );
+    ]);
     expect(pending()).toEqual([]);
     expect(await recorder.completeProcessingAsync?.(outcome)).toEqual(outcome);
     await recorder.waitForPendingInputSettlement!();
-  });
-});
+  }));
 
-it("shares transaction rows without retaining stale custody and returns the persisted staging postimage", async () => {
-  await withFixture(async ({ database }) => {
+it("shares transaction rows, returns the staging postimage and rejects stale custody", () =>
+  withFixture(async ({ database }) => {
     ensureSessionPendingInputsSchema(database.db);
     ensureSessionInputCompletionsSchema(database.db);
     const identity = {
@@ -255,8 +255,7 @@ it("shares transaction rows without retaining stale custody and returns the pers
       },
     ]);
 
-    const requeued = mutate(stage());
-    expect(requeued.stagedInput).toEqual(staged.stagedInput);
+    expect(mutate(stage()).stagedInput).toEqual(staged.stagedInput);
 
     const completionCounter = trackSqliteStatementExecutions(
       requireNativeSqliteDatabase(database.db),
@@ -279,28 +278,24 @@ it("shares transaction rows without retaining stale custody and returns the pers
       updatedAt: 2,
     });
     expect(() => mutate(stage(previous))).toThrow("no longer owns the admitted session");
-  });
-});
+  }));
 
-it("stages and settles an agent user-turn recorder without caller-thread SQL", async () => {
-  await withFixture(async ({ database, stage, pending }) => {
+it("stages and settles user turns without caller-thread SQL", () =>
+  withFixture(async ({ database, stage, pending, rows }) => {
     const recorder = makeRecorder("completed", database.path, true);
     let cancelled: SessionPendingInputReceipt | undefined;
     const sql = observeHostDataSql();
     try {
-      expect(await recorder.stageApproved?.({ runId: "completed", assertCurrent: () => {} })).toBe(
-        true,
-      );
+      expect(await recorder.stageApproved?.({ runId: "completed", assertCurrent() {} })).toBe(true);
       expect(sql.queries).toEqual([]);
-      const cancellation = await stage("cancelled");
-      cancelled = cancellation;
+      cancelled = await stage("cancelled");
       const outcome = ok();
       expect(await completeUserTurnProcessing(recorder, outcome)).toEqual(outcome);
       expect(recorder.getProcessingCompletion?.()).toEqual(outcome);
       recorder.finishPendingInput?.("interrupted");
-      cancellation.finish("cancelled");
-      expect(() => cancellation.run(() => {})).toThrow(SessionPendingInputCustodyError);
-      await Promise.all([recorder.waitForPendingInputSettlement?.(), cancellation.settled?.()]);
+      cancelled.finish("cancelled");
+      expect(() => cancelled?.run(() => {})).toThrow(SessionPendingInputCustodyError);
+      await Promise.all([recorder.waitForPendingInputSettlement?.(), cancelled.settled?.()]);
       expect(sql.queries).toEqual([]);
     } finally {
       sql.restore();
@@ -308,21 +303,17 @@ it("stages and settles an agent user-turn recorder without caller-thread SQL", a
       cancelled?.finish("interrupted");
       await Promise.all([recorder.waitForPendingInputSettlement?.(), cancelled?.settled?.()]);
     }
-    expect(pending()).toEqual([
-      expect.objectContaining({ run_id: "cancelled", state: "cancelled" }),
+    expect(pending()).toMatchObject([{ run_id: "cancelled", state: "cancelled" }]);
+    expect(rows("session_input_completions", "run_id, succeeded")).toEqual([
+      { run_id: "completed", succeeded: 1 },
     ]);
-    expect(
-      database.db.prepare("SELECT run_id, succeeded FROM session_input_completions").all(),
-    ).toEqual([{ run_id: "completed", succeeded: 1 }]);
-  });
-});
+  }));
 
 it.each(["cancelled", "consumed", "failed"] as const)(
   "reports a withdrawn input only after confirmed cancellation: %s",
-  async (result) => {
-    await withFixture(async ({ database, pending: readPending }) => {
-      const recorder = makeRecorder(result, database.path);
-      await recorder.stageApproved?.({ runId: result, assertCurrent: () => {} });
+  (result) =>
+    withFixture(async ({ database, pending: readPending }) => {
+      const recorder = await stageRecorder(result, database.path);
       const pending = expectDefined(
         (await listSessionPendingInputs(scope)).items[0],
         "Expected accepted input",
@@ -350,29 +341,21 @@ it.each(["cancelled", "consumed", "failed"] as const)(
         expect(readWithdrawnUserTurnInputId(recorder)).toBe(
           result === "cancelled" ? pending.id : undefined,
         );
-        expect(readPending()).toEqual(
+        expect(readPending()).toMatchObject(
           result === "consumed"
             ? []
-            : [
-                expect.objectContaining({
-                  run_id: result,
-                  state: result === "failed" ? "queued" : "cancelled",
-                }),
-              ],
+            : [{ run_id: result, state: result === "failed" ? "queued" : "cancelled" }],
         );
       } finally {
         spy.mockRestore();
         recorder.finishPendingInput?.("interrupted");
         await Promise.allSettled([recorder.waitForPendingInputSettlement?.()]);
       }
-    });
-  },
+    }),
 );
 
-it("retains cancellation disposition custody while accepted processing completion is waiting", async ({
-  signal,
-}) => {
-  await withFixture(async ({ stage }) => {
+it("retains cancellation custody while completion waits", ({ signal }) =>
+  withFixture(async ({ stage }) => {
     const receipt = await stage("cancelling", () => {}, true);
     await listSessionPendingInputs(scope);
     const entered = createDeferred();
@@ -417,13 +400,12 @@ it("retains cancellation disposition custody while accepted processing completio
       receipt.finish("cancelled");
       await Promise.allSettled([completion, receipt.settled?.()]);
     }
-  });
-});
+  }));
 
 it.each(["transaction", "commit"] as const)(
-  "refuses a staging grant when the run ends at %s without publishing input custody",
-  async (phase) => {
-    await withFixture(async ({ stage, pending }) => {
+  "refuses staging custody when the run ends at %s",
+  (phase) =>
+    withFixture(async ({ stage, pending }) => {
       let current = true;
       let revoked = false;
       const spy = interceptPublication(phase, ({ kind }) => {
@@ -445,12 +427,11 @@ it.each(["transaction", "commit"] as const)(
       } finally {
         spy.mockRestore();
       }
-    });
-  },
+    }),
 );
 
-it("rejects a worker-side request-hash mismatch with the original custody error class", async () => {
-  await withFixture(async ({ database, stage, pending, completions }) => {
+it("preserves custody errors for worker-side request-hash mismatches", () =>
+  withFixture(async ({ database, stage, pending, completions }) => {
     const receipt = await stage("hash-bound", () => {}, true);
     const original = pending();
     const originalHash = original[0]?.request_hash;
@@ -470,11 +451,10 @@ it("rejects a worker-side request-hash mismatch with the original custody error 
       receipt.finish("interrupted");
       await expect(receipt.settled?.()).rejects.toBeInstanceOf(SessionPendingInputCustodyError);
     }
-  });
-});
+  }));
 
-it("refuses processing completion when the admitted lifecycle changes during the worker wait", async () => {
-  await withFixture(async ({ stage, completions }) => {
+it("refuses completion after a lifecycle change during the worker wait", () =>
+  withFixture(async ({ stage, completions }) => {
     const receipt = await stage("stale-lifecycle", () => {}, true);
     let rotated = false;
     const spy = interceptPublication("transaction", ({ receipt: publicationReceipt }) => {
@@ -492,13 +472,12 @@ it("refuses processing completion when the admitted lifecycle changes during the
       receipt.finish("interrupted");
       await expect(receipt.settled?.()).rejects.toThrow();
     }
-  });
-});
+  }));
 
 it.each(["lost reply", "unknown settlement", "independent committed write"] as const)(
   "settles staging with %s without replaying its native write",
-  async (fault) => {
-    await withFixture(async ({ stage, pending }) => {
+  (fault) =>
+    withFixture(async ({ stage, pending }) => {
       let executions = 0;
       let restoreSettlement: (() => void) | undefined;
       const spy = interceptPendingInputWorker((worker, context) => {
@@ -520,18 +499,17 @@ it.each(["lost reply", "unknown settlement", "independent committed write"] as c
               return result;
             }
             executions++;
-            expect(nativeAdmission?.committed).toMatchObject({
-              facts: { kind: "pending-input-settlement", operation: "stage" },
+            expect(nativeAdmission).toMatchObject({
+              committed: { facts: { kind: "pending-input-settlement", operation: "stage" } },
+              settlement: { kind: "completed" },
             });
-            expect(nativeAdmission?.settlement?.kind).toBe("completed");
             if (fault === "independent committed write") {
               runOpenClawAgentWriteTransaction(
-                (database) => {
+                (database) =>
                   writeSessionEntry(database, "agent:main:independent-input", {
                     sessionId: "independent-input",
                     updatedAt: 2,
-                  });
-                },
+                  }),
                 { agentId: scope.agentId },
               );
               return result;
@@ -549,32 +527,22 @@ it.each(["lost reply", "unknown settlement", "independent committed write"] as c
       });
       let receipt: SessionPendingInputReceipt | undefined;
       try {
-        const result = await stage("lost-result").then(
-          (value) => ({ ok: true as const, value }),
-          (error: unknown) => ({ ok: false as const, error }),
-        );
-        expect(executions).toBe(1);
-        expect(pending()).toEqual([
-          expect.objectContaining({ run_id: "lost-result", state: "queued" }),
-        ]);
+        const result = stage("lost-result");
         if (fault === "unknown settlement") {
-          expect(result.ok).toBe(false);
-          if (!result.ok) {
-            expect(isSqliteWorkerError(result.error, "outcome-unknown")).toBe(true);
-          }
+          await expect(result).rejects.toSatisfy((error: unknown) =>
+            isSqliteWorkerError(error, "outcome-unknown"),
+          );
         } else {
-          expect(result.ok).toBe(true);
-          if (result.ok) {
-            receipt = result.value;
-            expect(receipt.run(() => "admitted once")).toBe("admitted once");
-          }
+          receipt = await result;
+          expect(receipt.run(() => "admitted once")).toBe("admitted once");
         }
+        expect(executions).toBe(1);
+        expect(pending()).toMatchObject([{ run_id: "lost-result", state: "queued" }]);
       } finally {
         restoreSettlement?.();
         spy.mockRestore();
         receipt?.finish("interrupted");
         await receipt?.settled?.();
       }
-    });
-  },
+    }),
 );

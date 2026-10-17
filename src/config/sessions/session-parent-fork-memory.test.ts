@@ -33,6 +33,8 @@ vi.mock("node:worker_threads", async (importOriginal) => ({
 const parentKey = "agent:main:dashboard:incognito-parent-fork";
 const env = { OPENCLAW_STATE_DIR: "/synthetic/memory-parent-fork" };
 const authority = { assertCurrent() {}, authorize() {} };
+const answer = (content = "First answer") => ({ role: "assistant", content, stopReason: "stop" });
+const history = (events: unknown) => ({ kind: "full", snapshot: { events } });
 const actors: SessionActor[] = [];
 afterEach(async () => {
   await Promise.all(actors.splice(0).map((actor) => actor.release()));
@@ -81,12 +83,7 @@ async function fixture(childAgent = "main") {
       timestamp: "2026-01-01T00:00:00.000Z",
     },
     { type: "message", id: "u1", parentId: null, message: { role: "user", content: "Question" } },
-    {
-      type: "message",
-      id: "a1",
-      parentId: "u1",
-      message: { role: "assistant", content: "First answer", stopReason: "stop" },
-    },
+    { type: "message", id: "a1", parentId: "u1", message: answer() },
   ];
   expect(await parent.create({ entry, transcriptEvents: events })).toMatchObject({
     kind: "committed",
@@ -103,12 +100,10 @@ async function fixture(childAgent = "main") {
   return { parent, child, childKey, entry, forkInput };
 }
 
-it.each([
-  { childAgent: "main", explicit: true },
-  { childAgent: "research", explicit: false },
-])(
-  "prepares current $childAgent forks through the selected memory owner",
-  async ({ childAgent, explicit }) => {
+it.each(["main", "research"])(
+  "prepares current %s forks through the selected memory owner",
+  async (childAgent) => {
+    const explicit = childAgent === "main";
     const { parent, child, entry, forkInput } = await fixture(childAgent);
     const append = parent.actor.appendTranscriptEvent(
       {
@@ -129,11 +124,7 @@ it.each([
               timestamp: "2026-01-01T00:00:01.000Z",
             },
             message: {
-              messageJson: JSON.stringify({
-                role: "assistant",
-                content: "Latest answer",
-                stopReason: "stop",
-              }),
+              messageJson: JSON.stringify(answer("Latest answer")),
               cwd: "/synthetic",
               validateTurn: false,
             },
@@ -155,14 +146,12 @@ it.each([
       : await child.run(() => prepareSessionForkTranscript(input));
     expect((await append).kind).toBe("committed");
     assert(prepared.status === "prepared");
-    expect(prepared).toMatchObject({
-      events: expect.arrayContaining([
-        expect.objectContaining({
-          id: "a2",
-          message: expect.objectContaining({ content: "Latest answer" }),
-        }),
-      ]),
-    });
+    expect(prepared.events).toContainEqual(
+      expect.objectContaining({
+        id: "a2",
+        message: expect.objectContaining({ content: "Latest answer" }),
+      }),
+    );
     expect(await child.readEntry()).toBeUndefined();
     expect(
       await child.create({
@@ -170,10 +159,7 @@ it.each([
         transcriptEvents: prepared.events,
       }),
     ).toMatchObject({ kind: "committed" });
-    expect(await child.readHistory()).toMatchObject({
-      kind: "full",
-      snapshot: { events: prepared.events },
-    });
+    expect(await child.readHistory()).toMatchObject(history(prepared.events));
   },
 );
 
@@ -219,18 +205,16 @@ it.each(["main", "research"])("adopts transcript-only forks in %s memory", async
   expect(fork.status).toBe("created");
   expect(child.owner.readSession(childKey, authority)?.entry).toBeUndefined();
   const pending = await child.readHistory("pending-child-transcript");
-  expect(pending).toMatchObject({
-    kind: "full",
-    snapshot: { events: expect.arrayContaining([expect.objectContaining({ id: "a1" })]) },
-  });
-  await upsertSessionEntryCore(
-    { agentId: childAgent, sessionKey: childKey, storePath: child.owner.path },
-    { sessionId: "pending-child-transcript", updatedAt: 2 },
+  expect(pending).toMatchObject(
+    history(expect.arrayContaining([expect.objectContaining({ id: "a1" })])),
   );
-  expect(await child.readHistory()).toMatchObject({
-    kind: "full",
-    snapshot: { events: pending.kind === "full" ? pending.snapshot.events : [] },
+  await upsertSessionEntryCore(child.scope, {
+    sessionId: "pending-child-transcript",
+    updatedAt: 2,
   });
+  expect(await child.readHistory()).toMatchObject(
+    history(pending.kind === "full" ? pending.snapshot.events : []),
+  );
 });
 
 it("forks current memory state with a data-only entry patch", async () => {

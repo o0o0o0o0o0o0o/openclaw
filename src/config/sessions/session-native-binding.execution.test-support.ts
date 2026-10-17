@@ -3,6 +3,7 @@ import { deserialize } from "node:v8";
 import { Worker } from "node:worker_threads";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, vi } from "vitest";
+import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import type * as admission from "../../infra/sqlite-worker-operation-admission.js";
 import { sqliteWorkerOwnerProbe as probe } from "../../infra/sqlite-worker-owner-probe.test-support.js";
 import type {
@@ -12,6 +13,18 @@ import type {
 
 type ExecutionModule = typeof import("../../state/openclaw-agent-execution.js");
 type Decorate = (worker: AgentDatabaseExecutionScope) => AgentDatabaseExecutionScope;
+
+export async function withHostDataSql<T>(
+  run: (sql: ReturnType<typeof observeHostDataSql>) => Promise<T>,
+  observe?: Parameters<typeof observeHostDataSql>[0],
+): Promise<T> {
+  const sql = observeHostDataSql(observe);
+  try {
+    return await run(sql);
+  } finally {
+    sql.restore();
+  }
+}
 
 export function publication(request: admission.SqliteWorkerAdmissionRequest) {
   const facts = isRecord(request.facts) ? request.facts.publication : undefined;
@@ -74,7 +87,7 @@ export function expectNoSql(queries: readonly string[], pattern: RegExp) {
   expect(queries.filter((query) => pattern.test(query))).toEqual([]);
 }
 
-export function wrapAgentExecution(
+function wrapAgentExecution(
   owner: OpenClawAgentDatabaseExecution,
   decorate: Decorate,
 ): OpenClawAgentDatabaseExecution {
@@ -88,19 +101,14 @@ export function wrapAgentExecution(
   };
 }
 
-// Keep both capture paths instrumented without changing the owner's lazy identity getter.
-export function instrumentAgentExecutions(actual: ExecutionModule, decorate: Decorate) {
-  return {
-    ...actual,
-    captureOpenClawAgentDatabaseExecution: (
-      ...args: Parameters<ExecutionModule["captureOpenClawAgentDatabaseExecution"]>
-    ) => wrapAgentExecution(actual.captureOpenClawAgentDatabaseExecution(...args), decorate),
-    captureOpenClawAgentDatabasePreparationExecution: (
-      ...args: Parameters<ExecutionModule["captureOpenClawAgentDatabasePreparationExecution"]>
-    ) =>
-      wrapAgentExecution(
-        actual.captureOpenClawAgentDatabasePreparationExecution(...args),
-        decorate,
-      ),
-  };
+// Capture the originals before spying; keep both paths and their lazy identity getters intact.
+export function spyAgentExecutions(module: ExecutionModule, decorate: Decorate) {
+  const capture = module.captureOpenClawAgentDatabaseExecution;
+  const prepare = module.captureOpenClawAgentDatabasePreparationExecution;
+  vi.spyOn(module, "captureOpenClawAgentDatabaseExecution").mockImplementation((...args) =>
+    wrapAgentExecution(capture(...args), decorate),
+  );
+  vi.spyOn(module, "captureOpenClawAgentDatabasePreparationExecution").mockImplementation(
+    (...args) => wrapAgentExecution(prepare(...args), decorate),
+  );
 }

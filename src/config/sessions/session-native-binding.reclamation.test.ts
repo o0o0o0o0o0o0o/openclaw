@@ -25,16 +25,26 @@ import {
   expectNoSql,
   observeNativeCommit,
   publication,
-  wrapAgentExecution,
+  spyAgentExecutions,
+  withHostDataSql,
 } from "./session-native-binding.execution.test-support.js";
 import { withNativeBindingFixture } from "./session-native-binding.test-support.js";
 
 afterEach(() => vi.restoreAllMocks());
 
+const expectOffThread = (operation: () => Promise<void>, bindings = false) =>
+  withHostDataSql(async ({ queries }) => {
+    await operation();
+    expectNoSql(queries, /\b(?:session_nodes|session_windows|transcript_events)\b/i);
+    if (bindings) {
+      expect(bindingWrites(queries)).toEqual([]);
+    }
+  });
+
 it.each([false, true])(
   "settles canonical replacement and native binding cleanup off thread (rollback: %s)",
-  async (rollback) => {
-    await withNativeBindingFixture("agentsapi", async (fixture) => {
+  (rollback) =>
+    withNativeBindingFixture("agentsapi", async (fixture) => {
       const before = fixture.readEntry();
       assert(before);
       const binding = fixture.readBinding();
@@ -45,13 +55,10 @@ it.each([false, true])(
           throw failure;
         }
       });
-      const sql = observeHostDataSql();
-      try {
+      await expectOffThread(async () => {
         const replacement = withPluginRuntimeRegistryScope(fixture.registry, () =>
           applySessionEntryCanonicalReplacements({
-            agentId: fixture.scope.agentId,
-            env: fixture.scope.env,
-            storePath: fixture.scope.storePath,
+            ...fixture.scope,
             skipMaintenance: true,
             sessionKeys: [fixture.scope.sessionKey, sessionKey],
             update: () => ({
@@ -68,11 +75,7 @@ it.each([false, true])(
           await expect(replacement).resolves.toBe("replaced");
         }
         expect(admitted).toHaveBeenCalled();
-        expectNoSql(sql.queries, /\b(?:session_nodes|session_windows|transcript_events)\b/i);
-        expect(bindingWrites(sql.queries)).toEqual([]);
-      } finally {
-        sql.restore();
-      }
+      }, true);
       expect([fixture.readEntry(), fixture.readBinding()]).toEqual(
         rollback ? [before, binding] : [undefined, undefined],
       );
@@ -84,14 +87,13 @@ it.each([false, true])(
         sessionKey: rollback ? fixture.scope.sessionKey : sessionKey,
       });
       expect(transcript).toEqual(fixture.events);
-    });
-  },
+    }),
 );
 
 it.each([false, true])(
   "settles typed reset and native reclamation without replacing a successor (%s)",
-  async (successor) => {
-    await withNativeBindingFixture("agentsapi", async (fixture) => {
+  (successor) =>
+    withNativeBindingFixture("agentsapi", async (fixture) => {
       const reset = {
         ...fixture.scope,
         sessionKey: "agent:main:reset-companion",
@@ -102,29 +104,19 @@ it.each([false, true])(
       writeSessionProgressCard(fixture.database.db, reset.sessionKey, {
         markdown: "Previous task",
       });
-      const next = successor
-        ? { sessionId: "successor", lifecycleRevision: "successor", updatedAt: 3 }
-        : { ...entry, lifecycleRevision: "after", updatedAt: 2 };
+      const resetEntry = { ...entry, lifecycleRevision: "after", updatedAt: 2 };
+      const next = { sessionId: "successor", lifecycleRevision: "successor", updatedAt: 3 };
       const inject = vi.fn(() => replaceSessionEntrySync(reset, next));
       if (successor) {
-        const capture = execution.captureOpenClawAgentDatabaseExecution;
-        const capturePreparation = execution.captureOpenClawAgentDatabasePreparationExecution;
-        const withDelivery = (owner: ReturnType<typeof capture>) =>
-          wrapAgentExecution(owner, (worker) => ({
-            execute: async (command, options) => {
-              const result = await worker.execute(command, options);
-              if (command.type === "session.nativeBindings.delete") {
-                inject();
-              }
-              return result;
-            },
-          }));
-        vi.spyOn(execution, "captureOpenClawAgentDatabaseExecution").mockImplementation((...args) =>
-          withDelivery(capture(...args)),
-        );
-        vi.spyOn(execution, "captureOpenClawAgentDatabasePreparationExecution").mockImplementation(
-          (...args) => withDelivery(capturePreparation(...args)),
-        );
+        spyAgentExecutions(execution, (worker) => ({
+          execute: async (command, options) => {
+            const result = await worker.execute(command, options);
+            if (command.type === "session.nativeBindings.delete") {
+              inject();
+            }
+            return result;
+          },
+        }));
       }
       let committed = false;
       const notifications: boolean[] = [];
@@ -144,15 +136,13 @@ it.each([false, true])(
         await expect(
           withPluginRuntimeRegistryScope(fixture.registry, () =>
             applySessionEntryLifecycleMutation({
-              agentId: fixture.scope.agentId,
-              env: fixture.scope.env,
-              storePath: fixture.scope.storePath,
+              ...fixture.scope,
               skipMaintenance: true,
               removals: [{ sessionKey: fixture.scope.sessionKey }],
               upserts: [
                 {
                   sessionKey: reset.sessionKey,
-                  entry: { ...entry, lifecycleRevision: "after", updatedAt: 2 },
+                  entry: resetEntry,
                   resetBoundary: { context: "clear", reason: "reset", cwd: "/synthetic/workspace" },
                 },
               ],
@@ -175,7 +165,7 @@ it.each([false, true])(
       }
       expect([fixture.readEntry(), fixture.readBinding()]).toEqual([undefined, undefined]);
       expect(readExactSessionEntryRow(fixture.database, reset.sessionKey)?.entry).toMatchObject(
-        next,
+        successor ? next : resetEntry,
       );
       expect(inject).toHaveBeenCalledTimes(successor ? 1 : 0);
       expect(resetIdentities).toEqual(successor ? [] : ["reset"]);
@@ -186,12 +176,11 @@ it.each([false, true])(
         reader.close();
       }
       expect(notifications).toEqual([true]);
-    });
-  },
+    }),
 );
 
-it("reclaims lifecycle artifacts with the native veto off the caller thread", async () => {
-  await withNativeBindingFixture("agentsapi", async (fixture) => {
+it("reclaims lifecycle artifacts with the native veto off the caller thread", () =>
+  withNativeBindingFixture("agentsapi", async (fixture) => {
     const published = vi.fn();
     const stop = onSessionIdentityMutation((change) => {
       if (change.previous.sessionKeys.includes(fixture.scope.sessionKey)) {
@@ -199,27 +188,23 @@ it("reclaims lifecycle artifacts with the native veto off the caller thread", as
       }
     });
     const granted = observeNativeCommit(admission);
-    const sql = observeHostDataSql();
     try {
-      await expect(fixture.cleanup()).resolves.toMatchObject({ removedEntries: 1 });
-      expect(granted).toHaveBeenCalled();
-      // Other-owner live authority reads remain outside the moved A transaction.
-      expectNoSql(sql.queries, /\b(?:session_nodes|session_windows|transcript_events)\b/i);
-      expect(bindingWrites(sql.queries)).toEqual([]);
+      await expectOffThread(async () => {
+        await expect(fixture.cleanup()).resolves.toMatchObject({ removedEntries: 1 });
+        expect(granted).toHaveBeenCalled();
+      }, true);
     } finally {
-      sql.restore();
       stop();
     }
     expect([fixture.readEntry(), fixture.readBinding()]).toEqual([undefined, undefined]);
     expect(loadTranscriptEventsSync(fixture.scope)).toEqual([]);
     expect(published.mock.calls).toEqual([["delete"]]);
-  });
-});
+  }));
 
 it.each([false, true])(
   "settles maintenance participants only for rows actually reclaimed (changed: %s)",
-  async (changed) => {
-    await withNativeBindingFixture("agentsapi", async (fixture) => {
+  (changed) =>
+    withNativeBindingFixture("agentsapi", async (fixture) => {
       const before = fixture.readEntry();
       assert(before);
       const binding = fixture.readBinding();
@@ -227,24 +212,19 @@ it.each([false, true])(
       if (changed) {
         replaceSessionEntrySync(fixture.scope, successor);
       }
-      const sql = observeHostDataSql();
-      try {
+      await expectOffThread(async () => {
         await expect(fixture.maintain(before)).resolves.toMatchObject({ pruned: changed ? 0 : 1 });
-        expectNoSql(sql.queries, /\b(?:session_nodes|session_windows|transcript_events)\b/i);
-      } finally {
-        sql.restore();
-      }
+      });
       expect([fixture.readEntry(), fixture.readBinding()]).toEqual(
         changed ? [successor, binding] : [undefined, undefined],
       );
-    });
-  },
+    }),
 );
 
 it.each([false, true])(
   "retains rollback authority until acknowledged worker deletion (binding: %s)",
-  async (withBinding) => {
-    await withNativeBindingFixture("agentsapi", async (fixture) => {
+  (withBinding) =>
+    withNativeBindingFixture("agentsapi", async (fixture) => {
       if (!withBinding) {
         fixture.registry.agentHarnesses.length = 0;
       }
@@ -257,6 +237,7 @@ it.each([false, true])(
       let fixtureRead = false;
       let revoked = true;
       const refusal = new Error("synthetic rollback authority revoked");
+      const deleteFailure = new Error("injected initializer delete failure");
       const create = admission.createSqliteWorkerOperationAdmission;
       vi.spyOn(admission, "createSqliteWorkerOperationAdmission").mockImplementation(
         (callback, attachment) => {
@@ -278,7 +259,7 @@ it.each([false, true])(
                 request.stage === "commit" &&
                 facts?.kind === "session-native-binding"
               ) {
-                throw new Error("injected initializer delete failure");
+                throw deleteFailure;
               }
               callback(request, grant);
             } finally {
@@ -315,31 +296,29 @@ it.each([false, true])(
         expect(fixture.readEntry()).toEqual(entry);
         expect(fixture.readBinding()).toBeDefined();
         revoked = false;
-        await expect(initializer.rollback(() => fixture.remove())).rejects.toThrow(
-          "injected initializer delete failure",
-        );
+        await expect(initializer.rollback(() => fixture.remove())).rejects.toThrow(deleteFailure);
         expect(() => initializer.handle.assertCurrent()).not.toThrow();
         expect(fixture.readEntry()).toEqual(entry);
         expect(fixture.readBinding()).toBeDefined();
         refuse = false;
         const measured: string[] = [];
         // Exclude only the test's explicit authority read, not any owner work.
-        const sql = observeHostDataSql((query) => {
-          if (!fixtureRead) {
-            measured.push(query);
-          }
-        });
-        try {
-          await expect(initializer.rollback(() => fixture.remove())).resolves.toMatchObject({
-            deleted: true,
-          });
-          expectNoSql(
-            measured,
-            /\b(?:session_nodes|session_windows|transcript_events|session_transcript_archives)\b/i,
-          );
-        } finally {
-          sql.restore();
-        }
+        await withHostDataSql(
+          async () => {
+            await expect(initializer.rollback(() => fixture.remove())).resolves.toMatchObject({
+              deleted: true,
+            });
+            expectNoSql(
+              measured,
+              /\b(?:session_nodes|session_windows|transcript_events|session_transcript_archives)\b/i,
+            );
+          },
+          (query) => {
+            if (!fixtureRead) {
+              measured.push(query);
+            }
+          },
+        );
         expect(authorityReads).toBeGreaterThan(0);
         expect(agentGrants).toBeGreaterThan(0);
         expect(fixture.readEntry()).toBeUndefined();
@@ -347,14 +326,9 @@ it.each([false, true])(
         expect(() => initializer.handle.assertCurrent()).toThrow(
           "Session initialization is rolling back",
         );
-        if (withBinding) {
-          expect(fixture.readBinding()).toBeUndefined();
-        } else {
-          expect(fixture.readBinding()).toBeDefined();
-        }
+        expect(fixture.readBinding() === undefined).toBe(withBinding);
       } finally {
         initializer.close();
       }
-    });
-  },
+    }),
 );

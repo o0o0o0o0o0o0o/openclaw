@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
@@ -16,7 +15,8 @@ import {
 } from "../../scripts/lib/release-publish-preflight-evidence.mts";
 import { createPluginSdkApiReleaseEvidence } from "../../scripts/plugin-sdk-api-release-evidence.mjs";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
-import { createNestedGitEnv, writeJsonFile } from "../helpers/temp-repo.js";
+import { writeJsonFile } from "../helpers/temp-repo.js";
+import { fixtureGit } from "./release-publish.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const version = "2026.9.5";
@@ -285,22 +285,7 @@ function coreEvidenceFixture() {
       openclaw: { release: { publishToNpm: true } },
     });
   }
-  const git = (...args: string[]) =>
-    execFileSync(
-      "git",
-      [
-        "-C",
-        source,
-        "-c",
-        "user.name=Release fixture",
-        "-c",
-        "user.email=release-fixture@example.invalid",
-        "-c",
-        "commit.gpgsign=false",
-        ...args,
-      ],
-      { env: createNestedGitEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-    ).trim();
+  const git = fixtureGit(source, "Release fixture", "release-fixture@example.invalid");
   git("init", "--quiet");
   git("add", ".");
   git("commit", "--quiet", "-m", "release source fixture");

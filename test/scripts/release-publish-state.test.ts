@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -8,7 +7,8 @@ import {
 } from "../../scripts/lib/release-publish-state.mts";
 import { writePublishablePluginFixture } from "../helpers/publishable-plugin-fixture.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
-import { createNestedGitEnv, writeJsonFile } from "../helpers/temp-repo.js";
+import { writeJsonFile } from "../helpers/temp-repo.js";
+import { fixtureGit, expectGate } from "./release-publish.test-support.js";
 
 const temps = useAutoCleanupTempDirTracker(afterEach);
 const version = "2026.9.5";
@@ -137,22 +137,7 @@ describe("release publication state", () => {
 
   it("reads plugin and opted-in core packages from the exact source commit, ignoring checkout changes", () => {
     const rootDir = temps.make("release-publish-state-");
-    const git = (...args: string[]) =>
-      execFileSync(
-        "git",
-        [
-          "-c",
-          "core.hooksPath=/dev/null",
-          "-c",
-          "commit.gpgsign=false",
-          "-c",
-          "user.name=Fixture",
-          "-c",
-          "user.email=fixture@example.invalid",
-          ...args,
-        ],
-        { cwd: rootDir, env: createNestedGitEnv(), encoding: "utf8" },
-      ).trim();
+    const git = fixtureGit(rootDir, "Fixture", "fixture@example.invalid", true);
     git("init", "--quiet");
     writeJsonFile(join(rootDir, "package.json"), {
       name: "openclaw",
@@ -331,16 +316,14 @@ describe("release concurrency observations", () => {
       "plugin-clawhub-release.yml",
       "plugin-clawhub-new.yml",
     ]) {
-      expect(result.gates).toContainEqual(
-        expect.objectContaining({
-          id: `concurrency.${workflow}.inventory`,
-          status: "WARN",
-          message: expect.stringContaining("observation budget exhausted"),
-          remediation: expect.stringContaining(
-            `gh api 'repos/openclaw/openclaw/actions/workflows/${workflow}/runs?status=in_progress&per_page=100' --method GET`,
-          ),
-        }),
-      );
+      expectGate(result.gates, {
+        id: `concurrency.${workflow}.inventory`,
+        status: "WARN",
+        message: expect.stringContaining("observation budget exhausted"),
+        remediation: expect.stringContaining(
+          `gh api 'repos/openclaw/openclaw/actions/workflows/${workflow}/runs?status=in_progress&per_page=100' --method GET`,
+        ),
+      });
     }
     expect(runGh).toHaveBeenCalledTimes(2);
   });
@@ -369,20 +352,16 @@ describe("release concurrency observations", () => {
         });
       },
     });
-    expect(result.gates).toContainEqual(
-      expect.objectContaining({
-        id: "concurrency.plugin-npm-release.yml.321",
-        status: "FAIL",
-      }),
-    );
-    expect(result.gates).toContainEqual(
-      expect.objectContaining({
-        id: "concurrency.plugin-npm-release.yml.inventory",
-        status: "WARN",
-        message: expect.stringContaining("HTTP 503: upstream unavailable"),
-        remediation: expect.stringContaining("status=in_progress"),
-      }),
-    );
+    expectGate(result.gates, {
+      id: "concurrency.plugin-npm-release.yml.321",
+      status: "FAIL",
+    });
+    expectGate(result.gates, {
+      id: "concurrency.plugin-npm-release.yml.inventory",
+      status: "WARN",
+      message: expect.stringContaining("HTTP 503: upstream unavailable"),
+      remediation: expect.stringContaining("status=in_progress"),
+    });
   });
 
   it("reads a published release by exact tag without transferring the full release inventory", () => {

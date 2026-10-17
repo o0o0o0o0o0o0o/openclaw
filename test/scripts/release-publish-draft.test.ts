@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
@@ -12,9 +12,23 @@ import { join, resolve } from "node:path";
 import { expect, it } from "vitest";
 import { parse } from "yaml";
 import { createNestedGitEnv } from "../helpers/temp-repo.js";
+import { fixtureGit } from "./release-publish.test-support.js";
 import { createScriptTestHarness } from "./test-helpers.js";
 
 const { createTempDir } = createScriptTestHarness();
+const parentEnv = {
+  GITHUB_REF: "refs/tags/release-publish/aaaaaaaaaaaa-1",
+  PARENT_WORKFLOW_SHA: "a".repeat(40),
+};
+function runBash(root: string, script: string, env: NodeJS.ProcessEnv, shell = "bash") {
+  return spawnSync(shell, ["-c", script], {
+    cwd: root,
+    encoding: "utf8",
+    env: { ...env, RUNNER_TEMP: root, ...parentEnv },
+  });
+}
+const publicationWorkflow = () =>
+  parse(readFileSync(".github/workflows/openclaw-release-publish.yml", "utf8"));
 
 function publicationFixture({
   releaseVersion = "2026.9.4",
@@ -31,26 +45,11 @@ function publicationFixture({
     join(root, "CHANGELOG.md"),
     `# Changelog\n\n## ${releaseVersion}\n\n### Fixes\n\n- Frozen release fix.\n`,
   );
-  const git = (args: string[]) =>
-    execFileSync("git", args, {
-      cwd: root,
-      encoding: "utf8",
-      env: createNestedGitEnv(),
-    }).trim();
-  git(["init", "-q"]);
-  git(["add", "."]);
-  git([
-    "-c",
-    "user.name=OpenClaw Test",
-    "-c",
-    "user.email=test@openclaw.invalid",
-    "-c",
-    "commit.gpgSign=false",
-    "commit",
-    "-qm",
-    "historical release",
-  ]);
-  const targetSha = git(["rev-parse", "HEAD"]);
+  const git = fixtureGit(root, "OpenClaw Test", "test@openclaw.invalid");
+  git("init", "-q");
+  git("add", ".");
+  git("commit", "-qm", "historical release");
+  const targetSha = git("rev-parse", "HEAD");
   writeFileSync(join(root, "CHANGELOG.md"), "Working tree content must not be published.\n");
   mkdirSync(join(root, ".release-harness/scripts/lib"), { recursive: true });
   writeFileSync(
@@ -80,16 +79,14 @@ function publicationFixture({
   // Publication installs tooling in the harness, then links the frozen target cwd to it.
   symlinkSync(join(repository, "node_modules"), join(root, ".release-harness/node_modules"), "dir");
   symlinkSync(".release-harness/node_modules", join(root, "node_modules"), "dir");
-  return { root, repository, targetSha };
+  return { root, targetSha };
 }
 
 it.each([true, false])(
   "renders and verifies an old pinned target with manifest present=%s",
   (hasManifest) => {
-    const { root, repository, targetSha } = publicationFixture();
-    const workflow = parse(
-      readFileSync(join(repository, ".github/workflows/openclaw-release-publish.yml"), "utf8"),
-    );
+    const { root, targetSha } = publicationFixture();
+    const workflow = publicationWorkflow();
     for (const name of [
       "Dispatch publish workflows",
       "Start core npm publication",
@@ -118,36 +115,27 @@ it.each([true, false])(
         }),
       );
     }
-    const result = spawnSync(
-      process.platform === "darwin" ? "/bin/bash" : "bash",
-      [
-        "-c",
-        `
+    const result = runBash(
+      root,
+      `
 set -euo pipefail
 ${prepare.run}
 source "$GITHUB_WORKSPACE/.release-harness/scripts/lib/release-publish-children.sh"
 render_github_release_notes "$NOTES_FILE" "$PROOF_FILE"
 canonical_release_body_matches "$NOTES_FILE"
 `,
-      ],
       {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...createNestedGitEnv(),
-          GITHUB_WORKSPACE: root,
-          RUNNER_TEMP: root,
-          GITHUB_REPOSITORY: "fixture/repository",
-          RELEASE_TAG: "v2026.9.4",
-          TARGET_SHA: targetSha,
-          GITHUB_REF: "refs/tags/release-publish/aaaaaaaaaaaa-1",
-          PARENT_WORKFLOW_SHA: "a".repeat(40),
-          NOTES_FILE: notes,
-          PROOF_FILE: proof,
-          RELEASE_EVIDENCE_MODE: "full-release-validation",
-          ...(hasManifest ? { FULL_RELEASE_VALIDATION_MANIFEST_DIR: root } : {}),
-        },
+        ...createNestedGitEnv(),
+        GITHUB_WORKSPACE: root,
+        GITHUB_REPOSITORY: "fixture/repository",
+        RELEASE_TAG: "v2026.9.4",
+        TARGET_SHA: targetSha,
+        NOTES_FILE: notes,
+        PROOF_FILE: proof,
+        RELEASE_EVIDENCE_MODE: "full-release-validation",
+        ...(hasManifest ? { FULL_RELEASE_VALIDATION_MANIFEST_DIR: root } : {}),
       },
+      process.platform === "darwin" ? "/bin/bash" : "bash",
     );
     expect(result.status, result.stderr).toBe(0);
     const prepared = readFileSync(join(root, "release-notes.md"), "utf8");
@@ -160,31 +148,23 @@ canonical_release_body_matches "$NOTES_FILE"
 it("renders the extended-stable context through the real publication entry point", () => {
   const releaseVersion = "2026.8.35";
   const toolingVersion = "2026.9.5";
-  const { root, repository, targetSha } = publicationFixture({ releaseVersion, toolingVersion });
-  const workflow = parse(
-    readFileSync(join(repository, ".github/workflows/openclaw-release-publish.yml"), "utf8"),
-  );
+  const { root, targetSha } = publicationFixture({ releaseVersion, toolingVersion });
+  const workflow = publicationWorkflow();
   const prepare = workflow.jobs.publish.steps.find(
     (step: { name?: string }) => step.name === "Prepare GitHub release notes",
   );
-  const result = spawnSync(
-    process.platform === "darwin" ? "/bin/bash" : "bash",
-    ["-c", prepare.run],
+  const result = runBash(
+    root,
+    prepare.run,
     {
-      cwd: root,
-      encoding: "utf8",
-      env: {
-        ...createNestedGitEnv(),
-        GITHUB_WORKSPACE: root,
-        RUNNER_TEMP: root,
-        GITHUB_REPOSITORY: "openclaw/openclaw",
-        RELEASE_TAG: `v${releaseVersion}`,
-        RELEASE_NPM_DIST_TAG: "extended-stable",
-        TARGET_SHA: targetSha,
-        GITHUB_REF: "refs/tags/release-publish/aaaaaaaaaaaa-1",
-        PARENT_WORKFLOW_SHA: "a".repeat(40),
-      },
+      ...createNestedGitEnv(),
+      GITHUB_WORKSPACE: root,
+      GITHUB_REPOSITORY: "openclaw/openclaw",
+      RELEASE_TAG: `v${releaseVersion}`,
+      RELEASE_NPM_DIST_TAG: "extended-stable",
+      TARGET_SHA: targetSha,
     },
+    process.platform === "darwin" ? "/bin/bash" : "bash",
   );
 
   expect(result.status, result.stderr).toBe(0);
@@ -212,11 +192,9 @@ it.each([
     const commands = join(root, "command");
     const notes = join(root, "notes.md");
     writeFileSync(notes, "Canonical release notes\n");
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        `
+    const result = runBash(
+      root,
+      `
 source "$OWNER_SCRIPT"
 verify_release_tag_target() { :; }
 canonical_release_body_matches() { [[ "$EXISTING" != diverged-public ]]; }
@@ -235,24 +213,16 @@ gh() {
 prepared_release_notes_file="$NOTES_FILE"
 create_or_update_github_release
 `,
-      ],
       {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          PATH: process.env.PATH,
-          OWNER_SCRIPT: resolve("scripts/lib/release-publish-children.sh"),
-          EXISTING: existing,
-          COMMAND_FILE: commands,
-          NOTES_FILE: notes,
-          RUNNER_TEMP: root,
-          GITHUB_STEP_SUMMARY: join(root, "summary"),
-          GITHUB_REPOSITORY: "fixture/repository",
-          GITHUB_REF: "refs/tags/release-publish/aaaaaaaaaaaa-1",
-          PARENT_WORKFLOW_SHA: "a".repeat(40),
-          RELEASE_TAG: "v2026.9.2",
-          RELEASE_NPM_DIST_TAG: distTag,
-        },
+        PATH: process.env.PATH,
+        OWNER_SCRIPT: resolve("scripts/lib/release-publish-children.sh"),
+        EXISTING: existing,
+        COMMAND_FILE: commands,
+        NOTES_FILE: notes,
+        GITHUB_STEP_SUMMARY: join(root, "summary"),
+        GITHUB_REPOSITORY: "fixture/repository",
+        RELEASE_TAG: "v2026.9.2",
+        RELEASE_NPM_DIST_TAG: distTag,
       },
     );
     expect(result.status, result.stderr).toBe(existing === "diverged-public" ? 1 : 0);
@@ -278,11 +248,9 @@ it.each(["create_or_update_github_release", "append_release_proof_to_github_rele
   (operation) => {
     const root = createTempDir("release-publish-docs-stage-");
     const commands = join(root, "commands");
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        `
+    const result = runBash(
+      root,
+      `
 source "$OWNER_SCRIPT"
 verify_release_tag_target() { :; }
 gh() {
@@ -294,22 +262,14 @@ gh() {
 }
 "$OPERATION"
 `,
-      ],
       {
-        cwd: root,
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          OWNER_SCRIPT: resolve("scripts/lib/release-publish-children.sh"),
-          COMMAND_FILE: commands,
-          RELEASE_TAG: "v2026.9.4",
-          RELEASE_NPM_DIST_TAG: "latest",
-          GITHUB_REPOSITORY: "fixture/repository",
-          RUNNER_TEMP: root,
-          OPERATION: operation,
-          GITHUB_REF: "refs/tags/release-publish/aaaaaaaaaaaa-1",
-          PARENT_WORKFLOW_SHA: "a".repeat(40),
-        },
+        ...process.env,
+        OWNER_SCRIPT: resolve("scripts/lib/release-publish-children.sh"),
+        COMMAND_FILE: commands,
+        RELEASE_TAG: "v2026.9.4",
+        RELEASE_NPM_DIST_TAG: "latest",
+        GITHUB_REPOSITORY: "fixture/repository",
+        OPERATION: operation,
       },
     );
     expect(result.status).toBe(1);
@@ -349,11 +309,9 @@ it.each([
     join(root, "existing.json"),
     state === "different" ? '{"source":"changed"}' : '{"source":"frozen"}',
   );
-  const result = spawnSync(
-    "bash",
-    [
-      "-c",
-      `
+  const result = runBash(
+    root,
+    `
 source "$GITHUB_WORKSPACE/.release-harness/scripts/lib/release-publish-children.sh"
 verify_release_tag_target() { :; }
 gh() {
@@ -377,26 +335,18 @@ guard_existing_public_release
 create_or_update_github_release
 attach_or_verify_release_asset "$RUNNER_TEMP/manifest.json" "$ASSET_NAME"
 `,
-    ],
     {
-      cwd: root,
-      encoding: "utf8",
-      env: {
-        ...createNestedGitEnv(),
-        GITHUB_WORKSPACE: root,
-        RUNNER_TEMP: root,
-        GITHUB_STEP_SUMMARY: join(root, "summary"),
-        GITHUB_REPOSITORY: "fixture/repository",
-        RELEASE_TAG: "v2026.9.4",
-        TARGET_SHA: targetSha,
-        GITHUB_REF: "refs/tags/release-publish/aaaaaaaaaaaa-1",
-        PARENT_WORKFLOW_SHA: "a".repeat(40),
-        PUBLISH_OPENCLAW_NPM: "true",
-        RELEASE_NPM_DIST_TAG: "latest",
-        RELEASE_EVIDENCE_MODE: "full-release-validation",
-        FULL_RELEASE_VALIDATION_MANIFEST_DIR: root,
-        ASSET_NAME: assetName,
-      },
+      ...createNestedGitEnv(),
+      GITHUB_WORKSPACE: root,
+      GITHUB_STEP_SUMMARY: join(root, "summary"),
+      GITHUB_REPOSITORY: "fixture/repository",
+      RELEASE_TAG: "v2026.9.4",
+      TARGET_SHA: targetSha,
+      PUBLISH_OPENCLAW_NPM: "true",
+      RELEASE_NPM_DIST_TAG: "latest",
+      RELEASE_EVIDENCE_MODE: "full-release-validation",
+      FULL_RELEASE_VALIDATION_MANIFEST_DIR: root,
+      ASSET_NAME: assetName,
     },
   );
   expect(result.status, result.stderr).toBe(error ? 1 : 0);

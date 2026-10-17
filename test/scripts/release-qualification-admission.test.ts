@@ -18,44 +18,48 @@ import {
   fixture,
 } from "./release-qualification-admission.test-support.js";
 
+const envelope = (inputs = request().inputs) =>
+  JSON.parse(expectDefined(inputs.trusted_workflow_json, "trusted workflow envelope"));
+const revalidate = (
+  f: ReturnType<typeof fixture>,
+  admission: ReturnType<typeof f.verify>,
+  runGh = f.runGh,
+) => revalidateQualificationAdmissionAuthority({ descriptor: f.descriptor, admission, runGh });
+
 describe("trusted P qualification admission", () => {
-  it.each(["upgrade"])("rejects narrowed cross-OS mode=%s", (mode) => {
-    expect(() => fixture(false, { inputs: { mode } })).toThrow("requires mode=both");
+  it("rejects narrowed cross-OS mode=upgrade", () => {
+    expect(() => fixture(false, { inputs: { mode: "upgrade" } })).toThrow("requires mode=both");
   });
 
-  it.each(['["extensions/codex/*.test.ts"]'])(
-    "rejects Node exclusions before producing admission: %s",
-    (patterns) => {
-      expect(() =>
-        fixture(false, { inputs: { plugin_prerelease_node_exclude_patterns_json: patterns } }),
-      ).toThrow("cannot exclude Plugin Prerelease Node tests");
-    },
-  );
-
-  it.each(["stable"])("rejects Telegram deferral for %s qualification", (profile) => {
+  it("rejects Node exclusions before producing admission", () => {
     expect(() =>
       fixture(false, {
-        inputs: { release_profile: profile, skip_package_telegram_e2e: "true" },
+        inputs: { plugin_prerelease_node_exclude_patterns_json: '["extensions/codex/*.test.ts"]' },
+      }),
+    ).toThrow("cannot exclude Plugin Prerelease Node tests");
+  });
+
+  it("rejects Telegram deferral for stable qualification", () => {
+    expect(() =>
+      fixture(false, {
+        inputs: { release_profile: "stable", skip_package_telegram_e2e: "true" },
       }),
     ).toThrow("cannot skip Package Telegram E2E");
   });
 
-  it.each(["npm:@openclaw/codex@latest"])(
-    "rejects a Codex dependency override from candidate qualification: %s",
-    (codex_plugin_spec) => {
-      expect(() => fixture(false, { inputs: { codex_plugin_spec } })).toThrow("codex_plugin_spec");
-    },
-  );
+  it("rejects a Codex dependency override from candidate qualification", () => {
+    expect(() =>
+      fixture(false, { inputs: { codex_plugin_spec: "npm:@openclaw/codex@latest" } }),
+    ).toThrow("codex_plugin_spec");
+  });
 
   it.each(["empty", "future", "altered-primary"])(
     "rejects %s qualification baselines without a registry fallback",
     (fault) => {
-      const envelope = JSON.parse(
-        expectDefined(request().inputs.trusted_workflow_json, "trusted workflow envelope"),
-      );
-      const baselines = JSON.parse(envelope.laneInputs.qualification_baselines_json);
+      const trusted = envelope();
+      const baselines = JSON.parse(trusted.laneInputs.qualification_baselines_json);
       if (fault === "empty") {
-        envelope.laneInputs.qualification_baselines_json = "";
+        trusted.laneInputs.qualification_baselines_json = "";
       } else {
         if (fault === "future") {
           baselines.upgradeBaseline = "openclaw@2027.1.1";
@@ -64,10 +68,10 @@ describe("trusted P qualification admission", () => {
         if (fault === "altered-primary") {
           baselines.upgradeBaseline = "openclaw@2026.7.8";
         }
-        envelope.laneInputs.qualification_baselines_json = JSON.stringify(baselines);
+        trusted.laneInputs.qualification_baselines_json = JSON.stringify(baselines);
       }
       expect(() =>
-        fixture(false, { inputs: { trusted_workflow_json: JSON.stringify(envelope) } }),
+        fixture(false, { inputs: { trusted_workflow_json: JSON.stringify(trusted) } }),
       ).toThrow(/baseline|predecessor/i);
     },
   );
@@ -84,15 +88,13 @@ describe("trusted P qualification admission", () => {
       packageSourceDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       policySourceDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
     });
-    const envelope = JSON.parse(
-      expectDefined(f.selected.inputs.trusted_workflow_json, "trusted workflow envelope"),
-    );
-    envelope.laneInputs.qualification_baselines_json = JSON.stringify({
+    const trusted = envelope(f.selected.inputs);
+    trusted.laneInputs.qualification_baselines_json = JSON.stringify({
       upgradeBaseline: "openclaw@2026.7.8",
       upgradeSurvivorBaselines: ["openclaw@2026.6.34", "openclaw@2026.7.8"],
     });
     expect(() =>
-      f.verify({ ...f.selected.inputs, trusted_workflow_json: JSON.stringify(envelope) }),
+      f.verify({ ...f.selected.inputs, trusted_workflow_json: JSON.stringify(trusted) }),
     ).toThrow(/authenticated operator request/);
   });
   it.each([false, true])(
@@ -116,13 +118,11 @@ describe("trusted P qualification admission", () => {
 
   it("removes only the self-referential locator and retains unknown semantic fields", () => {
     const original = request().inputs;
-    const envelope = JSON.parse(
-      expectDefined(original.trusted_workflow_json, "trusted workflow envelope"),
-    );
+    const trusted = envelope(original);
     const withLocator = {
       ...original,
       trusted_workflow_json: JSON.stringify({
-        ...envelope,
+        ...trusted,
         qualificationAdmission: { artifactId: 70 },
       }),
     };
@@ -131,7 +131,7 @@ describe("trusted P qualification admission", () => {
       semanticQualificationInputs({
         ...withLocator,
         trusted_workflow_json: JSON.stringify({
-          ...envelope,
+          ...trusted,
           laneInputs: { extension_test_exclude_patterns_json: '["changed"]' },
           qualificationAdmission: {},
         }),
@@ -209,27 +209,18 @@ describe("trusted P qualification admission", () => {
     ).toThrow(/archive bytes/);
   });
 
-  it.each([true])(
-    "revalidates current authority without reacquiring immutable evidence (protected=%s)",
-    (protectedTag) => {
-      const f = fixture(protectedTag);
-      const admission = f.verify();
-      const acquired = f.calls.length;
-      expect(() =>
-        revalidateQualificationAdmissionAuthority({
-          descriptor: f.descriptor,
-          admission,
-          runGh: f.runGh,
-        }),
-      ).not.toThrow();
-      const rechecks = f.calls.slice(acquired);
-      expect(rechecks.some((call) => call.includes("/permission"))).toBe(true);
-      expect(rechecks.some((call) => call.includes("actions/artifacts/70"))).toBe(true);
-      expect(rechecks.some((call) => call.includes("/contents/") || call.endsWith("/zip"))).toBe(
-        false,
-      );
-    },
-  );
+  it("revalidates current authority without reacquiring immutable evidence (protected)", () => {
+    const f = fixture(true);
+    const admission = f.verify();
+    const acquired = f.calls.length;
+    expect(() => revalidate(f, admission)).not.toThrow();
+    const rechecks = f.calls.slice(acquired);
+    expect(rechecks.some((call) => call.includes("/permission"))).toBe(true);
+    expect(rechecks.some((call) => call.includes("actions/artifacts/70"))).toBe(true);
+    expect(rechecks.some((call) => call.includes("/contents/") || call.endsWith("/zip"))).toBe(
+      false,
+    );
+  });
 
   it.each([
     "triggering-operator",
@@ -263,13 +254,7 @@ describe("trusted P qualification admission", () => {
     if (fault === "dispatch-title") {
       f.run.display_title = "different admission request";
     }
-    expect(() =>
-      revalidateQualificationAdmissionAuthority({
-        descriptor: f.descriptor,
-        admission,
-        runGh: f.runGh,
-      }),
-    ).toThrow();
+    expect(() => revalidate(f, admission)).toThrow();
   });
 
   it("rechecks operator grants after publication metadata has been read", () => {
@@ -282,9 +267,7 @@ describe("trusted P qualification admission", () => {
       }
       return value;
     };
-    expect(() =>
-      revalidateQualificationAdmissionAuthority({ descriptor: f.descriptor, admission, runGh }),
-    ).toThrow(/qualification authority/);
+    expect(() => revalidate(f, admission, runGh)).toThrow(/qualification authority/);
   });
 
   it("keeps admission read-only and excludes package preparation", () => {

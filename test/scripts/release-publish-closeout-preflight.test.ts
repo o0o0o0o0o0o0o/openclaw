@@ -4,6 +4,7 @@ import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import { createNestedGitEnv } from "../helpers/temp-repo.js";
+import { fixtureGit, expectGate } from "./release-publish.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const moduleUrl = new URL(
@@ -37,13 +38,7 @@ function evaluate(dir: string, source: string, bin?: string) {
 
 function sourceFixture(changelog?: string, version = "2026.9.4") {
   const dir = tempDirs.make("release-closeout-readiness-");
-  const git = (...args: string[]) =>
-    execFileSync("git", args, {
-      cwd: dir,
-      env: createNestedGitEnv(),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+  const git = fixtureGit(dir, "Test", "test@example.invalid");
   git("init", "-q");
   writeFileSync(join(dir, "package.json"), JSON.stringify({ version }));
   writeFileSync(join(dir, "appcast.xml"), "<rss><channel/></rss>");
@@ -51,18 +46,8 @@ function sourceFixture(changelog?: string, version = "2026.9.4") {
     writeFileSync(join(dir, "CHANGELOG.md"), changelog);
   }
   git("add", ".");
-  git(
-    "-c",
-    "user.name=Test",
-    "-c",
-    "user.email=test@example.invalid",
-    "-c",
-    "commit.gpgsign=false",
-    "commit",
-    "-qm",
-    "fixture",
-  );
-  return { dir, sha: git("rev-parse", "HEAD").trim() };
+  git("commit", "-qm", "fixture");
+  return { dir, sha: git("rev-parse", "HEAD") };
 }
 
 describe("publication preflight closeout phase", () => {
@@ -135,18 +120,14 @@ console.log(JSON.stringify({admission, observation, closeout}));
       bin,
     );
     expect(result.admission.admitted).toBe(admitted);
-    expect(result.observation.gates).toContainEqual(
-      expect.objectContaining({ id: "github.release", status }),
-    );
+    expectGate(result.observation.gates, { id: "github.release", status });
     if (state === "draft") {
       expect(result.observation.release).toMatchObject({ id: 7, draft: true });
-      expect(result.closeout).toContainEqual(
-        expect.objectContaining({
-          id: "stable-closeout.release-assets",
-          status: "WARN",
-          message: "GitHub release v2026.9.5 is still a draft.",
-        }),
-      );
+      expectGate(result.closeout, {
+        id: "stable-closeout.release-assets",
+        status: "WARN",
+        message: "GitHub release v2026.9.5 is still a draft.",
+      });
       const releaseReads = readFileSync(calls, "utf8")
         .trim()
         .split("\n")
@@ -157,18 +138,12 @@ console.log(JSON.stringify({admission, observation, closeout}));
         expect(result.admission.message).toContain("docs-publication owner");
       }
     } else if (state === "limited") {
-      expect(result.observation.gates).toContainEqual(
-        expect.objectContaining({ message: expect.stringContaining("push access") }),
-      );
-      expect(result.closeout).toContainEqual(
-        expect.objectContaining({ id: "stable-closeout.release-state", status: "WARN" }),
-      );
+      expectGate(result.observation.gates, { message: expect.stringContaining("push access") });
+      expectGate(result.closeout, { id: "stable-closeout.release-state", status: "WARN" });
     } else if (state !== "absent") {
-      expect(result.observation.gates).toContainEqual(
-        expect.objectContaining({
-          message: expect.stringContaining("GitHub release state could not be read:"),
-        }),
-      );
+      expectGate(result.observation.gates, {
+        message: expect.stringContaining("GitHub release state could not be read:"),
+      });
     }
   });
 
@@ -188,9 +163,7 @@ console.log(JSON.stringify({admission, observation, closeout}));
         console.log(JSON.stringify(rows));
       `,
     );
-    expect(result).toContainEqual(
-      expect.objectContaining({ id: "stable-closeout.main-source", status: "WARN" }),
-    );
+    expectGate(result, { id: "stable-closeout.main-source", status: "WARN" });
     expect(result).not.toContainEqual(expect.objectContaining({ status: "FAIL" }));
   });
 

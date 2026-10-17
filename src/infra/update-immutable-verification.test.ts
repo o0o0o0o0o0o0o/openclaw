@@ -197,15 +197,12 @@ it.each([90_000, 150_000])(
   },
 );
 
-it.each([{ name: "version", server: { version: "previous-version" } }])(
-  "reports a definitive $name failure without a verification receipt",
-  async (failure) => {
-    callGateway.mockImplementation(health(failure));
-    const result = await observe();
-    expect(result.outcome).toBe("failed");
-    expect(result.verification).toBeUndefined();
-  },
-);
+it("reports a definitive version failure without a verification receipt", async () => {
+  callGateway.mockImplementation(health({ server: { version: "previous-version" } }));
+  const result = await observe();
+  expect(result.outcome).toBe("failed");
+  expect(result.verification).toBeUndefined();
+});
 
 it("leaves an unavailable health RPC unverified rather than authorizing rollback", async () => {
   callGateway.mockRejectedValue(new Error("connection refused"));

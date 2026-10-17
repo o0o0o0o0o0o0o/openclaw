@@ -93,6 +93,14 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
     });
     afterEach(() => vi.restoreAllMocks());
 
+    const previousLauncher = (version: number) =>
+      fs
+        .readFileSync(
+          new URL(`../../test/fixtures/immutable-update/launcher-v${version}.mjs`, import.meta.url),
+          "utf8",
+        )
+        .replace(/^#![^\n]*\n/u, `#!${runtime}\n`);
+
     async function setup(install = true) {
       const parent = temporary.make("immutable-launch-admission-");
       const root = path.join(parent, "installation");
@@ -181,6 +189,12 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         },
       });
       const launch = () => spawnSync(launcher, [], { encoding: "utf8", timeout: 5000 });
+      const upgrade = (version: 1 | 2, assertCurrent = () => {}) =>
+        installImmutableLauncher({
+          root,
+          runtimePath: runtime,
+          upgrade: { version, assertCurrent },
+        });
       return {
         root,
         control,
@@ -193,6 +207,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         select,
         operation,
         launch,
+        upgrade,
       };
     }
 
@@ -294,13 +309,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
       const supported = f.launch();
       expect(supported.status, supported.stderr).toBe(0);
       expect(supported.stdout.trim()).toBe(f.oldSha);
-      const oldLauncher = fs
-        .readFileSync(
-          new URL("../../test/fixtures/immutable-update/launcher-v2.mjs", import.meta.url),
-          "utf8",
-        )
-        .replace(/^#![^\n]*\n/u, `#!${runtime}\n`);
-      fs.writeFileSync(f.launcher, oldLauncher);
+      fs.writeFileSync(f.launcher, previousLauncher(2));
       const before = fs.readFileSync(f.journal);
       const refused = f.launch();
       expect(refused.status).toBe(78);
@@ -350,26 +359,14 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
       "upgrades only the exact opted-in v%i launcher and retains its original bytes",
       async (version) => {
         const f = await setup(false);
-        const previous = fs
-          .readFileSync(
-            new URL(
-              `../../test/fixtures/immutable-update/launcher-v${version}.mjs`,
-              import.meta.url,
-            ),
-            "utf8",
-          )
-          .replace(/^#![^\n]*\n/u, `#!${runtime}\n`);
+        const previous = previousLauncher(version);
         fs.writeFileSync(f.launcher, previous, { mode: 0o755 });
         fs.mkdirSync(f.control, { mode: 0o755 });
         await expect(
           installImmutableLauncher({ root: f.root, runtimePath: runtime }),
         ).rejects.toThrow("conflicts");
         const oldIdentity = fileIdentity(f.launcher);
-        await installImmutableLauncher({
-          root: f.root,
-          runtimePath: runtime,
-          upgrade: { version, assertCurrent: () => {} },
-        });
+        await f.upgrade(version);
         expect(fileIdentity(f.launcher)).not.toBe(oldIdentity);
         expect(fs.readFileSync(path.join(f.control, `openclaw-gateway.v${version}`), "utf8")).toBe(
           previous,
@@ -377,11 +374,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         f.write(f.operation("stopping"));
         expect(f.launch().status).toBe(78);
         const current = fs.readFileSync(f.launcher);
-        await installImmutableLauncher({
-          root: f.root,
-          runtimePath: runtime,
-          upgrade: { version, assertCurrent: () => {} },
-        });
+        await f.upgrade(version);
         expect(fs.readFileSync(f.launcher)).toEqual(current);
       },
     );
@@ -393,13 +386,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         const previous = `#!${runtime}\n// custom operator launcher\n`;
         fs.writeFileSync(f.launcher, previous, { mode: 0o755 });
         fs.mkdirSync(f.control, { mode: 0o755 });
-        await expect(
-          installImmutableLauncher({
-            root: f.root,
-            runtimePath: runtime,
-            upgrade: { version, assertCurrent: () => {} },
-          }),
-        ).rejects.toThrow(`known v${version} upgrade`);
+        await expect(f.upgrade(version)).rejects.toThrow(`known v${version} upgrade`);
         expect(fs.readFileSync(f.launcher, "utf8")).toBe(previous);
         expect(fs.readdirSync(f.control)).toEqual([]);
       },
@@ -407,12 +394,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
 
     it("keeps the original launcher when upgrade authority is revoked after backup publication", async () => {
       const f = await setup(false);
-      const previous = fs
-        .readFileSync(
-          new URL("../../test/fixtures/immutable-update/launcher-v1.mjs", import.meta.url),
-          "utf8",
-        )
-        .replace(/^#![^\n]*\n/u, `#!${runtime}\n`);
+      const previous = previousLauncher(1);
       fs.writeFileSync(f.launcher, previous, { mode: 0o755 });
       fs.mkdirSync(f.control, { mode: 0o755 });
       let current = true;
@@ -424,17 +406,10 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         }
       });
       await expect(
-        installImmutableLauncher({
-          root: f.root,
-          runtimePath: runtime,
-          upgrade: {
-            version: 1,
-            assertCurrent: () => {
-              if (!current) {
-                throw new Error("upgrade authority ended");
-              }
-            },
-          },
+        f.upgrade(1, () => {
+          if (!current) {
+            throw new Error("upgrade authority ended");
+          }
         }),
       ).rejects.toThrow("upgrade authority ended");
       expect(fs.readFileSync(f.launcher, "utf8")).toBe(previous);

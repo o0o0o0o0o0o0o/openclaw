@@ -45,6 +45,22 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
         await import("./update-managed-service-handoff-process.test-support.js");
       const { createManagedHandoffLeaseStore } =
         await import("./update-managed-service-handoff-lease.js");
+      const readPrepared = async (child: ChildProcess) => {
+        const { paramsPath } = readManagedHandoffArtifacts(child.spawnargs);
+        const prepared = JSON.parse(await fs.promises.readFile(paramsPath, "utf8")) as {
+          updateLeaseDatabasePath: string;
+          updateLeaseDatabaseIdentity: import("./update-managed-service-handoff-database.js").ManagedUpdateLeaseDatabaseIdentity;
+        };
+        const store = createManagedHandoffLeaseStore({
+          databasePath: prepared.updateLeaseDatabasePath,
+          existingIdentity: prepared.updateLeaseDatabaseIdentity,
+          serviceManagerEnv: process.env,
+        });
+        return { prepared, store };
+      };
+      const transfer = (
+        started: Parameters<typeof handoff.transferManagedServiceUpdateHandoff>[0],
+      ) => expect(handoff.transferManagedServiceUpdateHandoff(started)).resolves.toBe(true);
       const helpers: Array<{ child: ChildProcess; closed: Promise<void> }> = [];
       params.spawnMock.mockImplementation((...args: Parameters<typeof spawn>) => {
         const child = spawn(...args);
@@ -105,22 +121,9 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
         if (!originalHelper) {
           throw new Error("missing original helper handle");
         }
-        const { paramsPath } = readManagedHandoffArtifacts(originalHelper.child.spawnargs);
-        const prepared = JSON.parse(await fs.promises.readFile(paramsPath, "utf8")) as {
-          updateLeaseDatabasePath: string;
-          updateLeaseDatabaseIdentity: import("./update-managed-service-handoff-database.js").ManagedUpdateLeaseDatabaseIdentity;
-        };
-        originalStore = createManagedHandoffLeaseStore({
-          databasePath: prepared.updateLeaseDatabasePath,
-          existingIdentity: prepared.updateLeaseDatabaseIdentity,
-          serviceManagerEnv: process.env,
-        });
-        await expect(
-          handoff.transferManagedServiceUpdateHandoff({
-            kind: "managed-update-handoff",
-            ...original,
-          }),
-        ).resolves.toBe(true);
+        const { prepared, store } = await readPrepared(originalHelper.child);
+        originalStore = store;
+        await transfer({ kind: "managed-update-handoff", ...original });
         await withinTest(
           Promise.race([
             receipts.waitFor(pidPath, "ready"),
@@ -139,8 +142,10 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
         if (bound.kind !== "current") {
           throw new Error("original executor lease was not published");
         }
-        expect(bound.lease.helper.pid).toBe(original.pid);
-        expect(bound.lease.executor.pid).toBe(executorPid);
+        expect(bound.lease).toMatchObject({
+          helper: { pid: original.pid },
+          executor: { pid: executorPid },
+        });
         expect(originalStore.isProcessIdentityCurrent(bound.lease.executor)).toBe(true);
         originalHelper.child.kill("SIGKILL");
         await withTimeout(originalHelper.closed, 15000);
@@ -183,17 +188,9 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
         }
         expect(helpers).toHaveLength(2);
         const replacement = helpers[1]!;
-        const { paramsPath: replacementParamsPath } = readManagedHandoffArtifacts(
-          replacement.child.spawnargs,
+        const { prepared: replacementPrepared, store: admittedStore } = await readPrepared(
+          replacement.child,
         );
-        const replacementPrepared = JSON.parse(
-          await fs.promises.readFile(replacementParamsPath, "utf8"),
-        ) as typeof prepared;
-        const admittedStore = createManagedHandoffLeaseStore({
-          databasePath: replacementPrepared.updateLeaseDatabasePath,
-          existingIdentity: replacementPrepared.updateLeaseDatabaseIdentity,
-          serviceManagerEnv: process.env,
-        });
         expect(admittedStore.read(root)).toMatchObject({
           kind: "current",
           lease: { owner: latest.handoffId, helper: { pid: latest.pid } },
@@ -206,12 +203,7 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
         } else {
           expect(originalStore.read(root)).toEqual({ kind: "absent" });
         }
-        await expect(
-          handoff.transferManagedServiceUpdateHandoff({
-            kind: "managed-update-handoff",
-            ...latest,
-          }),
-        ).resolves.toBe(true);
+        await transfer({ kind: "managed-update-handoff", ...latest });
         await withTimeout(replacement.closed, 15000);
         expect(replacement.child.exitCode).toBe(0);
         expect(admittedStore.read(root)).toEqual({ kind: "absent" });

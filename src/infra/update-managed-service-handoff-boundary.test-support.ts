@@ -57,6 +57,10 @@ import {
 } from "./update-managed-service-native.test-support.js";
 import { createUpdateRun, getUpdateRun } from "./update-run-ledger.js";
 
+async function readLines(file: string) {
+  return (await fs.readFile(file, "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
+}
+
 export function createManagedServiceManagerBoundary({
   spawnMock,
   tempDirs,
@@ -418,6 +422,11 @@ export function createManagedServiceManagerBoundary({
         });
       });
       helperCompletion = completion;
+      const request = async (command: string, response: string) => {
+        const received = waitForHandoffResponse(runningHelper.stdout, response);
+        runningHelper.stdin?.write(`${command}\n`);
+        await received;
+      };
       await waitForHandoffResponse(runningHelper.stdout, "OPENCLAW_UPDATE_HANDOFF_READY");
 
       const databasePath = String(generated.updateLeaseDatabasePath);
@@ -433,9 +442,7 @@ export function createManagedServiceManagerBoundary({
       if (options?.controlDisconnect) {
         await options.beforeDisconnect?.(run, env);
         if (options.controlDisconnect === "transferred") {
-          const transferred = waitForHandoffResponse(runningHelper.stdout, "transferred");
-          runningHelper.stdin?.write("transfer\n");
-          await transferred;
+          await request("transfer", "transferred");
           await expect(pathExists(commandsPath)).resolves.toBe(false);
         }
         if (options.controlDisconnect === "dead-parent") {
@@ -477,12 +484,7 @@ export function createManagedServiceManagerBoundary({
           expect(parent).toMatchObject({ exitCode: null, signalCode: null });
           await expect(pathExists(commandsPath)).resolves.toBe(false);
           if (options.cancelDuringValidation) {
-            const cancelled = waitForHandoffResponse(
-              runningHelper.stdout,
-              options.systemScope ? "cancel-unavailable" : "cancelled",
-            );
-            runningHelper.stdin?.write("cancel\n");
-            await cancelled;
+            await request("cancel", options.systemScope ? "cancel-unavailable" : "cancelled");
             if (options.systemScope) {
               await fs.writeFile(validationReleasePath, "settle updater");
             }
@@ -500,16 +502,12 @@ export function createManagedServiceManagerBoundary({
             if (selectedDriverPath) {
               await waitForFile(statePath + ".park-prefix", signal);
               await expect(pathExists(commandsPath)).resolves.toBe(false);
-              expect(parent.exitCode).toBeNull();
-              expect(parent.signalCode).toBeNull();
+              expect(parent).toMatchObject({ exitCode: null, signalCode: null });
               await fs.writeFile(statePath + ".park-tail", "complete request");
             }
             if (notice) {
               await notice;
-              const inspections = (await fs.readFile(commandsPath, "utf8").catch(() => ""))
-                .trim()
-                .split("\n")
-                .filter(Boolean);
+              const inspections = await readLines(commandsPath);
               expect(
                 inspections.every(isManagedServiceInspectionCommand),
                 inspections.join("\n"),
@@ -532,9 +530,7 @@ export function createManagedServiceManagerBoundary({
                 },
                 { timeout: 5_000 },
               );
-              const cancelled = waitForHandoffResponse(runningHelper.stdout, "cancelled");
-              runningHelper.stdin?.write("cancel\n");
-              await cancelled;
+              await request("cancel", "cancelled");
               await fs.writeFile(activationReleasePath, "continue");
               await vi.waitFor(
                 async () => {
@@ -605,30 +601,22 @@ export function createManagedServiceManagerBoundary({
         expect(stdout).not.toContain("committed\n");
         await expect(pathExists(updaterPath)).resolves.toBe(false);
       } else if (options?.launchdFault === "wrong-parent" || options?.overdueCommit) {
-        const cancelled = waitForHandoffResponse(runningHelper.stdout, "cancelled");
-        runningHelper.stdin?.write("park\n");
-        await cancelled;
+        await request("park", "cancelled");
         expect(await completion, stderr).toBe(0);
         expect(parent).toMatchObject({ exitCode: null, signalCode: null });
         await expect(pathExists(updaterPath)).resolves.toBe(false);
       } else {
-        const parked = waitForHandoffResponse(runningHelper.stdout, "parked");
-        runningHelper.stdin?.write("park\n");
-        await parked;
+        await request("park", "parked");
         expect(parent.exitCode).toBeNull();
         await expect(pathExists(updaterPath)).resolves.toBe(false);
         if (options?.cancelAfterPark) {
-          const restoring = waitForHandoffResponse(runningHelper.stdout, "restore-after-exit");
-          runningHelper.stdin?.write("cancel\n");
-          await restoring;
+          await request("cancel", "restore-after-exit");
           expect(stdout).not.toContain("committed\n");
           parent.stdin?.end();
           expect(await completion, stderr).toBe(0);
           await expect(pathExists(updaterPath)).resolves.toBe(false);
         } else {
-          const committed = waitForHandoffResponse(runningHelper.stdout, "committed");
-          runningHelper.stdin?.write("commit\n");
-          await committed;
+          await request("commit", "committed");
           parent.stdin?.end();
           const code = await completion;
           const helperLog = await fs.readFile(String(generated.logPath), "utf8").catch(() => "");
@@ -656,10 +644,7 @@ export function createManagedServiceManagerBoundary({
         ...(options?.expireParentWhileStopPending
           ? { stopSettlement: JSON.parse(await fs.readFile(stopSettlementPath, "utf8")) }
           : {}),
-        commands: (await fs.readFile(commandsPath, "utf8").catch(() => ""))
-          .trim()
-          .split("\n")
-          .filter(Boolean),
+        commands: await readLines(commandsPath),
         parentSignal: parent.signalCode,
         parkAdmitted: stdout.includes("park-admitted\n"),
         state: JSON.parse(await fs.readFile(statePath, "utf8").catch(() => "{}")),
@@ -672,11 +657,9 @@ export function createManagedServiceManagerBoundary({
         sensitiveFilesRemoved: (
           await Promise.all((generated.sensitivePaths as string[]).map(pathExists))
         ).every((exists) => !exists),
-        commandTimings: (await fs.readFile(commandTimingsPath, "utf8").catch(() => ""))
-          .trim()
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => JSON.parse(line) as ManagedServiceCommandTiming),
+        commandTimings: (await readLines(commandTimingsPath)).map(
+          (line) => JSON.parse(line) as ManagedServiceCommandTiming,
+        ),
       };
     } catch (error) {
       const helperLog = helperLogPath

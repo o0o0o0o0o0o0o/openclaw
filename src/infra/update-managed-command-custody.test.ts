@@ -47,7 +47,21 @@ function fixture() {
           leaseQueries(db).selectFrom("managed_update_handoffs").selectAll(),
         ).rows,
     );
-  return { directory, privateTmp, databasePath, store, roots, rows };
+  const expectBusy = (targets = roots) => {
+    for (const root of targets) {
+      expect(store.acquire(root, "next", { kind: "update" }).kind).toBe("busy");
+    }
+  };
+  const releaseNext = () => {
+    for (const root of roots) {
+      const acquired = store.acquire(root, "next", { kind: "update" });
+      expect(acquired.kind).toBe("acquired");
+      if (acquired.kind === "acquired") {
+        expect(store.release(acquired.lease)).toBe(true);
+      }
+    }
+  };
+  return { directory, privateTmp, databasePath, store, roots, rows, expectBusy, releaseNext };
 }
 
 describe.skipIf(process.platform === "win32")("managed command process custody", () => {
@@ -139,23 +153,13 @@ describe.skipIf(process.platform === "win32")("managed command process custody",
       expect(f.store.release(current.lease)).toBe(false);
       expect(f.store.bind(current.lease, process.pid)).toBeNull();
     }
-    for (const root of f.roots) {
-      expect(f.store.acquire(root, "next", { kind: "update" }).kind).toBe("busy");
-    }
+    f.expectBusy();
     reservation.settled();
     expect(f.rows()).toHaveLength(f.roots.length);
-    for (const root of f.roots) {
-      expect(f.store.acquire(root, "next", { kind: "update" }).kind).toBe("busy");
-    }
+    f.expectBusy();
     retained.releaseAnchors();
     expect(f.rows()).toEqual([]);
-    for (const root of f.roots) {
-      const acquired = f.store.acquire(root, "next", { kind: "update" });
-      expect(acquired.kind).toBe("acquired");
-      if (acquired.kind === "acquired") {
-        expect(f.store.release(acquired.lease)).toBe(true);
-      }
-    }
+    f.releaseNext();
   });
 
   it.each(["current", "legacy"])(
@@ -271,9 +275,7 @@ process.kill(process.pid, "SIGKILL");
           executor: { pid: holder.pid },
         });
       }
-      for (const root of [...f.roots, pendingRoot]) {
-        expect(f.store.acquire(root, "next", { kind: "update" }).kind).toBe("busy");
-      }
+      f.expectBusy([...f.roots, pendingRoot]);
       const pending = f.rows().find((row) => row.owner === "pending-owner");
       expect(pending).toBeDefined();
       const retained = f.store.read(pending!.install_root);
@@ -284,14 +286,8 @@ process.kill(process.pid, "SIGKILL");
 
       holder.kill("SIGKILL");
       await closed;
-      for (const root of f.roots) {
-        const acquired = f.store.acquire(root, "next", { kind: "update" });
-        expect(acquired.kind).toBe("acquired");
-        if (acquired.kind === "acquired") {
-          expect(f.store.release(acquired.lease)).toBe(true);
-        }
-      }
-      expect(f.store.acquire(pendingRoot, "next", { kind: "update" }).kind).toBe("busy");
+      f.releaseNext();
+      f.expectBusy([pendingRoot]);
     } finally {
       holder.kill("SIGKILL");
       await closed;

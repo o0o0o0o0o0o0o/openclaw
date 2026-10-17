@@ -21,6 +21,27 @@ const DNS_ANSWER: LookupAddress[] = [{ address: "127.0.0.1", family: 4 }];
 const CLOSED_AUTHORITY = "Channel read authority is no longer active.";
 const TRANSPORTS = ["performMatrixRequest JSON", "SDK fetch"] as const;
 
+const withRead = <T>(run: () => Promise<T>) => withChannelReadAuthority(() => undefined, run);
+
+// Capture a pending request in its original scope, then close that scope before releasing I/O.
+function pendingRead(read: () => Promise<unknown>, started: Promise<void>) {
+  return withRead(async () => {
+    const request = read();
+    await started;
+    return { request };
+  });
+}
+
+function deferDns() {
+  const started = createDeferred<void>();
+  const result = createDeferred<LookupAddress[]>();
+  lookup.mockImplementationOnce(() => {
+    started.resolve();
+    return result.promise;
+  });
+  return { started: started.promise, release: () => result.resolve(DNS_ANSWER) };
+}
+
 class TransportMatrixClient extends MatrixClient {
   async readTransport(transport: (typeof TRANSPORTS)[number], path: string): Promise<unknown> {
     if (transport === "SDK fetch") {
@@ -78,8 +99,6 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
     { name: "initial DNS", redirect: false },
     { name: "redirect DNS", redirect: true },
   ])("stops the next physical request when the read closes during $name", async ({ redirect }) => {
-    const dnsStarted = createDeferred<void>();
-    const dnsResult = createDeferred<LookupAddress[]>();
     const runtimeFetch = vi.fn<typeof fetch>(async () => new Response(PAYLOAD));
     if (redirect) {
       lookup.mockResolvedValueOnce(DNS_ANSWER);
@@ -87,32 +106,17 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
         new Response(null, { status: 302, headers: { location: READ_PATH } }),
       );
     }
-    lookup.mockImplementationOnce(() => {
-      dnsStarted.resolve();
-      return dnsResult.promise;
-    });
+    const dns = deferDns();
     stubRuntimeFetch(runtimeFetch);
     const { read } = createReader(transport);
 
-    // Return the pending transport promise without awaiting it so the host scope
-    // closes here; its own result fence cannot make a broken transport pass.
-    const pending = await withChannelReadAuthority(
-      () => undefined,
-      async () => {
-        const request = read(redirect ? "/redirect" : READ_PATH);
-        await dnsStarted.promise;
-        return { request };
-      },
-    );
+    const pending = await pendingRead(() => read(redirect ? "/redirect" : READ_PATH), dns.started);
     const rejected = expect(pending.request).rejects.toThrow(CLOSED_AUTHORITY);
 
-    await withChannelReadAuthority(
-      () => undefined,
-      async () => {
-        dnsResult.resolve(DNS_ANSWER);
-        await rejected;
-      },
-    );
+    await withRead(async () => {
+      dns.release();
+      await rejected;
+    });
     expect(runtimeFetch.mock.calls.map(([url]) => url)).toEqual(
       redirect ? [`${HOMESERVER}/redirect`] : [],
     );
@@ -136,14 +140,7 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
     stubRuntimeFetch(runtimeFetch);
     const { read } = createReader(transport);
 
-    const pending = await withChannelReadAuthority(
-      () => undefined,
-      async () => {
-        const request = read(READ_PATH);
-        await bodyStarted.promise;
-        return { request };
-      },
-    );
+    const pending = await pendingRead(() => read(READ_PATH), bodyStarted.promise);
     const rejected = expect(pending.request).rejects.toThrow(CLOSED_AUTHORITY);
     deliverBody.resolve();
 
@@ -152,28 +149,20 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
   });
 
   it("stops physical I/O when the client closes during DNS with read authority still active", async () => {
-    const dnsStarted = createDeferred<void>();
-    const dnsResult = createDeferred<LookupAddress[]>();
-    lookup.mockImplementationOnce(() => {
-      dnsStarted.resolve();
-      return dnsResult.promise;
-    });
+    const dns = deferDns();
     const runtimeFetch = vi.fn<typeof fetch>(async () => new Response(PAYLOAD));
     stubRuntimeFetch(runtimeFetch);
     const { client, read } = createReader(transport);
 
-    await withChannelReadAuthority(
-      () => undefined,
-      async () => {
-        const rejected = expect(read(READ_PATH)).rejects.toThrow(
-          "Matrix client generation is no longer active.",
-        );
-        await dnsStarted.promise;
-        await client.stopWithoutPersist();
-        dnsResult.resolve(DNS_ANSWER);
-        await rejected;
-      },
-    );
+    await withRead(async () => {
+      const rejected = expect(read(READ_PATH)).rejects.toThrow(
+        "Matrix client generation is no longer active.",
+      );
+      await dns.started;
+      await client.stopWithoutPersist();
+      dns.release();
+      await rejected;
+    });
     expect(runtimeFetch).not.toHaveBeenCalled();
   });
 
@@ -187,14 +176,7 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
     });
     const { read } = createReader(transport);
 
-    const pending = await withChannelReadAuthority(
-      () => undefined,
-      async () => {
-        const request = read(READ_PATH);
-        await cleanupStarted.promise;
-        return { request };
-      },
-    );
+    const pending = await pendingRead(() => read(READ_PATH), cleanupStarted.promise);
     const rejected = expect(pending.request).rejects.toThrow(CLOSED_AUTHORITY);
     finishCleanup.resolve();
     await rejected;
@@ -203,38 +185,27 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
 });
 
 it("reuses an SDK fetch without poisoning a valid read or reviving its closed first read", async () => {
-  const dnsStarted = createDeferred<void>();
-  const firstDns = createDeferred<LookupAddress[]>();
-  lookup.mockImplementationOnce(() => {
-    dnsStarted.resolve();
-    return firstDns.promise;
-  });
+  const dns = deferDns();
   const runtimeFetch = vi.fn<typeof fetch>(async () => new Response(PAYLOAD));
   stubRuntimeFetch(runtimeFetch);
 
-  const first = await withChannelReadAuthority(
-    () => undefined,
-    async () => {
-      const { read } = createReader("SDK fetch");
-      const result = Promise.allSettled([read(`${READ_PATH}?limit=1`)]);
-      await dnsStarted.promise;
-      return { read, result };
-    },
-  );
+  const first = await withRead(async () => {
+    const { read } = createReader("SDK fetch");
+    const result = Promise.allSettled([read(`${READ_PATH}?limit=1`)]);
+    await dns.started;
+    return { read, result };
+  });
 
-  await withChannelReadAuthority(
-    () => undefined,
-    async () => {
-      const second = await Promise.allSettled([first.read(`${READ_PATH}?limit=2`)]);
-      firstDns.resolve(DNS_ANSWER);
-      const firstResult = await first.result;
+  await withRead(async () => {
+    const second = await Promise.allSettled([first.read(`${READ_PATH}?limit=2`)]);
+    dns.release();
+    const firstResult = await first.result;
 
-      expect(second).toEqual([{ status: "fulfilled", value: PAYLOAD }]);
-      expect(firstResult).toEqual([
-        { status: "rejected", reason: expect.objectContaining({ message: CLOSED_AUTHORITY }) },
-      ]);
-    },
-  );
+    expect(second).toEqual([{ status: "fulfilled", value: PAYLOAD }]);
+    expect(firstResult).toEqual([
+      { status: "rejected", reason: expect.objectContaining({ message: CLOSED_AUTHORITY }) },
+    ]);
+  });
   expect(runtimeFetch.mock.calls.map(([url]) => url)).toEqual([
     `${HOMESERVER}${READ_PATH}?limit=2`,
   ]);

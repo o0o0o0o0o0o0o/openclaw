@@ -2,9 +2,6 @@ import { createServer } from "node:http";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { msteamsPlugin } from "../extensions/msteams/api.js";
-import { createOperationalRunInstanceRef } from "../src/agents/admitted-run-context.js";
-import { wrapToolWithGatewayCallerIdentity } from "../src/agents/tools/gateway-caller-context.js";
-import { createMessageTool } from "../src/agents/tools/message-tool-execution.js";
 import { dispatchChannelMessageAction } from "../src/channels/plugins/message-action-dispatch.js";
 import type { ChannelThreadingToolContext } from "../src/channels/plugins/types.public.js";
 import { createDefaultDeps } from "../src/cli/deps.js";
@@ -13,24 +10,12 @@ import { registerMessageCommands } from "../src/cli/program/register.message.js"
 import { messageCommand } from "../src/commands/message.js";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../src/config/config.js";
 import type { OpenClawConfig } from "../src/config/types.js";
-import { createAgentRuntimeApprovalAuthorityValidator } from "../src/gateway/agent-runtime-approval-authority.js";
-import {
-  mintMessageActionTurnCapability,
-  resolveMessageActionTurnCapability,
-  revokeMessageActionTurnCapability,
-} from "../src/gateway/message-action-turn-capability.js";
-import { sendHandlers } from "../src/gateway/server-methods/send.js";
-import type { GatewayClient, GatewayRequestContext } from "../src/gateway/server-methods/types.js";
-import {
-  claimAgentRunDelegatedAuthority,
-  releaseAgentRunDelegatedAuthority,
-  validateAgentRunDelegatedAuthority,
-} from "../src/infra/agent-run-registry.js";
 import { getPluginInstance } from "../src/plugins/plugin-instance-scope.js";
 import { createPluginRegistry } from "../src/plugins/registry.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../src/plugins/runtime.js";
 import type { PluginRuntime } from "../src/plugins/runtime/types.js";
 import { createPluginRecord } from "../src/plugins/status.test-fixtures.js";
+import { createTeamsReadCaller } from "./msteams-read.test-support.js";
 
 const graph = vi.hoisted(() => ({
   endpoint: undefined as { origin: string; signal: AbortSignal } | undefined,
@@ -100,7 +85,6 @@ type Route = "tool" | "gateway";
 type Destination = typeof current;
 type GraphRequest = { method: string | undefined; path: string; authorization: string | undefined };
 const cleanups: Array<() => Promise<void>> = [];
-let sequence = 0;
 
 beforeEach(() => {
   if (graph.endpoint) {
@@ -157,9 +141,6 @@ async function createFixture(
   setActivePluginRegistry(owner.registry);
   setRuntimeConfigSnapshot(cfg, cfg);
 
-  const sessionKey = "agent:main:msteams:channel:origin";
-  const operationalRunInstance = createOperationalRunInstanceRef(`teams-target-${++sequence}`);
-  const delegatedAuthority = claimAgentRunDelegatedAuthority(operationalRunInstance);
   const toolContext: ChannelThreadingToolContext | undefined =
     currentContext === "none"
       ? undefined
@@ -176,37 +157,7 @@ async function createFixture(
           }),
           currentChannelProvider: "msteams",
         };
-  const capabilityParams = { agentId: "main", runId: operationalRunInstance.runId, sessionKey };
-  const turnCapability = mintMessageActionTurnCapability({
-    ...capabilityParams,
-    requesterAccountId: "default",
-    requesterSenderId: requesterId,
-    toolContext,
-  });
-  const messageActionContext = resolveMessageActionTurnCapability({
-    ...capabilityParams,
-    token: turnCapability,
-  });
-  if (!messageActionContext) {
-    throw new Error("Expected an admitted Teams turn");
-  }
-  const client = {
-    internal: {
-      agentRuntimeIdentity: {
-        kind: "agentRuntime",
-        agentId: "main",
-        sessionKey,
-        operationalRunInstance,
-        delegatedAuthority: { kind: "local", ...delegatedAuthority },
-        messageActionContext: { ...messageActionContext, turnCapability },
-      },
-    },
-  } as GatewayClient;
-  const context = {
-    dedupe: new Map(),
-    getRuntimeConfig: () => cfg,
-    validateAgentRuntimeApprovalAuthority: createAgentRuntimeApprovalAuthorityValidator(),
-  } as GatewayRequestContext;
+  const caller = createTeamsReadCaller(cfg, toolContext, requesterId);
   const requests: GraphRequest[] = [];
   const controller = new AbortController();
   const pending = new Set<Promise<unknown>>();
@@ -266,8 +217,7 @@ async function createFixture(
   });
   cleanups.push(async () => {
     controller.abort(new Error("Teams fixture closed"));
-    revokeMessageActionTurnCapability(turnCapability);
-    releaseAgentRunDelegatedAuthority(delegatedAuthority);
+    caller.dispose();
     server.closeAllConnections();
     await Promise.allSettled(pending);
     await new Promise<void>((resolve, reject) => {
@@ -284,28 +234,6 @@ async function createFixture(
     throw new Error("Expected a loopback Graph fixture address");
   }
   graph.endpoint = { origin: `http://127.0.0.1:${address.port}`, signal: controller.signal };
-  const tool = wrapToolWithGatewayCallerIdentity(
-    createMessageTool({
-      ...capabilityParams,
-      ...toolContext,
-      agentSessionKey: sessionKey,
-      agentAccountId: "default",
-      messageActionTurnCapability: turnCapability,
-      config: cfg,
-      getScopedChannelsCommandSecretTargets: () => ({ targetIds: new Set<string>() }),
-      resolveCommandSecretRefsViaGateway: async ({ config }) => ({
-        resolvedConfig: config,
-        diagnostics: [],
-        targetStatesByPath: {},
-        hadUnresolvedTargets: false,
-      }),
-    }),
-    {
-      ...capabilityParams,
-      operationalRunInstance,
-      receiptAuthority: () => validateAgentRunDelegatedAuthority(delegatedAuthority),
-    },
-  );
   function retain<T>(operation: () => Promise<T>): Promise<T> {
     const result = Promise.resolve().then(() => {
       controller.signal.throwIfAborted();
@@ -322,43 +250,9 @@ async function createFixture(
   return {
     requests,
     invoke(route: Route, action: Action, params: Record<string, unknown> = {}) {
-      return retain(async () => {
-        const actionParams = { ...inputFor(action), ...params };
-        if (route === "tool") {
-          return (
-            await tool.execute(
-              `teams-call-${++sequence}`,
-              { action, channel: "msteams", ...actionParams },
-              controller.signal,
-            )
-          ).details;
-        }
-        const respond =
-          vi.fn<(ok: boolean, payload?: unknown, error?: { message?: string }) => void>();
-        await sendHandlers["message.action"]!({
-          params: {
-            action,
-            channel: "msteams",
-            params: actionParams,
-            agentId: "main",
-            sessionKey,
-            idempotencyKey: `teams-call-${++sequence}`,
-          },
-          respond,
-          context,
-          client,
-          req: { type: "req", id: `teams-rpc-${sequence}`, method: "message.action" },
-          isWebchatConnect: () => false,
-          signal: controller.signal,
-        });
-        expect(respond).toHaveBeenCalledTimes(1);
-        const [ok, payload, error] = respond.mock.calls[0]!;
-        if (!ok) {
-          expect(payload).toBeUndefined();
-          throw new Error(error?.message ?? "Gateway Teams action failed");
-        }
-        return payload;
-      });
+      return retain(() =>
+        caller.invoke(route, action, { ...inputFor(action), ...params }, controller.signal),
+      );
     },
     invokeAdapter(action: Action, params: Record<string, unknown>) {
       return retain(async () => {

@@ -26,9 +26,6 @@ vi.mock("../../plugins/catalog-search.js", () => ({ searchInstallablePluginPacka
 const { pluginMutationHandlers: pluginsHandlers } = await import("./plugins-mutations.js");
 const application = { operationId: "test-operation", generation: 42, pluginIds: ["workboard"] };
 const applyRuntime = vi.fn<NonNullable<GatewayRequestContext["applyPluginLifecycleChange"]>>();
-const context: Pick<GatewayRequestContext, "applyPluginLifecycleChange"> = {
-  applyPluginLifecycleChange: applyRuntime,
-};
 type ManagedMutationOptions = Pick<
   Parameters<typeof installManagedPlugin>[0],
   "applyRuntime" | "beforePersistentApply" | "signal"
@@ -53,8 +50,7 @@ async function callHandler(
     params,
     client: null,
     isWebchatConnect: () => false,
-    // This fixture supplies the sole Gateway capability consumed by these lifecycle handlers.
-    context: context as GatewayRequestContext,
+    context: { applyPluginLifecycleChange: applyRuntime } as GatewayRequestContext,
     respond: (success, _result, requestError) => {
       ok = success;
       error = requestError;
@@ -81,6 +77,12 @@ async function waitForPublication(entered: Promise<unknown>, pending: Promise<un
     }),
   ]);
 }
+function expectUnavailable(result: unknown, failure: Error) {
+  expect(result).toMatchObject({
+    ok: false,
+    error: { code: "UNAVAILABLE", message: failure.message },
+  });
+}
 
 describe("plugin lifecycle invoker ownership", () => {
   beforeEach(() => {
@@ -90,148 +92,120 @@ describe("plugin lifecycle invoker ownership", () => {
     }
   });
 
-  it("preserves the management lease guard while the request remains open", async () => {
+  const createInvocation = (fence: "signal" | "guard" | "client" | "lease") => {
     const controller = new AbortController();
-    const requestGuard = vi.fn();
-    const entered = createDeferred();
-    const released = createDeferred();
-    const publish = vi.fn();
-    const failure = new Error("plugin mutation lease lost");
-    let leaseOwned = true;
-    applyRuntime.mockImplementation(
-      async (change: Parameters<NonNullable<ManagedMutationOptions["applyRuntime"]>>[0]) => {
-        entered.resolve();
-        await released.promise;
-        change.assertInvokerOwned?.();
-        publish();
-        return application;
-      },
+    const failure = new Error(
+      {
+        signal: "plugin request aborted",
+        client: "Plugin mutation authority is no longer active.",
+        lease: "plugin mutation lease lost",
+        guard: "plugin mutation owner closed",
+      }[fence],
     );
-    managementMocks.reload.mockImplementation(async (options: ManagedMutationOptions) => ({
-      application: await applyReload(options, () => {
-        if (!leaseOwned) {
+    let open = true;
+    return {
+      failure,
+      invocation: {
+        signal: controller.signal,
+        hasCurrentClientAuthority: () => fence !== "client" || open,
+        sessionMutationCommitGuard: vi.fn(() => {
+          if (fence === "guard" && !open) {
+            throw failure;
+          }
+        }),
+      },
+      assertInvokerOwned: () => {
+        if (fence === "lease" && !open) {
           throw failure;
         }
-      }),
-    }));
-    const pending = callHandler({
-      signal: controller.signal,
-      sessionMutationCommitGuard: requestGuard,
-    });
-    try {
-      await waitForPublication(entered.promise, pending);
-      leaseOwned = false;
-      released.resolve();
-      expect(await pending).toMatchObject({
-        ok: false,
-        error: { code: "UNAVAILABLE", message: failure.message },
-      });
-      expect(controller.signal.aborted).toBe(false);
-      expect(requestGuard).toHaveBeenCalled();
-      expect(publish).not.toHaveBeenCalled();
-    } finally {
-      released.resolve();
-      await pending;
-    }
-  });
-  describe.each(["signal", "guard", "client"] as const)("closed %s", (fence) => {
-    const createInvocation = () => {
-      const controller = new AbortController();
-      const failure = new Error(
-        fence === "signal"
-          ? "plugin request aborted"
-          : fence === "client"
-            ? "Plugin mutation authority is no longer active."
-            : "plugin mutation owner closed",
-      );
-      let open = true;
-      return {
-        failure,
-        invocation: {
-          signal: controller.signal,
-          hasCurrentClientAuthority: () => fence !== "client" || open,
-          sessionMutationCommitGuard: () => {
-            if (fence === "guard" && !open) {
-              throw failure;
-            }
-          },
-        },
-        close: () => {
-          if (fence === "signal") {
-            controller.abort(failure);
-          } else {
-            open = false;
-          }
-        },
-      };
-    };
-
-    it("rejects reload before management dispatch", async () => {
-      const owner = createInvocation();
-      managementMocks.reload.mockResolvedValue({ application });
-      owner.close();
-      expect(await callHandler(owner.invocation)).toMatchObject({
-        ok: false,
-        error: { code: "UNAVAILABLE", message: owner.failure.message },
-      });
-      expect(managementMocks.reload).not.toHaveBeenCalled();
-      expect(applyRuntime).not.toHaveBeenCalled();
-    });
-
-    it.each(["persistence", "runtime", "publication"] as const)(
-      "rejects retained reload %s work after an await",
-      async (checkpoint) => {
-        const owner = createInvocation();
-        const entered = createDeferred();
-        const paused = createDeferred();
-        const persist = vi.fn();
-        if (checkpoint === "publication") {
-          applyRuntime.mockImplementation(
-            async (change: Parameters<NonNullable<ManagedMutationOptions["applyRuntime"]>>[0]) => {
-              entered.resolve();
-              await paused.promise;
-              change.assertInvokerOwned?.();
-              persist();
-              return application;
-            },
-          );
-        }
-        managementMocks.reload.mockImplementation(async (options: ManagedMutationOptions) => {
-          if (checkpoint !== "publication") {
-            entered.resolve();
-            await paused.promise;
-          }
-          if (checkpoint === "persistence") {
-            options.beforePersistentApply?.();
-            persist();
-            return { application };
-          }
-          return { application: await applyReload(options) };
-        });
-        const pending = callHandler(owner.invocation);
-        try {
-          await waitForPublication(entered.promise, pending);
-          expect(managementMocks.reload).toHaveBeenCalledOnce();
-          owner.close();
-          paused.resolve();
-          expect(await pending).toMatchObject({
-            ok: false,
-            error: { code: "UNAVAILABLE", message: owner.failure.message },
-          });
-          expect(persist).not.toHaveBeenCalled();
-          expect(applyRuntime).toHaveBeenCalledTimes(checkpoint === "publication" ? 1 : 0);
-          expect(managementMocks.reload).toHaveBeenCalledWith(
-            expect.objectContaining({
-              signal: owner.invocation.signal,
-              beforePersistentApply: expect.any(Function),
-              applyRuntime: expect.any(Function),
-            }),
-          );
-        } finally {
-          paused.resolve();
-          await pending;
+      },
+      close: () => {
+        if (fence === "signal") {
+          controller.abort(failure);
+        } else {
+          open = false;
         }
       },
-    );
-  });
+    };
+  };
+
+  it.each(["signal", "guard", "client"] as const)(
+    "rejects closed %s before management dispatch",
+    async (fence) => {
+      const owner = createInvocation(fence);
+      managementMocks.reload.mockResolvedValue({ application });
+      owner.close();
+      expectUnavailable(await callHandler(owner.invocation), owner.failure);
+      expect(managementMocks.reload).not.toHaveBeenCalled();
+      expect(applyRuntime).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ...(["signal", "guard", "client"] as const).flatMap((fence) =>
+      (["persistence", "runtime", "publication"] as const).map((checkpoint) => ({
+        fence,
+        checkpoint,
+      })),
+    ),
+    { fence: "lease", checkpoint: "publication" } as const,
+  ])(
+    "rejects retained reload $checkpoint work after $fence closes",
+    async ({ fence, checkpoint }) => {
+      const owner = createInvocation(fence);
+      const entered = createDeferred();
+      const paused = createDeferred();
+      const persist = vi.fn();
+      if (checkpoint === "publication") {
+        applyRuntime.mockImplementation(async (change) => {
+          entered.resolve();
+          await paused.promise;
+          change.assertInvokerOwned?.();
+          persist();
+          return application;
+        });
+      }
+      managementMocks.reload.mockImplementation(async (options: ManagedMutationOptions) => {
+        if (checkpoint !== "publication") {
+          entered.resolve();
+          await paused.promise;
+        }
+        if (checkpoint === "persistence") {
+          options.beforePersistentApply?.();
+          persist();
+          return { application };
+        }
+        return {
+          application: await applyReload(
+            options,
+            fence === "lease" ? owner.assertInvokerOwned : undefined,
+          ),
+        };
+      });
+      const pending = callHandler(owner.invocation);
+      try {
+        await waitForPublication(entered.promise, pending);
+        expect(managementMocks.reload).toHaveBeenCalledOnce();
+        owner.close();
+        paused.resolve();
+        expectUnavailable(await pending, owner.failure);
+        expect(persist).not.toHaveBeenCalled();
+        if (fence === "lease") {
+          expect(owner.invocation.signal.aborted).toBe(false);
+          expect(owner.invocation.sessionMutationCommitGuard).toHaveBeenCalled();
+        }
+        expect(applyRuntime).toHaveBeenCalledTimes(checkpoint === "publication" ? 1 : 0);
+        expect(managementMocks.reload).toHaveBeenCalledWith(
+          expect.objectContaining({
+            signal: owner.invocation.signal,
+            beforePersistentApply: expect.any(Function),
+            applyRuntime: expect.any(Function),
+          }),
+        );
+      } finally {
+        paused.resolve();
+        await pending;
+      }
+    },
+  );
 });

@@ -1,15 +1,9 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { expect, it, vi, type Mock } from "vitest";
+import type { NodeInvokeParams, NodeInvokeResult } from "../node-invoke.types.js";
+import type { GatewayRequestHandlerOptions } from "./types.js";
 
-export type RespondCall = [
-  boolean,
-  unknown?,
-  {
-    code?: number;
-    message?: string;
-    details?: unknown;
-  }?,
-];
+export type RespondCall = Parameters<GatewayRequestHandlerOptions["respond"]>;
 
 type MockCallSource = {
   mock: {
@@ -43,17 +37,6 @@ export function mockArg(source: MockCallSource, callIndex: number, argIndex: num
   return mockCall(source, callIndex)[argIndex];
 }
 
-function makeNodeInvokeParams(overrides?: Partial<Record<string, unknown>>) {
-  return {
-    nodeId: "ios-node-1",
-    command: "camera.capture",
-    params: { quality: "high" },
-    timeoutMs: 5000,
-    idempotencyKey: "idem-node-invoke",
-    ...overrides,
-  };
-}
-
 export function createNodeInvokeTestHarness({
   getRuntimeConfig,
   nodeHandlers,
@@ -61,27 +44,14 @@ export function createNodeInvokeTestHarness({
   getRuntimeConfig: () => unknown;
   nodeHandlers: (typeof import("./nodes.js"))["nodeHandlers"];
 }) {
-  async function invokeNode(params: {
+  return async (params: {
     nodeRegistry: {
       get: (nodeId: string) => TestNodeSession | undefined;
       getForPairingGeneration?: (
         nodeId: string,
         pairingGeneration: string,
       ) => TestNodeSession | undefined;
-      invoke: (payload: {
-        nodeId: string;
-        command: string;
-        params?: unknown;
-        timeoutMs?: number;
-        signal?: AbortSignal;
-        idempotencyKey?: string;
-        expectedPairingGeneration?: string;
-      }) => Promise<{
-        ok: boolean;
-        payload?: unknown;
-        payloadJSON?: string | null;
-        error?: { code?: string; message?: string } | null;
-      }>;
+      invoke: (payload: NodeInvokeParams) => Promise<NodeInvokeResult>;
     };
     client?: unknown;
     signal?: AbortSignal;
@@ -91,12 +61,8 @@ export function createNodeInvokeTestHarness({
       projectDecisionIfActive: (id: string, decision: string) => string | null;
       retainForHandoff?: (id: string) => (() => void) | null;
     };
-  }) {
+  }) => {
     const respond = vi.fn();
-    const logGateway = {
-      info: vi.fn(),
-      warn: vi.fn(),
-    };
     const nodeRegistry = {
       ...params.nodeRegistry,
       getForPairingGeneration:
@@ -113,12 +79,19 @@ export function createNodeInvokeTestHarness({
       nodeHandlers["node.invoke"],
       'nodeHandlers["node.invoke"] test invariant',
     )({
-      params: makeNodeInvokeParams(params.requestParams),
+      params: {
+        nodeId: "ios-node-1",
+        command: "camera.capture",
+        params: { quality: "high" },
+        timeoutMs: 5000,
+        idempotencyKey: "idem-node-invoke",
+        ...params.requestParams,
+      },
       respond: respond as never,
       context: {
         nodeRegistry,
         execApprovalManager,
-        logGateway,
+        logGateway: { info: vi.fn(), warn: vi.fn() },
         getRuntimeConfig,
         validateAgentRuntimeApprovalAuthority: params.validateAgentRuntimeApprovalAuthority,
       } as never,
@@ -128,9 +101,7 @@ export function createNodeInvokeTestHarness({
       isWebchatConnect: () => false,
     });
     return respond;
-  }
-
-  return invokeNode;
+  };
 }
 
 export function createOperatorClient(params?: {
@@ -169,78 +140,65 @@ export function registerNodeInvokeUploadTests({
   };
   invokeNode: ReturnType<typeof createNodeInvokeTestHarness>;
 }): void {
-  it.each(["terminal.upload"])(
-    "blocks external %s upload bytes before node lookup, including spoofed internal params",
-    async (command) => {
-      mocks.getRuntimeConfig.mockReturnValue({ gateway: { uploads: { enabled: false } } });
-      const nodeRegistry = { get: vi.fn(), invoke: vi.fn() };
-      const respond = await invokeNode({
-        nodeRegistry,
-        client: createOperatorClient({ scopes: ["operator.admin"] }),
-        requestParams: {
-          command,
-          params: { contentBase64: "", internal: { syntheticClient: true } },
-        },
-      });
-      expect(firstRespondCall(respond)).toMatchObject([
-        false,
-        undefined,
-        {
-          code: "FORBIDDEN",
-          details: { code: "UPLOADS_DISABLED" },
-        },
-      ]);
-      expect(nodeRegistry.get).not.toHaveBeenCalled();
-      expect(nodeRegistry.invoke).not.toHaveBeenCalled();
-    },
-  );
-
-  it("rejects terminal bytes when uploads are disabled during dispatch preparation", async () => {
-    mocks.getRuntimeConfig.mockReturnValue({ gateway: { uploads: { enabled: true } } });
-    mocks.resolveNodeCommandAllowlist.mockReturnValue(new Set(["terminal.upload"]));
-    mocks.sanitizeNodeInvokeParamsForForwarding.mockImplementationOnce(({ rawParams }) => {
-      mocks.getRuntimeConfig.mockReturnValue({ gateway: { uploads: { enabled: false } } });
-      return { ok: true, params: rawParams };
-    });
-    const nodeRegistry = {
-      get: vi.fn(() => ({ nodeId: "upload-node", commands: ["terminal.upload"] })),
-      invoke: vi.fn(),
-    };
-    const respond = await invokeNode({
+  const setUploads = (enabled: boolean) =>
+    mocks.getRuntimeConfig.mockReturnValue({ gateway: { uploads: { enabled } } });
+  const upload = (
+    nodeRegistry: Parameters<typeof invokeNode>[0]["nodeRegistry"],
+    internal = {},
+    params: Record<string, unknown> = { name: "proof", contentBase64: "cHJvb2Y=" },
+  ) =>
+    invokeNode({
       nodeRegistry,
-      client: createOperatorClient({ scopes: ["operator.admin"] }),
-      requestParams: {
-        nodeId: "upload-node",
-        command: "terminal.upload",
-        params: { name: "proof", contentBase64: "cHJvb2Y=" },
-      },
+      client: { ...createOperatorClient({ scopes: ["operator.admin"] }), internal },
+      requestParams: { nodeId: "upload-node", command: "terminal.upload", params },
     });
+  const uploadNode = () => ({
+    get: vi.fn(() => ({ nodeId: "upload-node", commands: ["terminal.upload"] })),
+    invoke: vi.fn(),
+  });
+  const expectDisabled = (respond: Mock, error = {}) =>
     expect(firstRespondCall(respond)).toMatchObject([
       false,
       undefined,
-      { details: { code: "UPLOADS_DISABLED" } },
+      { ...error, details: { code: "UPLOADS_DISABLED" } },
     ]);
-    expect(nodeRegistry.invoke).not.toHaveBeenCalled();
-  });
-
-  it("preserves terminal upload dispatch for internal services", async () => {
-    mocks.getRuntimeConfig.mockReturnValue({ gateway: { uploads: { enabled: false } } });
-    mocks.resolveNodeCommandAllowlist.mockReturnValue(new Set(["terminal.upload"]));
-    const nodeRegistry = {
-      get: vi.fn(() => ({ nodeId: "upload-node", commands: ["terminal.upload"] })),
-      invoke: vi.fn().mockResolvedValue({ ok: true, payloadJSON: '{"path":"/uploads/proof"}' }),
-    };
-    const client = createOperatorClient({ scopes: ["operator.admin"] });
-    const respond = await invokeNode({
-      nodeRegistry,
-      client: { ...client, internal: { syntheticClient: true } },
-      requestParams: {
-        nodeId: "upload-node",
-        command: "terminal.upload",
-        params: { name: "proof", contentBase64: "cHJvb2Y=" },
-      },
-    });
-    expect(firstRespondCall(respond)[0]).toBe(true);
-    expect(nodeRegistry.invoke).toHaveBeenCalledOnce();
-  });
+  it.each(["before lookup", "during preparation", "internal service"])(
+    "enforces terminal upload policy: %s",
+    async (stage) => {
+      const internal = stage === "internal service";
+      setUploads(stage === "during preparation");
+      const nodeRegistry =
+        stage === "before lookup" ? { get: vi.fn(), invoke: vi.fn() } : uploadNode();
+      if (stage !== "before lookup") {
+        mocks.resolveNodeCommandAllowlist.mockReturnValue(new Set(["terminal.upload"]));
+      }
+      if (stage === "during preparation") {
+        mocks.sanitizeNodeInvokeParamsForForwarding.mockImplementationOnce(({ rawParams }) => {
+          setUploads(false);
+          return { ok: true, params: rawParams };
+        });
+      }
+      if (internal) {
+        nodeRegistry.invoke.mockResolvedValue({
+          ok: true,
+          payloadJSON: '{"path":"/uploads/proof"}',
+        });
+      }
+      const bytes =
+        stage === "before lookup"
+          ? { contentBase64: "", internal: { syntheticClient: true } }
+          : undefined;
+      const respond = await upload(nodeRegistry, internal ? { syntheticClient: true } : {}, bytes);
+      if (internal) {
+        expect(firstRespondCall(respond)[0]).toBe(true);
+        expect(nodeRegistry.invoke).toHaveBeenCalledOnce();
+      } else {
+        expectDisabled(respond, stage === "before lookup" ? { code: "FORBIDDEN" } : {});
+        expect(nodeRegistry.invoke).not.toHaveBeenCalled();
+      }
+      if (stage === "before lookup") {
+        expect(nodeRegistry.get).not.toHaveBeenCalled();
+      }
+    },
+  );
 }

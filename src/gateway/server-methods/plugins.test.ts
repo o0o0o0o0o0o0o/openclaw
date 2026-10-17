@@ -1,5 +1,3 @@
-// Plugin management read tests cover inventory, inspection, and catalog DTOs.
-
 import { expectDefined } from "@openclaw/normalization-core";
 import { Compile } from "typebox/compile";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,7 +10,6 @@ import {
   withPluginRuntimeRegistryScope,
 } from "../../plugins/runtime/gateway-request-scope.js";
 import { warnPluginSdkDeprecation } from "../../plugins/sdk-deprecation.js";
-import type { GatewayRequestContext } from "./types.js";
 
 const managementMocks = vi.hoisted(() => ({
   inspect: vi.fn(),
@@ -45,11 +42,7 @@ vi.mock("../../infra/clawhub-plugin-catalog.js", () => ({
 
 const { pluginsHandlers } = await import("./plugins.js");
 
-async function callHandler(
-  method: string,
-  params: Record<string, unknown>,
-  runtimeConfig: Record<string, unknown> = {},
-) {
+async function callHandler(method: string, params: Record<string, unknown>) {
   let ok: boolean | null = null;
   let response: unknown;
   let error: unknown;
@@ -63,7 +56,7 @@ async function callHandler(
       client: null as never,
       isWebchatConnect: () => false,
       context: {
-        getRuntimeConfig: () => runtimeConfig,
+        getRuntimeConfig: () => ({}),
       } as never,
       respond: (success, result, requestError) => {
         ok = success;
@@ -73,6 +66,10 @@ async function callHandler(
     }),
   );
   return { ok, response, error };
+}
+
+async function expectBrowse(params: Record<string, unknown>, response: unknown) {
+  expect(await callHandler("plugins.catalog.browse", params)).toMatchObject({ ok: true, response });
 }
 
 const workboard = {
@@ -86,30 +83,11 @@ const workboard = {
 };
 
 const reviewToken = "a".repeat(64);
+const remoteUnavailable =
+  "ClawHub is unavailable: service unavailable. Installed plugins remain available.";
 function inventory(plugins: unknown[] = [], mutationAllowed = true) {
   managementMocks.list.mockResolvedValue({ plugins, diagnostics: [], mutationAllowed });
 }
-function declared(overrides = {}) {
-  return {
-    channels: [],
-    providers: [],
-    tools: [],
-    contracts: [],
-    hooks: [],
-    mcpServers: [],
-    cliCommands: [],
-    cliBackends: [],
-    skills: [],
-    dangerousConfigFlags: [],
-    ...overrides,
-  };
-}
-const grants = {
-  hooks: {
-    allowPromptInjection: { effective: false },
-    allowConversationAccess: { effective: false },
-  },
-};
 const memoryBundle = {
   id: "memory-bundle",
   name: "Memory Bundle",
@@ -122,13 +100,9 @@ const memoryBundle = {
 
 describe("plugin management Gateway handlers", () => {
   beforeEach(() => {
-    managementMocks.inspect.mockReset();
-    managementMocks.list.mockReset();
-    searchMock.mockReset();
-    catalogMocks.browse.mockReset();
-    catalogMocks.categories.mockReset();
-    catalogMocks.overview.mockReset();
-    catalogMocks.detail.mockReset();
+    Object.values({ ...managementMocks, ...catalogMocks, searchMock }).forEach((mock) =>
+      mock.mockReset(),
+    );
   });
 
   it("returns observed SDK compatibility per plugin without changing runtime state", async () => {
@@ -222,18 +196,8 @@ describe("plugin management Gateway handlers", () => {
     const inspection = {
       ok: true,
       reviewToken,
-      plugin: {
-        id: "community-plugin",
-        name: "Community Plugin",
-        version: "1.2.3",
-        origin: "global",
-        installed: true,
-        enabled: false,
-      },
+      plugin: { id: "community-plugin", installed: true },
       source: { kind: "clawhub", packageName: "community/plugin" },
-      declared: declared(),
-      components: emptyInstalledPluginComponents(),
-      grants,
     } as const;
     managementMocks.inspect.mockResolvedValue(inspection);
     catalogMocks.detail.mockImplementation(() => new Promise(() => {}));
@@ -248,81 +212,47 @@ describe("plugin management Gateway handlers", () => {
     });
   });
 
-  it("maps plugin-only ClawHub search results to the public DTO", async () => {
-    searchMock.mockResolvedValue([
-      {
-        score: 0.91,
-        package: {
-          name: "@openclaw/diffs",
-          displayName: "Diffs",
-          family: "code-plugin",
-          channel: "official",
-          isOfficial: true,
-          summary: "Readable diffs",
-          latestVersion: "1.2.3",
-          runtimeId: "diffs",
-          ownerHandle: "openclaw",
-          verificationTier: "source-linked",
-          stats: { downloads: 149263, installs: 280, stars: 0, versions: 83 },
-        },
+  it.each([
+    {
+      label: "public plugin fields and valid download stats",
+      score: 0.91,
+      query: { query: "diff", limit: 12 },
+      expected: {
+        name: "@openclaw/diffs",
+        displayName: "Diffs",
+        family: "code-plugin",
+        channel: "official",
+        isOfficial: true,
+        summary: "Readable diffs",
+        latestVersion: "1.2.3",
+        runtimeId: "diffs",
+        verificationTier: "source-linked",
+        downloads: 149263,
       },
-    ]);
-
-    const result = await callHandler("plugins.search", { query: "diff", limit: 12 });
-
-    expect(searchMock).toHaveBeenCalledWith({ query: "diff", limit: 12 });
-    expect(result.response).toEqual({
-      results: [
-        {
-          score: 0.91,
-          package: {
-            name: "@openclaw/diffs",
-            displayName: "Diffs",
-            family: "code-plugin",
-            channel: "official",
-            isOfficial: true,
-            summary: "Readable diffs",
-            latestVersion: "1.2.3",
-            runtimeId: "diffs",
-            downloads: 149263,
-            verificationTier: "source-linked",
-          },
-        },
-      ],
-    });
-  });
-
-  it("omits malformed ClawHub download stats from the public DTO", async () => {
-    searchMock.mockResolvedValue([
-      {
-        score: 0.5,
-        package: {
-          name: "community/demo",
-          displayName: "Demo",
-          family: "code-plugin",
-          channel: "community",
-          isOfficial: false,
-          stats: { downloads: Number.NaN },
-        },
+      stats: { downloads: 149263, installs: 280, stars: 0, versions: 83 },
+    },
+    {
+      label: "malformed download stats",
+      score: 0.5,
+      query: { query: "demo" },
+      expected: {
+        name: "community/demo",
+        displayName: "Demo",
+        family: "code-plugin",
+        channel: "community",
+        isOfficial: false,
       },
+      stats: { downloads: Number.NaN },
+    },
+  ])("maps $label to the public DTO", async ({ score, query, expected, stats }) => {
+    const { downloads: _downloads, ...fields } = expected;
+    searchMock.mockResolvedValue([
+      { score, package: { ...fields, ownerHandle: "openclaw", stats } },
     ]);
-
-    const result = await callHandler("plugins.search", { query: "demo" });
-
-    expect(result.response).toEqual({
-      results: [
-        {
-          score: 0.5,
-          package: {
-            name: "community/demo",
-            displayName: "Demo",
-            family: "code-plugin",
-            channel: "community",
-            isOfficial: false,
-          },
-        },
-      ],
+    expect((await callHandler("plugins.search", query)).response).toEqual({
+      results: [{ score, package: expected }],
     });
+    expect(searchMock).toHaveBeenCalledWith({ query: query.query, limit: query.limit });
   });
 
   it("rejects search cursors before contacting ClawHub", async () => {
@@ -522,15 +452,17 @@ describe("plugin management Gateway handlers", () => {
     };
     inventory([provider]);
     catalogMocks.browse.mockResolvedValueOnce({ items: [], nextCursor: "media-next" });
-    const first = await callHandler("plugins.catalog.browse", { category: "media" });
     const expectedItem = {
       catalog: { categories: ["models", "media"] },
       local: { pluginId: "novita", enabled: true, action: "manage" },
     };
-    expect(first).toMatchObject({
-      ok: true,
-      response: { items: [expectedItem], nextCursor: "media-next" },
-    });
+    await expectBrowse(
+      { category: "media" },
+      {
+        items: [expectedItem],
+        nextCursor: "media-next",
+      },
+    );
     catalogMocks.browse.mockResolvedValueOnce({
       items: [
         {
@@ -543,21 +475,12 @@ describe("plugin management Gateway handlers", () => {
         },
       ],
     });
-    const second = await callHandler("plugins.catalog.browse", {
-      category: "media",
-      cursor: "media-next",
-    });
-    expect(second).toMatchObject({
-      ok: true,
-      response: {
-        items: [
-          {
-            ...expectedItem,
-            catalog: { ...expectedItem.catalog, downloads: 123 },
-          },
-        ],
+    await expectBrowse(
+      { category: "media", cursor: "media-next" },
+      {
+        items: [{ ...expectedItem, catalog: { ...expectedItem.catalog, downloads: 123 } }],
       },
-    });
+    );
     expect(catalogMocks.browse).toHaveBeenNthCalledWith(2, {
       query: undefined,
       intent: "all",
@@ -566,29 +489,22 @@ describe("plugin management Gateway handlers", () => {
       limit: 20,
     });
     catalogMocks.browse.mockRejectedValueOnce(new Error("service unavailable"));
-    const offline = await callHandler("plugins.catalog.browse", { category: "media" });
-    expect(offline).toMatchObject({
-      ok: true,
-      response: {
-        items: [expectedItem],
-        remoteError:
-          "ClawHub is unavailable: service unavailable. Installed plugins remain available.",
-      },
-    });
+    await expectBrowse(
+      { category: "media" },
+      { items: [expectedItem], remoteError: remoteUnavailable },
+    );
     inventory([
       { ...provider, enabled: false, state: "disabled", capabilityCategories: undefined },
     ]);
     catalogMocks.browse.mockResolvedValueOnce({ items: [] });
-    const disabledMedia = await callHandler("plugins.catalog.browse", { category: "media" });
-    expect(disabledMedia).toMatchObject({ ok: true, response: { items: [] } });
+    await expectBrowse({ category: "media" }, { items: [] });
     catalogMocks.browse.mockResolvedValueOnce({ items: [] });
-    const disabledModels = await callHandler("plugins.catalog.browse", { category: "models" });
-    expect(disabledModels).toMatchObject({
-      ok: true,
-      response: {
+    await expectBrowse(
+      { category: "models" },
+      {
         items: [{ catalog: { categories: ["models"] }, local: { enabled: false } }],
       },
-    });
+    );
     expect(managementMocks.inspect).not.toHaveBeenCalled();
   });
 
@@ -604,14 +520,17 @@ describe("plugin management Gateway handlers", () => {
     expect(result.response).toMatchObject({
       items: [],
       nextCursor: "page-two",
-      remoteError:
-        "ClawHub is unavailable: service unavailable. Installed plugins remain available.",
+      remoteError: remoteUnavailable,
     });
   });
 
-  it.each([undefined, "openclaw-control-ui"])(
-    "keeps local results private while forwarding catalog search attribution: %s",
-    async (searchSource) => {
+  it.each([
+    { intent: "all", searchSource: undefined },
+    { intent: "all", searchSource: "openclaw-control-ui" },
+    { intent: "bundled", searchSource: undefined },
+  ])(
+    "keeps local results private in $intent search with attribution $searchSource",
+    async ({ intent, searchSource }) => {
       const remote = {
         packageName: "@alice/memory-plus",
         displayName: "Memory Plus",
@@ -625,42 +544,33 @@ describe("plugin management Gateway handlers", () => {
 
       const result = await callHandler("plugins.catalog.browse", {
         query: "memory",
-        intent: "all",
+        intent,
         pageSize: 25,
         ...(searchSource ? { searchSource } : {}),
       });
 
-      expect(catalogMocks.browse).toHaveBeenCalledWith({
-        query: "memory",
-        intent: "all",
-        category: undefined,
-        cursor: undefined,
-        limit: 25,
-        ...(searchSource ? { searchSource } : {}),
-      });
+      if (intent === "bundled") {
+        expect(catalogMocks.browse).not.toHaveBeenCalled();
+      } else {
+        expect(catalogMocks.browse).toHaveBeenCalledWith({
+          query: "memory",
+          intent,
+          category: undefined,
+          cursor: undefined,
+          limit: 25,
+          ...(searchSource ? { searchSource } : {}),
+        });
+      }
       expect(result.response).toMatchObject({
         items: [
           { catalog: { name: "Memory Bundle", publishedToClawHub: false } },
-          { catalog: { name: "Memory Plus", publishedToClawHub: true } },
+          ...(intent === "bundled"
+            ? []
+            : [{ catalog: { name: "Memory Plus", publishedToClawHub: true } }]),
         ],
       });
     },
   );
-
-  it("keeps queried Bundled requests limited to unpublished bundled plugins", async () => {
-    inventory([memoryBundle]);
-
-    const result = await callHandler("plugins.catalog.browse", {
-      query: "memory",
-      intent: "bundled",
-      pageSize: 25,
-    });
-
-    expect(catalogMocks.browse).not.toHaveBeenCalled();
-    expect(result.response).toMatchObject({
-      items: [{ catalog: { name: "Memory Bundle", publishedToClawHub: false } }],
-    });
-  });
 
   it("resolves and inspects an uninstalled official discovery candidate locally", async () => {
     const localOnly = {
@@ -688,9 +598,6 @@ describe("plugin management Gateway handlers", () => {
       },
     ]);
     managementMocks.inspect.mockResolvedValue({
-      ok: true,
-      plugin: localOnly,
-      source: { kind: "official-catalog" },
       overview: {
         capabilities: {
           channels: ["workboard-chat"],
@@ -698,15 +605,12 @@ describe("plugin management Gateway handlers", () => {
           contracts: {},
         },
       },
-      declared: declared({
-        channels: ["workboard-chat"],
-        providers: ["workboard-models"],
+      declared: {
         tools: ["workboard_read"],
         mcpServers: ["workboard"],
         skills: ["Workboard planning"],
-      }),
+      },
       components: emptyInstalledPluginComponents(),
-      grants,
     });
 
     const result = await callHandler("plugins.catalog.get", {
@@ -750,19 +654,6 @@ vi.mock("../../infra/clawhub-plugin-skills.js", () => ({
   fetchClawHubPluginSkill: readers.catalog,
 }));
 
-async function read(params: Record<string, unknown>) {
-  const respond = vi.fn();
-  await pluginsHandlers["plugins.skills.read"]!({
-    req: { type: "req", id: "skill-read", method: "plugins.skills.read", params },
-    params,
-    client: null,
-    isWebchatConnect: () => false,
-    respond,
-    context: { getRuntimeConfig: () => ({}) } as GatewayRequestContext,
-  });
-  return respond;
-}
-
 describe("plugin skill read Gateway boundary", () => {
   it.each(["installed", "catalog"])(
     "routes %s reads through the declared owner and returns the full bundle",
@@ -777,7 +668,8 @@ describe("plugin skill read Gateway boundary", () => {
       };
       readers.installed.mockResolvedValue(bundle);
       readers.catalog.mockResolvedValue(bundle);
-      const result = await read(
+      const result = await callHandler(
+        "plugins.skills.read",
         source === "installed"
           ? { source, pluginId: "example", skillName: "guide" }
           : {
@@ -787,7 +679,7 @@ describe("plugin skill read Gateway boundary", () => {
               skillName: "guide",
             },
       );
-      expect(result).toHaveBeenCalledWith(true, bundle, undefined);
+      expect(result).toEqual({ ok: true, response: bundle, error: undefined });
       if (source === "catalog") {
         expect(readers.catalog).toHaveBeenLastCalledWith({
           packageName: "@example/plugin",
@@ -806,11 +698,10 @@ describe("plugin skill read Gateway boundary", () => {
     },
     { source: "installed", pluginId: "example", skillName: "guide", path: "/private" },
   ])("rejects invalid source/path requests", async (params) => {
-    const result = await read(params);
-    expect(result).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ code: "INVALID_REQUEST" }),
-    );
+    expect(await callHandler("plugins.skills.read", params)).toEqual({
+      ok: false,
+      response: undefined,
+      error: expect.objectContaining({ code: "INVALID_REQUEST" }),
+    });
   });
 });

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import {
   createSessionEventSubscriberRegistry,
@@ -13,6 +13,7 @@ const { recordHostStatsMock } = vi.hoisted(() => ({ recordHostStatsMock: vi.fn()
 vi.mock("../../infra/device-pairing-node.js", () => ({
   recordPairedNodeHostStats: recordHostStatsMock,
 }));
+afterEach(() => vi.restoreAllMocks());
 
 describe("node host stats receipt", () => {
   it.each([true, false])(
@@ -22,32 +23,13 @@ describe("node host stats receipt", () => {
       const hostStats = { ...stats, updatedAtMs: 1_250 };
       const persistence = createDeferred<boolean>();
       recordHostStatsMock.mockReset().mockReturnValue(persistence.promise);
-      const session = { nodeId: "node-1", connId: "conn-1", pairingGeneration: "generation-1" };
-      const warn = vi.fn();
-      const broadcast = vi.fn();
-      const updateHostStats = vi.fn(() => (accepted ? hostStats : null));
-      const params = { event: "node.host.stats", payload: stats };
-      const respond = vi.fn();
-      await nodeEventHandlers["node.event"]!({
-        req: { type: "req", id: "stats", method: "node.event", params },
-        params,
-        client: {
-          connId: session.connId,
-          connect: { device: { id: session.nodeId } },
-        } as GatewayRequestHandlerOptions["client"],
-        isWebchatConnect: () => false,
-        respond,
-        context: {
-          nodeRegistry: {
-            get: () => session,
-            getForPairingGeneration: () => session,
-            isConnectionCurrentPairingState: async () => true,
-            updateHostStats,
-          },
-          broadcast,
-          logGateway: { warn },
-        } as unknown as GatewayRequestHandlerOptions["context"],
-      });
+      const h = createNodeEventHarness();
+      const client = h.register("conn-1");
+      const { warn, broadcast } = h;
+      const updateHostStats = vi
+        .spyOn(h.nodeRegistry, "updateHostStats")
+        .mockReturnValue(accepted ? hostStats : null);
+      const respond = await h.send(client, stats, "node.host.stats");
 
       expect(updateHostStats).toHaveBeenCalledWith({ nodeId: "node-1", connId: "conn-1", stats });
       const result = [
@@ -64,13 +46,13 @@ describe("node host stats receipt", () => {
       expect(respond.mock.calls).toEqual([result]);
       if (accepted) {
         expect(recordHostStatsMock).toHaveBeenCalledExactlyOnceWith({
-          nodeId: session.nodeId,
+          nodeId: "node-1",
           hostStats,
-          expectedPairingGeneration: { nodeId: session.nodeId, key: session.pairingGeneration },
+          expectedPairingGeneration: { nodeId: "node-1", key: h.binding.generation },
         });
         expect(broadcast).toHaveBeenCalledWith(
           "node.hostStats",
-          { nodeId: session.nodeId, hostStats },
+          { nodeId: "node-1", hostStats },
           { dropIfSlow: true },
         );
         persistence.reject(new Error("stats store unavailable"));
@@ -94,6 +76,7 @@ function createNodeEventHarness() {
   const binding = { identity: "identity-1", generation: "generation-1" };
   const resolvePairing = vi.fn(async () => binding);
   const broadcast = vi.fn();
+  const warn = vi.fn();
   const runtime = createGatewayNodeSessionRuntime({
     broadcast,
     resolveCurrentPairingState: resolvePairing,
@@ -124,6 +107,9 @@ function createNodeEventHarness() {
       pairingIdentity: binding.identity,
       pairingGeneration: binding.generation,
     });
+    onTestFinished(() => {
+      runtime.nodeRegistry.unregister(connId);
+    });
     return client;
   };
   const send = async (
@@ -142,7 +128,7 @@ function createNodeEventHarness() {
       context: {
         ...runtime,
         broadcast,
-        logGateway: { warn: vi.fn() },
+        logGateway: { warn },
       } as unknown as GatewayRequestHandlerOptions["context"],
     });
     return respond;
@@ -151,7 +137,7 @@ function createNodeEventHarness() {
     broadcast.mock.calls
       .filter(([event]) => event === "node.runnerInventory.changed")
       .map(([, payload]) => payload);
-  return { ...runtime, binding, resolvePairing, register, send, changes };
+  return { ...runtime, binding, resolvePairing, register, send, changes, warn, broadcast };
 }
 
 describe("registered node desktop availability events", () => {
@@ -188,7 +174,6 @@ describe("registered node desktop availability events", () => {
     expect(h.nodeRegistry.get("node-1")).toBeUndefined();
     expect(h.changes()).toHaveLength(6);
     expect(h.changes().at(-1)).toEqual({ nodeId: "node-1" });
-    h.nodeRegistry.unregister("conn-other");
   });
 
   it("rejects malformed states and attempts to supply another node identity", async () => {
@@ -203,7 +188,6 @@ describe("registered node desktop availability events", () => {
     }
     expect(h.nodeRegistry.get("node-1")).not.toHaveProperty("desktopAvailability");
     expect(h.changes()).toEqual([]);
-    h.nodeRegistry.unregister(client.connId);
   });
 
   it("rejects an event whose connection is replaced while pairing validation is pending", async () => {
@@ -224,7 +208,6 @@ describe("registered node desktop availability events", () => {
     expect(h.changes()).toHaveLength(2);
     expect(h.changes().at(-1)).toEqual({ nodeId: "node-1" });
     expect((await h.send(replacement, { state: "locked" })).mock.calls[0]?.[0]).toBe(false);
-    h.nodeRegistry.unregister(replacement.connId);
   });
 
   it("rejects a late event while the closed transport is retained for lifecycle draining", async () => {
@@ -242,7 +225,6 @@ describe("registered node desktop availability events", () => {
     });
     expect(h.nodeRegistry.get("node-1")).not.toHaveProperty("desktopAvailability");
     expect(h.changes()).toEqual([]);
-    h.nodeRegistry.unregister(client.connId);
   });
 });
 
@@ -254,30 +236,25 @@ describe("registered node presence activity events", () => {
     node.declaredPermissions = { accessibility: true };
     h.nodeRegistry.updateSurface("node-1", { commands: [], permissions: { accessibility: true } });
     const clock = vi.spyOn(Date, "now").mockReturnValue(100_000);
-    try {
-      await h.send(client, { idleSeconds: 0 }, "node.presence.activity");
-      expect(h.nodeRegistry.getActiveNode()).toMatchObject({
-        lastActiveAtMs: 100_000,
-        presenceActivitySource: "system",
-      });
-      clock.mockReturnValue(105_000);
-      await h.send(client, { idleSeconds: 20, source: "app" }, "node.presence.activity");
-      expect(h.nodeRegistry.getActiveNode()).toMatchObject({
-        lastActiveAtMs: 85_000,
-        presenceActivitySource: "app",
-      });
-      clock.mockReturnValue(106_000);
-      await h.send(client, { idleSeconds: 30, source: "app" }, "node.presence.activity");
-      expect(h.nodeRegistry.getActiveNode()?.lastActiveAtMs).toBe(85_000);
-      h.nodeRegistry.updateSurface("node-1", {
-        commands: [],
-        permissions: { accessibility: false },
-      });
-      expect(h.nodeRegistry.getActiveNode()?.lastActiveAtMs).toBe(85_000);
-    } finally {
-      clock.mockRestore();
-      h.nodeRegistry.unregister(client.connId);
-    }
+    await h.send(client, { idleSeconds: 0 }, "node.presence.activity");
+    expect(h.nodeRegistry.getActiveNode()).toMatchObject({
+      lastActiveAtMs: 100_000,
+      presenceActivitySource: "system",
+    });
+    clock.mockReturnValue(105_000);
+    await h.send(client, { idleSeconds: 20, source: "app" }, "node.presence.activity");
+    expect(h.nodeRegistry.getActiveNode()).toMatchObject({
+      lastActiveAtMs: 85_000,
+      presenceActivitySource: "app",
+    });
+    clock.mockReturnValue(106_000);
+    await h.send(client, { idleSeconds: 30, source: "app" }, "node.presence.activity");
+    expect(h.nodeRegistry.getActiveNode()?.lastActiveAtMs).toBe(85_000);
+    h.nodeRegistry.updateSurface("node-1", {
+      commands: [],
+      permissions: { accessibility: false },
+    });
+    expect(h.nodeRegistry.getActiveNode()?.lastActiveAtMs).toBe(85_000);
   });
 
   it.each([
@@ -291,27 +268,22 @@ describe("registered node presence activity events", () => {
     async ({ source, clientId, platform, accepted }) => {
       const h = createNodeEventHarness();
       const client = h.register("conn-1", "node-1", clientId, platform);
-      try {
-        const respond = await h.send(client, { idleSeconds: 0, source }, "node.presence.activity");
-        expect(respond.mock.calls[0]?.[1]).toMatchObject({ handled: accepted });
-        expect(h.nodeRegistry.getActiveNode()?.nodeId).toBe(accepted ? "node-1" : undefined);
-        if (accepted) {
-          const replacement = h.register("conn-2");
-          expect(h.nodeRegistry.getActiveNode()).toBeUndefined();
-          expect(h.nodeRegistry.get("node-1")?.presenceActivitySource).toBeUndefined();
-          expect(
-            (await h.send(client, { idleSeconds: 0, source }, "node.presence.activity")).mock
-              .calls[0]?.[0],
-          ).toBe(false);
-          await h.send(replacement, { idleSeconds: 0, source }, "node.presence.activity");
-          expect(h.nodeRegistry.getActiveNode()?.nodeId).toBe("node-1");
-          await h.send(replacement, { action: "clear" }, "node.presence.activity");
-          expect(h.nodeRegistry.getActiveNode()).toBeUndefined();
-          expect(h.nodeRegistry.get("node-1")?.presenceActivitySource).toBeUndefined();
-          h.nodeRegistry.unregister(replacement.connId);
-        }
-      } finally {
-        h.nodeRegistry.unregister(client.connId);
+      const respond = await h.send(client, { idleSeconds: 0, source }, "node.presence.activity");
+      expect(respond.mock.calls[0]?.[1]).toMatchObject({ handled: accepted });
+      expect(h.nodeRegistry.getActiveNode()?.nodeId).toBe(accepted ? "node-1" : undefined);
+      if (accepted) {
+        const replacement = h.register("conn-2");
+        expect(h.nodeRegistry.getActiveNode()).toBeUndefined();
+        expect(h.nodeRegistry.get("node-1")?.presenceActivitySource).toBeUndefined();
+        expect(
+          (await h.send(client, { idleSeconds: 0, source }, "node.presence.activity")).mock
+            .calls[0]?.[0],
+        ).toBe(false);
+        await h.send(replacement, { idleSeconds: 0, source }, "node.presence.activity");
+        expect(h.nodeRegistry.getActiveNode()?.nodeId).toBe("node-1");
+        await h.send(replacement, { action: "clear" }, "node.presence.activity");
+        expect(h.nodeRegistry.getActiveNode()).toBeUndefined();
+        expect(h.nodeRegistry.get("node-1")?.presenceActivitySource).toBeUndefined();
       }
     },
   );

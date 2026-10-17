@@ -138,32 +138,29 @@ describe("node.pending handlers", () => {
     });
   });
 
-  it("rejects node.pending.drain without a connected device identity", async () => {
-    expect(await callPending("node.pending.drain", {})).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ message: expect.stringContaining("connected device identity") }),
-    );
-    expect(mocks.drainNodePendingWork).not.toHaveBeenCalled();
-  });
-
-  it("rejects a changed pairing before draining its pending work", async () => {
-    const context = makeContext(() => ({ connId: "conn-1", pairingGeneration: generation.key }));
-    context.nodeRegistry.isConnectionCurrentPairingState.mockResolvedValue(false);
-    expectPairingChanged(await drain(context));
-    expect(mocks.drainNodePendingWork).not.toHaveBeenCalled();
-  });
-
-  it("rejects a same-generation reconnect before destructively draining", async () => {
-    let connId = "conn-1";
-    const context = makeContext(() => ({ connId, pairingGeneration: generation.key }));
-    context.nodeRegistry.isConnectionCurrentPairingState.mockImplementation(async () => {
-      connId = "replacement";
-      return true;
-    });
-    expectPairingChanged(await drain(context));
-    expect(mocks.drainNodePendingWork).not.toHaveBeenCalled();
-  });
+  it.each(["missing identity", "changed pairing", "same-generation reconnect"])(
+    "rejects %s before destructively draining",
+    async (reason) => {
+      let connId = "conn-1";
+      const context = makeContext(() => ({ connId, pairingGeneration: generation.key }));
+      context.nodeRegistry.isConnectionCurrentPairingState.mockImplementation(async () => {
+        connId = "replacement";
+        return reason === "same-generation reconnect";
+      });
+      if (reason === "missing identity") {
+        expect(await callPending("node.pending.drain", {})).toHaveBeenCalledWith(
+          false,
+          undefined,
+          expect.objectContaining({
+            message: expect.stringContaining("connected device identity"),
+          }),
+        );
+      } else {
+        expectPairingChanged(await drain(context));
+      }
+      expect(mocks.drainNodePendingWork).not.toHaveBeenCalled();
+    },
+  );
 
   it("normalizes the target identity before queueing and waking a disconnected node", async () => {
     let connected = false;

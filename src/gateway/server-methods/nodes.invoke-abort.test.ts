@@ -7,6 +7,8 @@ import {
   releaseAgentRunDelegatedAuthority,
 } from "../../infra/agent-run-registry.js";
 import { NODE_WORKER_SUPERVISOR_STATUS_COMMAND } from "../../infra/node-commands.js";
+import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
+import type { NodeInvokeParams } from "../node-invoke.types.js";
 import type { NodeRegistry } from "../node-registry.js";
 import { isNodeWakeLifecycleCurrent } from "../node-wake-state.js";
 import { resetNodeWakeStateForTest } from "../node-wake-state.test-support.js";
@@ -71,6 +73,30 @@ const connect = {
 function createStream(isRuntimeCurrent = () => true) {
   return { onProgress: vi.fn(), onDispatchReady: vi.fn(), isRuntimeCurrent };
 }
+function agentClient(
+  bound: boolean,
+  identity: Omit<AgentRuntimeIdentity, "kind" | "agentId">,
+  connection = connect,
+) {
+  const agentRuntimeIdentity: AgentRuntimeIdentity = {
+    kind: "agentRuntime",
+    agentId: "main",
+    ...identity,
+  };
+  return { connect: connection, internal: bound ? { agentRuntimeIdentity } : undefined };
+}
+function streamingInvoke(
+  prefix: string,
+  inspect?: (params: NodeInvokeParams) => void,
+  payload = {},
+) {
+  return vi.fn(async (params: NodeInvokeParams) => {
+    inspect?.(params);
+    params.onDispatchReady?.(`${prefix}-invoke`);
+    params.onProgress?.(`${prefix}-progress`);
+    return { ok: true, payload };
+  });
+}
 function expectFailure(respond: ReturnType<typeof vi.fn>, error: Record<string, unknown>) {
   expect(respond).toHaveBeenCalledWith(false, undefined, expect.objectContaining(error));
 }
@@ -99,6 +125,7 @@ function startNodeInvoke(options: {
   if (!handler) {
     throw new Error("node.invoke handler is not registered");
   }
+  const getSession = () => ({ ...session, commands: options.commands ?? session.commands });
   const invocation = handler({
     req: { type: "req", id: "paired-inference-request", method: "node.invoke" },
     params: {
@@ -114,11 +141,8 @@ function startNodeInvoke(options: {
     respond,
     context: {
       nodeRegistry: {
-        get: () => ({ ...session, commands: options.commands ?? session.commands }),
-        getForPairingGeneration: () => ({
-          ...session,
-          commands: options.commands ?? session.commands,
-        }),
+        get: getSession,
+        getForPairingGeneration: getSession,
         invoke: options.invoke,
       },
       getRuntimeConfig: () => options.config ?? {},
@@ -165,26 +189,19 @@ describe("node.invoke caller cancellation", () => {
       const events: AgentEventPayload[] = [];
       const stop = onAgentEvent((event) => events.push(event));
       try {
-        const client: NonNullable<GatewayRequestHandlerOptions["client"]> = {
-          connect: {
+        const client = agentClient(
+          bound,
+          {
+            sessionKey: "agent:main:permission",
+            operationalRunInstance: run,
+            delegatedAuthority: { ...authority, kind: "local" },
+          },
+          {
             ...connect,
             scopes: ["operator.admin"],
             client: { ...connect.client, version: "test" },
           },
-          ...(bound
-            ? {
-                internal: {
-                  agentRuntimeIdentity: {
-                    kind: "agentRuntime",
-                    agentId: "main",
-                    sessionKey: "agent:main:permission",
-                    operationalRunInstance: run,
-                    delegatedAuthority: { ...authority, kind: "local" },
-                  },
-                },
-              }
-            : {}),
-        };
+        );
         const { invocation, respond } = startNodeInvoke({
           invoke,
           client,
@@ -241,21 +258,15 @@ describe("node.invoke caller cancellation", () => {
       ...createStream(() => runtimeCurrent),
       idleTimeoutMs: 5_000,
     };
-    const invoke = vi.fn(
-      async (params: {
-        onProgress?: (chunk: string) => void;
-        onDispatchReady?: (invokeId: string) => void;
-        isDispatchAuthorized?: () => boolean;
-        signal?: AbortSignal;
-      }) => {
+    const invoke = streamingInvoke(
+      "paired-stream",
+      (params) => {
         expect(
           params.signal &&
             isNodeWakeLifecycleCurrent("paired-node", params.signal, "generation:paired-node:1"),
         ).toBe(true);
-        params.onDispatchReady?.("paired-stream-invoke");
-        params.onProgress?.("paired-stream-progress");
-        return { ok: true, payload: { delivered: true } };
       },
+      { delivered: true },
     );
 
     const { invocation, respond } = startNodeInvoke({
@@ -288,17 +299,7 @@ describe("node.invoke caller cancellation", () => {
     { name: "ownerless synthetic client", owner: false },
   ])("ignores duplex hooks on an untrusted $name", async (clientOptions) => {
     const stream = createStream(() => false);
-    const invoke = vi.fn(
-      async (params: {
-        onProgress?: (chunk: string) => void;
-        onDispatchReady?: (invokeId: string) => void;
-        isDispatchAuthorized?: () => boolean;
-      }) => {
-        params.onDispatchReady?.("untrusted-stream-invoke");
-        params.onProgress?.("untrusted-stream-progress");
-        return { ok: true, payload: {} };
-      },
-    );
+    const invoke = streamingInvoke("untrusted-stream");
 
     const { invocation } = startNodeInvoke({
       invoke,
@@ -311,48 +312,41 @@ describe("node.invoke caller cancellation", () => {
     expect(invoke.mock.calls[0]?.[0].isDispatchAuthorized?.()).toBe(true);
   });
 
-  it("does not bypass system.run approval sanitization for trusted duplex hooks", async () => {
-    mocks.sanitizeNodeInvokeParamsForForwarding.mockReturnValueOnce({
-      ok: false,
-      message: "system.run approval could not be verified",
-    });
-    const stream = createStream();
-    const invoke = vi.fn();
+  it.each(["system.run", NODE_WORKER_SUPERVISOR_STATUS_COMMAND])(
+    "does not let trusted duplex hooks bypass the %s dispatch guard",
+    async (command) => {
+      const privateControl = command !== "system.run";
+      const message = "system.run approval could not be verified";
+      if (!privateControl) {
+        mocks.sanitizeNodeInvokeParamsForForwarding.mockReturnValueOnce({ ok: false, message });
+      }
+      const invoke = vi.fn();
+      const stream = createStream();
+      const { invocation, respond } = startNodeInvoke({
+        invoke,
+        command,
+        commands: [command],
+        config: privateControl
+          ? { gateway: { nodes: { commands: { allow: [command] } } } }
+          : undefined,
+        client: createNodeInvokeStreamClient(stream),
+      });
 
-    const { invocation, respond } = startNodeInvoke({
-      invoke,
-      command: "system.run",
-      commands: ["system.run"],
-      client: createNodeInvokeStreamClient(stream),
-    });
-    await invocation;
+      await invocation;
 
-    expect(mocks.sanitizeNodeInvokeParamsForForwarding).toHaveBeenCalledOnce();
-    expect(invoke).not.toHaveBeenCalled();
-    expect(stream.onDispatchReady).not.toHaveBeenCalled();
-    expectFailure(respond, { message: "system.run approval could not be verified" });
-  });
-
-  it("rejects private controls before public policy and dispatch", async () => {
-    const command = NODE_WORKER_SUPERVISOR_STATUS_COMMAND;
-    const invoke = vi.fn();
-    const stream = createStream();
-    const { invocation, respond } = startNodeInvoke({
-      invoke,
-      command,
-      commands: [command],
-      config: { gateway: { nodes: { commands: { allow: [command] } } } },
-      client: createNodeInvokeStreamClient(stream),
-    });
-
-    await invocation;
-
-    expect(invoke).not.toHaveBeenCalled();
-    expect(mocks.resolveNodeCommandAllowlist).not.toHaveBeenCalled();
-    expect(mocks.applyPluginNodeInvokePolicy).not.toHaveBeenCalled();
-    expect(stream.onDispatchReady).not.toHaveBeenCalled();
-    expectFailure(respond, { message: expect.stringContaining("private") });
-  });
+      expect(invoke).not.toHaveBeenCalled();
+      if (privateControl) {
+        expect(mocks.resolveNodeCommandAllowlist).not.toHaveBeenCalled();
+        expect(mocks.applyPluginNodeInvokePolicy).not.toHaveBeenCalled();
+      } else {
+        expect(mocks.sanitizeNodeInvokeParamsForForwarding).toHaveBeenCalledOnce();
+      }
+      expect(stream.onDispatchReady).not.toHaveBeenCalled();
+      expectFailure(respond, {
+        message: privateControl ? expect.stringContaining("private") : message,
+      });
+    },
+  );
 
   it("cancels paired-node work without breaking pairing lifecycle identity", async () => {
     const controller = new AbortController();
@@ -394,27 +388,16 @@ it.each([true, false])(
       payload: { exitCode: 0 },
     }));
     const operationalRunInstance = createOperationalRunInstanceRef("captured-source-run");
-    const client: NonNullable<GatewayRequestHandlerOptions["client"]> = {
-      connect,
-      ...(bound
-        ? {
-            internal: {
-              agentRuntimeIdentity: {
-                kind: "agentRuntime",
-                agentId: "main",
-                sessionKey: "agent:main:main",
-                operationalRunInstance,
-                delegatedAuthority: {
-                  kind: "local",
-                  operationalRunInstance,
-                  lifecycleGeneration: "generation",
-                  claimId: "claim",
-                },
-              },
-            },
-          }
-        : {}),
-    };
+    const client = agentClient(bound, {
+      sessionKey: "agent:main:main",
+      operationalRunInstance,
+      delegatedAuthority: {
+        kind: "local",
+        operationalRunInstance,
+        lifecycleGeneration: "generation",
+        claimId: "claim",
+      },
+    });
     const { invocation, respond } = startNodeInvoke({
       invoke,
       command: "system.run",

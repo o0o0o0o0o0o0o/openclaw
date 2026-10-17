@@ -6,73 +6,68 @@ import {
   resolveQualificationAdmissionDescriptor,
   revalidateQualificationAdmissionAuthority,
   semanticQualificationInputs,
-  verifyQualificationAdmission,
   QUALIFICATION_ADMISSION_WORKFLOW,
 } from "../../scripts/release-qualification-admission.mjs";
 import {
-  repository,
   candidateSha,
   publisherSha,
-  transportRef,
   request,
   fixture,
 } from "./release-qualification-admission.test-support.js";
 
 const envelope = (inputs = request().inputs) =>
   JSON.parse(expectDefined(inputs.trusted_workflow_json, "trusted workflow envelope"));
+const withEnvelope = (trusted: Record<string, unknown>, inputs = request().inputs) => ({
+  ...inputs,
+  trusted_workflow_json: JSON.stringify(trusted),
+});
 const revalidate = (
   f: ReturnType<typeof fixture>,
   admission: ReturnType<typeof f.verify>,
   runGh = f.runGh,
 ) => revalidateQualificationAdmissionAuthority({ descriptor: f.descriptor, admission, runGh });
+type Fixture = ReturnType<typeof fixture>;
+const change =
+  <K extends "run" | "authority" | "metadata">(target: K, values: Partial<Fixture[K]>) =>
+  (f: Fixture) =>
+    Object.assign(f[target], values);
 
 describe("trusted P qualification admission", () => {
-  it("rejects narrowed cross-OS mode=upgrade", () => {
-    expect(() => fixture(false, { inputs: { mode: "upgrade" } })).toThrow("requires mode=both");
+  it.each([
+    [{ mode: "upgrade" }, "requires mode=both"],
+    [
+      { plugin_prerelease_node_exclude_patterns_json: '["extensions/codex/*.test.ts"]' },
+      "cannot exclude Plugin Prerelease Node tests",
+    ],
+    [
+      { release_profile: "stable", skip_package_telegram_e2e: "true" },
+      "cannot skip Package Telegram E2E",
+    ],
+    [{ codex_plugin_spec: "npm:@openclaw/codex@latest" }, "codex_plugin_spec"],
+  ] as const)("rejects narrowed qualification inputs %j", (inputs, error) => {
+    expect(() => fixture(false, { inputs })).toThrow(error);
   });
 
-  it("rejects Node exclusions before producing admission", () => {
-    expect(() =>
-      fixture(false, {
-        inputs: { plugin_prerelease_node_exclude_patterns_json: '["extensions/codex/*.test.ts"]' },
-      }),
-    ).toThrow("cannot exclude Plugin Prerelease Node tests");
-  });
-
-  it("rejects Telegram deferral for stable qualification", () => {
-    expect(() =>
-      fixture(false, {
-        inputs: { release_profile: "stable", skip_package_telegram_e2e: "true" },
-      }),
-    ).toThrow("cannot skip Package Telegram E2E");
-  });
-
-  it("rejects a Codex dependency override from candidate qualification", () => {
-    expect(() =>
-      fixture(false, { inputs: { codex_plugin_spec: "npm:@openclaw/codex@latest" } }),
-    ).toThrow("codex_plugin_spec");
-  });
-
-  it.each(["empty", "future", "altered-primary"])(
+  it.each([
+    ["empty", null],
+    [
+      "future",
+      {
+        upgradeBaseline: "openclaw@2027.1.1",
+        upgradeSurvivorBaselines: ["openclaw@2026.6.34", "openclaw@2027.1.1"],
+      },
+    ],
+    ["altered-primary", { upgradeBaseline: "openclaw@2026.7.8" }],
+  ] as const)(
     "rejects %s qualification baselines without a registry fallback",
-    (fault) => {
+    (_fault, override) => {
       const trusted = envelope();
       const baselines = JSON.parse(trusted.laneInputs.qualification_baselines_json);
-      if (fault === "empty") {
-        trusted.laneInputs.qualification_baselines_json = "";
-      } else {
-        if (fault === "future") {
-          baselines.upgradeBaseline = "openclaw@2027.1.1";
-          baselines.upgradeSurvivorBaselines = ["openclaw@2026.6.34", "openclaw@2027.1.1"];
-        }
-        if (fault === "altered-primary") {
-          baselines.upgradeBaseline = "openclaw@2026.7.8";
-        }
-        trusted.laneInputs.qualification_baselines_json = JSON.stringify(baselines);
-      }
-      expect(() =>
-        fixture(false, { inputs: { trusted_workflow_json: JSON.stringify(trusted) } }),
-      ).toThrow(/baseline|predecessor/i);
+      trusted.laneInputs.qualification_baselines_json =
+        override === null ? "" : JSON.stringify({ ...baselines, ...override });
+      expect(() => fixture(false, { inputs: withEnvelope(trusted) })).toThrow(
+        /baseline|predecessor/i,
+      );
     },
   );
 
@@ -93,9 +88,9 @@ describe("trusted P qualification admission", () => {
       upgradeBaseline: "openclaw@2026.7.8",
       upgradeSurvivorBaselines: ["openclaw@2026.6.34", "openclaw@2026.7.8"],
     });
-    expect(() =>
-      f.verify({ ...f.selected.inputs, trusted_workflow_json: JSON.stringify(trusted) }),
-    ).toThrow(/authenticated operator request/);
+    expect(() => f.verify(withEnvelope(trusted, f.selected.inputs))).toThrow(
+      /authenticated operator request/,
+    );
   });
   it.each([false, true])(
     "authenticates exact P receipt without Q main ancestry (protected=%s)",
@@ -105,11 +100,8 @@ describe("trusted P qualification admission", () => {
       expect(f.calls.some((call) => call.includes("compare/" + candidateSha))).toBe(false);
       expect(
         resolveQualificationAdmissionDescriptor({
-          repository,
-          runId: 40,
-          runAttempt: 1,
+          ...f.producer,
           workflowRef: f.producer.workflowHeadBranch,
-          workflowSha: publisherSha,
           runGh: f.runGh,
         }),
       ).toEqual(f.descriptor);
@@ -119,23 +111,22 @@ describe("trusted P qualification admission", () => {
   it("removes only the self-referential locator and retains unknown semantic fields", () => {
     const original = request().inputs;
     const trusted = envelope(original);
-    const withLocator = {
-      ...original,
-      trusted_workflow_json: JSON.stringify({
-        ...trusted,
-        qualificationAdmission: { artifactId: 70 },
-      }),
-    };
+    const withLocator = withEnvelope(
+      { ...trusted, qualificationAdmission: { artifactId: 70 } },
+      original,
+    );
     expect(semanticQualificationInputs(withLocator)).toEqual(original);
     expect(
-      semanticQualificationInputs({
-        ...withLocator,
-        trusted_workflow_json: JSON.stringify({
-          ...trusted,
-          laneInputs: { extension_test_exclude_patterns_json: '["changed"]' },
-          qualificationAdmission: {},
-        }),
-      }),
+      semanticQualificationInputs(
+        withEnvelope(
+          {
+            ...trusted,
+            laneInputs: { extension_test_exclude_patterns_json: '["changed"]' },
+            qualificationAdmission: {},
+          },
+          withLocator,
+        ),
+      ),
     ).not.toEqual(original);
   });
 
@@ -149,37 +140,33 @@ describe("trusted P qualification admission", () => {
     { reviewed: false },
     { qualificationSha: publisherSha },
     { transportRef: "release-ci/bbbbbbbbbbbb-123" },
-  ])("rejects an unattested or changed C=Q tuple: %j", (change) => {
-    expect(() => buildQualificationAdmissionRequest({ ...request(), ...change })).toThrow(
+  ])("rejects an unattested or changed C=Q tuple: %j", (override) => {
+    expect(() => buildQualificationAdmissionRequest({ ...request(), ...override })).toThrow(
       /reviewed C=Q/,
     );
   });
 
-  it.each(["failed-run", "wrong-P", "actions-bot", "wrong-upload", "generic-success"])(
-    "rejects %s instead of trusting workflow success",
-    (failure) => {
-      const f = fixture();
-      if (failure === "failed-run") {
-        f.run.conclusion = "failure";
-      }
-      if (failure === "wrong-P") {
-        f.authority.ancestry = "behind";
-      }
-      if (failure === "actions-bot") {
-        f.run.actor = { id: 41898282, login: "github-actions[bot]", type: "Bot" };
-      }
-      if (failure === "wrong-upload") {
-        f.metadata.created_at = "2026-09-27T00:00:02Z";
-      }
-      if (failure === "generic-success") {
+  it.each([
+    ["failed-run", change("run", { conclusion: "failure" })],
+    ["wrong-P", change("authority", { ancestry: "behind" })],
+    [
+      "actions-bot",
+      change("run", { actor: { id: 41898282, login: "github-actions[bot]", type: "Bot" } }),
+    ],
+    ["wrong-upload", change("metadata", { created_at: "2026-09-27T00:00:02Z" })],
+    [
+      "generic-success",
+      (f: Fixture) =>
         f.sources.set(
           publisherSha + ":" + QUALIFICATION_ADMISSION_WORKFLOW,
           "name: Arbitrary success\n",
-        );
-      }
-      expect(() => f.verify()).toThrow();
-    },
-  );
+        ),
+    ],
+  ] as const)("rejects %s instead of trusting workflow success", (_failure, mutate) => {
+    const f = fixture();
+    mutate(f);
+    expect(() => f.verify()).toThrow();
+  });
 
   it("revalidates operator authority after artifact download", () => {
     const f = fixture();
@@ -196,17 +183,7 @@ describe("trusted P qualification admission", () => {
     expect(() => f.verify(f.selected.inputs, () => Buffer.from("not the exact ZIP"))).toThrow(
       /archive bytes/,
     );
-    expect(() =>
-      verifyQualificationAdmission({
-        descriptor: f.descriptor,
-        repository,
-        candidateSha,
-        qualificationSha: candidateSha,
-        workflowRef: transportRef,
-        runGh: f.runGh,
-        downloadArchive: () => new Uint8Array(0),
-      }),
-    ).toThrow(/archive bytes/);
+    expect(() => f.verify(f.selected.inputs, () => new Uint8Array(0))).toThrow(/archive bytes/);
   });
 
   it("revalidates current authority without reacquiring immutable evidence (protected)", () => {
@@ -223,37 +200,21 @@ describe("trusted P qualification admission", () => {
   });
 
   it.each([
-    "triggering-operator",
-    "protected-P",
-    "original-attempt",
-    "artifact-expiry",
-    "artifact-digest",
-    "seal-job",
-    "dispatch-title",
-  ])("denies revoked %s authority after successful acquisition", (fault) => {
+    ["triggering-operator", (f: Fixture) => Object.assign(f.run.triggering_actor, { id: 999 })],
+    ["protected-P", change("authority", { tagSha: candidateSha })],
+    ["original-attempt", change("run", { run_attempt: 2 })],
+    ["artifact-expiry", change("metadata", { expires_at: "2000-01-01T00:00:00Z" })],
+    ["artifact-digest", change("metadata", { digest: "sha256:" + "f".repeat(64) })],
+    [
+      "seal-job",
+      (f: Fixture) =>
+        Object.assign(expectDefined(f.jobs.jobs[0], "seal job"), { conclusion: "failure" }),
+    ],
+    ["dispatch-title", change("run", { display_title: "different admission request" })],
+  ] as const)("denies revoked %s authority after successful acquisition", (_fault, mutate) => {
     const f = fixture(true);
     const admission = f.verify();
-    if (fault === "triggering-operator") {
-      f.run.triggering_actor = { ...f.actor, id: 999 };
-    }
-    if (fault === "protected-P") {
-      f.authority.tagSha = candidateSha;
-    }
-    if (fault === "original-attempt") {
-      f.run.run_attempt = 2;
-    }
-    if (fault === "artifact-expiry") {
-      f.metadata.expires_at = "2000-01-01T00:00:00Z";
-    }
-    if (fault === "artifact-digest") {
-      f.metadata.digest = "sha256:" + "f".repeat(64);
-    }
-    if (fault === "seal-job") {
-      expectDefined(f.jobs.jobs[0], "seal job").conclusion = "failure";
-    }
-    if (fault === "dispatch-title") {
-      f.run.display_title = "different admission request";
-    }
+    mutate(f);
     expect(() => revalidate(f, admission)).toThrow();
   });
 

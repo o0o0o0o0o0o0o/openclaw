@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { crc32 } from "node:zlib";
 import {
   buildQualificationAdmissionRequest,
   produceQualificationAdmission,
@@ -11,6 +10,7 @@ import {
   QUALIFICATION_WORKFLOW,
   verifyQualificationAdmission,
 } from "../../scripts/release-qualification-admission.mjs";
+import { makeStoredZip } from "./actions-artifact-zip.test-support.js";
 
 export const repository = "openclaw/openclaw";
 export const candidateSha = "a".repeat(40);
@@ -22,33 +22,6 @@ export const qualificationBaselinesJson = JSON.stringify({
 });
 const requestId = "12345678-1234-1234-1234-123456789abc";
 const digest = (bytes: Uint8Array) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
-
-// A single stored ZIP exercises the actual bounded archive consumer without I/O.
-function zip(bytes: Buffer) {
-  const name = Buffer.from(QUALIFICATION_ADMISSION_FILE);
-  const local = Buffer.alloc(30);
-  local.writeUInt32LE(0x04034b50, 0);
-  local.writeUInt16LE(20, 4);
-  local.writeUInt32LE(crc32(bytes), 14);
-  local.writeUInt32LE(bytes.length, 18);
-  local.writeUInt32LE(bytes.length, 22);
-  local.writeUInt16LE(name.length, 26);
-  const central = Buffer.alloc(46);
-  central.writeUInt32LE(0x02014b50, 0);
-  central.writeUInt16LE(20, 4);
-  central.writeUInt16LE(20, 6);
-  central.writeUInt32LE(crc32(bytes), 16);
-  central.writeUInt32LE(bytes.length, 20);
-  central.writeUInt32LE(bytes.length, 24);
-  central.writeUInt16LE(name.length, 28);
-  const end = Buffer.alloc(22);
-  end.writeUInt32LE(0x06054b50, 0);
-  end.writeUInt16LE(1, 8);
-  end.writeUInt16LE(1, 10);
-  end.writeUInt32LE(central.length + name.length, 12);
-  end.writeUInt32LE(local.length + name.length + bytes.length, 16);
-  return Buffer.concat([local, name, bytes, central, name, end]);
-}
 
 export function request(
   overrides: Record<string, string | number | boolean> = {},
@@ -144,34 +117,28 @@ export function fixture(
     ],
     requiredParentJobs: ["Release Decision"],
   };
-  const sources = new Map([
-    [
-      publisherSha + ":" + QUALIFICATION_ADMISSION_WORKFLOW,
-      'env:\n  RELEASE_QUALIFICATION_ADMISSION_CONTRACT: "1"\njobs:\n  admit_qualification:\n',
-    ],
-    [
-      sourceSha + ":" + QUALIFICATION_WORKFLOW,
-      options.workflowSource ??
+  const sources = new Map(
+    Object.entries({
+      [publisherSha + ":" + QUALIFICATION_ADMISSION_WORKFLOW]:
+        'env:\n  RELEASE_QUALIFICATION_ADMISSION_CONTRACT: "1"\njobs:\n  admit_qualification:\n',
+      [sourceSha + ":" + QUALIFICATION_WORKFLOW]:
+        options.workflowSource ??
         "on:\n  workflow_dispatch:\n    inputs:\n" +
           Object.keys(selected.inputs)
             .map((key) => "      " + key + ":\n        type: string\n")
             .join("") +
           "jobs:\n  untrusted:\n    run: NEVER_EXECUTE_Q\n",
-    ],
-    [sourceSha + ":scripts/lib/release-qualification-coverage.json", JSON.stringify(policy)],
-    [
-      sourceSha + ":package.json",
-      JSON.stringify({ version: options.candidateVersion ?? "2026.8.1" }),
-    ],
-    [
-      sourceSha + ":scripts/lib/upgrade-survivor-scenarios.json",
-      JSON.stringify({
+      [sourceSha + ":scripts/lib/release-qualification-coverage.json"]: JSON.stringify(policy),
+      [sourceSha + ":package.json"]: JSON.stringify({
+        version: options.candidateVersion ?? "2026.8.1",
+      }),
+      [sourceSha + ":scripts/lib/upgrade-survivor-scenarios.json"]: JSON.stringify({
         oldestSupportedBaseline: Object.hasOwn(options, "oldestSupportedBaseline")
           ? options.oldestSupportedBaseline
           : "2026.6.34",
       }),
-    ],
-  ]);
+    }),
+  );
   const metadata = {
     id: 70,
     name: qualificationAdmissionArtifactName(40, 1),
@@ -217,26 +184,22 @@ export function fixture(
       throw new Error("Wrong repository");
     }
     const path = endpoint.slice(prefix.length);
-    if (path === "compare/" + publisherSha + "...main") {
-      return JSON.stringify({ status: authority.ancestry });
-    }
-    if (path === "git/ref/tags/" + ref) {
-      return JSON.stringify({
+    const routes: Record<string, unknown> = {
+      ["compare/" + publisherSha + "...main"]: { status: authority.ancestry },
+      ["git/ref/tags/" + ref]: {
         ref: producer.workflowFullRef,
         object: { type: "commit", sha: authority.tagSha },
-      });
-    }
-    if (path === "actions/runs/40/attempts/1") {
-      return JSON.stringify(run);
-    }
-    if (path === "collaborators/" + actor.login + "/permission") {
-      return JSON.stringify({ permission: authority.permission, user: actor });
-    }
-    if (path === "actions/artifacts/70") {
-      return JSON.stringify(metadata);
-    }
-    if (path === "actions/runs/40/attempts/1/jobs?per_page=100") {
-      return JSON.stringify(jobs);
+      },
+      "actions/runs/40/attempts/1": run,
+      ["collaborators/" + actor.login + "/permission"]: {
+        permission: authority.permission,
+        user: actor,
+      },
+      "actions/artifacts/70": metadata,
+      "actions/runs/40/attempts/1/jobs?per_page=100": jobs,
+    };
+    if (Object.hasOwn(routes, path)) {
+      return JSON.stringify(routes[path]);
     }
     if (path.startsWith("actions/runs/40/artifacts?")) {
       return JSON.stringify({ total_count: 1, artifacts: [metadata] });
@@ -263,13 +226,9 @@ export function fixture(
     throw new Error("Unexpected API: " + path);
   };
   const receipt = produceQualificationAdmission({ request: selected, producer, runGh });
-  let archive = zip(Buffer.from(JSON.stringify(receipt)));
-  const seal = () => {
-    archive = zip(Buffer.from(JSON.stringify(receipt)));
-    metadata.digest = digest(archive);
-    metadata.size_in_bytes = archive.length;
-  };
-  seal();
+  const archive = makeStoredZip({ [QUALIFICATION_ADMISSION_FILE]: JSON.stringify(receipt) });
+  metadata.digest = digest(archive);
+  metadata.size_in_bytes = archive.length;
   run.status = "completed";
   run.conclusion = "success";
   const descriptor = {
@@ -279,7 +238,7 @@ export function fixture(
     artifactDigest: metadata.digest,
     artifactSizeBytes: metadata.size_in_bytes,
   };
-  const verify = (inputs = selected.inputs, downloadArchive = () => archive) =>
+  const verify = (inputs = selected.inputs, downloadArchive: () => Uint8Array = () => archive) =>
     verifyQualificationAdmission({
       descriptor,
       repository,
@@ -304,7 +263,6 @@ export function fixture(
     receipt,
     descriptor,
     verify,
-    seal,
     archive: () => archive,
   };
 }

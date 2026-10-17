@@ -7,6 +7,7 @@ import {
   evaluateReleasePublishGates,
 } from "../../scripts/lib/release-publish-gates.mts";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { expectGate } from "./release-publish.test-support.js";
 
 const tempRoots = useAutoCleanupTempDirTracker(afterEach);
 const targetSha = "a".repeat(40);
@@ -20,17 +21,26 @@ const manifest = {
   childRuns: { productPerformance: { conclusion: "success" } },
   validationInputs: { coveragePolicy: "full" },
 };
+type GateInput = Parameters<typeof evaluateReleasePublishGates>[0];
+function evaluate(changes: Record<string, unknown> = {}, input: Partial<GateInput> = {}) {
+  return evaluateReleasePublishGates({
+    manifest: { ...manifest, ...changes },
+    releaseTag: "v2026.9.5",
+    npmDistTag: "latest",
+    consumer: "publisher",
+    ...input,
+  });
+}
+const failureIds = (gates: ReturnType<typeof evaluate>) =>
+  gates.filter((gate) => gate.status === "FAIL").map((gate) => gate.id);
 it.each([
   { releaseTag: "v2026.9.5-alpha.1", npmDistTag: "beta" },
   { releaseTag: "v2026.9.5", npmDistTag: "alpha" },
 ])("rejects retired alpha gate input %j", (input) => {
-  const result = evaluateReleasePublishGates({ ...input, manifest: {}, consumer: "publisher" });
-  expect(result).toContainEqual(
-    expect.objectContaining({
-      status: "FAIL",
-      message: "Alpha releases are retired; use a beta prerelease instead.",
-    }),
-  );
+  expectGate(evaluate({}, input), {
+    status: "FAIL",
+    message: "Alpha releases are retired; use a beta prerelease instead.",
+  });
 });
 
 describe("release publication control admission", () => {
@@ -59,74 +69,55 @@ describe("release publication control admission", () => {
     },
   ])("evaluates every publication consumer for $name", ({ overrides, waiver, failures }) => {
     for (const consumer of ["publisher", "core-npm", "stable-closeout"] as const) {
-      const gates = evaluateReleasePublishGates({
-        manifest: { ...manifest, ...overrides },
+      const gates = evaluate(overrides, {
         consumer,
-        releaseTag: "v2026.9.5",
-        npmDistTag: "latest",
         ...(waiver ? { stableSoakWaiver: waiver } : {}),
         expectedSha: targetSha,
       });
-      expect(gates.filter((gate) => gate.status === "FAIL").map((gate) => gate.id)).toEqual(
-        failures.map((id) => `${consumer}.${id}`),
-      );
+      expect(failureIds(gates)).toEqual(failures.map((id) => `${consumer}.${id}`));
     }
   });
 
   it("does not require deferred performance for beta tags published to beta", () => {
-    const input = {
-      manifest: {
-        ...manifest,
-        releaseProfile: "beta",
-        controls: { performanceBlocking: false },
-        childRuns: {},
-      },
-      releaseTag: "v2026.9.5-beta.1",
-      npmDistTag: "beta",
+    const changes = {
+      releaseProfile: "beta",
+      controls: { performanceBlocking: false },
+      childRuns: {},
     };
     for (const consumer of ["publisher", "core-npm"] as const) {
       expect(
-        evaluateReleasePublishGates({ ...input, consumer }).filter(
-          (gate) => gate.status === "FAIL",
+        failureIds(
+          evaluate(changes, {
+            releaseTag: "v2026.9.5-beta.1",
+            npmDistTag: "beta",
+            consumer,
+          }),
         ),
       ).toEqual([]);
     }
   });
 
   it("retains strict stable closeout soak evidence", () => {
-    const input = {
-      manifest: { ...manifest, runReleaseSoak: true },
-      releaseTag: "v2026.9.5",
-      npmDistTag: "latest",
-    };
+    expect(failureIds(evaluate({ runReleaseSoak: true }))).toEqual([]);
     expect(
-      evaluateReleasePublishGates({ ...input, consumer: "publisher" }).some(
-        (gate) => gate.status === "FAIL",
-      ),
-    ).toBe(false);
-    expect(
-      evaluateReleasePublishGates({ ...input, consumer: "stable-closeout" }).some(
-        (gate) => gate.status === "FAIL",
-      ),
-    ).toBe(true);
+      failureIds(evaluate({ runReleaseSoak: true }, { consumer: "stable-closeout" })),
+    ).not.toEqual([]);
   });
 
   it("reports independent identity and policy failures together", () => {
-    const gates = evaluateReleasePublishGates({
-      manifest: {
-        ...manifest,
+    const gates = evaluate(
+      {
         workflowName: "Other",
         targetSha: "b".repeat(40),
         rerunGroup: "performance",
         runReleaseSoak: "false",
       },
-      consumer: "publisher",
-      releaseTag: "v2026.9.5",
-      npmDistTag: "latest",
-      expectedSha: targetSha,
-      expectedReleaseProfile: "full",
-    });
-    expect(gates.filter((gate) => gate.status === "FAIL").map((gate) => gate.id)).toEqual([
+      {
+        expectedSha: targetSha,
+        expectedReleaseProfile: "full",
+      },
+    );
+    expect(failureIds(gates)).toEqual([
       "publisher.workflow",
       "publisher.target",
       "publisher.profile",
@@ -140,8 +131,6 @@ describe("release publication control admission", () => {
     (consumer) => {
       const historicalInput = {
         consumer,
-        releaseTag: "v2026.9.5",
-        npmDistTag: "latest",
         manifest: {
           ...manifest,
           releaseProfile: "beta",
@@ -155,8 +144,7 @@ describe("release publication control admission", () => {
           laneWaiver: "2026.9.5 approved",
         },
       };
-      const gates = evaluateReleasePublishGates(historicalInput);
-      expect(gates.filter((gate) => gate.status === "FAIL").map((gate) => gate.id)).toEqual([
+      expect(failureIds(evaluate({}, historicalInput))).toEqual([
         `${consumer}.performance`,
         `${consumer}.stable-profile`,
         `${consumer}.soak`,
@@ -171,43 +159,27 @@ describe("release publication control admission", () => {
     { advisoryJobs: [{ child: "normalCi", job: "tests", conclusion: "failure" }] },
   ])("rejects recorded waiver or unclassified advisory evidence: %j", (recorded) => {
     for (const releaseTag of ["v2026.9.5", "v2026.9.5-beta.1"]) {
-      const gates = evaluateReleasePublishGates({
-        consumer: "publisher",
+      const gates = evaluate(recorded, {
         releaseTag,
         npmDistTag: releaseTag.includes("beta") ? "beta" : "latest",
-        manifest: { ...manifest, ...recorded },
       });
-      expect(gates).toContainEqual(
-        expect.objectContaining({ id: "publisher.selected-lanes", status: "FAIL" }),
-      );
+      expectGate(gates, { id: "publisher.selected-lanes", status: "FAIL" });
     }
   });
 
   it("rejects failed Windows child evidence even when its retired advisory row is removed", () => {
-    const gates = evaluateReleasePublishGates({
-      consumer: "publisher",
-      releaseTag: "v2026.9.5",
-      npmDistTag: "latest",
-      manifest: {
-        ...manifest,
-        childEvidence: {
-          normalCi: {
-            runId: "42",
-            jobs: [
-              {
-                name: "checks-windows-node-test-2",
-                status: "completed",
-                conclusion: "failure",
-              },
-            ],
-          },
+    const gates = evaluate({
+      childEvidence: {
+        normalCi: {
+          runId: "42",
+          jobs: [
+            { name: "checks-windows-node-test-2", status: "completed", conclusion: "failure" },
+          ],
         },
-        advisoryJobs: [],
       },
+      advisoryJobs: [],
     });
-    expect(gates).toContainEqual(
-      expect.objectContaining({ id: "publisher.selected-lanes", status: "FAIL" }),
-    );
+    expectGate(gates, { id: "publisher.selected-lanes", status: "FAIL" });
   });
 
   it.each([false, true])(
@@ -236,15 +208,10 @@ describe("release publication control admission", () => {
           },
         }),
       );
+      const script = resolve("scripts/lib/release-publish-gates.mts");
       const result = spawnSync(
         process.execPath,
-        [
-          resolve("scripts/lib/release-publish-gates.mts"),
-          "--consumer",
-          "publisher",
-          "--manifest",
-          manifestPath,
-        ],
+        [script, "--consumer", "publisher", "--manifest", manifestPath],
         {
           cwd: root,
           encoding: "utf8",

@@ -13,12 +13,43 @@ import { fixtureGit, expectGate } from "./release-publish.test-support.js";
 const temps = useAutoCleanupTempDirTracker(afterEach);
 const version = "2026.9.5";
 const sourceSha = "a".repeat(40);
+const pkg = (packageName: string) => ({ packageName, version });
+const corePackages = [pkg("@openclaw/ai"), pkg("@openclaw/gateway-protocol")];
+const npmOptions = { version, npmDistTag: "latest", plugins: [] };
+const distTags = (latest: string, beta = latest) => ({ latest, beta });
+function registry(name: string, versions = [version], tags = distTags(version)) {
+  return Response.json({
+    name,
+    versions: Object.fromEntries(versions.map((entry) => [entry, { name, version: entry }])),
+    "dist-tags": tags,
+  });
+}
 const githubOptions = {
   repository: "openclaw/openclaw",
   releaseTag: `v${version}`,
   sourceSha,
   npmDistTag: "latest",
 };
+function observeGitHub(
+  runGh: NonNullable<Parameters<typeof observeReleaseGitHubState>[0]["runGh"]>,
+  options: Partial<Parameters<typeof observeReleaseGitHubState>[0]> = {},
+) {
+  return observeReleaseGitHubState({ ...githubOptions, ...options, runGh });
+}
+function workflowRun(id: number, status: string, display_title: string, run_attempt = 1) {
+  return {
+    id,
+    status,
+    display_title,
+    run_attempt,
+    event: "workflow_dispatch",
+    html_url: `https://github.com/openclaw/openclaw/actions/runs/${id}`,
+  };
+}
+const runInventory = (
+  workflow_runs: ReturnType<typeof workflowRun>[],
+  total_count = workflow_runs.length,
+) => JSON.stringify({ total_count, workflow_runs });
 const pluginOptions = {
   version,
   npmDistTag: "latest",
@@ -37,62 +68,39 @@ const pluginOptions = {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("release publication state", () => {
-  it.each([
-    {
-      tags: { latest: "2026.9.4", beta: version },
-      versions: [version],
-      expected: { status: "FAIL", remediation: expect.stringContaining("dist-tag") },
-    },
-    {
-      tags: { latest: version, beta: "2026.9.4" },
-      versions: [version],
-      expected: { status: "FAIL", remediation: expect.stringContaining("dist-tag") },
-    },
-    {
-      tags: { latest: "2026.9.7", beta: "2026.9.7" },
-      versions: ["2026.9.7", version],
-      expected: {
+  const selectorRepair = { status: "FAIL", remediation: expect.stringContaining("dist-tag") };
+  it.each<[ReturnType<typeof distTags>, string[], Record<string, unknown>, number?]>([
+    [distTags("2026.9.4", version), [version], selectorRepair],
+    [distTags(version, "2026.9.4"), [version], selectorRepair],
+    [
+      distTags("2026.9.7"),
+      ["2026.9.7", version],
+      {
         status: "WARN",
         message: expect.stringContaining(
           "already published; dist-tag latest stays at 2026.9.7 (superseded)",
         ),
       },
-      published: 1,
-    },
-    {
-      tags: { latest: "2026.9.7", beta: "2026.9.7" },
-      versions: ["2026.9.7"],
-      expected: {
+      1,
+    ],
+    [
+      distTags("2026.9.7"),
+      ["2026.9.7"],
+      {
         status: "FAIL",
         message: expect.stringContaining('cannot be safely moved to "2026.9.5" (ahead)'),
       },
-      published: 0,
-    },
+      0,
+    ],
   ])(
     "gates plugin publication against existing registry selectors: %j",
-    async ({ tags, versions, expected, published }) => {
+    async (tags, versions, expected, published) => {
       vi.stubGlobal(
         "fetch",
-        vi.fn(async () =>
-          Response.json({
-            name: "@openclaw/example",
-            versions: Object.fromEntries(
-              versions.map((packageVersion) => [
-                packageVersion,
-                { name: "@openclaw/example", version: packageVersion },
-              ]),
-            ),
-            "dist-tags": tags,
-          }),
-        ),
+        vi.fn(async () => registry("@openclaw/example", versions, tags)),
       );
       const result = await observeReleaseNpmState(pluginOptions);
-      expect(result.gates).toContainEqual(
-        expect.objectContaining({
-          id: "npm.package.@openclaw/example",
-          ...expected,
-        }),
-      );
+      expectGate(result.gates, { id: "npm.package.@openclaw/example", ...expected });
       if (published !== undefined) {
         expect(result.publishedPackages.length).toBe(published);
       }
@@ -107,9 +115,7 @@ describe("release publication state", () => {
       });
       vi.stubGlobal("fetch", fetch);
       const result = await observeReleaseNpmState({
-        version,
-        npmDistTag: "latest",
-        plugins: [],
+        ...npmOptions,
         npmDecisions: [
           {
             packageName: "openclaw",
@@ -145,26 +151,21 @@ describe("release publication state", () => {
       dependencies: { "@openclaw/ai": version },
     });
     writePublishablePluginFixture(rootDir, { version, publishTo: "both" });
-    writeJsonFile(join(rootDir, "packages/ai/package.json"), { name: "@openclaw/ai", version });
-    writeJsonFile(join(rootDir, "packages/gateway-protocol/package.json"), {
-      name: "@openclaw/gateway-protocol",
-      version,
-      openclaw: { release: { publishToNpm: true } },
-    });
-    writeJsonFile(join(rootDir, "packages/gateway-client/package.json"), {
-      name: "@openclaw/gateway-client",
-      version,
-      openclaw: { release: { publishToNpm: false } },
-    });
+    const writePackage = (name: string, packageVersion = version, publishToNpm?: boolean) =>
+      writeJsonFile(join(rootDir, `packages/${name}/package.json`), {
+        name: `@openclaw/${name}`,
+        version: packageVersion,
+        ...(publishToNpm === undefined ? {} : { openclaw: { release: { publishToNpm } } }),
+      });
+    writePackage("ai");
+    writePackage("gateway-protocol", version, true);
+    writePackage("gateway-client", version, false);
     git("add", ".");
     git("commit", "--quiet", "-m", "test: frozen release fixture");
     const sha = git("rev-parse", "HEAD");
     writeJsonFile(join(rootDir, "package.json"), { name: "openclaw", version: "2026.9.6" });
     writePublishablePluginFixture(rootDir, { version: "2026.9.6", publishTo: "both" });
-    writeJsonFile(join(rootDir, "packages/ai/package.json"), {
-      name: "@openclaw/ai",
-      version: "2026.9.6",
-    });
+    writePackage("ai", "2026.9.6");
 
     const result = readReleasePublicationPackages({
       rootDir,
@@ -172,15 +173,14 @@ describe("release publication state", () => {
       npmDistTag: "latest",
       pluginPublishScope: "all-publishable",
     });
-    expect(result.version).toBe(version);
-    expect(result.npmPlugins).toMatchObject([{ packageName: "@openclaw/demo-plugin", version }]);
-    expect(result.clawhubPlugins).toMatchObject([
-      { packageName: "@openclaw/demo-plugin", version },
-    ]);
-    expect(result.corePackages).toEqual([
-      { packageName: "@openclaw/ai", version },
-      { packageName: "@openclaw/gateway-protocol", version },
-    ]);
+    expect(result).toEqual(
+      expect.objectContaining({
+        version,
+        corePackages,
+        npmPlugins: [expect.objectContaining(pkg("@openclaw/demo-plugin"))],
+        clawhubPlugins: [expect.objectContaining(pkg("@openclaw/demo-plugin"))],
+      }),
+    );
     expect(() =>
       readReleasePublicationPackages({
         rootDir,
@@ -200,23 +200,12 @@ describe("release publication state", () => {
         vi.fn(async (input: string) => {
           const name = decodeURIComponent(new URL(input).pathname.slice(1));
           requested.push(name);
-          return new Response(
-            JSON.stringify({
-              name,
-              versions: { [version]: { name, version } },
-              "dist-tags": { latest: version, beta: version },
-            }),
-          );
+          return registry(name);
         }),
       );
-      const corePackages = [
-        { packageName: "@openclaw/ai", version },
-        { packageName: "@openclaw/gateway-protocol", version },
-      ];
       const result = await observeReleaseNpmState({
-        version,
+        ...npmOptions,
         npmDistTag,
-        plugins: [],
         corePackages,
       });
       expect(requested.toSorted()).toEqual([
@@ -224,11 +213,12 @@ describe("release publication state", () => {
         "@openclaw/gateway-protocol",
         "openclaw",
       ]);
-      expect(result.corePublished).toBe(true);
-      expect(result.publishedPackages).toEqual([
-        { packageName: "openclaw", version },
-        ...corePackages,
-      ]);
+      expect(result).toEqual(
+        expect.objectContaining({
+          corePublished: true,
+          publishedPackages: [pkg("openclaw"), ...corePackages],
+        }),
+      );
       expect(result.gates.some((gate) => gate.status === "FAIL")).toBe(false);
     },
   );
@@ -241,10 +231,8 @@ function observeRuns(params: {
   count?: number;
   onProgress?: (message: string) => void;
 }) {
-  return observeReleaseGitHubState({
-    ...githubOptions,
-    onProgress: params.onProgress,
-    runGh: (args) => {
+  return observeGitHub(
+    (args) => {
       const endpoint = args[1];
       if (endpoint === undefined) {
         throw new Error("Expected a GitHub REST endpoint.");
@@ -261,21 +249,12 @@ function observeRuns(params: {
       if (endpoint.includes("/actions/workflows/")) {
         const selected =
           endpoint.includes(`/${params.workflow}/`) && endpoint.includes("status=waiting");
-        return JSON.stringify({
-          total_count: selected ? (params.count ?? 1) : 0,
-          workflow_runs: selected
-            ? [
-                {
-                  id: 123,
-                  run_attempt: 2,
-                  status: "waiting",
-                  event: "workflow_dispatch",
-                  display_title: params.title ?? "Plugin ClawHub Release",
-                  html_url: "https://github.com/openclaw/openclaw/actions/runs/123",
-                },
-              ]
+        return runInventory(
+          selected
+            ? [workflowRun(123, "waiting", params.title ?? "Plugin ClawHub Release", 2)]
             : [],
-        });
+          selected ? (params.count ?? 1) : 0,
+        );
       }
       if (endpoint.endsWith("/attempts/2/jobs?per_page=100")) {
         return JSON.stringify({ jobs: [{ id: 456, status: "completed" }] });
@@ -288,7 +267,8 @@ function observeRuns(params: {
       }
       throw new Error(`Unavailable fixture endpoint: ${endpoint}`);
     },
-  }).gates.filter((gate) => gate.id.startsWith(`concurrency.${params.workflow}.`));
+    { onProgress: params.onProgress },
+  ).gates.filter((gate) => gate.id.startsWith(`concurrency.${params.workflow}.`));
 }
 
 describe("release concurrency observations", () => {
@@ -302,12 +282,7 @@ describe("release concurrency observations", () => {
       now += 100;
       return "[]";
     });
-    const result = observeReleaseGitHubState({
-      ...githubOptions,
-      budgetMs: 100,
-      now: () => now,
-      runGh,
-    });
+    const result = observeGitHub(runGh, { budgetMs: 100, now: () => now });
     expect(result.gates.every((gate) => gate.status === "WARN")).toBe(true);
     expect(result.gates[0]?.message).toContain("observation budget exhausted (100 ms)");
     for (const workflow of [
@@ -329,28 +304,15 @@ describe("release concurrency observations", () => {
   });
 
   it("retains a gh stderr failure and exact unread command without hiding known blockers", () => {
-    const result = observeReleaseGitHubState({
-      ...githubOptions,
-      runGh(args) {
-        if (args[1]?.includes("/plugin-npm-release.yml/") && args[1].includes("status=queued")) {
-          return JSON.stringify({
-            total_count: 1,
-            workflow_runs: [
-              {
-                id: 321,
-                run_attempt: 1,
-                status: "queued",
-                event: "workflow_dispatch",
-                display_title: `Plugin NPM Release [default] ${sourceSha}`,
-                html_url: "https://github.com/openclaw/openclaw/actions/runs/321",
-              },
-            ],
-          });
-        }
-        throw Object.assign(new Error("spawnSync gh ETIMEDOUT"), {
-          stderr: Buffer.from("HTTP 503: upstream unavailable"),
-        });
-      },
+    const result = observeGitHub((args) => {
+      if (args[1]?.includes("/plugin-npm-release.yml/") && args[1].includes("status=queued")) {
+        return runInventory([
+          workflowRun(321, "queued", `Plugin NPM Release [default] ${sourceSha}`),
+        ]);
+      }
+      throw Object.assign(new Error("spawnSync gh ETIMEDOUT"), {
+        stderr: Buffer.from("HTTP 503: upstream unavailable"),
+      });
     });
     expectGate(result.gates, {
       id: "concurrency.plugin-npm-release.yml.321",
@@ -374,36 +336,31 @@ describe("release concurrency observations", () => {
       target_commitish: sourceSha,
     };
     const runGh = vi.fn((args: string[]) =>
-      args[1]?.includes("/releases/tags/")
-        ? JSON.stringify(release)
-        : JSON.stringify({ total_count: 0, workflow_runs: [] }),
+      args[1]?.includes("/releases/tags/") ? JSON.stringify(release) : runInventory([]),
     );
-    const result = observeReleaseGitHubState({
-      ...githubOptions,
-      runGh,
-    });
+    const result = observeGitHub(runGh);
     expect(result.release).toMatchObject(release);
     expect(runGh.mock.calls.some(([args]) => args[1]?.includes("/releases?"))).toBe(false);
   });
 
   it("replays a failed filtered release-inventory read with its exact --jq filter", () => {
-    const result = observeReleaseGitHubState({
-      ...githubOptions,
-      runGh(args) {
-        if (args[1]?.includes("/releases/tags/")) {
-          throw new Error("HTTP 404: Not Found");
-        }
-        if (args[1]?.includes("/releases?")) {
-          throw new Error("HTTP 502: Bad Gateway");
-        }
-        return JSON.stringify({ total_count: 0, workflow_runs: [] });
-      },
+    const result = observeGitHub((args) => {
+      if (args[1]?.includes("/releases/tags/")) {
+        throw new Error("HTTP 404: Not Found");
+      }
+      if (args[1]?.includes("/releases?")) {
+        throw new Error("HTTP 502: Bad Gateway");
+      }
+      return runInventory([]);
     });
     const gate = result.gates.find((entry) => entry.id === "github.release");
-    expect(gate).toMatchObject({ status: "WARN", message: expect.stringContaining("HTTP 502") });
-    expect(gate?.remediation).toContain(
-      `gh api 'repos/openclaw/openclaw/releases?per_page=100&page=1' --method GET --jq 'map(if .tag_name == "v${version}" then . else {tag_name} end)'`,
-    );
+    expect(gate).toMatchObject({
+      status: "WARN",
+      message: expect.stringContaining("HTTP 502"),
+      remediation: expect.stringContaining(
+        `gh api 'repos/openclaw/openclaw/releases?per_page=100&page=1' --method GET --jq 'map(if .tag_name == "v${version}" then . else {tag_name} end)'`,
+      ),
+    });
   });
 
   const targetLog = `2026-09-18T01:02:03Z   TARGET_REF: ${sourceSha}`;

@@ -1,8 +1,7 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, onTestFinished, vi } from "vitest";
 import { prepareDevicePairingBinding } from "../../infra/device-pairing-binding.js";
-import type { PairedDevice } from "../../infra/device-pairing.js";
-import { resolveNodePairingState } from "../../infra/device-pairing.js";
+import { resolveNodePairingState, type PairedDevice } from "../../infra/device-pairing.js";
 import {
   NODE_RUNNER_UPDATE_REQUIRED_ISSUE,
   NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE,
@@ -12,52 +11,48 @@ import { updateNodeRunnerInventory } from "../node-registry-private.js";
 import { NodeRegistry } from "../node-registry.js";
 import { createDevicePairingNodeSnapshot, pairedNodeDevice } from "./environments.test-support.js";
 import { nodeEventHandlers } from "./nodes.event.js";
+import { invokeNodeRequest } from "./nodes.invoke.test-support.js";
 import { nodeReadHandlers } from "./nodes.read.js";
 import { createWorkerSupervisorNodeClient } from "./nodes.runner-inventory.test-support.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
-const {
-  readPairingSnapshotMock,
-  listNodePairingMock,
-  recordHostStatsMock,
-  resolveLocalNodeIdMock,
-} = vi.hoisted(() => ({
-  readPairingSnapshotMock: vi.fn(),
-  listNodePairingMock: vi.fn(),
-  recordHostStatsMock: vi.fn(),
-  resolveLocalNodeIdMock: vi.fn(),
+const mocks = vi.hoisted(() => ({
+  snapshot: vi.fn(),
+  pairing: vi.fn(),
+  stats: vi.fn(),
+  localId: vi.fn(),
 }));
 
-vi.mock("../../infra/device-pairing-store-readonly.js", async () => {
-  const actual = await vi.importActual<
-    typeof import("../../infra/device-pairing-store-readonly.js")
-  >("../../infra/device-pairing-store-readonly.js");
-  return { ...actual, readDevicePairingNodeSnapshot: readPairingSnapshotMock };
+vi.mock("../../infra/device-pairing-store-readonly.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../infra/device-pairing-store-readonly.js")>();
+  return { ...actual, readDevicePairingNodeSnapshot: mocks.snapshot };
 });
 
 vi.mock("../../node-host/local-id.js", () => ({
-  resolveLocalNodeId: resolveLocalNodeIdMock,
+  resolveLocalNodeId: mocks.localId,
 }));
 
 vi.mock("../../infra/device-pairing-node.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../infra/device-pairing-node.js")>();
   return {
     ...actual,
-    listNodePairing: listNodePairingMock,
-    recordPairedNodeHostStats: recordHostStatsMock,
+    listNodePairing: mocks.pairing,
+    recordPairedNodeHostStats: mocks.stats,
   };
 });
 
 function createPairedNode(nodeId: string) {
   return pairedNodeDevice(nodeId, { displayName: nodeId, caps: [], commands: [] });
 }
-afterEach(() => recordHostStatsMock.mockReset());
+let registry: NodeRegistry;
+beforeEach(() => {
+  registry = new NodeRegistry();
+  mocks.localId.mockResolvedValue(undefined);
+});
+afterEach(() => mocks.stats.mockReset());
 
-function registerNode(
-  registry: NodeRegistry,
-  pairedNode: PairedDevice,
-  connId = `connection-${pairedNode.deviceId}`,
-) {
+function registerNode(pairedNode: PairedDevice, connId = `connection-${pairedNode.deviceId}`) {
   const pairingState = expectDefined(
     resolveNodePairingState(pairedNode),
     `${pairedNode.deviceId} pairing state`,
@@ -76,253 +71,218 @@ function registerNode(
   return client;
 }
 
-async function invoke(
-  nodeRegistry: NodeRegistry,
+function invoke(
   method: string,
   params: Record<string, unknown>,
   client: GatewayRequestHandlerOptions["client"] = {
     connect: { scopes: ["operator.read"] },
   } as GatewayRequestHandlerOptions["client"],
 ) {
-  const respond = vi.fn();
   const handlers = method === "node.event" ? nodeEventHandlers : nodeReadHandlers;
-  await expectDefined(
-    handlers[method],
-    method,
-  )({
-    req: { type: "req", id: method, method, params },
-    params,
-    client,
-    respond,
-    isWebchatConnect: () => false,
-    context: {
-      nodeRegistry,
+  return invokeNodeRequest(
+    expectDefined(handlers[method], method),
+    {
+      nodeRegistry: registry,
       broadcast: vi.fn(),
       logGateway: { warn: vi.fn() },
     } as unknown as GatewayRequestHandlerOptions["context"],
-  });
-  return respond;
+    client,
+    method,
+    params,
+  );
 }
 
 async function request(
-  registry: NodeRegistry,
   method = "node.list",
   params: Record<string, unknown> = {},
   client?: GatewayRequestHandlerOptions["client"],
 ) {
-  const respond = await invoke(registry, method, params, client);
+  const respond = await invoke(method, params, client);
   expect(respond).toHaveBeenCalledWith(true, expect.anything(), undefined);
   return respond.mock.calls[0]![1];
 }
 
 const publishPairing = (paired: PairedDevice[]) =>
-  readPairingSnapshotMock.mockResolvedValue(createDevicePairingNodeSnapshot(paired));
+  mocks.snapshot.mockResolvedValue(createDevicePairingNodeSnapshot(paired));
 const sampleStats = { cpuCount: 4, memoryTotalBytes: 8192, memoryFreeBytes: 4096 };
 
-describe("node read projections", () => {
-  beforeEach(() => resolveLocalNodeIdMock.mockResolvedValue(undefined));
-  it("uses current node bindings when pairing publications replace historical roles", async () => {
-    const current = createPairedNode("current-node");
-    const revoked = createPairedNode("revoked-node");
-    const operator = createPairedNode("operator-device");
-    // Devices without approved surfaces are still listed if they hold a current node token.
-    for (const device of [current, revoked, operator]) {
-      delete device.nodeSurface;
-    }
-    revoked.tokens!.node!.revokedAtMs = 2;
-    operator.roles = ["operator"];
-    operator.tokens = {
-      operator: { token: "test-operator-token", role: "operator", scopes: [], createdAtMs: 1 },
-    };
-    const registry = new NodeRegistry();
-    const paired = [current, revoked, operator];
-    publishPairing(paired);
-    const readIds = async () =>
-      (await request(registry)).nodes.map((node: NodeListNode) => node.nodeId);
-    expect(await readIds()).toEqual(["current-node"]);
-    current.tokens!.node!.revokedAtMs = 3;
-    publishPairing(paired);
-    expect(await readIds()).toEqual([]);
+it("uses current node bindings when pairing publications replace historical roles", async () => {
+  const current = createPairedNode("current-node");
+  const revoked = createPairedNode("revoked-node");
+  const operator = createPairedNode("operator-device");
+  for (const device of [current, revoked, operator]) {
+    delete device.nodeSurface;
+  }
+  revoked.tokens!.node!.revokedAtMs = 2;
+  operator.roles = ["operator"];
+  operator.tokens = {
+    operator: { token: "test-operator-token", role: "operator", scopes: [], createdAtMs: 1 },
+  };
+  const paired = [current, revoked, operator];
+  publishPairing(paired);
+  const readIds = async () => (await request()).nodes.map((node: NodeListNode) => node.nodeId);
+  expect(await readIds()).toEqual(["current-node"]);
+  current.tokens!.node!.revokedAtMs = 3;
+  publishPairing(paired);
+  expect(await readIds()).toEqual([]);
+});
+
+it("shares immutable catalog rows until pairing or live node facts change", async () => {
+  const paired = createPairedNode("cached-node");
+  const client = registerNode(paired);
+  publishPairing([paired]);
+  const admin = {
+    connect: { scopes: ["operator.admin"] },
+  } as GatewayRequestHandlerOptions["client"];
+  const read = async (): Promise<NodeListNode> => (await request("node.list", {}, admin)).nodes[0];
+  const initial = await read();
+  expect(initial).toMatchObject({ nodeId: "cached-node", connected: true, commands: [] });
+  expect(await read()).toBe(initial);
+  expect(Object.isFrozen(initial)).toBe(true);
+  expect(Object.isFrozen(initial.commands)).toBe(true);
+
+  registry.updateHostStats({
+    nodeId: paired.deviceId,
+    connId: client.connId,
+    stats: sampleStats,
+    observedAtMs: 100,
   });
+  const stats = await read();
+  expect(stats).not.toBe(initial);
+  expect(stats.hostStats).toMatchObject({ memoryFreeBytes: 4096, updatedAtMs: 100 });
+  expect(initial.hostStats).toBeUndefined();
+  expect(await read()).toBe(stats);
 
-  it("shares immutable catalog rows until pairing or live node facts change", async () => {
-    const paired = createPairedNode("cached-node");
-    const registry = new NodeRegistry();
-    const client = registerNode(registry, paired);
-    publishPairing([paired]);
-    const admin = {
-      connect: { scopes: ["operator.admin"] },
-    } as GatewayRequestHandlerOptions["client"];
-    const read = async (): Promise<NodeListNode> =>
-      (await request(registry, "node.list", {}, admin)).nodes[0];
-    const initial = await read();
-    expect(initial).toMatchObject({ nodeId: "cached-node", connected: true, commands: [] });
-    expect(await read()).toBe(initial);
-    expect(Object.isFrozen(initial)).toBe(true);
-    expect(Object.isFrozen(initial.commands)).toBe(true);
+  paired.nodeSurface!.displayName = "Renamed node";
+  publishPairing([paired]);
+  const renamed = await read();
+  expect(renamed.displayName).toBe("Renamed node");
+  expect(await read()).toBe(renamed);
 
-    registry.updateHostStats({
-      nodeId: paired.deviceId,
-      connId: client.connId,
-      stats: sampleStats,
-      observedAtMs: 100,
-    });
-    const stats = await read();
-    expect(stats).not.toBe(initial);
-    expect(stats.hostStats).toMatchObject({ memoryFreeBytes: 4096, updatedAtMs: 100 });
-    expect(initial.hostStats).toBeUndefined();
-    expect(await read()).toBe(stats);
+  registry.unregister(client.connId);
+  const offline = await read();
+  expect(offline).toMatchObject({ connected: false, displayName: "Renamed node" });
+  expect(offline.hostStats).toBeUndefined();
+  expect(await read()).toBe(offline);
 
-    paired.nodeSurface!.displayName = "Renamed node";
-    publishPairing([paired]);
-    const renamed = await read();
-    expect(renamed.displayName).toBe("Renamed node");
-    expect(await read()).toBe(renamed);
+  publishPairing([]);
+  expect(await read()).toBeUndefined();
+});
 
-    registry.unregister(client.connId);
-    const offline = await read();
-    expect(offline).toMatchObject({ connected: false, displayName: "Renamed node" });
-    expect(offline.hostStats).toBeUndefined();
-    expect(await read()).toBe(offline);
-
-    publishPairing([]);
-    expect(await read()).toBeUndefined();
+it("retains received stats after replacement and rejects the retired connection", async () => {
+  const pairedNode = createPairedNode("stats-node");
+  registry = new NodeRegistry({
+    resolveCurrentPairingState: async () =>
+      prepareDevicePairingBinding(pairedNode.deviceId, pairedNode).binding ?? undefined,
   });
+  const registered = registerNode(pairedNode);
+  pairedNode.nodeSurface!.lastHostStats = {
+    ...sampleStats,
+    memoryFreeBytes: 1024,
+    updatedAtMs: 50_000,
+  };
+  mocks.stats.mockImplementation(async ({ hostStats }) => {
+    pairedNode.nodeSurface!.lastHostStats = structuredClone(hostStats);
+    return true;
+  });
+  mocks.snapshot.mockImplementation(async () => createDevicePairingNodeSnapshot([pairedNode]));
+  const sendStats = () =>
+    invoke("node.event", { event: "node.host.stats", payload: sampleStats }, registered);
+  const readNode = async (): Promise<NodeListNode> => (await request()).nodes[0];
 
-  it("retains received stats after replacement and rejects the retired connection", async () => {
-    const pairedNode = createPairedNode("stats-node");
-    const nodeRegistry = new NodeRegistry({
-      resolveCurrentPairingState: async () =>
-        prepareDevicePairingBinding(pairedNode.deviceId, pairedNode).binding ?? undefined,
-    });
-    const registered = registerNode(nodeRegistry, pairedNode);
-    const stats = sampleStats;
-    pairedNode.nodeSurface!.lastHostStats = {
-      ...stats,
-      memoryFreeBytes: 1024,
-      updatedAtMs: 50_000,
-    };
-    recordHostStatsMock.mockReset().mockImplementation(async ({ hostStats }) => {
-      pairedNode.nodeSurface!.lastHostStats = structuredClone(hostStats);
-      return true;
-    });
-    readPairingSnapshotMock.mockImplementation(async () =>
-      createDevicePairingNodeSnapshot([pairedNode]),
-    );
-    const sendStats = () =>
-      invoke(nodeRegistry, "node.event", { event: "node.host.stats", payload: stats }, registered);
-    const readNode = async (): Promise<NodeListNode> => (await request(nodeRegistry)).nodes[0];
-
-    expect(await sendStats()).toHaveBeenCalledWith(
-      true,
-      { ok: true, event: "node.host.stats", handled: true, reason: "updated" },
-      undefined,
-    );
-    const hostStats = nodeRegistry.get(pairedNode.deviceId)!.hostStats!;
-    expect(hostStats).toEqual({ ...stats, updatedAtMs: expect.any(Number) });
-    const connected = await readNode();
-    expect(connected).toMatchObject({ connected: true, hostStats });
-    expect(connected.hostStats).not.toBe(nodeRegistry.get(pairedNode.deviceId)?.hostStats);
-    const replacement = registerNode(nodeRegistry, pairedNode, "replacement");
-    const pairingState = resolveNodePairingState(pairedNode)!;
-    // Replacement retires A before its transport close, which cannot save A's stats.
-    expect(nodeRegistry.unregister(registered.connId)).toBeNull();
-    expect(await readNode()).toMatchObject({ connected: true });
-    expect(await readNode()).not.toHaveProperty("hostStats");
-    expect(await sendStats()).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ details: { code: "PAIRING_CHANGED" } }),
-    );
-    nodeRegistry.unregister(replacement.connId);
-    const offline = await readNode();
-    expect(offline).toMatchObject({ connected: false, hostStats });
-    expect(offline.hostStats).not.toBe(pairedNode.nodeSurface!.lastHostStats);
-    expect(recordHostStatsMock).toHaveBeenCalledExactlyOnceWith({
+  expect(await sendStats()).toHaveBeenCalledWith(
+    true,
+    { ok: true, event: "node.host.stats", handled: true, reason: "updated" },
+    undefined,
+  );
+  const hostStats = registry.get(pairedNode.deviceId)!.hostStats!;
+  expect(hostStats).toEqual({ ...sampleStats, updatedAtMs: expect.any(Number) });
+  const connected = await readNode();
+  expect(connected).toMatchObject({ connected: true, hostStats });
+  expect(connected.hostStats).not.toBe(registry.get(pairedNode.deviceId)?.hostStats);
+  const replacement = registerNode(pairedNode, "replacement");
+  const pairingState = resolveNodePairingState(pairedNode)!;
+  expect(registry.unregister(registered.connId)).toBeNull();
+  expect(await readNode()).toMatchObject({ connected: true });
+  expect(await readNode()).not.toHaveProperty("hostStats");
+  expect(await sendStats()).toHaveBeenCalledWith(
+    false,
+    undefined,
+    expect.objectContaining({ details: { code: "PAIRING_CHANGED" } }),
+  );
+  registry.unregister(replacement.connId);
+  const offline = await readNode();
+  expect(offline).toMatchObject({ connected: false, hostStats });
+  expect(offline.hostStats).not.toBe(pairedNode.nodeSurface!.lastHostStats);
+  expect(mocks.stats).toHaveBeenCalledExactlyOnceWith({
+    nodeId: pairedNode.deviceId,
+    hostStats,
+    expectedPairingGeneration: {
       nodeId: pairedNode.deviceId,
-      hostStats,
-      expectedPairingGeneration: {
-        nodeId: pairedNode.deviceId,
-        key: pairingState.generation!.key,
-      },
-    });
+      key: pairingState.generation!.key,
+    },
+  });
+});
+
+it("preserves Gateway-local ownership across list and describe", async () => {
+  const localNodeId = "local-node",
+    remoteNodeId = "remote-node";
+  const pairedNodes = [localNodeId, remoteNodeId].map(createPairedNode);
+  const [, remoteClient] = pairedNodes.map((paired) => registerNode(paired));
+  expect(
+    updateNodeRunnerInventory({
+      registry,
+      nodeId: remoteNodeId,
+      connId: remoteClient?.connId,
+      declaration: { protocolFeatures: ["node-worker-supervisor-v1"] },
+    }),
+  ).toEqual({ changed: true });
+  publishPairing(pairedNodes);
+  mocks.localId.mockResolvedValue(localNodeId);
+
+  const { nodes }: { nodes: NodeListNode[] } = await request();
+  expect(nodes.filter((node) => node.gatewayLocal)).toEqual([
+    expect.objectContaining({ nodeId: localNodeId, gatewayLocal: true }),
+  ]);
+  const [local, remote] = [localNodeId, remoteNodeId].map((id) =>
+    nodes.find((node) => node.nodeId === id),
+  );
+  expect(remote).not.toHaveProperty("gatewayLocal");
+  expect(local).not.toHaveProperty("issues");
+  expect(remote?.issues).toEqual([NODE_RUNNER_UPDATE_REQUIRED_ISSUE]);
+
+  expect(await request("node.describe", { nodeId: localNodeId })).toEqual(
+    expect.objectContaining({ nodeId: localNodeId, gatewayLocal: true }),
+  );
+  expect(await request("node.describe", { nodeId: remoteNodeId })).toMatchObject({
+    issues: [NODE_RUNNER_UPDATE_REQUIRED_ISSUE],
+  });
+});
+
+it("names the pending capability surface approval when inventory publication lacks a pairing generation", async () => {
+  const nodeId = "pending-surface-node";
+  const pairedNode = createPairedNode(nodeId);
+  delete pairedNode.nodeSurface;
+  const client = registerNode(pairedNode);
+  mocks.pairing.mockResolvedValue({
+    pending: [{ requestId: "surface-request-1", nodeId, ts: 1 }],
+    paired: [],
   });
 
-  it("preserves Gateway-local ownership across list and describe", async () => {
-    const localNodeId = "local-node";
-    const remoteNodeId = "remote-node";
-    const pairedNodes = [createPairedNode(localNodeId), createPairedNode(remoteNodeId)];
-    const nodeRegistry = new NodeRegistry();
-    const [, remoteClient] = pairedNodes.map((paired) => registerNode(nodeRegistry, paired));
-    expect(
-      updateNodeRunnerInventory({
-        registry: nodeRegistry,
-        nodeId: remoteNodeId,
-        connId: remoteClient?.connId,
-        declaration: { protocolFeatures: ["node-worker-supervisor-v1"] },
-      }),
-    ).toEqual({ changed: true });
-    publishPairing(pairedNodes);
-    resolveLocalNodeIdMock.mockResolvedValue(localNodeId);
+  const respond = await invoke(
+    "node.runnerInventory.update",
+    {
+      protocolFeatures: [NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE],
+      workerHost: { enabled: true, capacity: { total: 2, available: 2 } },
+    },
+    client,
+  );
 
-    const list = (await request(nodeRegistry)) as {
-      nodes: Array<{ nodeId: string; gatewayLocal?: boolean; issues?: unknown[] }>;
-    };
-    expect(list.nodes.filter((node) => node.gatewayLocal)).toEqual([
-      expect.objectContaining({ nodeId: localNodeId, gatewayLocal: true }),
-    ]);
-    expect(list.nodes.find((node) => node.nodeId === remoteNodeId)).not.toHaveProperty(
-      "gatewayLocal",
-    );
-    expect(list.nodes.find((node) => node.nodeId === localNodeId)).not.toHaveProperty("issues");
-    expect(list.nodes.find((node) => node.nodeId === remoteNodeId)?.issues).toEqual([
-      NODE_RUNNER_UPDATE_REQUIRED_ISSUE,
-    ]);
-
-    await expect(request(nodeRegistry, "node.describe", { nodeId: localNodeId })).resolves.toEqual(
-      expect.objectContaining({ nodeId: localNodeId, gatewayLocal: true }),
-    );
-    await expect(
-      request(nodeRegistry, "node.describe", { nodeId: remoteNodeId }),
-    ).resolves.toMatchObject({
-      issues: [NODE_RUNNER_UPDATE_REQUIRED_ISSUE],
-    });
-  });
-
-  it("names the pending capability surface approval when inventory publication lacks a pairing generation", async () => {
-    const nodeId = "pending-surface-node";
-    const pairedNode = createPairedNode(nodeId);
-    // A pending capability surface means no approved node surface yet, so the
-    // registered session carries no pairing generation.
-    delete (pairedNode as { nodeSurface?: unknown }).nodeSurface;
-    pairedNode.pendingNodeSurface = {
-      requestId: "surface-request-1",
-      revision: "revision-1",
-      ts: 1,
-    };
-    const nodeRegistry = new NodeRegistry();
-    const client = registerNode(nodeRegistry, pairedNode);
-    listNodePairingMock.mockResolvedValue({
-      pending: [{ requestId: "surface-request-1", nodeId, ts: 1 }],
-      paired: [],
-    });
-
-    const respond = await invoke(
-      nodeRegistry,
-      "node.runnerInventory.update",
-      {
-        protocolFeatures: [NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE],
-        workerHost: { enabled: true, capacity: { total: 2, available: 2 } },
-      },
-      client,
-    );
-
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({
-        message: expect.stringContaining("openclaw nodes approve surface-request-1"),
-      }),
-    );
-  });
+  expect(respond).toHaveBeenCalledWith(
+    false,
+    undefined,
+    expect.objectContaining({
+      message: expect.stringContaining("openclaw nodes approve surface-request-1"),
+    }),
+  );
 });

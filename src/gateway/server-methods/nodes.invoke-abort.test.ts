@@ -8,11 +8,14 @@ import {
 } from "../../infra/agent-run-registry.js";
 import { NODE_WORKER_SUPERVISOR_STATUS_COMMAND } from "../../infra/node-commands.js";
 import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
+import type { isNodeCommandAllowed } from "../node-command-policy.js";
+import type { sanitizeNodeInvokeParamsForForwarding } from "../node-invoke-sanitize.js";
 import type { NodeInvokeParams } from "../node-invoke.types.js";
 import type { NodeRegistry } from "../node-registry.js";
 import { isNodeWakeLifecycleCurrent } from "../node-wake-state.js";
 import { resetNodeWakeStateForTest } from "../node-wake-state.test-support.js";
 import { nodeInvokeHandlers } from "./nodes.invoke.js";
+import { createNodeInvokeTestHarness } from "./nodes.invoke.test-support.js";
 import type { GatewayNodeInvokeStream, GatewayRequestHandlerOptions } from "./shared-types.js";
 
 const mocks = vi.hoisted(() => ({
@@ -21,18 +24,11 @@ const mocks = vi.hoisted(() => ({
     key: `generation:${nodeId}:1`,
   })),
   isNodePairingGenerationCurrent: vi.fn(async () => true),
-  isNodeCommandAllowed: vi.fn((): { ok: true } | { ok: false; reason: string } => ({ ok: true })),
+  isNodeCommandAllowed: vi.fn<typeof isNodeCommandAllowed>(() => ({ ok: true })),
   resolveNodeCommandAllowlist: vi.fn(() => new Set<string>()),
   applyPluginNodeInvokePolicy: vi.fn(async () => undefined),
-  sanitizeNodeInvokeParamsForForwarding: vi.fn(
-    ({
-      rawParams,
-    }: {
-      rawParams: unknown;
-    }): { ok: true; params: unknown } | { ok: false; message: string } => ({
-      ok: true,
-      params: rawParams,
-    }),
+  sanitizeNodeInvokeParamsForForwarding: vi.fn<typeof sanitizeNodeInvokeParamsForForwarding>(
+    async ({ rawParams }) => ({ ok: true, params: rawParams }),
   ),
 }));
 
@@ -121,14 +117,15 @@ function startNodeInvoke(options: {
   validateAgentRuntimeApprovalAuthority?: () => boolean;
 }) {
   const respond = vi.fn();
-  const handler = nodeInvokeHandlers["node.invoke"];
-  if (!handler) {
-    throw new Error("node.invoke handler is not registered");
-  }
   const getSession = () => ({ ...session, commands: options.commands ?? session.commands });
-  const invocation = handler({
-    req: { type: "req", id: "paired-inference-request", method: "node.invoke" },
-    params: {
+  const invokeNode = createNodeInvokeTestHarness({
+    nodeHandlers: nodeInvokeHandlers,
+    getRuntimeConfig: () => options.config ?? {},
+  });
+  const invocation = invokeNode({
+    respond,
+    requestId: "paired-inference-request",
+    requestParams: {
       nodeId: "paired-node",
       command: options.command ?? "ollama.chat",
       params: { model: "node-local:small", prompt: "answer locally" },
@@ -137,19 +134,13 @@ function startNodeInvoke(options: {
       ...options.requestParams,
     },
     client: options.client ?? null,
-    isWebchatConnect: () => false,
-    respond,
-    context: {
-      nodeRegistry: {
-        get: getSession,
-        getForPairingGeneration: getSession,
-        invoke: options.invoke,
-      },
-      getRuntimeConfig: () => options.config ?? {},
-      validateAgentRuntimeApprovalAuthority: options.validateAgentRuntimeApprovalAuthority,
-      logGateway: { info: vi.fn(), warn: vi.fn() },
-    } as unknown as GatewayRequestHandlerOptions["context"],
-    ...(options.signal ? { signal: options.signal } : {}),
+    nodeRegistry: {
+      get: getSession,
+      getForPairingGeneration: getSession,
+      invoke: options.invoke,
+    },
+    validateAgentRuntimeApprovalAuthority: options.validateAgentRuntimeApprovalAuthority,
+    signal: options.signal,
   });
   return { invocation, respond };
 }
@@ -318,7 +309,7 @@ describe("node.invoke caller cancellation", () => {
       const privateControl = command !== "system.run";
       const message = "system.run approval could not be verified";
       if (!privateControl) {
-        mocks.sanitizeNodeInvokeParamsForForwarding.mockReturnValueOnce({ ok: false, message });
+        mocks.sanitizeNodeInvokeParamsForForwarding.mockResolvedValueOnce({ ok: false, message });
       }
       const invoke = vi.fn();
       const stream = createStream();

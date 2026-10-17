@@ -21,7 +21,6 @@ vi.mock("../../plugins/management-mutations.js", () => ({
 vi.mock("../../plugins/management-uninstall.js", () => ({
   uninstallManagedPlugin: managementMocks.uninstall,
 }));
-vi.mock("../../plugins/catalog-search.js", () => ({ searchInstallablePluginPackages: vi.fn() }));
 
 const { pluginMutationHandlers: pluginsHandlers } = await import("./plugins-mutations.js");
 const application = { operationId: "test-operation", generation: 42, pluginIds: ["workboard"] };
@@ -57,25 +56,6 @@ async function callHandler(
     },
   });
   return { ok, error };
-}
-function applyReload(options: ManagedMutationOptions, assertInvokerOwned?: () => void) {
-  return expectDefined(
-    options.applyRuntime,
-    "managed runtime apply",
-  )({
-    config: {},
-    pluginIds: ["workboard"],
-    reason: "reload",
-    assertInvokerOwned,
-  });
-}
-async function waitForPublication(entered: Promise<unknown>, pending: Promise<unknown>) {
-  await Promise.race([
-    entered,
-    pending.then(() => {
-      throw new Error("reload completed before queued publication");
-    }),
-  ]);
 }
 function expectUnavailable(result: unknown, failure: Error) {
   expect(result).toMatchObject({
@@ -176,15 +156,25 @@ describe("plugin lifecycle invoker ownership", () => {
           return { application };
         }
         return {
-          application: await applyReload(
-            options,
-            fence === "lease" ? owner.assertInvokerOwned : undefined,
-          ),
+          application: await expectDefined(
+            options.applyRuntime,
+            "managed runtime apply",
+          )({
+            config: {},
+            pluginIds: ["workboard"],
+            reason: "reload",
+            assertInvokerOwned: fence === "lease" ? owner.assertInvokerOwned : undefined,
+          }),
         };
       });
       const pending = callHandler(owner.invocation);
       try {
-        await waitForPublication(entered.promise, pending);
+        await Promise.race([
+          entered.promise,
+          pending.then(() => {
+            throw new Error("reload completed before queued publication");
+          }),
+        ]);
         expect(managementMocks.reload).toHaveBeenCalledOnce();
         owner.close();
         paused.resolve();

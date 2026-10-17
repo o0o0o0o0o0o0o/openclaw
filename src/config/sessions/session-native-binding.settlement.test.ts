@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { deserialize } from "node:v8";
-import { Worker } from "node:worker_threads";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -9,9 +7,13 @@ import {
 } from "../../agents/harness/native-session/deletion-participant.js";
 import { SqliteWorkerError } from "../../infra/sqlite-worker-contract.js";
 import * as admission from "../../infra/sqlite-worker-operation-admission.js";
-import { sqliteWorkerOwnerProbe as probe } from "../../infra/sqlite-worker-owner-probe.test-support.js";
 import { assertPluginStatePublicationSettled } from "../../plugin-state/plugin-state-publication.js";
 import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.js";
+import {
+  captureCommandWorker,
+  observeNativeGrants as observeGrants,
+  publication,
+} from "./session-native-binding.execution.test-support.js";
 import { withNativeBindingFixture } from "./session-native-binding.test-support.js";
 
 const delivery = vi.hoisted(() => ({
@@ -46,18 +48,19 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+const observeNativeGrants = (observe: Parameters<typeof observeGrants>[1]) =>
+  observeGrants(admission, observe);
+
 it("releases a binding after refusal before worker dispatch and permits a fresh deletion", async () => {
   await withNativeBindingFixture("agentsapi", async (fixture) => {
     const entry = fixture.readEntry();
     const binding = fixture.readBinding();
     const refused = new Error("synthetic refusal before native binding dispatch");
     let readiness = 0;
-    probe.admission(admission, (request, grant, callback) => {
-      const facts = isRecord(request.facts) ? request.facts.publication : undefined;
-      if (isRecord(facts) && facts.kind === "native-binding-ready") {
+    observeNativeGrants((_request, facts) => {
+      if (facts.kind === "native-binding-ready") {
         readiness++;
       }
-      callback(request, grant);
     });
     const rejectDispatch = vi.fn(() => {
       const held = fixture.readBinding();
@@ -107,9 +110,7 @@ it("does not finalize native custody from a mismatched actual A receipt", async 
         const owned = create((request, grant) => {
           if (
             request.stage === "commit" &&
-            isRecord(request.facts) &&
-            isRecord(request.facts.publication) &&
-            request.facts.publication.kind === "session-native-binding"
+            publication(request)?.kind === "session-native-binding"
           ) {
             native = owned;
           }
@@ -148,25 +149,21 @@ it("joins a real pending heartbeat after readiness refusal and enters A and S on
     let ready = 0;
     let sharedDelete = 0;
     let agentCommit = 0;
-    probe.admission(admission, (request, grant, callback) => {
-      const facts = isRecord(request.facts) ? request.facts.publication : undefined;
-      if (isRecord(facts)) {
-        if (facts.kind === "native-binding-ready" && ++ready === 1) {
-          // Accept the actual heartbeat immediately before the synchronous readiness decision.
-          vi.advanceTimersByTime(21_000);
-        }
-        if (
-          facts.kind === "native-binding-storage" &&
-          facts.phase === "delete" &&
-          facts.stage === "transaction"
-        ) {
-          sharedDelete++;
-        }
-        if (request.stage === "commit" && facts.kind === "session-native-binding") {
-          agentCommit++;
-        }
+    observeNativeGrants((request, facts) => {
+      if (facts.kind === "native-binding-ready" && ++ready === 1) {
+        // Accept the actual heartbeat immediately before the synchronous readiness decision.
+        vi.advanceTimersByTime(21_000);
       }
-      callback(request, grant);
+      if (
+        facts.kind === "native-binding-storage" &&
+        facts.phase === "delete" &&
+        facts.stage === "transaction"
+      ) {
+        sharedDelete++;
+      }
+      if (request.stage === "commit" && facts.kind === "session-native-binding") {
+        agentCommit++;
+      }
     });
     try {
       await expect(fixture.remove()).resolves.toMatchObject({ deleted: true });
@@ -200,43 +197,19 @@ it.each([
       assert(original);
       const identity = captureOpenClawStateWorkerContext({ env: fixture.scope.env }).admission
         .identity.key;
-      let terminateWorker: (() => Promise<number>) | undefined;
+      const terminateWorker = captureCommandWorker("session.nativeBindings.delete");
       let stopped: Promise<number> | undefined;
-      // The interceptor forwards the original method with its exact Worker receiver below.
-      // oxlint-disable-next-line typescript/unbound-method
-      const posted = Worker.prototype.postMessage;
-      vi.spyOn(Worker.prototype, "postMessage").mockImplementation(function (
-        this: Worker,
-        ...args
-      ) {
-        const message: unknown = args[0];
-        if (
-          isRecord(message) &&
-          message.type === "execute" &&
-          message.input instanceof Uint8Array
-        ) {
-          const command: unknown = deserialize(message.input);
-          if (isRecord(command) && command.type === "session.nativeBindings.delete") {
-            terminateWorker = () => this.terminate();
-          }
-        }
-        return Reflect.apply(posted, this, args);
-      });
-      probe.admission(admission, (request, grant, callback) => {
-        const facts = isRecord(request.facts) ? request.facts.publication : undefined;
+      observeNativeGrants((request, facts) => {
         const atCheckpoint =
-          isRecord(facts) &&
-          (checkpoint === "S commit"
+          checkpoint === "S commit"
             ? facts.kind === "native-binding-storage" &&
               facts.phase === "delete" &&
               facts.stage === "commit"
-            : request.stage === "commit" && facts.kind === "session-native-binding");
+            : request.stage === "commit" && facts.kind === "session-native-binding";
         if (atCheckpoint && !stopped) {
-          assert(terminateWorker, "native deletion must dispatch before its commit grant");
           stopped = terminateWorker();
           throw new Error("synthetic native worker termination");
         }
-        callback(request, grant);
       });
       try {
         const deletion = fixture.remove();

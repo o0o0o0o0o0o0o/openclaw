@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { deserialize } from "node:v8";
-import { Worker } from "node:worker_threads";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import { SqliteWorkerError } from "../../infra/sqlite-worker-contract.js";
@@ -12,6 +9,10 @@ import { onSessionIdentityMutation } from "../../sessions/session-lifecycle-even
 import { loadBundledPluginFacade } from "../../test-utils/bundled-plugin-public-surface.js";
 import { loadTranscriptEventsSync } from "./session-accessor.sqlite-read.js";
 import { replaceTranscriptEventsSync } from "./session-accessor.sqlite-transcript-write.test-support.js";
+import {
+  captureCommandWorker,
+  publication,
+} from "./session-native-binding.execution.test-support.js";
 import {
   withNativeBindingFixture,
   type NativeBindingClientTestApi,
@@ -92,8 +93,8 @@ function observeNativeGrants(
   ) => void,
 ) {
   probe.admission(admission, (request, grant, callback) => {
-    const facts = isRecord(request.facts) ? request.facts.publication : undefined;
-    if (isRecord(facts) && facts.kind === "native-binding-ready") {
+    const facts = publication(request);
+    if (facts?.kind === "native-binding-ready") {
       // Production joins renewal and quiesces the lease before invoking this grant.
       callback(request, () => {
         observe(request, facts);
@@ -106,7 +107,7 @@ function observeNativeGrants(
       });
       return;
     }
-    if (isRecord(facts)) {
+    if (facts) {
       observe(request, facts);
     }
     callback(request, grant);
@@ -186,24 +187,10 @@ it("blocks branch switching after actual worker loss without releasing native su
       fixture.bindingStore,
       fixture.bindingKey,
     );
-    let terminateWorker: (() => Promise<number>) | undefined;
+    const terminateWorker = captureCommandWorker("session.messageCut.commit");
     let stopped: Promise<number> | undefined;
-    // Forward with the original receiver; terminate only the exact C3 command's worker.
-    // oxlint-disable-next-line typescript/unbound-method
-    const posted = Worker.prototype.postMessage;
-    vi.spyOn(Worker.prototype, "postMessage").mockImplementation(function (this: Worker, ...args) {
-      const message: unknown = args[0];
-      if (isRecord(message) && message.type === "execute" && message.input instanceof Uint8Array) {
-        const command: unknown = deserialize(message.input);
-        if (isRecord(command) && command.type === "session.messageCut.commit") {
-          terminateWorker = () => this.terminate();
-        }
-      }
-      return Reflect.apply(posted, this, args);
-    });
     observeNativeGrants((request, facts) => {
       if (request.stage === "commit" && facts.kind === "session-native-binding" && !stopped) {
-        assert(terminateWorker);
         stopped = terminateWorker();
         throw new Error("synthetic branch worker termination");
       }

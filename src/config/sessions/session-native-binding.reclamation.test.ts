@@ -4,7 +4,6 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import * as admission from "../../infra/sqlite-worker-operation-admission.js";
-import { sqliteWorkerOwnerProbe as probe } from "../../infra/sqlite-worker-owner-probe.test-support.js";
 import { withPluginRuntimeRegistryScope } from "../../plugins/runtime/gateway-request-scope.js";
 import {
   readSessionProgressCard,
@@ -24,6 +23,8 @@ import { applySessionEntryCanonicalReplacements } from "./session-accessor.sqlit
 import {
   bindingWrites,
   expectNoSql,
+  observeNativeCommit,
+  publication,
   wrapAgentExecution,
 } from "./session-native-binding.execution.test-support.js";
 import { withNativeBindingFixture } from "./session-native-binding.test-support.js";
@@ -39,20 +40,10 @@ it.each([false, true])(
       const binding = fixture.readBinding();
       const sessionKey = "agent:main:replacement-target";
       const failure = new Error("synthetic replacement commit refusal");
-      let admitted = false;
-      probe.admission(admission, (request, grant, callback) => {
-        const facts = isRecord(request.facts) ? request.facts.publication : undefined;
-        if (
-          request.stage === "commit" &&
-          isRecord(facts) &&
-          facts.kind === "session-native-binding"
-        ) {
-          admitted = true;
-          if (rollback) {
-            throw failure;
-          }
+      const admitted = observeNativeCommit(admission, () => {
+        if (rollback) {
+          throw failure;
         }
-        callback(request, grant);
       });
       const sql = observeHostDataSql();
       try {
@@ -76,14 +67,15 @@ it.each([false, true])(
         } else {
           await expect(replacement).resolves.toBe("replaced");
         }
-        expect(admitted).toBe(true);
+        expect(admitted).toHaveBeenCalled();
         expectNoSql(sql.queries, /\b(?:session_nodes|session_windows|transcript_events)\b/i);
         expect(bindingWrites(sql.queries)).toEqual([]);
       } finally {
         sql.restore();
       }
-      expect(fixture.readEntry()).toEqual(rollback ? before : undefined);
-      expect(fixture.readBinding()).toEqual(rollback ? binding : undefined);
+      expect([fixture.readEntry(), fixture.readBinding()]).toEqual(
+        rollback ? [before, binding] : [undefined, undefined],
+      );
       expect(readExactSessionEntryRow(fixture.database, sessionKey)?.entry).toEqual(
         rollback ? undefined : before,
       );
@@ -181,8 +173,7 @@ it.each([false, true])(
         stop();
         stopIdentity();
       }
-      expect(fixture.readEntry()).toBeUndefined();
-      expect(fixture.readBinding()).toBeUndefined();
+      expect([fixture.readEntry(), fixture.readBinding()]).toEqual([undefined, undefined]);
       expect(readExactSessionEntryRow(fixture.database, reset.sessionKey)?.entry).toMatchObject(
         next,
       );
@@ -207,22 +198,11 @@ it("reclaims lifecycle artifacts with the native veto off the caller thread", as
         published(change.kind);
       }
     });
-    let granted = false;
-    probe.admission(admission, (request, grant, callback) => {
-      const facts = isRecord(request.facts) ? request.facts.publication : undefined;
-      if (
-        request.stage === "commit" &&
-        isRecord(facts) &&
-        facts.kind === "session-native-binding"
-      ) {
-        granted = true;
-      }
-      callback(request, grant);
-    });
+    const granted = observeNativeCommit(admission);
     const sql = observeHostDataSql();
     try {
       await expect(fixture.cleanup()).resolves.toMatchObject({ removedEntries: 1 });
-      expect(granted).toBe(true);
+      expect(granted).toHaveBeenCalled();
       // Other-owner live authority reads remain outside the moved A transaction.
       expectNoSql(sql.queries, /\b(?:session_nodes|session_windows|transcript_events)\b/i);
       expect(bindingWrites(sql.queries)).toEqual([]);
@@ -230,8 +210,7 @@ it("reclaims lifecycle artifacts with the native veto off the caller thread", as
       sql.restore();
       stop();
     }
-    expect(fixture.readEntry()).toEqual(undefined);
-    expect(fixture.readBinding()).toEqual(undefined);
+    expect([fixture.readEntry(), fixture.readBinding()]).toEqual([undefined, undefined]);
     expect(loadTranscriptEventsSync(fixture.scope)).toEqual([]);
     expect(published.mock.calls).toEqual([["delete"]]);
   });
@@ -255,8 +234,9 @@ it.each([false, true])(
       } finally {
         sql.restore();
       }
-      expect(fixture.readEntry()).toEqual(changed ? successor : undefined);
-      expect(fixture.readBinding()).toEqual(changed ? binding : undefined);
+      expect([fixture.readEntry(), fixture.readBinding()]).toEqual(
+        changed ? [successor, binding] : [undefined, undefined],
+      );
     });
   },
 );
@@ -292,12 +272,11 @@ it.each([false, true])(
               agentGrants++;
             }
             try {
-              const facts = isRecord(request.facts) ? request.facts.publication : undefined;
+              const facts = publication(request);
               if (
                 refuse &&
                 request.stage === "commit" &&
-                isRecord(facts) &&
-                facts.kind === "session-native-binding"
+                facts?.kind === "session-native-binding"
               ) {
                 throw new Error("injected initializer delete failure");
               }

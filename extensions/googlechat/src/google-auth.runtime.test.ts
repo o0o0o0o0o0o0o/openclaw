@@ -120,44 +120,86 @@ const validCredentials = {
   universe_domain: "googleapis.com",
 };
 
+function credentialAccount(
+  overrides: Partial<Parameters<typeof resolveValidatedGoogleChatCredentials>[0]>,
+) {
+  return {
+    accountId: "default",
+    enabled: true,
+    config: {},
+    credentialSource: "inline" as const,
+    ...overrides,
+  };
+}
+
+const tokenUrl = "https://oauth2.googleapis.com/token";
+async function authFetch(init: RequestInit = { method: "POST" }) {
+  return (await createGoogleAuthTransportFetch())(tokenUrl, init);
+}
+
+function expectGuardCall(overrides: Record<string, unknown>) {
+  expect(mocks.fetchWithSsrFGuard).toHaveBeenCalledWith({
+    auditContext: "googlechat.auth.google-auth",
+    init: { method: "POST" },
+    policy: { hostnameAllowlist: ["accounts.google.com", "googleapis.com"] },
+    timeoutMs: 30_000,
+    url: tokenUrl,
+    ...overrides,
+  });
+}
+
 describe("googlechat google auth runtime", () => {
-  it("routes Google auth fetches through the SSRF guard and preserves explicit proxy mTLS", async () => {
-    const release = mockGuardedResponse();
-    const controller = new AbortController();
-
-    const guardedFetch = await createGoogleAuthTransportFetch();
-    const response = await guardedFetch("https://oauth2.googleapis.com/token", {
-      agent: { proxy: new URL("http://proxy.example:8080") },
-      cert: "CLIENT_CERT",
-      headers: { "content-type": "application/json" },
-      key: "CLIENT_KEY",
-      method: "POST",
-      proxy: "http://proxy.example:8080",
-      signal: controller.signal,
-    } as RequestInit);
-
-    expect(mocks.fetchWithSsrFGuard).toHaveBeenCalledWith({
-      auditContext: "googlechat.auth.google-auth",
-      dispatcherPolicy: {
-        allowPrivateProxy: true,
-        mode: "explicit-proxy",
-        proxyTls: {
-          cert: "CLIENT_CERT",
-          key: "CLIENT_KEY",
-        },
-        proxyUrl: "http://proxy.example:8080",
-      },
+  it.each([
+    {
+      name: "routes Google auth fetches through the SSRF guard and preserves explicit proxy mTLS",
       init: {
-        headers: { "content-type": "application/json" },
-        method: "POST",
-        signal: controller.signal,
+        agent: { proxy: new URL("http://proxy.example:8080") },
+        proxy: "http://proxy.example:8080",
       },
       policy: {
-        hostnameAllowlist: ["accounts.google.com", "googleapis.com"],
+        allowPrivateProxy: true,
+        mode: "explicit-proxy",
+        proxyUrl: "http://proxy.example:8080",
       },
-      signal: controller.signal,
-      timeoutMs: 30_000,
-      url: "https://oauth2.googleapis.com/token",
+      env: undefined,
+      withSignal: true,
+    },
+    {
+      name: "bypasses explicit proxy when noProxy excludes the Google auth host",
+      init: { noProxy: ["oauth2.googleapis.com"], proxy: "http://proxy.example:8080" },
+      policy: { mode: "direct" },
+      env: undefined,
+      withSignal: false,
+    },
+    {
+      name: "preserves env-proxy transport when HTTPS proxy is configured",
+      init: {},
+      policy: { mode: "env-proxy" },
+      env: {
+        HTTPS_PROXY: "http://env-proxy.example:8080",
+        https_proxy: "http://lower-proxy.example:8080",
+      },
+      withSignal: false,
+    },
+  ])("$name", async ({ init, policy, env, withSignal }) => {
+    if (env) {
+      stubIsolatedProcessEnv(env);
+    }
+    const release = mockGuardedResponse();
+    const signal = withSignal ? new AbortController().signal : undefined;
+    const request = {
+      method: "POST",
+      ...(signal ? { headers: { "content-type": "application/json" }, signal } : {}),
+    };
+    const tls = { cert: "CLIENT_CERT", key: "CLIENT_KEY" };
+    const response = await authFetch({ ...request, ...tls, ...init } as RequestInit);
+    expectGuardCall({
+      dispatcherPolicy: {
+        ...policy,
+        ...(policy.mode === "direct" ? { connect: tls } : { proxyTls: tls }),
+      },
+      init: request,
+      ...(signal ? { signal } : {}),
     });
     await expect(response.text()).resolves.toBe("ok");
     expect(release).toHaveBeenCalledOnce();
@@ -182,87 +224,11 @@ describe("googlechat google auth runtime", () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
-  it("bypasses explicit proxy when noProxy excludes the Google auth host", async () => {
-    const release = mockGuardedResponse();
-
-    const guardedFetch = await createGoogleAuthTransportFetch();
-    const response = await guardedFetch("https://oauth2.googleapis.com/token", {
-      cert: "CLIENT_CERT",
-      key: "CLIENT_KEY",
-      method: "POST",
-      noProxy: ["oauth2.googleapis.com"],
-      proxy: "http://proxy.example:8080",
-    } as RequestInit);
-
-    expect(mocks.fetchWithSsrFGuard).toHaveBeenCalledWith({
-      auditContext: "googlechat.auth.google-auth",
-      dispatcherPolicy: {
-        connect: {
-          cert: "CLIENT_CERT",
-          key: "CLIENT_KEY",
-        },
-        mode: "direct",
-      },
-      init: {
-        method: "POST",
-      },
-      policy: {
-        hostnameAllowlist: ["accounts.google.com", "googleapis.com"],
-      },
-      timeoutMs: 30_000,
-      url: "https://oauth2.googleapis.com/token",
-    });
-    await expect(response.text()).resolves.toBe("ok");
-    expect(release).toHaveBeenCalledOnce();
-  });
-
-  it("preserves env-proxy transport when HTTPS proxy is configured", async () => {
-    const release = mockGuardedResponse();
-    stubIsolatedProcessEnv({
-      HTTPS_PROXY: "http://env-proxy.example:8080",
-      https_proxy: "http://lower-proxy.example:8080",
-    });
-
-    const guardedFetch = await createGoogleAuthTransportFetch();
-    const response = await guardedFetch("https://oauth2.googleapis.com/token", {
-      cert: "CLIENT_CERT",
-      key: "CLIENT_KEY",
-      method: "POST",
-    } as RequestInit);
-
-    expect(mocks.fetchWithSsrFGuard).toHaveBeenCalledWith({
-      auditContext: "googlechat.auth.google-auth",
-      dispatcherPolicy: {
-        mode: "env-proxy",
-        proxyTls: {
-          cert: "CLIENT_CERT",
-          key: "CLIENT_KEY",
-        },
-      },
-      init: {
-        method: "POST",
-      },
-      policy: {
-        hostnameAllowlist: ["accounts.google.com", "googleapis.com"],
-      },
-      timeoutMs: 30_000,
-      url: "https://oauth2.googleapis.com/token",
-    });
-    await expect(response.text()).resolves.toBe("ok");
-    expect(release).toHaveBeenCalledOnce();
-  });
-
   it("rejects non-stream guarded auth responses instead of buffering them unbounded", async () => {
     const { response, arrayBuffer } = createUnstreamedAuthResponse();
     const release = mockGuardedResponse(response);
 
-    const guardedFetch = await createGoogleAuthTransportFetch();
-
-    await expect(
-      guardedFetch("https://oauth2.googleapis.com/token", {
-        method: "POST",
-      } as RequestInit),
-    ).rejects.toThrow(
+    await expect(authFetch()).rejects.toThrow(
       "Google auth response body stream unavailable; refusing to buffer unbounded response.",
     );
     expect(arrayBuffer).not.toHaveBeenCalled();
@@ -275,13 +241,7 @@ describe("googlechat google auth runtime", () => {
     });
     const release = mockGuardedResponse(response);
 
-    const guardedFetch = await createGoogleAuthTransportFetch();
-
-    await expect(
-      guardedFetch("https://oauth2.googleapis.com/token", {
-        method: "POST",
-      } as RequestInit),
-    ).rejects.toThrow("Google auth response exceeds 1048576 bytes.");
+    await expect(authFetch()).rejects.toThrow("Google auth response exceeds 1048576 bytes.");
     expect(arrayBuffer).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledOnce();
   });
@@ -344,18 +304,16 @@ describe("googlechat google auth runtime", () => {
 
   it("rejects service-account credentials that override Google auth endpoints", async () => {
     await expect(
-      resolveValidatedGoogleChatCredentials({
-        accountId: "default",
-        config: {},
-        credentialSource: "inline",
-        credentials: {
-          client_email: "bot@example.iam.gserviceaccount.com",
-          private_key: "key",
-          token_uri: "https://evil.example/token",
-          type: "service_account",
-        },
-        enabled: true,
-      }),
+      resolveValidatedGoogleChatCredentials(
+        credentialAccount({
+          credentials: {
+            client_email: "bot@example.iam.gserviceaccount.com",
+            private_key: "key",
+            token_uri: "https://evil.example/token",
+            type: "service_account",
+          },
+        }),
+      ),
     ).rejects.toThrow(/token_uri/);
   });
 
@@ -365,19 +323,14 @@ describe("googlechat google auth runtime", () => {
       const credentialsPath = path.join(tempDir, "service-account.json");
       await fs.writeFile(credentialsPath, JSON.stringify(validCredentials), "utf8");
 
-      const credentials = await resolveValidatedGoogleChatCredentials({
-        accountId: "default",
-        config: {},
-        credentialSource: "file",
-        credentialsFile: credentialsPath,
-        enabled: true,
+      const credentials = await resolveValidatedGoogleChatCredentials(
+        credentialAccount({ credentialSource: "file", credentialsFile: credentialsPath }),
+      );
+      expect(credentials).toMatchObject({
+        client_email: "bot@example.iam.gserviceaccount.com",
+        token_uri: tokenUrl,
+        type: "service_account",
       });
-      if (!credentials) {
-        throw new Error("expected validated credentials");
-      }
-      expect(credentials.client_email).toBe("bot@example.iam.gserviceaccount.com");
-      expect(credentials.token_uri).toBe("https://oauth2.googleapis.com/token");
-      expect(credentials.type).toBe("service_account");
     } finally {
       await fs.rm(tempDir, { force: true, recursive: true });
     }
@@ -388,13 +341,9 @@ describe("googlechat google auth runtime", () => {
 
     let thrown: unknown;
     try {
-      await resolveValidatedGoogleChatCredentials({
-        accountId: "default",
-        config: {},
-        credentialSource: "file",
-        credentialsFile: missingPath,
-        enabled: true,
-      });
+      await resolveValidatedGoogleChatCredentials(
+        credentialAccount({ credentialSource: "file", credentialsFile: missingPath }),
+      );
     } catch (error) {
       thrown = error;
     }

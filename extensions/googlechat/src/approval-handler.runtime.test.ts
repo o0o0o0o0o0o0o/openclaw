@@ -117,26 +117,8 @@ function getTextParagraphText(payload: unknown, header: string): string {
   return text;
 }
 
-function isUtf16WellFormed(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const codeUnit = value.charCodeAt(index);
-    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-      const nextCodeUnit = index + 1 < value.length ? value.charCodeAt(index + 1) : -1;
-      if (nextCodeUnit < 0xdc00 || nextCodeUnit > 0xdfff) {
-        return false;
-      }
-      index += 1;
-      continue;
-    }
-    if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
-      return false;
-    }
-  }
-  return true;
-}
-
 describe("googleChatApprovalNativeRuntime", () => {
-  async function preparePendingDelivery(view = createPendingView()) {
+  async function preparePendingDelivery(view = createPendingView(), context = handlerContext) {
     const nowMs = Date.now();
     const request = {
       id: view.approvalId,
@@ -145,7 +127,7 @@ describe("googleChatApprovalNativeRuntime", () => {
       expiresAtMs: view.expiresAtMs,
     };
     const pendingPayload = await googleChatApprovalNativeRuntime.presentation.buildPendingPayload({
-      ...handlerContext,
+      ...context,
       request,
       approvalKind: "exec",
       nowMs,
@@ -157,7 +139,7 @@ describe("googleChatApprovalNativeRuntime", () => {
       reason: "preferred" as const,
     };
     const prepared = await googleChatApprovalNativeRuntime.transport.prepareTarget({
-      ...handlerContext,
+      ...context,
       plannedTarget,
       request,
       approvalKind: "exec",
@@ -167,7 +149,17 @@ describe("googleChatApprovalNativeRuntime", () => {
     if (!prepared) {
       throw new Error("Expected prepared target");
     }
-    return { pendingPayload, plannedTarget, prepared, request, view };
+    const deliver = () =>
+      googleChatApprovalNativeRuntime.transport.deliverPending({
+        ...context,
+        plannedTarget,
+        preparedTarget: prepared.target,
+        request,
+        approvalKind: "exec",
+        view,
+        pendingPayload,
+      });
+    return { pendingPayload, request, view, deliver };
   }
 
   it("keeps truncated pending command card text UTF-16 well formed", async () => {
@@ -179,7 +171,7 @@ describe("googleChatApprovalNativeRuntime", () => {
 
     expect(commandText.length).toBeLessThanOrEqual(1800);
     expect(commandText.endsWith("...")).toBe(true);
-    expect(isUtf16WellFormed(commandText)).toBe(true);
+    expect(commandText.isWellFormed()).toBe(true);
     expect(JSON.stringify(pendingPayload.cardsV2)).not.toContain("\\ud83d");
   });
 
@@ -187,8 +179,7 @@ describe("googleChatApprovalNativeRuntime", () => {
     sendGoogleChatMessage.mockResolvedValue({ messageName: "spaces/AAA/messages/msg-1" });
     updateGoogleChatMessage.mockResolvedValue({ messageName: "spaces/AAA/messages/msg-1" });
 
-    const { pendingPayload, plannedTarget, prepared, request, view } =
-      await preparePendingDelivery();
+    const { pendingPayload, request, view, deliver } = await preparePendingDelivery();
 
     expect(JSON.stringify(pendingPayload)).toContain("cardsV2");
     const commandText = getTextParagraphText(pendingPayload, "Command");
@@ -198,15 +189,7 @@ describe("googleChatApprovalNativeRuntime", () => {
     );
     expect(JSON.stringify(pendingPayload.cardsV2)).not.toContain("/approve approval-1 allow-once");
 
-    const entry = await googleChatApprovalNativeRuntime.transport.deliverPending({
-      ...handlerContext,
-      plannedTarget,
-      preparedTarget: prepared.target,
-      request,
-      approvalKind: "exec",
-      view,
-      pendingPayload,
-    });
+    const entry = await deliver();
 
     expect(sendGoogleChatMessage).toHaveBeenCalledWith({
       account,
@@ -271,18 +254,8 @@ describe("googleChatApprovalNativeRuntime", () => {
   it("suppresses manual approval follow-ups while the native card send is in flight", async () => {
     const deferred = createDeferred<{ messageName: string }>();
     sendGoogleChatMessage.mockReturnValue(deferred.promise);
-    const { pendingPayload, plannedTarget, prepared, request, view } =
-      await preparePendingDelivery();
-
-    const deliveryPromise = googleChatApprovalNativeRuntime.transport.deliverPending({
-      ...handlerContext,
-      plannedTarget,
-      preparedTarget: prepared.target,
-      request,
-      approvalKind: "exec",
-      view,
-      pendingPayload,
-    });
+    const { deliver } = await preparePendingDelivery();
+    const deliveryPromise = deliver();
 
     await vi.waitFor(() => expect(sendGoogleChatMessage).toHaveBeenCalled());
     expect(
@@ -299,20 +272,8 @@ describe("googleChatApprovalNativeRuntime", () => {
 
   it("restores manual approval follow-ups when the native card send fails", async () => {
     sendGoogleChatMessage.mockRejectedValue(new Error("send failed"));
-    const { pendingPayload, plannedTarget, prepared, request, view } =
-      await preparePendingDelivery();
-
-    await expect(
-      googleChatApprovalNativeRuntime.transport.deliverPending({
-        ...handlerContext,
-        plannedTarget,
-        preparedTarget: prepared.target,
-        request,
-        approvalKind: "exec",
-        view,
-        pendingPayload,
-      }),
-    ).rejects.toThrow("send failed");
+    const { deliver } = await preparePendingDelivery();
+    await expect(deliver()).rejects.toThrow("send failed");
     expect(
       shouldSuppressGoogleChatManualExecApprovalFollowupText(
         "Please reply with:\n`/approve approval-1 allow-once`",
@@ -321,42 +282,14 @@ describe("googleChatApprovalNativeRuntime", () => {
   });
 
   it("uses the named Chat action when app-url add-on principal binding is absent", async () => {
-    const view = createPendingView();
-    const pendingPayload = await googleChatApprovalNativeRuntime.presentation.buildPendingPayload({
-      cfg: {
-        channels: {
-          googlechat: {
-            serviceAccount: {
-              type: "service_account",
-              client_email: "bot@example.com",
-              private_key: "test-key",
-              token_uri: "https://oauth2.googleapis.com/token",
-            },
-            audienceType: "app-url",
-            audience: "https://chat-app.example.test/googlechat",
-            allowFrom: ["users/123"],
-          },
-        },
-      },
-      accountId: "default",
+    const { appPrincipal: _principal, ...accountConfig } = account.config;
+    const { appPrincipal: _cfgPrincipal, ...channelConfig } = cfg.channels!.googlechat!;
+    const { pendingPayload } = await preparePendingDelivery(createPendingView(), {
+      ...handlerContext,
+      cfg: { channels: { googlechat: channelConfig } },
       context: {
-        account: {
-          ...account,
-          config: {
-            audienceType: "app-url",
-            audience: "https://chat-app.example.test/googlechat",
-          },
-        },
+        account: { ...account, config: accountConfig },
       },
-      request: {
-        id: "approval-1",
-        request: { command: "echo hi" },
-        createdAtMs: Date.now(),
-        expiresAtMs: view.expiresAtMs,
-      },
-      approvalKind: "exec",
-      nowMs: Date.now(),
-      view,
     });
 
     expect(JSON.stringify(pendingPayload.cardsV2)).toContain("openclaw.approval");

@@ -63,20 +63,21 @@ afterAll(() => {
   vi.resetModules();
 });
 
+type ChatConfig = NonNullable<NonNullable<OpenClawConfig["channels"]>["googlechat"]>;
+function chatConfig(googlechat: ChatConfig): OpenClawConfig {
+  return { channels: { googlechat } };
+}
+
 function createGoogleChatCfg(): OpenClawConfig {
-  return {
-    channels: {
-      googlechat: {
-        enabled: true,
-        serviceAccount: {
-          type: "service_account",
-          client_email: "bot@example.com",
-          private_key: "test-key", // pragma: allowlist secret
-          token_uri: "https://oauth2.googleapis.com/token",
-        },
-      },
+  return chatConfig({
+    enabled: true,
+    serviceAccount: {
+      type: "service_account",
+      client_email: "bot@example.com",
+      private_key: "test-key", // pragma: allowlist secret
+      token_uri: "https://oauth2.googleapis.com/token",
     },
-  };
+  });
 }
 
 function requireMockArg(mock: ReturnType<typeof vi.fn>, callIndex = 0, argIndex = 0): unknown {
@@ -116,33 +117,29 @@ describe("googlechatPlugin outbound", () => {
             text: "threaded",
             threadId: "thread-1",
           });
-          const request = requireMockArg(sendGoogleChatMessageMock) as {
-            space?: string;
-            thread?: string;
-          };
-          expect(request.space).toBe("spaces/AAA");
-          expect(request.thread).toBe("thread-1");
+          expect(requireMockArg(sendGoogleChatMessageMock)).toMatchObject({
+            space: "spaces/AAA",
+            thread: "thread-1",
+          });
         },
         messageSendingHooks: () => {
           expect(googlechatMessageAdapter.send?.text).toBeTypeOf("function");
         },
       },
     });
-    expect(proofs).toStrictEqual([
-      { capability: "text", status: "verified" },
-      { capability: "media", status: "not_declared" },
-      { capability: "poll", status: "not_declared" },
-      { capability: "payload", status: "not_declared" },
-      { capability: "silent", status: "not_declared" },
-      { capability: "replyTo", status: "not_declared" },
-      { capability: "thread", status: "verified" },
-      { capability: "nativeQuote", status: "not_declared" },
-      { capability: "messageSendingHooks", status: "verified" },
-      { capability: "batch", status: "not_declared" },
-      { capability: "reconcileUnknownSend", status: "not_declared" },
-      { capability: "afterSendSuccess", status: "not_declared" },
-      { capability: "afterCommit", status: "not_declared" },
-    ]);
+    expect(proofs).toStrictEqual(
+      (
+        "text,media,poll,payload,silent,replyTo,thread,nativeQuote,messageSendingHooks," +
+        "batch,reconcileUnknownSend,afterSendSuccess,afterCommit"
+      )
+        .split(",")
+        .map((capability) => ({
+          capability,
+          status: ["text", "thread", "messageSendingHooks"].includes(capability)
+            ? "verified"
+            : "not_declared",
+        })),
+    );
   });
 
   it("renders and chunks outbound text without requiring Google Chat runtime initialization", () => {
@@ -156,44 +153,15 @@ describe("googlechatPlugin outbound", () => {
 
 describe("googlechatPlugin threading", () => {
   it("honors per-account replyToMode overrides", () => {
-    const cfg = {
-      channels: {
-        googlechat: {
-          replyToMode: "all",
-          accounts: {
-            work: {
-              replyToMode: "first",
-            },
-          },
-        },
-      },
-    } as OpenClawConfig;
+    const cfg = chatConfig({ replyToMode: "all", accounts: { work: { replyToMode: "first" } } });
 
-    const workAccount = googlechatThreadingAdapter.scopedAccountReplyToMode.resolveAccount(
-      cfg,
-      "work",
-    );
-    const defaultAccount = googlechatThreadingAdapter.scopedAccountReplyToMode.resolveAccount(
-      cfg,
-      "default",
-    );
-
-    expect(
-      googlechatThreadingAdapter.scopedAccountReplyToMode.resolveReplyToMode(workAccount),
-    ).toBe("first");
-    expect(
-      googlechatThreadingAdapter.scopedAccountReplyToMode.resolveReplyToMode(defaultAccount),
-    ).toBe("all");
+    const mode = googlechatThreadingAdapter.scopedAccountReplyToMode;
+    expect(mode.resolveReplyToMode(mode.resolveAccount(cfg, "work"))).toBe("first");
+    expect(mode.resolveReplyToMode(mode.resolveAccount(cfg, "default"))).toBe("all");
   });
 
   it("uses the inbound thread resource as the current tool reply target", () => {
-    const cfg = {
-      channels: {
-        googlechat: {
-          replyToMode: "all",
-        },
-      },
-    } as OpenClawConfig;
+    const cfg = chatConfig({ replyToMode: "all" });
     const hasRepliedRef = { value: false };
 
     const context = googlechatThreadingAdapter.buildToolContext({
@@ -217,13 +185,7 @@ describe("googlechatPlugin threading", () => {
   });
 
   it("does not use message resources as implicit Google Chat reply targets", () => {
-    const cfg = {
-      channels: {
-        googlechat: {
-          replyToMode: "all",
-        },
-      },
-    } as OpenClawConfig;
+    const cfg = chatConfig({ replyToMode: "all" });
 
     const context = googlechatThreadingAdapter.buildToolContext({
       cfg,
@@ -247,48 +209,28 @@ const resolveTarget = googlechatOutboundAdapter.base.resolveTarget;
 
 describe("googlechatPlugin outbound resolveTarget", () => {
   it("resolves email targets", () => {
-    const result = resolveTarget({
-      to: "user@example.com",
+    expect(resolveTarget({ to: "user@example.com" })).toEqual({
+      ok: true,
+      to: "users/user@example.com",
     });
-
-    expect(result.ok).toBe(true);
-    if (!result.ok) {
-      throw result.error;
-    }
-    expect(result.to).toBe("users/user@example.com");
   });
 
   it("errors on invalid targets", () => {
-    const result = resolveTarget({
-      to: "   ",
+    expect(resolveTarget({ to: "   " })).toEqual({
+      ok: false,
+      error: new Error("Delivering to Google Chat requires target <spaces/{space}|users/{user}>"),
     });
-
-    expect(result.ok).toBe(false);
-    if (result.ok) {
-      throw new Error("Expected invalid target to fail");
-    }
-    expect(result.error.message).toBe(
-      "Delivering to Google Chat requires target <spaces/{space}|users/{user}>",
-    );
   });
 });
 
 describe("googlechatPlugin outbound cfg threading", () => {
   it("preserves accountId when sending pairing approvals", async () => {
-    const cfg = {
-      channels: {
-        googlechat: {
-          enabled: true,
-          accounts: {
-            work: {
-              serviceAccount: {
-                type: "service_account",
-              },
-            },
-          },
-        },
+    const cfg = chatConfig({
+      enabled: true,
+      accounts: {
+        work: { serviceAccount: { type: "service_account" } },
       },
-    };
+    });
     const account = {
       accountId: "work",
       enabled: true,
@@ -327,40 +269,31 @@ describe("googlechat directory", () => {
   const runtimeEnv = createDirectoryTestRuntime() as never;
 
   it("lists peers and groups from config", async () => {
-    const cfg = {
-      channels: {
-        googlechat: {
-          serviceAccount: { client_email: "bot@example.com" },
-          allowFrom: [" users/alice ", " googlechat:user:Bob@Example.com "],
-          groups: {
-            "spaces/AAA": {},
-            "spaces/BBB": {},
-          },
-        },
+    const cfg = chatConfig({
+      serviceAccount: { client_email: "bot@example.com" },
+      allowFrom: [" users/alice ", " googlechat:user:Bob@Example.com "],
+      groups: {
+        "spaces/AAA": {},
+        "spaces/BBB": {},
       },
-    } as unknown as OpenClawConfig;
+    });
 
     const directory = expectDirectorySurface(googlechatDirectoryAdapter);
 
-    const peers = await directory.listPeers({
+    const request = {
       cfg,
       accountId: undefined,
       query: undefined,
       limit: undefined,
       runtime: runtimeEnv,
-    });
+    };
+    const peers = await directory.listPeers(request);
     expect(peers).toStrictEqual([
       { kind: "user", id: "users/alice" },
       { kind: "user", id: "users/bob@example.com" },
     ]);
 
-    const groups = await directory.listGroups({
-      cfg,
-      accountId: undefined,
-      query: undefined,
-      limit: undefined,
-      runtime: runtimeEnv,
-    });
+    const groups = await directory.listGroups(request);
     expect(groups).toStrictEqual([
       { kind: "group", id: "spaces/AAA" },
       { kind: "group", id: "spaces/BBB" },
@@ -370,15 +303,11 @@ describe("googlechat directory", () => {
 
 describe("googlechatPlugin security", () => {
   it("normalizes prefixed DM allowlist entries to lowercase user ids", () => {
-    const cfg = {
-      channels: {
-        googlechat: {
-          serviceAccount: { client_email: "bot@example.com" },
-          dmPolicy: "allowlist",
-          allowFrom: ["  googlechat:user:Bob@Example.com  "],
-        },
-      },
-    } as OpenClawConfig;
+    const cfg = chatConfig({
+      serviceAccount: { client_email: "bot@example.com" },
+      dmPolicy: "allowlist",
+      allowFrom: ["  googlechat:user:Bob@Example.com  "],
+    });
 
     const account = resolveGoogleChatAccount({ cfg, accountId: "default" });
 

@@ -43,10 +43,6 @@ vi.mock("../config/sessions/paths.js", () => ({
   resolveSessionStorePathCore: (...args: unknown[]) => state.resolveStorePathMock(...args),
 }));
 
-async function loadModule() {
-  return mod;
-}
-
 type ShouldSwitchParams = Parameters<
   typeof import("./live-model-switch.js").shouldSwitchToLiveModel
 >[0];
@@ -91,36 +87,22 @@ describe("live model switch", () => {
           overrideProvider?: string;
           overrideModel?: string;
         }) => {
-          const defaultProvider = params.defaultProvider.trim();
-          const overrideProvider = params.overrideProvider?.trim();
-          const overrideModel = params.overrideModel?.trim();
-          if (overrideModel) {
-            if (overrideProvider) {
-              return { provider: overrideProvider, model: overrideModel };
+          for (const [provider, model] of [
+            [params.overrideProvider, params.overrideModel],
+            [params.runtimeProvider, params.runtimeModel],
+          ]) {
+            const selected = model?.trim();
+            if (!selected) {
+              continue;
             }
-            const slash = overrideModel.indexOf("/");
-            if (slash <= 0 || slash === overrideModel.length - 1) {
-              return { provider: defaultProvider, model: overrideModel };
+            const explicitProvider = provider?.trim();
+            if (explicitProvider) {
+              return { provider: explicitProvider, model: selected };
             }
-            return {
-              provider: overrideModel.slice(0, slash),
-              model: overrideModel.slice(slash + 1),
-            };
-          }
-          const runtimeProvider = params.runtimeProvider?.trim();
-          const runtimeModel = params.runtimeModel?.trim();
-          if (runtimeModel) {
-            if (runtimeProvider) {
-              return { provider: runtimeProvider, model: runtimeModel };
-            }
-            const slash = runtimeModel.indexOf("/");
-            if (slash <= 0 || slash === runtimeModel.length - 1) {
-              return { provider: defaultProvider, model: runtimeModel };
-            }
-            return {
-              provider: runtimeModel.slice(0, slash),
-              model: runtimeModel.slice(slash + 1),
-            };
+            const slash = selected.indexOf("/");
+            return slash <= 0 || slash === selected.length - 1
+              ? { provider: params.defaultProvider.trim(), model: selected }
+              : { provider: selected.slice(0, slash), model: selected.slice(slash + 1) };
           }
           return null;
         },
@@ -193,9 +175,7 @@ describe("live model switch", () => {
         },
       });
 
-      const { shouldSwitchToLiveModel } = await loadModule();
-
-      const result = await shouldSwitchToLiveModel(makeShouldSwitchParams());
+      const result = await mod.shouldSwitchToLiveModel(makeShouldSwitchParams());
 
       expect(result).toBeUndefined();
       expect(state.loadSessionStoreMock).toHaveBeenCalledWith({
@@ -208,9 +188,7 @@ describe("live model switch", () => {
     });
 
     it("returns undefined when sessionKey is missing", async () => {
-      const { shouldSwitchToLiveModel } = await loadModule();
-
-      const result = await shouldSwitchToLiveModel(
+      const result = await mod.shouldSwitchToLiveModel(
         makeShouldSwitchParams({ sessionKey: undefined }),
       );
 
@@ -356,9 +334,7 @@ describe("live model switch", () => {
 
   describe("clearLiveModelSwitchPending", () => {
     it("is a no-op when sessionKey is missing", async () => {
-      const { clearLiveModelSwitchPending } = await loadModule();
-
-      await clearLiveModelSwitchPending({
+      await mod.clearLiveModelSwitchPending({
         cfg: { session: { store: "/tmp/custom-store.json" } },
         sessionKey: undefined,
         agentId: "reply",

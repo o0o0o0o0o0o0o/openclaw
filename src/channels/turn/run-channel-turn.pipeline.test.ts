@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { noteDispatchProcessedOutcome } from "../../auto-reply/reply/dispatch-processed-outcome.js";
-import type { DispatchReplyWithBufferedBlockDispatcher } from "../../auto-reply/reply/provider-dispatcher.types.js";
+import type { DispatchReplyWithBufferedBlockDispatcher as Dispatch } from "../../auto-reply/reply/provider-dispatcher.types.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
 import { getReplySystemEventContext } from "../../auto-reply/reply/system-event-session-key.js";
 import { PlatformMessageNotDispatchedError } from "../../infra/outbound/deliver-types.js";
@@ -20,12 +20,11 @@ import {
   expectDispatched,
 } from "./run-channel-turn.delivery.test-helpers.js";
 import * as fixture from "./turn-state.test-support.js";
-import type { AssembledChannelTurn, PreparedChannelTurn } from "./types.js";
+import type { AssembledChannelTurn, ChannelTurnLogEvent } from "./types.js";
 
 const subsystemWarn = vi.hoisted(() => vi.fn());
 
 vi.mock("../../logging/subsystem.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../logging/subsystem.js")>();
   const makeLogger = (subsystem: string): import("../../logging/subsystem.js").SubsystemLogger => ({
     subsystem,
     isEnabled: () => true,
@@ -39,12 +38,12 @@ vi.mock("../../logging/subsystem.js", async (importOriginal) => {
     child: (name: string) => makeLogger(`${subsystem}/${name}`),
   });
   return {
-    ...actual,
+    ...(await importOriginal<typeof import("../../logging/subsystem.js")>()),
     createSubsystemLogger: makeLogger,
   };
 });
 
-const { emitMessageSent, readRecentUserAssistantTextForSession } = channelTurnMocks;
+const { emitMessageSent, readRecentUserAssistantTextForSession: readRecent } = channelTurnMocks;
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 let storePath: string;
@@ -70,20 +69,11 @@ function runDelivery(
   });
 }
 
-function runTestPreparedChannelTurn<TDispatchResult>(
-  params: Pick<PreparedChannelTurn<TDispatchResult>, "runDispatch" | "log" | "messageId">,
-) {
-  return runPreparedChannelTurn({
-    ...fixture.turnContext(storePath),
-    ...params,
-  });
-}
-
 describe("channel turn pipeline", () => {
   beforeEach(() => {
     storePath = path.join(tempDirs.make("openclaw-channel-turn-pipeline-"), "sessions.json");
     fixture.resetTurnState();
-    readRecentUserAssistantTextForSession.mockResolvedValue([]);
+    readRecent.mockResolvedValue([]);
   });
 
   afterEach(fixture.resetTurnLogger);
@@ -102,11 +92,7 @@ describe("channel turn pipeline", () => {
       }),
     ).rejects.toBe(observerError);
 
-    expect(emitMessageSent).toHaveBeenCalledExactlyOnceWith({
-      success: true,
-      content: "reply",
-      messageId: "om-visible",
-    });
+    fixture.expectMessagesSent(["reply", "om-visible"]);
     expect(onError).not.toHaveBeenCalled();
     expect(observerError).toMatchObject({ sentBeforeError: true, visibleReplySent: true });
   });
@@ -118,15 +104,15 @@ describe("channel turn pipeline", () => {
       cause: new Error("provider rejected edit"),
     });
     const onError = vi.fn();
-    const dispatch = vi.fn(async (params) => {
-      await params.dispatcherOptions.deliver({ text: "requested final" }, fixture.finalInfo);
+    const dispatch = vi.fn<Dispatch>(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: "requested final" }, fixture.finalInfo);
       expect(catchSpy).toHaveBeenCalledOnce();
       rejectFinalization(finalizationError);
       await new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
       return fixture.finalDispatch();
-    }) as DispatchReplyWithBufferedBlockDispatcher;
+    });
 
     await expect(
       runDelivery(
@@ -138,12 +124,11 @@ describe("channel turn pipeline", () => {
       ),
     ).rejects.toBe(finalizationError);
 
-    expect(emitMessageSent).toHaveBeenCalledExactlyOnceWith({
-      success: false,
-      content: "requested final",
-      error: "final edit failed | provider rejected edit",
-      messageId: undefined,
-    });
+    fixture.expectMessagesSent([
+      "requested final",
+      undefined,
+      "final edit failed | provider rejected edit",
+    ]);
     expect(onError).toHaveBeenCalledExactlyOnceWith(finalizationError, fixture.finalInfo);
   });
 
@@ -163,40 +148,31 @@ describe("channel turn pipeline", () => {
       .fn()
       .mockResolvedValueOnce({ visibleReplySent: false, finalization: firstFinalization })
       .mockResolvedValueOnce({ visibleReplySent: false, finalization: secondFinalization });
-    const dispatch = vi.fn(async (params) => {
-      await params.dispatcherOptions.deliver({ text: "first requested" }, fixture.finalInfo);
-      await params.dispatcherOptions.deliver({ text: "second requested" }, fixture.finalInfo);
+    const dispatch = vi.fn<Dispatch>(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: "first requested" }, fixture.finalInfo);
+      await dispatcherOptions.deliver({ text: "second requested" }, fixture.finalInfo);
       rejectFirst(firstError);
       rejectSecond(partialError);
       throw new Error("stream close failed");
-    }) as DispatchReplyWithBufferedBlockDispatcher;
+    });
 
     await expect(runDelivery({ deliver }, dispatch)).rejects.toBe(partialError);
 
-    expect(emitMessageSent).toHaveBeenCalledTimes(2);
-    expect(emitMessageSent).toHaveBeenNthCalledWith(1, {
-      success: false,
-      content: "first requested",
-      error: "first finalization failed",
-      messageId: undefined,
-    });
-    expect(emitMessageSent).toHaveBeenNthCalledWith(2, {
-      success: false,
-      content: "accepted second preview",
-      error: "second finalization failed",
-      messageId: "om-second-preview",
-    });
+    fixture.expectMessagesSent(
+      ["first requested", undefined, "first finalization failed"],
+      ["accepted second preview", "om-second-preview", "second finalization failed"],
+    );
   });
 
   it("suppresses message_sent when the adapter proves provider dispatch never began", async () => {
-    const dispatch = vi.fn(async (params) => {
+    const dispatch = vi.fn<Dispatch>(async ({ dispatcherOptions }) => {
       try {
-        await params.dispatcherOptions.deliver({ ...fixture.reply }, fixture.finalInfo);
+        await dispatcherOptions.deliver({ ...fixture.reply }, fixture.finalInfo);
       } catch {
         // The buffered dispatcher already owns delivery-error reporting.
       }
       return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
-    }) as DispatchReplyWithBufferedBlockDispatcher;
+    });
 
     await runDelivery(
       {
@@ -230,8 +206,8 @@ describe("channel turn pipeline", () => {
         }
       },
     );
-    const dispatch = vi.fn(async (params) => {
-      const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+    const dispatch = vi.fn<Dispatch>(async ({ dispatcherOptions }) => {
+      const dispatcher = createReplyDispatcher(dispatcherOptions);
       expect(dispatcher.sendFinalReply({ text: "private reply" })).toBe(false);
       expect(dispatcher.sendFinalReply({ text: "public reply" })).toBe(true);
       dispatcher.markComplete();
@@ -240,7 +216,7 @@ describe("channel turn pipeline", () => {
         queuedFinal: dispatcher.getQueuedCounts().final > 0,
         counts: dispatcher.getQueuedCounts(),
       };
-    }) as DispatchReplyWithBufferedBlockDispatcher;
+    });
 
     const turn = runDelivery({ deliver, onDelivered }, dispatch, {
       channel: "test",
@@ -263,11 +239,7 @@ describe("channel turn pipeline", () => {
       fixture.finalInfo,
       expect.objectContaining(finalized),
     );
-    expect(emitMessageSent).toHaveBeenCalledExactlyOnceWith({
-      success: true,
-      content: "public reply",
-      messageId: "om-public",
-    });
+    fixture.expectMessagesSent(["public reply", "om-public"]);
   });
 
   it("can record a target session without changing the command dispatch session", async () => {
@@ -278,16 +250,14 @@ describe("channel turn pipeline", () => {
       events.push("adopted");
     });
     const turnAdoptionLifecycle = { onAdopted };
-    const dispatch = vi.fn<DispatchReplyWithBufferedBlockDispatcher>(async (params) => {
-      expect(params.ctx).not.toHaveProperty("SystemEventSessionKey");
-      expect(params.ctx.SessionKey).toBe(commandSessionKey);
-      expect(getReplySystemEventContext({ ...params.replyOptions })?.sessionKey).toBe(
-        routeSessionKey,
-      );
+    const dispatch = vi.fn<Dispatch>(async ({ ctx, replyOptions, dispatcherOptions }) => {
+      expect(ctx).not.toHaveProperty("SystemEventSessionKey");
+      expect(ctx.SessionKey).toBe(commandSessionKey);
+      expect(getReplySystemEventContext({ ...replyOptions })?.sessionKey).toBe(routeSessionKey);
       events.push("dispatch");
-      expect(params.replyOptions?.turnAdoptionLifecycle).toBe(turnAdoptionLifecycle);
-      await params.replyOptions?.turnAdoptionLifecycle?.onAdopted();
-      await params.dispatcherOptions.deliver({ ...fixture.reply }, fixture.finalInfo);
+      expect(replyOptions?.turnAdoptionLifecycle).toBe(turnAdoptionLifecycle);
+      await replyOptions?.turnAdoptionLifecycle?.onAdopted();
+      await dispatcherOptions.deliver({ ...fixture.reply }, fixture.finalInfo);
       return fixture.finalDispatch();
     });
     const routeSessionKey = "agent:main:telegram:group:42";
@@ -315,7 +285,6 @@ describe("channel turn pipeline", () => {
 
     expectDispatched(result);
     expect(events).toEqual(["record", "afterRecord", "dispatch", "adopted"]);
-    expect(onAdopted).toHaveBeenCalledOnce();
     expect(log).not.toHaveBeenCalledWith(
       expect.objectContaining({ reason: "zero-count-visible-dispatch" }),
     );
@@ -326,12 +295,8 @@ describe("channel turn pipeline", () => {
     expect(recordInboundSession).toHaveBeenCalledWith(
       expect.objectContaining({ sessionKey: targetSessionKey }),
     );
-    expect(readRecentUserAssistantTextForSession).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agentId: "main",
-        sessionKey: targetSessionKey,
-        storePath,
-      }),
+    expect(readRecent).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: "main", sessionKey: targetSessionKey, storePath }),
     );
   });
 
@@ -349,45 +314,48 @@ describe("channel turn pipeline", () => {
     expect(historyMap.get("room")).toStrictEqual([]);
   });
 
-  it.each([false, true])(
-    "keeps zero-visible diagnostics internal; deferred steer=%s",
-    async (deferred) => {
-      const log = vi.fn();
-      const signal = { deferredToActiveRun: "steer" } as const;
-      const result = await runTestPreparedChannelTurn({
-        log,
-        messageId: deferred ? "msg-zero" : "msg-zero-cause",
-        runDispatch: async () => {
-          if (deferred) {
-            return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 }, ...signal };
-          }
-          noteDispatchProcessedOutcome({ outcome: "skipped", reason: "duplicate" });
-          return {
-            ...fixture.finalDispatch(),
-            settledReceipt: createReplyDispatchReceipt({ final: { deliveredNotVisible: 1 } }),
-          };
-        },
-      });
+  it("keeps zero-visible diagnostic attribution internal", async () => {
+    const log = vi.fn<(event: ChannelTurnLogEvent) => void>();
+    const result = await runPreparedChannelTurn({
+      ...fixture.turnContext(storePath),
+      log,
+      messageId: "msg-zero-cause",
+      runDispatch: async () => {
+        noteDispatchProcessedOutcome({ outcome: "skipped", reason: "duplicate" });
+        return {
+          ...fixture.finalDispatch(),
+          settledReceipt: createReplyDispatchReceipt({ final: { deliveredNotVisible: 1 } }),
+        };
+      },
+    });
 
-      expectDispatched(result);
-      if (deferred) {
-        expect(result.dispatchResult).toMatchObject(signal);
-        expect(log.mock.calls).not.toContainEqual([
-          expect.objectContaining({ reason: "zero-count-visible-dispatch" }),
-        ]);
-        return;
-      }
-      expect(subsystemWarn).toHaveBeenCalledWith(
-        expect.stringContaining("messageId=msg-zero-cause"),
-      );
-      expect(subsystemWarn).toHaveBeenCalledWith(
-        expect.stringContaining("cause=skipped:duplicate"),
-      );
-      const warning = log.mock.calls
-        .map(([event]) => event as Record<string, unknown>)
-        .find((event) => event.reason === "zero-count-visible-dispatch");
-      expect(warning).toBeDefined();
-      expect(warning).not.toHaveProperty("cause");
-    },
-  );
+    expectDispatched(result);
+    expect(subsystemWarn).toHaveBeenCalledWith(expect.stringContaining("messageId=msg-zero-cause"));
+    expect(subsystemWarn).toHaveBeenCalledWith(expect.stringContaining("cause=skipped:duplicate"));
+    const warning = log.mock.calls
+      .map(([event]) => event)
+      .find((event) => event.reason === "zero-count-visible-dispatch");
+    expect(warning).toBeDefined();
+    expect(warning).not.toHaveProperty("cause");
+  });
+
+  it("does not warn for a steer deferred to the active run", async () => {
+    const log = vi.fn();
+    const signal = { deferredToActiveRun: "steer" } as const;
+    const result = await runPreparedChannelTurn({
+      ...fixture.turnContext(storePath),
+      log,
+      messageId: "msg-zero",
+      runDispatch: async () => ({
+        queuedFinal: false,
+        counts: { tool: 0, block: 0, final: 0 },
+        ...signal,
+      }),
+    });
+    expectDispatched(result);
+    expect(result.dispatchResult).toMatchObject(signal);
+    expect(log.mock.calls).not.toContainEqual([
+      expect.objectContaining({ reason: "zero-count-visible-dispatch" }),
+    ]);
+  });
 });

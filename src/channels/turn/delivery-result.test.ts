@@ -119,23 +119,16 @@ describe("channel delivery results", () => {
     expect(result).not.toHaveProperty("threadId");
   });
   it("keeps legacy messageIds while attaching the receipt", () => {
-    const accepted = receipt({
-      primaryPlatformMessageId: "m1",
-      platformMessageIds: ["m1", "m2"],
-      threadId: "canonical-thread",
-    });
-    const deliveryIntent = {
-      id: "intent-1",
-      kind: "outbound_queue",
-      queuePolicy: "required",
-    } as const;
-
     const input = {
-      receipt: accepted,
+      receipt: receipt({
+        primaryPlatformMessageId: "m1",
+        platformMessageIds: ["m1", "m2"],
+        threadId: "canonical-thread",
+      }),
       threadId: "requested-thread",
       replyToId: "reply-1",
       visibleReplySent: true,
-      deliveryIntent,
+      deliveryIntent: { id: "intent-1", kind: "outbound_queue", queuePolicy: "required" } as const,
     };
     expect(createChannelDeliveryResultFromReceipt(input)).toEqual({
       ...input,

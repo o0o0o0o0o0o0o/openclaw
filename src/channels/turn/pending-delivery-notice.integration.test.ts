@@ -60,8 +60,9 @@ describe("pending delivery notice end to end", () => {
   };
   const locator = () => ({ sessionKey, storePath });
   const entry = () => loadSessionEntry(locator());
+  const settlementRef = () => ({ kind: "pending-final" as const, ...completion });
   const settle = (state: "queued" | "unknown") =>
-    settlePendingFinalDelivery({ kind: "pending-final", ...completion }, state, ["prepared"]);
+    settlePendingFinalDelivery(settlementRef(), state, ["prepared"]);
   const visible = async () => ({ visibleReplySent: true });
   const finalPayload = (bindCustody = true, custody = completion) => {
     const payload = { text: "the final answer" };
@@ -115,7 +116,7 @@ describe("pending delivery notice end to end", () => {
     return dispatch({ deliver });
   };
   const freshTurn = () => runTurn(visible, false);
-  function queueFinal(prepared = false, beforeIdle = async () => {}, custody = completion) {
+  function queueFinal(prepared = false, custody = completion, beforeIdle = Promise.resolve()) {
     dispatchCore.mockImplementationOnce(async (params) => {
       const dispatcher = createReplyDispatcher(params.dispatcherOptions);
       const payload = finalPayload(true, custody);
@@ -129,7 +130,7 @@ describe("pending delivery notice end to end", () => {
         dispatcher.sendFinalReply(payload);
       }
       dispatcher.markComplete();
-      await beforeIdle();
+      await beforeIdle;
       const settledReceipt = await dispatcher.waitForIdle();
       return { queuedFinal: true, counts: dispatcher.getQueuedCounts(), settledReceipt };
     });
@@ -176,14 +177,7 @@ describe("pending delivery notice end to end", () => {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const buffered = createDeferred();
       const flush = createDeferred();
-      queueFinal(
-        false,
-        async () => {
-          await buffered.promise;
-          flush.resolve();
-        },
-        { ...completion },
-      );
+      queueFinal(false, { ...completion }, buffered.promise.then(flush.resolve));
       await expect(
         dispatch({
           deliverWithProviderMessageSending: async (_payload, info) => {
@@ -217,42 +211,39 @@ describe("pending delivery notice end to end", () => {
     { failure: "retryable", operation: "prepared", state: "prepared" },
     { failure: "queue-owned", operation: "raw", state: "queued" },
     { failure: "queue-owned", operation: "prepared", state: "queued" },
-  ] as const)(
-    "does not owe a notice after $failure durable $operation delivery",
-    async ({ failure, operation, state }) => {
-      const cause = new PlatformMessageNotDispatchedError("sender preflight failed", {
-        cause: undefined,
-        retryable: failure !== "rejected",
-      });
-      const error =
-        failure === "queue-owned"
-          ? Object.assign(new OutboundDeliveryError(cause.message, { cause }), {
-              queueCustody: "held",
-            })
-          : cause;
-      withDurableDeliveryRuntime.mockImplementationOnce(async () => {
-        if (failure === "queue-owned") {
-          await settle("queued");
-        }
-        throw error;
-      });
-      queueFinal(operation === "prepared");
-      const deliver = vi.fn(visible);
-      const onError = vi.fn();
-      await dispatch({ deliver, durable: {}, onError });
+  ] as const)("no notice: $failure/$operation", async ({ failure, operation, state }) => {
+    const cause = new PlatformMessageNotDispatchedError("sender preflight failed", {
+      cause: undefined,
+      retryable: failure !== "rejected",
+    });
+    const error =
+      failure === "queue-owned"
+        ? Object.assign(new OutboundDeliveryError(cause.message, { cause }), {
+            queueCustody: "held",
+          })
+        : cause;
+    withDurableDeliveryRuntime.mockImplementationOnce(async () => {
+      if (failure === "queue-owned") {
+        await settle("queued");
+      }
+      throw error;
+    });
+    queueFinal(operation === "prepared");
+    const deliver = vi.fn(visible);
+    const onError = vi.fn();
+    await dispatch({ deliver, durable: {}, onError });
 
-      const current = entry();
-      expect(current?.pendingFinalDelivery?.deliveries).toEqual([
-        { id: completion.deliveryId, state },
-      ]);
-      expect(current?.pendingDeliveryNotice).toBeUndefined();
-      expect(deliver).not.toHaveBeenCalled();
-      expect(onError).toHaveBeenCalledExactlyOnceWith(error, { kind: "final" });
+    const current = entry();
+    expect(current?.pendingFinalDelivery?.deliveries).toEqual([
+      { id: completion.deliveryId, state },
+    ]);
+    expect(current?.pendingDeliveryNotice).toBeUndefined();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledExactlyOnceWith(error, { kind: "final" });
 
-      await freshTurn();
-      expect(sendRecoveryNotice).not.toHaveBeenCalled();
-    },
-  );
+    await freshTurn();
+    expect(sendRecoveryNotice).not.toHaveBeenCalled();
+  });
 
   it.each([false, true])("settles suppression=%s once", async (suppressed) => {
     sendRecoveryNotice.mockResolvedValue({ suppressed });
@@ -266,7 +257,6 @@ describe("pending delivery notice end to end", () => {
     expect(sendRecoveryNotice).not.toHaveBeenCalled();
 
     await freshTurn();
-
     expect(sendRecoveryNotice).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         ...context,
@@ -278,10 +268,7 @@ describe("pending delivery notice end to end", () => {
     await closeOpenClawAgentDatabasesAsync(path.dirname(storePath));
     closeOpenClawAgentDatabasesForTest(path.dirname(storePath));
     // A queue restart can repeat owner settlement after its first write committed.
-    await settleDurableDelivery(
-      { kind: "pending-final", ...completion },
-      { platformSendStarted: true },
-    );
+    await settleDurableDelivery(settlementRef(), { platformSendStarted: true });
     await freshTurn();
     expect(sendRecoveryNotice).toHaveBeenCalledTimes(1);
     expectNoticeState(suppressed);

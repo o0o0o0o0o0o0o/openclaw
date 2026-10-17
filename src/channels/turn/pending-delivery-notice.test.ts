@@ -28,7 +28,8 @@ describe("pending delivery notice", () => {
   const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-pending-notice-");
   let storePath: string;
   const sessionKey = "agent:main:telegram:direct:chat-1";
-  const context = { channel: "telegram", to: "chat-1", accountId: "default", threadId: 42 };
+  const route = { channel: "telegram", accountId: "default" };
+  const context = { ...route, to: "chat-1", threadId: 42 };
   const locator = () => ({ sessionKey, storePath });
   const entry = () => loadSessionEntry(locator())!;
   const deliver = () => deliverPendingDeliveryNotice(sessionKey, storePath);
@@ -58,12 +59,7 @@ describe("pending delivery notice", () => {
       sessionId: "session-1",
       status: "done",
       updatedAt: Date.now(),
-      delivery: {
-        kind: "external",
-        route: { channel: "telegram", accountId: "default" },
-        context,
-        origin: {},
-      },
+      delivery: { kind: "external", route, context, origin: {} },
       pendingDeliveryNotice: {
         createdAt: Date.now(),
         context,
@@ -120,21 +116,18 @@ describe("pending delivery notice", () => {
     }
     expectNotice(state);
   });
-  it.each([false, true])(
-    "keeps acknowledgment when suppression finishes first=%s",
-    async (suppressedFirst) => {
-      const first = pendingNotice();
-      const second = pendingNotice();
-      const attempts = [deliver(), deliver()];
-      await Promise.all([first.started, second.started]);
-      first.resolve({ suppressed: suppressedFirst });
-      await Promise.race(attempts);
-      second.resolve({ suppressed: !suppressedFirst });
-      await Promise.all(attempts);
-      expectNotice("acknowledged");
-      expect(appendAssistantMessageToSessionTranscript).toHaveBeenCalledTimes(1);
-    },
-  );
+  it.each([false, true])("acknowledges with suppressed-first=%s", async (suppressedFirst) => {
+    const first = pendingNotice();
+    const second = pendingNotice();
+    const attempts = [deliver(), deliver()];
+    await Promise.all([first.started, second.started]);
+    first.resolve({ suppressed: suppressedFirst });
+    await Promise.race(attempts);
+    second.resolve({ suppressed: !suppressedFirst });
+    await Promise.all(attempts);
+    expectNotice("acknowledged");
+    expect(appendAssistantMessageToSessionTranscript).toHaveBeenCalledTimes(1);
+  });
 
   it("leaves a replacement notice owed when an earlier send finishes", async () => {
     const sent = pendingNotice();

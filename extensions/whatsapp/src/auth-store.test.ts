@@ -66,8 +66,6 @@ describe("auth-store", () => {
   });
 
   it("does not restore creds from backup on ordinary reads", async () => {
-    const authDir = tempDirs.make("openclaw-wa-auth-read-");
-    const credsPath = path.join(authDir, "creds.json");
     const backupPath = path.join(authDir, "creds.json.bak");
     fsSync.writeFileSync(backupPath, JSON.stringify({ me: { id: "123@s.whatsapp.net" } }), "utf-8");
 
@@ -108,8 +106,6 @@ describe("auth-store", () => {
   );
 
   it("leaves malformed creds unchanged when the backup is malformed", async () => {
-    const authDir = tempDirs.make("openclaw-wa-auth-malformed-backup-");
-    const credsPath = path.join(authDir, "creds.json");
     fsSync.writeFileSync(credsPath, "{x", "utf-8");
     fsSync.writeFileSync(path.join(authDir, "creds.json.bak"), "{y", "utf-8");
 
@@ -212,7 +208,6 @@ describe("auth-store", () => {
   });
 
   it("reports unstable auth state when the shared barrier read times out", async () => {
-    const authDir = tempDirs.make("openclaw-wa-auth-unstable-state-");
     fsSync.writeFileSync(
       path.join(authDir, "creds.json"),
       JSON.stringify({ me: { id: "15551234567@s.whatsapp.net" } }),

@@ -86,6 +86,39 @@ const workboard = {
 };
 
 const reviewToken = "a".repeat(64);
+function inventory(plugins: unknown[] = [], mutationAllowed = true) {
+  managementMocks.list.mockResolvedValue({ plugins, diagnostics: [], mutationAllowed });
+}
+function declared(overrides = {}) {
+  return {
+    channels: [],
+    providers: [],
+    tools: [],
+    contracts: [],
+    hooks: [],
+    mcpServers: [],
+    cliCommands: [],
+    cliBackends: [],
+    skills: [],
+    dangerousConfigFlags: [],
+    ...overrides,
+  };
+}
+const grants = {
+  hooks: {
+    allowPromptInjection: { effective: false },
+    allowConversationAccess: { effective: false },
+  },
+};
+const memoryBundle = {
+  id: "memory-bundle",
+  name: "Memory Bundle",
+  packageName: "@openclaw/memory-bundle",
+  origin: "bundled",
+  installed: false,
+  enabled: false,
+  state: "not-installed",
+};
 
 describe("plugin management Gateway handlers", () => {
   beforeEach(() => {
@@ -108,18 +141,14 @@ describe("plugin management Gateway handlers", () => {
           replacement: "getSessionEntryAsync",
         }),
       );
-      managementMocks.list.mockResolvedValue({
-        plugins: [
-          {
-            ...workboard,
-            id: "deprecated-sdk-fixture",
-            clawhubPackage: "@openclaw/workboard",
-          },
-          { ...workboard, id: "local-only" },
-        ],
-        diagnostics: [],
-        mutationAllowed: true,
-      });
+      inventory([
+        {
+          ...workboard,
+          id: "deprecated-sdk-fixture",
+          clawhubPackage: "@openclaw/workboard",
+        },
+        { ...workboard, id: "local-only" },
+      ]);
       const result = await callHandler("plugins.list", {});
       expect(result.ok).toBe(true);
       expect(result.response).toMatchObject({
@@ -202,25 +231,9 @@ describe("plugin management Gateway handlers", () => {
         enabled: false,
       },
       source: { kind: "clawhub", packageName: "community/plugin" },
-      declared: {
-        channels: [],
-        providers: [],
-        tools: [],
-        contracts: [],
-        hooks: [],
-        mcpServers: [],
-        cliCommands: [],
-        cliBackends: [],
-        skills: [],
-        dangerousConfigFlags: [],
-      },
+      declared: declared(),
       components: emptyInstalledPluginComponents(),
-      grants: {
-        hooks: {
-          allowPromptInjection: { effective: false },
-          allowConversationAccess: { effective: false },
-        },
-      },
+      grants,
     } as const;
     managementMocks.inspect.mockResolvedValue(inspection);
     catalogMocks.detail.mockImplementation(() => new Promise(() => {}));
@@ -328,12 +341,12 @@ describe("plugin management Gateway handlers", () => {
   it.each([{}, { query: "memory" }])(
     "starts remote discovery while inventory is pending: %j",
     async (params) => {
-      const inventory = Promise.withResolvers<{
+      const pendingInventory = Promise.withResolvers<{
         plugins: (typeof workboard)[];
         diagnostics: [];
         mutationAllowed: boolean;
       }>();
-      managementMocks.list.mockReturnValue(inventory.promise);
+      managementMocks.list.mockReturnValue(pendingInventory.promise);
       catalogMocks.overview.mockResolvedValue({ items: [], categories: [] });
       catalogMocks.browse.mockResolvedValue({ items: [] });
       const request = callHandler("plugins.catalog.browse", params);
@@ -342,7 +355,7 @@ describe("plugin management Gateway handlers", () => {
           catalogMocks.overview.mock.calls.length + catalogMocks.browse.mock.calls.length,
         ).toBe(1);
       } finally {
-        inventory.resolve({ plugins: [workboard], diagnostics: [], mutationAllowed: true });
+        pendingInventory.resolve({ plugins: [workboard], diagnostics: [], mutationAllowed: true });
         await request;
       }
       expect(await request).toMatchObject({ ok: true });
@@ -393,11 +406,7 @@ describe("plugin management Gateway handlers", () => {
       skills: [],
       versions: [{ version: "1.0.0", createdAt: 100, changelog: "", tags: ["latest"] }],
     });
-    managementMocks.list.mockResolvedValue({
-      plugins: [],
-      diagnostics: [],
-      mutationAllowed: false,
-    });
+    inventory([], false);
 
     const result = await callHandler("plugins.catalog.get", {
       id: "ch_bWVtb3J5LXBsdXM",
@@ -436,11 +445,7 @@ describe("plugin management Gateway handlers", () => {
   ])(
     "uses only proven ClawHub identity for offline detail: $label",
     async ({ plugin, matches }) => {
-      managementMocks.list.mockResolvedValue({
-        plugins: [plugin],
-        diagnostics: [],
-        mutationAllowed: true,
-      });
+      inventory([plugin]);
       managementMocks.inspect.mockResolvedValue({
         declared: {
           tools: ["workboard_read"],
@@ -515,11 +520,7 @@ describe("plugin management Gateway handlers", () => {
       categories: ["models"],
       capabilityCategories: ["media"],
     };
-    managementMocks.list.mockResolvedValue({
-      plugins: [provider],
-      diagnostics: [],
-      mutationAllowed: true,
-    });
+    inventory([provider]);
     catalogMocks.browse.mockResolvedValueOnce({ items: [], nextCursor: "media-next" });
     const first = await callHandler("plugins.catalog.browse", { category: "media" });
     const expectedItem = {
@@ -574,13 +575,9 @@ describe("plugin management Gateway handlers", () => {
           "ClawHub is unavailable: service unavailable. Installed plugins remain available.",
       },
     });
-    managementMocks.list.mockResolvedValue({
-      plugins: [
-        { ...provider, enabled: false, state: "disabled", capabilityCategories: undefined },
-      ],
-      diagnostics: [],
-      mutationAllowed: true,
-    });
+    inventory([
+      { ...provider, enabled: false, state: "disabled", capabilityCategories: undefined },
+    ]);
     catalogMocks.browse.mockResolvedValueOnce({ items: [] });
     const disabledMedia = await callHandler("plugins.catalog.browse", { category: "media" });
     expect(disabledMedia).toMatchObject({ ok: true, response: { items: [] } });
@@ -597,11 +594,7 @@ describe("plugin management Gateway handlers", () => {
 
   it("preserves a failed browse cursor so the same page remains retryable", async () => {
     catalogMocks.browse.mockRejectedValue(new Error("service unavailable"));
-    managementMocks.list.mockResolvedValue({
-      plugins: [],
-      diagnostics: [],
-      mutationAllowed: true,
-    });
+    inventory();
 
     const result = await callHandler("plugins.catalog.browse", {
       intent: "all",
@@ -628,21 +621,7 @@ describe("plugin management Gateway handlers", () => {
         runtimeId: "memory-plus",
       };
       catalogMocks.browse.mockResolvedValue({ items: [remote] });
-      managementMocks.list.mockResolvedValue({
-        plugins: [
-          {
-            id: "memory-bundle",
-            name: "Memory Bundle",
-            packageName: "@openclaw/memory-bundle",
-            origin: "bundled",
-            installed: false,
-            enabled: false,
-            state: "not-installed",
-          },
-        ],
-        diagnostics: [],
-        mutationAllowed: true,
-      });
+      inventory([memoryBundle]);
 
       const result = await callHandler("plugins.catalog.browse", {
         query: "memory",
@@ -669,21 +648,7 @@ describe("plugin management Gateway handlers", () => {
   );
 
   it("keeps queried Bundled requests limited to unpublished bundled plugins", async () => {
-    managementMocks.list.mockResolvedValue({
-      plugins: [
-        {
-          id: "memory-bundle",
-          name: "Memory Bundle",
-          packageName: "@openclaw/memory-bundle",
-          origin: "bundled",
-          installed: false,
-          enabled: false,
-          state: "not-installed",
-        },
-      ],
-      diagnostics: [],
-      mutationAllowed: true,
-    });
+    inventory([memoryBundle]);
 
     const result = await callHandler("plugins.catalog.browse", {
       query: "memory",
@@ -711,21 +676,17 @@ describe("plugin management Gateway handlers", () => {
       category: "tools",
       install: { source: "official" as const, pluginId: "workboard" },
     };
-    managementMocks.list.mockResolvedValue({
-      plugins: [
-        localOnly,
-        {
-          id: "other-plugin",
-          packageName: "workboard",
-          name: "Alias collision",
-          installed: false,
-          enabled: false,
-          state: "not-installed",
-        },
-      ],
-      diagnostics: [],
-      mutationAllowed: true,
-    });
+    inventory([
+      localOnly,
+      {
+        id: "other-plugin",
+        packageName: "workboard",
+        name: "Alias collision",
+        installed: false,
+        enabled: false,
+        state: "not-installed",
+      },
+    ]);
     managementMocks.inspect.mockResolvedValue({
       ok: true,
       plugin: localOnly,
@@ -737,25 +698,15 @@ describe("plugin management Gateway handlers", () => {
           contracts: {},
         },
       },
-      declared: {
+      declared: declared({
         channels: ["workboard-chat"],
         providers: ["workboard-models"],
         tools: ["workboard_read"],
-        contracts: [],
-        hooks: [],
         mcpServers: ["workboard"],
-        cliCommands: [],
-        cliBackends: [],
         skills: ["Workboard planning"],
-        dangerousConfigFlags: [],
-      },
+      }),
       components: emptyInstalledPluginComponents(),
-      grants: {
-        hooks: {
-          allowPromptInjection: { effective: false },
-          allowConversationAccess: { effective: false },
-        },
-      },
+      grants,
     });
 
     const result = await callHandler("plugins.catalog.get", {

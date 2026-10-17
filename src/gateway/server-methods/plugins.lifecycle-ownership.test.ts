@@ -29,26 +29,19 @@ const applyRuntime = vi.fn<NonNullable<GatewayRequestContext["applyPluginLifecyc
 const context: Pick<GatewayRequestContext, "applyPluginLifecycleChange"> = {
   applyPluginLifecycleChange: applyRuntime,
 };
-const lifecycleRequests = [
-  {
-    method: "plugins.reload",
-    params: { plugins: [{ pluginId: "workboard" }] },
-    operation: managementMocks.reload,
-  },
-] as const;
 type ManagedMutationOptions = Pick<
   Parameters<typeof installManagedPlugin>[0],
   "applyRuntime" | "beforePersistentApply" | "signal"
 >;
 
 async function callHandler(
-  method: string,
-  params: Record<string, unknown>,
   invocation: Pick<
     GatewayRequestHandlerOptions,
     "signal" | "sessionMutationCommitGuard" | "hasCurrentClientAuthority"
   >,
 ) {
+  const method = "plugins.reload";
+  const params = { plugins: [{ pluginId: "workboard" }] };
   let ok: boolean | null = null;
   let error: ErrorShape | undefined;
   await expectDefined(
@@ -68,6 +61,25 @@ async function callHandler(
     },
   });
   return { ok, error };
+}
+function applyReload(options: ManagedMutationOptions, assertInvokerOwned?: () => void) {
+  return expectDefined(
+    options.applyRuntime,
+    "managed runtime apply",
+  )({
+    config: {},
+    pluginIds: ["workboard"],
+    reason: "reload",
+    assertInvokerOwned,
+  });
+}
+async function waitForPublication(entered: Promise<unknown>, pending: Promise<unknown>) {
+  await Promise.race([
+    entered,
+    pending.then(() => {
+      throw new Error("reload completed before queued publication");
+    }),
+  ]);
 }
 
 describe("plugin lifecycle invoker ownership", () => {
@@ -96,35 +108,18 @@ describe("plugin lifecycle invoker ownership", () => {
       },
     );
     managementMocks.reload.mockImplementation(async (options: ManagedMutationOptions) => ({
-      application: await expectDefined(
-        options.applyRuntime,
-        "managed runtime apply",
-      )({
-        config: {},
-        pluginIds: ["workboard"],
-        reason: "reload",
-        assertInvokerOwned: () => {
-          if (!leaseOwned) {
-            throw failure;
-          }
-        },
+      application: await applyReload(options, () => {
+        if (!leaseOwned) {
+          throw failure;
+        }
       }),
     }));
-    const pending = callHandler(
-      "plugins.reload",
-      { plugins: [{ pluginId: "workboard" }] },
-      {
-        signal: controller.signal,
-        sessionMutationCommitGuard: requestGuard,
-      },
-    );
+    const pending = callHandler({
+      signal: controller.signal,
+      sessionMutationCommitGuard: requestGuard,
+    });
     try {
-      await Promise.race([
-        entered.promise,
-        pending.then(() => {
-          throw new Error("reload completed before queued publication");
-        }),
-      ]);
+      await waitForPublication(entered.promise, pending);
       leaseOwned = false;
       released.resolve();
       expect(await pending).toMatchObject({
@@ -171,33 +166,21 @@ describe("plugin lifecycle invoker ownership", () => {
       };
     };
 
-    it.each(lifecycleRequests)(
-      "rejects $method before management dispatch",
-      async ({ method, params, operation }) => {
-        const owner = createInvocation();
-        operation.mockResolvedValue({ application });
-        owner.close();
-        expect(await callHandler(method, params, owner.invocation)).toMatchObject({
-          ok: false,
-          error: { code: "UNAVAILABLE", message: owner.failure.message },
-        });
-        expect(operation).not.toHaveBeenCalled();
-        expect(applyRuntime).not.toHaveBeenCalled();
-      },
-    );
+    it("rejects reload before management dispatch", async () => {
+      const owner = createInvocation();
+      managementMocks.reload.mockResolvedValue({ application });
+      owner.close();
+      expect(await callHandler(owner.invocation)).toMatchObject({
+        ok: false,
+        error: { code: "UNAVAILABLE", message: owner.failure.message },
+      });
+      expect(managementMocks.reload).not.toHaveBeenCalled();
+      expect(applyRuntime).not.toHaveBeenCalled();
+    });
 
-    it.each(
-      lifecycleRequests.flatMap(({ method, params, operation }) =>
-        (["persistence", "runtime", "publication"] as const).map((checkpoint) => ({
-          method,
-          params,
-          operation,
-          checkpoint,
-        })),
-      ),
-    )(
-      "rejects retained $method $checkpoint work after an await",
-      async ({ method, params, operation, checkpoint }) => {
+    it.each(["persistence", "runtime", "publication"] as const)(
+      "rejects retained reload %s work after an await",
+      async (checkpoint) => {
         const owner = createInvocation();
         const entered = createDeferred();
         const paused = createDeferred();
@@ -213,7 +196,7 @@ describe("plugin lifecycle invoker ownership", () => {
             },
           );
         }
-        operation.mockImplementation(async (options: ManagedMutationOptions) => {
+        managementMocks.reload.mockImplementation(async (options: ManagedMutationOptions) => {
           if (checkpoint !== "publication") {
             entered.resolve();
             await paused.promise;
@@ -223,26 +206,12 @@ describe("plugin lifecycle invoker ownership", () => {
             persist();
             return { application };
           }
-          return {
-            application: await expectDefined(
-              options.applyRuntime,
-              "managed runtime apply",
-            )({
-              config: {},
-              pluginIds: ["workboard"],
-              reason: "reload",
-            }),
-          };
+          return { application: await applyReload(options) };
         });
-        const pending = callHandler(method, params, owner.invocation);
+        const pending = callHandler(owner.invocation);
         try {
-          await Promise.race([
-            entered.promise,
-            pending.then(() => {
-              throw new Error(`${method} completed before queued ${checkpoint}`);
-            }),
-          ]);
-          expect(operation).toHaveBeenCalledOnce();
+          await waitForPublication(entered.promise, pending);
+          expect(managementMocks.reload).toHaveBeenCalledOnce();
           owner.close();
           paused.resolve();
           expect(await pending).toMatchObject({
@@ -251,7 +220,7 @@ describe("plugin lifecycle invoker ownership", () => {
           });
           expect(persist).not.toHaveBeenCalled();
           expect(applyRuntime).toHaveBeenCalledTimes(checkpoint === "publication" ? 1 : 0);
-          expect(operation).toHaveBeenCalledWith(
+          expect(managementMocks.reload).toHaveBeenCalledWith(
             expect.objectContaining({
               signal: owner.invocation.signal,
               beforePersistentApply: expect.any(Function),

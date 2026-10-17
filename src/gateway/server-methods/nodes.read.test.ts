@@ -1,5 +1,5 @@
 import { expectDefined } from "@openclaw/normalization-core";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { prepareDevicePairingBinding } from "../../infra/device-pairing-binding.js";
 import type { PairedDevice } from "../../infra/device-pairing.js";
 import { resolveNodePairingState } from "../../infra/device-pairing.js";
@@ -96,15 +96,31 @@ async function invoke(
   return respond;
 }
 
+async function request(
+  registry: NodeRegistry,
+  method = "node.list",
+  params: Record<string, unknown> = {},
+  client?: GatewayRequestHandlerOptions["client"],
+) {
+  const respond = await invoke(registry, method, params, client);
+  expect(respond).toHaveBeenCalledWith(true, expect.anything(), undefined);
+  return respond.mock.calls[0]![1];
+}
+
+const publishPairing = (paired: PairedDevice[]) =>
+  readPairingSnapshotMock.mockResolvedValue(createDevicePairingNodeSnapshot(paired));
+const sampleStats = { cpuCount: 4, memoryTotalBytes: 8192, memoryFreeBytes: 4096 };
+
 describe("node read projections", () => {
+  beforeEach(() => resolveLocalNodeIdMock.mockResolvedValue(undefined));
   it("uses current node bindings when pairing publications replace historical roles", async () => {
     const current = createPairedNode("current-node");
     const revoked = createPairedNode("revoked-node");
     const operator = createPairedNode("operator-device");
     // Devices without approved surfaces are still listed if they hold a current node token.
-    delete current.nodeSurface;
-    delete revoked.nodeSurface;
-    delete operator.nodeSurface;
+    for (const device of [current, revoked, operator]) {
+      delete device.nodeSurface;
+    }
     revoked.tokens!.node!.revokedAtMs = 2;
     operator.roles = ["operator"];
     operator.tokens = {
@@ -112,16 +128,12 @@ describe("node read projections", () => {
     };
     const registry = new NodeRegistry();
     const paired = [current, revoked, operator];
-    readPairingSnapshotMock.mockResolvedValue(createDevicePairingNodeSnapshot(paired));
-    resolveLocalNodeIdMock.mockResolvedValue(undefined);
-    const readIds = async () => {
-      const respond = await invoke(registry, "node.list", {});
-      expect(respond).toHaveBeenCalledWith(true, expect.anything(), undefined);
-      return respond.mock.calls[0]![1].nodes.map((node: NodeListNode) => node.nodeId);
-    };
+    publishPairing(paired);
+    const readIds = async () =>
+      (await request(registry)).nodes.map((node: NodeListNode) => node.nodeId);
     expect(await readIds()).toEqual(["current-node"]);
     current.tokens!.node!.revokedAtMs = 3;
-    readPairingSnapshotMock.mockResolvedValue(createDevicePairingNodeSnapshot(paired));
+    publishPairing(paired);
     expect(await readIds()).toEqual([]);
   });
 
@@ -129,16 +141,12 @@ describe("node read projections", () => {
     const paired = createPairedNode("cached-node");
     const registry = new NodeRegistry();
     const client = registerNode(registry, paired);
-    readPairingSnapshotMock.mockResolvedValue(createDevicePairingNodeSnapshot([paired]));
-    resolveLocalNodeIdMock.mockResolvedValue(undefined);
+    publishPairing([paired]);
     const admin = {
       connect: { scopes: ["operator.admin"] },
     } as GatewayRequestHandlerOptions["client"];
-    const read = async () => {
-      const respond = await invoke(registry, "node.list", {}, admin);
-      expect(respond).toHaveBeenCalledWith(true, expect.anything(), undefined);
-      return respond.mock.calls[0]![1].nodes[0] as NodeListNode;
-    };
+    const read = async (): Promise<NodeListNode> =>
+      (await request(registry, "node.list", {}, admin)).nodes[0];
     try {
       const initial = await read();
       expect(initial).toMatchObject({ nodeId: "cached-node", connected: true, commands: [] });
@@ -149,7 +157,7 @@ describe("node read projections", () => {
       registry.updateHostStats({
         nodeId: paired.deviceId,
         connId: client.connId,
-        stats: { cpuCount: 4, memoryTotalBytes: 8192, memoryFreeBytes: 4096 },
+        stats: sampleStats,
         observedAtMs: 100,
       });
       const stats = await read();
@@ -159,7 +167,7 @@ describe("node read projections", () => {
       expect(await read()).toBe(stats);
 
       paired.nodeSurface!.displayName = "Renamed node";
-      readPairingSnapshotMock.mockResolvedValue(createDevicePairingNodeSnapshot([paired]));
+      publishPairing([paired]);
       const renamed = await read();
       expect(renamed.displayName).toBe("Renamed node");
       expect(await read()).toBe(renamed);
@@ -170,7 +178,7 @@ describe("node read projections", () => {
       expect(offline.hostStats).toBeUndefined();
       expect(await read()).toBe(offline);
 
-      readPairingSnapshotMock.mockResolvedValue(createDevicePairingNodeSnapshot([]));
+      publishPairing([]);
       expect(await read()).toBeUndefined();
     } finally {
       registry.unregister(client.connId);
@@ -187,7 +195,7 @@ describe("node read projections", () => {
         }),
     );
     const registered = registerNode(nodeRegistry, pairedNode);
-    const stats = { cpuCount: 4, memoryTotalBytes: 8192, memoryFreeBytes: 4096 };
+    const stats = sampleStats;
     const lastHostStats = { ...stats, memoryFreeBytes: 1024, updatedAtMs: 50_000 };
     pairedNode.nodeSurface!.lastHostStats = lastHostStats;
     recordHostStatsMock.mockReset().mockImplementation(async ({ hostStats }) => {
@@ -197,32 +205,14 @@ describe("node read projections", () => {
     readPairingSnapshotMock.mockImplementation(async () =>
       createDevicePairingNodeSnapshot([pairedNode]),
     );
-    resolveLocalNodeIdMock.mockResolvedValue(undefined);
     const sendStats = () =>
-      invoke(
-        nodeRegistry,
-        "node.event",
-        {
-          event: "node.host.stats",
-          payload: stats,
-        },
-        registered,
-      );
-    const readNode = async (): Promise<NodeListNode> => {
-      const respond = await invoke(nodeRegistry, "node.list", {});
-      expect(respond).toHaveBeenCalledWith(true, expect.anything(), undefined);
-      return respond.mock.calls[0]?.[1].nodes[0];
-    };
+      invoke(nodeRegistry, "node.event", { event: "node.host.stats", payload: stats }, registered);
+    const readNode = async (): Promise<NodeListNode> => (await request(nodeRegistry)).nodes[0];
 
     try {
       expect(await sendStats()).toHaveBeenCalledWith(
         true,
-        {
-          ok: true,
-          event: "node.host.stats",
-          handled: true,
-          reason: "updated",
-        },
+        { ok: true, event: "node.host.stats", handled: true, reason: "updated" },
         undefined,
       );
       const hostStats = nodeRegistry.get(pairedNode.deviceId)!.hostStats!;
@@ -270,13 +260,7 @@ describe("node read projections", () => {
     const pairedNodes = [createPairedNode(localNodeId), createPairedNode(remoteNodeId)];
     const runtime = createNodeRegistryRuntime(() => new NodeRegistry());
     const { nodeRegistry } = runtime;
-    let remoteClient: ReturnType<typeof registerNode> | undefined;
-    for (const pairedNode of pairedNodes) {
-      const client = registerNode(nodeRegistry, pairedNode);
-      if (pairedNode.deviceId === remoteNodeId) {
-        remoteClient = client;
-      }
-    }
+    const [, remoteClient] = pairedNodes.map((paired) => registerNode(nodeRegistry, paired));
     expect(
       updateNodeRunnerInventory({
         registry: nodeRegistry,
@@ -285,16 +269,10 @@ describe("node read projections", () => {
         declaration: { protocolFeatures: ["node-worker-supervisor-v1"] },
       }),
     ).toEqual({ changed: true });
-    readPairingSnapshotMock.mockResolvedValue(createDevicePairingNodeSnapshot(pairedNodes));
+    publishPairing(pairedNodes);
     resolveLocalNodeIdMock.mockResolvedValue(localNodeId);
 
-    async function request(method: "node.list" | "node.describe", params: Record<string, unknown>) {
-      const respond = await invoke(nodeRegistry, method, params);
-      expect(respond).toHaveBeenCalledWith(true, expect.anything(), undefined);
-      return respond.mock.calls[0]?.[1];
-    }
-
-    const list = (await request("node.list", {})) as {
+    const list = (await request(nodeRegistry)) as {
       nodes: Array<{ nodeId: string; gatewayLocal?: boolean; issues?: unknown[] }>;
     };
     expect(list.nodes.filter((node) => node.gatewayLocal)).toEqual([
@@ -308,10 +286,12 @@ describe("node read projections", () => {
       NODE_RUNNER_UPDATE_REQUIRED_ISSUE,
     ]);
 
-    await expect(request("node.describe", { nodeId: localNodeId })).resolves.toEqual(
+    await expect(request(nodeRegistry, "node.describe", { nodeId: localNodeId })).resolves.toEqual(
       expect.objectContaining({ nodeId: localNodeId, gatewayLocal: true }),
     );
-    await expect(request("node.describe", { nodeId: remoteNodeId })).resolves.toMatchObject({
+    await expect(
+      request(nodeRegistry, "node.describe", { nodeId: remoteNodeId }),
+    ).resolves.toMatchObject({
       issues: [NODE_RUNNER_UPDATE_REQUIRED_ISSUE],
     });
   });

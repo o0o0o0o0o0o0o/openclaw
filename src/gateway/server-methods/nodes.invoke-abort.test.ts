@@ -61,6 +61,19 @@ const session = {
   commands: ["ollama.chat"],
   client: { invalidated: false },
 };
+const connect = {
+  minProtocol: 3,
+  maxProtocol: 3,
+  client: { id: "gateway-client", version: "internal", platform: "node", mode: "backend" },
+  role: "operator",
+  scopes: ["operator.admin", "operator.write"],
+} satisfies NonNullable<GatewayRequestHandlerOptions["client"]>["connect"];
+function createStream(isRuntimeCurrent = () => true) {
+  return { onProgress: vi.fn(), onDispatchReady: vi.fn(), isRuntimeCurrent };
+}
+function expectFailure(respond: ReturnType<typeof vi.fn>, error: Record<string, unknown>) {
+  expect(respond).toHaveBeenCalledWith(false, undefined, expect.objectContaining(error));
+}
 
 beforeEach(() => {
   resetNodeWakeStateForTest();
@@ -122,13 +135,7 @@ function createNodeInvokeStreamClient(
   options?: { synthetic?: boolean; owner?: boolean },
 ): NonNullable<GatewayRequestHandlerOptions["client"]> {
   return {
-    connect: {
-      minProtocol: 3,
-      maxProtocol: 3,
-      client: { id: "gateway-client", version: "internal", platform: "node", mode: "backend" },
-      role: "operator",
-      scopes: ["operator.write"],
-    },
+    connect: { ...connect, scopes: ["operator.write"] },
     internal: {
       ...(options?.synthetic === false ? {} : { syntheticClient: true }),
       ...(options?.owner === false ? {} : { pluginRuntimeOwnerId: "duplex-fixture" }),
@@ -160,11 +167,9 @@ describe("node.invoke caller cancellation", () => {
       try {
         const client: NonNullable<GatewayRequestHandlerOptions["client"]> = {
           connect: {
-            minProtocol: 3,
-            maxProtocol: 3,
-            role: "operator",
+            ...connect,
             scopes: ["operator.admin"],
-            client: { id: "gateway-client", version: "test", platform: "node", mode: "backend" },
+            client: { ...connect.client, version: "test" },
           },
           ...(bound
             ? {
@@ -194,23 +199,19 @@ describe("node.invoke caller cancellation", () => {
           command: "computer.act",
           ...nativeDetails,
         };
-        expect(respond).toHaveBeenCalledWith(
-          false,
-          undefined,
-          expect.objectContaining({
-            message: expect.stringContaining(
-              "Accessibility, Event Posting, Screen Recording, Computer Control required on node paired-node",
-            ),
-            details: expect.objectContaining({
-              nodeError: {
-                code: "PERMISSION_MISSING",
-                message: "Native permissions missing",
-                details: nativeDetails,
-              },
-              permissionMissing,
-            }),
+        expectFailure(respond, {
+          message: expect.stringContaining(
+            "Accessibility, Event Posting, Screen Recording, Computer Control required on node paired-node",
+          ),
+          details: expect.objectContaining({
+            nodeError: {
+              code: "PERMISSION_MISSING",
+              message: "Native permissions missing",
+              details: nativeDetails,
+            },
+            permissionMissing,
           }),
-        );
+        });
         const error = respond.mock.calls[0]?.[2];
         expect(error.message).toContain("Do not retry until the user confirms");
         expect(error.message.includes("shown a Grant card")).toBe(bound);
@@ -237,10 +238,8 @@ describe("node.invoke caller cancellation", () => {
   it("carries trusted plugin duplex hooks through the canonical paired dispatch", async () => {
     let runtimeCurrent = true;
     const stream = {
-      onProgress: vi.fn(),
-      onDispatchReady: vi.fn(),
+      ...createStream(() => runtimeCurrent),
       idleTimeoutMs: 5_000,
-      isRuntimeCurrent: () => runtimeCurrent,
     };
     const invoke = vi.fn(
       async (params: {
@@ -288,11 +287,7 @@ describe("node.invoke caller cancellation", () => {
     { name: "network client", synthetic: false },
     { name: "ownerless synthetic client", owner: false },
   ])("ignores duplex hooks on an untrusted $name", async (clientOptions) => {
-    const stream = {
-      onProgress: vi.fn(),
-      onDispatchReady: vi.fn(),
-      isRuntimeCurrent: () => false,
-    };
+    const stream = createStream(() => false);
     const invoke = vi.fn(
       async (params: {
         onProgress?: (chunk: string) => void;
@@ -321,11 +316,7 @@ describe("node.invoke caller cancellation", () => {
       ok: false,
       message: "system.run approval could not be verified",
     });
-    const stream = {
-      onProgress: vi.fn(),
-      onDispatchReady: vi.fn(),
-      isRuntimeCurrent: () => true,
-    };
+    const stream = createStream();
     const invoke = vi.fn();
 
     const { invocation, respond } = startNodeInvoke({
@@ -339,21 +330,13 @@ describe("node.invoke caller cancellation", () => {
     expect(mocks.sanitizeNodeInvokeParamsForForwarding).toHaveBeenCalledOnce();
     expect(invoke).not.toHaveBeenCalled();
     expect(stream.onDispatchReady).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ message: "system.run approval could not be verified" }),
-    );
+    expectFailure(respond, { message: "system.run approval could not be verified" });
   });
 
   it("rejects private controls before public policy and dispatch", async () => {
     const command = NODE_WORKER_SUPERVISOR_STATUS_COMMAND;
     const invoke = vi.fn();
-    const stream = {
-      onProgress: vi.fn(),
-      onDispatchReady: vi.fn(),
-      isRuntimeCurrent: () => true,
-    };
+    const stream = createStream();
     const { invocation, respond } = startNodeInvoke({
       invoke,
       command,
@@ -368,11 +351,7 @@ describe("node.invoke caller cancellation", () => {
     expect(mocks.resolveNodeCommandAllowlist).not.toHaveBeenCalled();
     expect(mocks.applyPluginNodeInvokePolicy).not.toHaveBeenCalled();
     expect(stream.onDispatchReady).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ message: expect.stringContaining("private") }),
-    );
+    expectFailure(respond, { message: expect.stringContaining("private") });
   });
 
   it("cancels paired-node work without breaking pairing lifecycle identity", async () => {
@@ -399,15 +378,11 @@ describe("node.invoke caller cancellation", () => {
     await invocation;
 
     expect(invocationSignal.aborted).toBe(true);
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({
-        details: expect.objectContaining({
-          nodeError: expect.objectContaining({ code: "ABORTED" }),
-        }),
+    expectFailure(respond, {
+      details: expect.objectContaining({
+        nodeError: expect.objectContaining({ code: "ABORTED" }),
       }),
-    );
+    });
   });
 });
 
@@ -420,13 +395,7 @@ it.each([true, false])(
     }));
     const operationalRunInstance = createOperationalRunInstanceRef("captured-source-run");
     const client: NonNullable<GatewayRequestHandlerOptions["client"]> = {
-      connect: {
-        minProtocol: 3,
-        maxProtocol: 3,
-        client: { id: "gateway-client", version: "internal", platform: "node", mode: "backend" },
-        role: "operator",
-        scopes: ["operator.admin", "operator.write"],
-      },
+      connect,
       ...(bound
         ? {
             internal: {

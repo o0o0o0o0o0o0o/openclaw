@@ -40,7 +40,17 @@ vi.mock("./nodes.wake.js", () => ({
 const nodeId = "node-1";
 const generation = { nodeId, key: "generation-1" };
 const item = { id: "pending-1", type: "location.request", priority: "high" };
+const wakeResult = { available: true, throttled: false, path: "sent", durationMs: 0 };
 let lifecycle: AbortController;
+const wakeOptions = () => ({
+  wakeReason: "node.pending",
+  cfg: {},
+  lifecycle: lifecycle.signal,
+  generation,
+});
+function expectReply(respond: ReturnType<typeof vi.fn>, payload: unknown) {
+  expect(respond).toHaveBeenCalledWith(true, payload, undefined);
+}
 
 function makeContext(
   getSession: () => { connId: string; pairingGeneration?: string } | undefined = () => undefined,
@@ -104,12 +114,7 @@ describe("node.pending handlers", () => {
       (_nodeId: string, signal: AbortSignal) => !signal.aborted,
     );
     mocks.enqueueNodePendingWork.mockReturnValue({ revision: 4, deduped: false, item });
-    mocks.maybeWakeNodeWithApns.mockResolvedValue({
-      available: true,
-      throttled: false,
-      path: "sent",
-      durationMs: 0,
-    });
+    mocks.maybeWakeNodeWithApns.mockResolvedValue(wakeResult);
     mocks.maybeSendNodeWakeNudge.mockResolvedValue({
       sent: false,
       throttled: false,
@@ -179,12 +184,7 @@ describe("node.pending handlers", () => {
       nodeId,
       generation.key,
     );
-    expect(mocks.maybeWakeNodeWithApns).toHaveBeenCalledWith(nodeId, {
-      wakeReason: "node.pending",
-      cfg: {},
-      lifecycle: lifecycle.signal,
-      generation,
-    });
+    expect(mocks.maybeWakeNodeWithApns).toHaveBeenCalledWith(nodeId, wakeOptions());
     expect(mocks.waitForNodeReconnect).toHaveBeenCalledWith({
       nodeId,
       context,
@@ -194,11 +194,7 @@ describe("node.pending handlers", () => {
     });
     expect(mocks.maybeSendNodeWakeNudge).not.toHaveBeenCalled();
     expect(mocks.releaseNodeWakeLifecycle).toHaveBeenCalledWith(nodeId, lifecycle.signal);
-    expect(respond).toHaveBeenCalledWith(
-      true,
-      { nodeId, revision: 4, queued: item, wakeTriggered: true },
-      undefined,
-    );
+    expectReply(respond, { nodeId, revision: 4, queued: item, wakeTriggered: true });
   });
 
   it.each([
@@ -208,10 +204,9 @@ describe("node.pending handlers", () => {
     "retries a disconnected node only when its first wake is available=$available",
     async ({ available, forces, timeouts }) => {
       mocks.maybeWakeNodeWithApns.mockResolvedValue({
+        ...wakeResult,
         available,
-        throttled: false,
         path: available ? "sent" : "no-registration",
-        durationMs: 0,
       });
       mocks.waitForNodeReconnect.mockResolvedValue(false);
       const respond = await enqueue();
@@ -224,11 +219,7 @@ describe("node.pending handlers", () => {
       expect(mocks.maybeSendNodeWakeNudge).toHaveBeenCalledOnce();
       expect(mocks.removeNodePendingWorkItem).not.toHaveBeenCalled();
       expect(mocks.releaseNodeWakeLifecycle).toHaveBeenCalledWith(nodeId, lifecycle.signal);
-      expect(respond).toHaveBeenCalledWith(
-        true,
-        expect.objectContaining({ wakeTriggered: available }),
-        undefined,
-      );
+      expectReply(respond, expect.objectContaining({ wakeTriggered: available }));
     },
   );
 
@@ -248,12 +239,7 @@ describe("node.pending handlers", () => {
     });
     expectPairingChanged(await enqueue());
     expect(mocks.captureNodeWakeLifecycle).toHaveBeenCalledWith(nodeId, generation.key);
-    expect(mocks.maybeWakeNodeWithApns).toHaveBeenCalledExactlyOnceWith(nodeId, {
-      wakeReason: "node.pending",
-      cfg: {},
-      lifecycle: lifecycle.signal,
-      generation,
-    });
+    expect(mocks.maybeWakeNodeWithApns).toHaveBeenCalledExactlyOnceWith(nodeId, wakeOptions());
     expect(mocks.maybeSendNodeWakeNudge).not.toHaveBeenCalled();
     expect(mocks.releaseNodeWakeLifecycle).toHaveBeenCalledWith(nodeId, lifecycle.signal);
     expect(mocks.removeNodePendingWorkItem).toHaveBeenCalledWith({

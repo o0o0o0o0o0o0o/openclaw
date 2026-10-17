@@ -79,7 +79,7 @@ function waitForFile(filePath) {
     const directory = path.dirname(filePath);
     const filename = path.basename(filePath);
     const watcher = fs.watch(directory, (_event, changed) => {
-      if (changed && changed.toString() !== filename) {
+      if (changed && changed !== filename) {
         return;
       }
       if (fs.existsSync(filePath)) {
@@ -167,7 +167,9 @@ function createProbeServer(
         server.sendToolListChanged();
         // The SDK helper is fire-and-forget. Yield once so the notification is
         // queued before the successful call lets the next request begin.
-        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => {
+          setImmediate(resolve);
+        });
       }
       return buildProbeResult({ label: `${label}-app`, marker, generation });
     });
@@ -291,7 +293,7 @@ async function runStressStdio(label) {
   };
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", (chunk) => {
-    buffer += chunk;
+    buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
     while (true) {
       const newline = buffer.indexOf("\n");
       if (newline < 0) {

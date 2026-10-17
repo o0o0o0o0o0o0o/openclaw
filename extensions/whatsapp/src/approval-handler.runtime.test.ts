@@ -38,6 +38,18 @@ const plannedTarget = {
   target: { to: "15551230000@s.whatsapp.net" },
 };
 
+async function finishPending<T>(operation: T | Promise<T>, complete: () => void) {
+  let settled = false;
+  const pending = Promise.resolve(operation).then((value) => {
+    settled = true;
+    return value;
+  });
+  await tick();
+  expect(settled).toBe(false);
+  complete();
+  return pending;
+}
+
 describe("whatsappApprovalNativeRuntime", () => {
   it("renders allowed thumbs-only reactions in pending exec approvals", async () => {
     const payload = await presentation.buildPendingPayload({
@@ -114,28 +126,14 @@ it("waits for native reaction binding and cleanup completion", async () => {
   };
   const context = approvalContext("exec-pending");
   try {
-    let bindingSettled = false;
-    const binding = Promise.resolve(interactions!.bindPending!({ ...context, entry })).then(
-      (value) => {
-        bindingSettled = true;
-        return value;
-      },
+    await expect(
+      finishPending(interactions!.bindPending!({ ...context, entry }), () =>
+        bindingWrite.resolve(null),
+      ),
+    ).resolves.toBeNull();
+    await finishPending(interactions!.unbindPending!({ ...context, entry, binding: true }), () =>
+      cleanupWrite.resolve(),
     );
-    await tick();
-    expect(bindingSettled).toBe(false);
-    bindingWrite.resolve(null);
-    await expect(binding).resolves.toBeNull();
-
-    let cleanupSettled = false;
-    const cleanup = Promise.resolve(
-      interactions!.unbindPending!({ ...context, entry, binding: true }),
-    ).then(() => {
-      cleanupSettled = true;
-    });
-    await tick();
-    expect(cleanupSettled).toBe(false);
-    cleanupWrite.resolve();
-    await cleanup;
   } finally {
     bindingWrite.resolve(null);
     cleanupWrite.resolve();

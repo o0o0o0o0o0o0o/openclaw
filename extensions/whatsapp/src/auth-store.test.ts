@@ -17,14 +17,11 @@ import {
   restoreCredsFromBackupIfNeeded,
   webAuthExists,
   WhatsAppAuthUnstableError,
-  WHATSAPP_AUTH_UNSTABLE_CODE,
 } from "./auth-store.js";
 import type { CredsQueueWaitResult } from "./creds-persistence.js";
 
 const hoisted = vi.hoisted(() => ({
-  waitForCredsSaveQueueWithTimeout: vi.fn<() => Promise<CredsQueueWaitResult>>(
-    async () => "drained",
-  ),
+  waitForCredsSaveQueueWithTimeout: vi.fn<() => Promise<CredsQueueWaitResult>>(),
   oauthDir: "/tmp/openclaw-wa-auth-store-test-oauth",
 }));
 
@@ -87,19 +84,28 @@ describe("auth-store", () => {
     });
   });
 
-  it("revalidates setup ownership immediately before restoring backup credentials", async () => {
-    writeAuthFiles({ "creds.json": "{x", "creds.json.bak": backupCreds });
-    const guardError = new Error("verified inference route changed");
-
-    await expect(
-      restoreCredsFromBackupIfNeeded(authDir, {
-        beforeCredentialPersistence: async () => {
-          throw guardError;
-        },
-      }),
-    ).rejects.toBe(guardError);
-    expect(fsSync.readFileSync(credsPath, "utf-8")).toBe("{x");
-  });
+  it.each([
+    ["restore", "{x"],
+    ["logout", "{}"],
+  ] as const)(
+    "%s revalidates ownership immediately before credential persistence",
+    async (action, contents) => {
+      writeAuthFiles({ "creds.json": contents });
+      if (action === "restore") {
+        writeAuthFiles({ "creds.json.bak": backupCreds });
+      }
+      const guardError = new Error("verified inference route changed");
+      const beforeCredentialPersistence = async () => {
+        throw guardError;
+      };
+      const operation =
+        action === "restore"
+          ? restoreCredsFromBackupIfNeeded(authDir, { beforeCredentialPersistence })
+          : logoutWeb({ authDir, beforeCredentialPersistence });
+      await expect(operation).rejects.toBe(guardError);
+      expect(fsSync.readFileSync(credsPath, "utf-8")).toBe(contents);
+    },
+  );
 
   it("leaves malformed creds unchanged when the backup is malformed", async () => {
     const authDir = tempDirs.make("openclaw-wa-auth-malformed-backup-");
@@ -155,11 +161,10 @@ describe("auth-store", () => {
 
     await expect(readWebAuthState(authDir)).resolves.toBe("linked");
     const snapshot = await readWebAuthSnapshot(authDir);
-    expect(snapshot.authAgeMs).toBeTypeOf("number");
     expect(snapshot.authAgeMs).toBeGreaterThanOrEqual(-1);
     expect(snapshot).toEqual({
       state: "linked",
-      authAgeMs: snapshot.authAgeMs,
+      authAgeMs: expect.any(Number),
       selfId: {
         e164: "+15551234567",
         jid: "15551234567@s.whatsapp.net",
@@ -189,25 +194,22 @@ describe("auth-store", () => {
     });
   });
 
-  it.runIf(supportsSymlinks)(
-    "treats creds under symlinked auth directories as missing",
-    async () => {
-      const rootDir = tempDirs.make("openclaw-wa-auth-symlink-parent-");
-      const targetAuthDir = path.join(rootDir, "target-auth");
-      authDir = path.join(rootDir, "linked-auth");
-      fsSync.mkdirSync(targetAuthDir);
-      fsSync.writeFileSync(path.join(targetAuthDir, "creds.json"), selfCreds, "utf-8");
-      fsSync.symlinkSync(targetAuthDir, authDir, "dir");
-      credsPath = path.join(authDir, "creds.json");
+  it.runIf(supportsSymlinks)("treats symlinked auth directories as missing", async () => {
+    const rootDir = tempDirs.make("openclaw-wa-auth-symlink-parent-");
+    const targetAuthDir = path.join(rootDir, "target-auth");
+    authDir = path.join(rootDir, "linked-auth");
+    fsSync.mkdirSync(targetAuthDir);
+    fsSync.writeFileSync(path.join(targetAuthDir, "creds.json"), selfCreds, "utf-8");
+    fsSync.symlinkSync(targetAuthDir, authDir, "dir");
+    credsPath = path.join(authDir, "creds.json");
 
-      expect(fsSync.lstatSync(authDir).isSymbolicLink()).toBe(true);
-      expect(fsSync.lstatSync(credsPath).isFile()).toBe(true);
-      expect(hasWebCredsSync(authDir)).toBe(false);
-      expect(readCredsJsonRaw(credsPath)).toBeNull();
-      await expect(webAuthExists(authDir)).resolves.toBe(false);
-      await expect(readWebAuthState(authDir)).resolves.toBe("not-linked");
-    },
-  );
+    expect(fsSync.lstatSync(authDir).isSymbolicLink()).toBe(true);
+    expect(fsSync.lstatSync(credsPath).isFile()).toBe(true);
+    expect(hasWebCredsSync(authDir)).toBe(false);
+    expect(readCredsJsonRaw(credsPath)).toBeNull();
+    await expect(webAuthExists(authDir)).resolves.toBe(false);
+    await expect(readWebAuthState(authDir)).resolves.toBe("not-linked");
+  });
 
   it("reports unstable auth state when the shared barrier read times out", async () => {
     const authDir = tempDirs.make("openclaw-wa-auth-unstable-state-");
@@ -232,21 +234,6 @@ describe("auth-store", () => {
     writeAuthFiles({ "creds.json": "{", "creds.json.bak": backupCreds });
     await expect(logoutWeb({ authDir, runtime: createRuntimeSpies() })).resolves.toBe(true);
     expect(fsSync.existsSync(authDir)).toBe(false);
-  });
-
-  it("revalidates setup ownership immediately before deleting linked credentials", async () => {
-    const guardError = new Error("verified inference route changed");
-    fsSync.writeFileSync(credsPath, "{}", "utf-8");
-
-    await expect(
-      logoutWeb({
-        authDir,
-        beforeCredentialPersistence: async () => {
-          throw guardError;
-        },
-      }),
-    ).rejects.toBe(guardError);
-    expect(fsSync.existsSync(credsPath)).toBe(true);
   });
 
   it("does not delete the whole legacy auth root when targeted cleanup fails", async () => {
@@ -326,15 +313,8 @@ describe("auth-store", () => {
   it("throws a typed unstable-auth error when channel selection times out", async () => {
     hoisted.waitForCredsSaveQueueWithTimeout.mockResolvedValueOnce("timed_out");
 
-    const error = await pickWebChannel("auto", "/tmp/openclaw-wa-auth-unstable").catch(
-      (caught: unknown) => caught,
-    );
+    const error = await pickWebChannel("auto", authDir).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(WhatsAppAuthUnstableError);
-    expect(error).toEqual(
-      Object.assign(new WhatsAppAuthUnstableError(), {
-        code: WHATSAPP_AUTH_UNSTABLE_CODE,
-        name: WhatsAppAuthUnstableError.name,
-      }),
-    );
+    expect(error).toEqual(new WhatsAppAuthUnstableError());
   });
 });

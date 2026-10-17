@@ -178,42 +178,34 @@ describe("web auto-reply terminal failure delivery", () => {
     return { spies, onMessage };
   }
 
-  it("sends a terminal failure final to a direct chat", async () => {
-    const { spies, onMessage } = await startMonitorWithTerminalFailure();
-
-    await sendWebDirectInboundMessage({
-      onMessage,
-      spies,
-      id: "direct-terminal-failure",
-      from: "+1000",
-      to: "+2000",
-      body: "hello",
-    });
-
-    expect(spies.reply).toHaveBeenCalledTimes(1);
-    const sentText = spies.reply.mock.calls[0]?.[0];
-    expect(sentText).toContain(TERMINAL_FAILURE_TEXT);
-    // Suppressing the terminal failure previously left core to substitute its generic
-    // no-visible-reply fallback, which hides the real reason the turn ended.
-    expect(sentText).not.toContain("No reply was generated");
-  });
-
-  it("sends a terminal failure final to a group chat", async () => {
-    const { spies, onMessage } = await startMonitorWithTerminalFailure();
-
-    await sendWebGroupInboundMessage({
-      onMessage,
-      spies,
-      id: "group-terminal-failure",
-      body: "hello",
-      senderE164: "+1000",
-      senderName: "Tester",
-      selfE164: "+2000",
-      selfJid: SELF_JID,
-      mentionedJids: [SELF_JID],
-    });
-
-    expect(spies.reply).toHaveBeenCalledTimes(1);
-    expect(spies.reply.mock.calls[0]?.[0]).toContain(TERMINAL_FAILURE_TEXT);
-  });
+  it.each(["direct", "group"] as const)(
+    "sends a terminal failure final to a %s chat",
+    async (kind) => {
+      const { spies, onMessage } = await startMonitorWithTerminalFailure();
+      const inbound = { onMessage, spies, body: "hello" };
+      if (kind === "direct") {
+        await sendWebDirectInboundMessage({
+          ...inbound,
+          id: "direct-terminal-failure",
+          from: "+1000",
+          to: "+2000",
+        });
+      } else {
+        await sendWebGroupInboundMessage({
+          ...inbound,
+          id: "group-terminal-failure",
+          senderE164: "+1000",
+          senderName: "Tester",
+          selfE164: "+2000",
+          selfJid: SELF_JID,
+          mentionedJids: [SELF_JID],
+        });
+      }
+      expect(spies.reply).toHaveBeenCalledTimes(1);
+      const sentText = spies.reply.mock.calls[0]?.[0];
+      expect(sentText).toContain(TERMINAL_FAILURE_TEXT);
+      // Preserve the terminal reason instead of core's generic no-visible-reply fallback.
+      expect(sentText).not.toContain("No reply was generated");
+    },
+  );
 });

@@ -9,6 +9,7 @@ import {
   restoreRestartHealthMocks,
 } from "../cli/daemon-cli/restart-health.test-helpers.js";
 import { gatewayHealthResponse } from "../gateway/health-response.test-support.js";
+import { syntheticImmutableServiceObservation } from "./update-immutable-activation.test-support.js";
 import type { ImmutableInstallDescriptor } from "./update-immutable-install-schema.js";
 import type { ImmutableServiceObservation } from "./update-immutable-service.js";
 import { waitForImmutableGateway } from "./update-immutable-verification.js";
@@ -62,33 +63,14 @@ const descriptor: ImmutableInstallDescriptor = {
   source: "https://github.com/openclaw/openclaw.git",
 };
 function serviceObservation(): ImmutableServiceObservation {
-  return {
-    phase: "running",
-    definitionDigest: "d".repeat(64),
+  const observed = syntheticImmutableServiceObservation(descriptor, {
     pid: 8000,
-    processStartTicks: "100",
     generationPath: generation.path,
-    runtimePath: descriptor.runtime.path,
-    controlGroup: "/system.slice/synthetic.service",
-    state: {
-      installed: true,
-      loadState: { status: "loaded" },
-      running: true,
-      command: null,
-      env: {},
-      runtime: { status: "running", pid: 8000 },
-    },
-    identity: {
-      scope: "system",
-      unitName: "synthetic.service",
-      unitPath: "/synthetic/service",
-      bus: { address: "synthetic" },
-      busId: "bus",
-      managerOwner: "manager",
-      managerUid: 0,
-      serviceUser: "synthetic",
-    },
-  };
+  });
+  observed.processStartTicks = "100";
+  observed.controlGroup = "/system.slice/synthetic.service";
+  observed.state.env = {};
+  return observed;
 }
 const health = (overrides: Parameters<typeof gatewayHealthResponse>[0] = {}) => {
   const respond = gatewayHealthResponse({

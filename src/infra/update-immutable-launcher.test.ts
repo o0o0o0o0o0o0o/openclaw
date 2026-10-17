@@ -1,10 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createHotSqliteRollbackJournal } from "../../test/helpers/sqlite-hot-journal.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import {
+  fileIdentity,
+  immutableDescriptor,
+  readBytes,
+  readText,
+  withDatabase,
+} from "./package-update-activation-fixtures.test-support.js";
 import {
   resolvePackageActivationAnchor,
   resolvePackageActivationControl,
@@ -13,6 +19,18 @@ import { installImmutableLauncher } from "./update-immutable-generation.js";
 import type { ImmutableInstallDescriptor } from "./update-immutable-install-schema.js";
 
 const temporary = useAutoCleanupTempDirTracker(afterEach);
+const writeGenerationFile = (generation: string, name: string, source: string, mode = 0o444) => {
+  fs.mkdirSync(path.join(generation, "dist"), { recursive: true, mode: 0o755 });
+  fs.writeFileSync(path.join(generation, "package.json"), '{"type":"module"}');
+  fs.writeFileSync(path.join(generation, "dist", name), source, { mode });
+};
+const copyRuntime = (directory: string) => {
+  const runtime = path.join(directory, "node");
+  fs.copyFileSync(process.execPath, runtime);
+  fs.chownSync(runtime, 0, 0);
+  fs.chmodSync(runtime, 0o755);
+  return runtime;
+};
 
 it.runIf(process.platform === "linux" && process.getuid?.() === 0)(
   "execs one physical generation and keeps lazy imports pinned after current changes, refusing an escaping pointer",
@@ -20,22 +38,14 @@ it.runIf(process.platform === "linux" && process.getuid?.() === 0)(
     const fixture = temporary.make("openclaw-immutable-launcher-");
     const root = path.join(fixture, "installation");
     fs.mkdirSync(root, { mode: 0o755 });
-    const runtime = path.join(fixture, "node");
-    fs.copyFileSync(process.execPath, runtime);
-    fs.chownSync(runtime, 0, 0);
-    fs.chmodSync(runtime, 0o755);
+    const runtime = copyRuntime(fixture);
     const previous = path.join(root, "releases", "a".repeat(40));
     const next = path.join(root, "releases", "b".repeat(40));
     for (const { generation, value } of [
       { generation: previous, value: "previous" },
       { generation: next, value: "next" },
     ]) {
-      fs.mkdirSync(path.join(generation, "dist"), { recursive: true, mode: 0o755 });
-      fs.writeFileSync(path.join(generation, "package.json"), '{"type":"module"}');
-      fs.writeFileSync(
-        path.join(generation, "dist", "lazy.js"),
-        `export default ${JSON.stringify(value)};`,
-      );
+      writeGenerationFile(generation, "lazy.js", `export default ${JSON.stringify(value)};`, 0o666);
     }
     fs.symlinkSync(previous, path.join(root, "current"));
     const payload = `
@@ -68,15 +78,11 @@ console.log(JSON.stringify({cwd: process.cwd(), entry: process.argv[1], args: pr
     await expect(installImmutableLauncher({ root, runtimePath: runtime })).rejects.toThrow(
       "conflicts",
     );
-    expect(fs.readFileSync(launcher, "utf8")).toBe("foreign launcher\n");
+    expect(readText(launcher)).toBe("foreign launcher\n");
   },
 );
 
 const suiteTemporary = useAutoCleanupTempDirTracker(afterAll);
-const fileIdentity = (file: string) => {
-  const stat = fs.lstatSync(file, { bigint: true });
-  return `${stat.dev}:${stat.ino}`;
-};
 
 describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
   "immutable launcher activation admission",
@@ -85,10 +91,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
     beforeAll(() => {
       runtime = fs.realpathSync(process.execPath);
       if (fs.statSync(runtime).uid !== 0) {
-        runtime = path.join(suiteTemporary.make("immutable-launcher-runtime-"), "node");
-        fs.copyFileSync(process.execPath, runtime);
-        fs.chownSync(runtime, 0, 0);
-        fs.chmodSync(runtime, 0o755);
+        runtime = copyRuntime(suiteTemporary.make("immutable-launcher-runtime-"));
       }
     });
     afterEach(() => vi.restoreAllMocks());
@@ -107,13 +110,10 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
       const oldSha = "a".repeat(40),
         nextSha = "b".repeat(40);
       for (const sha of [oldSha, nextSha]) {
-        const generation = path.join(root, "releases", sha);
-        fs.mkdirSync(path.join(generation, "dist"), { recursive: true, mode: 0o755 });
-        fs.writeFileSync(path.join(generation, "package.json"), '{"type":"module"}');
-        fs.writeFileSync(
-          path.join(generation, "dist", "index.js"),
+        writeGenerationFile(
+          path.join(root, "releases", sha),
+          "index.js",
           `console.log(${JSON.stringify(sha)});`,
-          { mode: 0o444 },
         );
       }
       fs.symlinkSync(`releases/${oldSha}`, path.join(root, "current"));
@@ -132,31 +132,21 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         buildDigest: "c".repeat(64),
       });
       const descriptor: ImmutableInstallDescriptor = {
-        version: 2,
-        activationEnabled: true,
-        kind: "immutable",
-        root,
-        rootIdentity: fileIdentity(root),
-        releasesIdentity: fileIdentity(path.join(root, "releases")),
-        current: {
-          ...generation(oldSha),
-          pointerIdentity: fileIdentity(path.join(root, "current")),
-        },
-        runtime: { path: runtime, identity: "fixture-runtime" },
-        service: {
+        ...immutableDescriptor(root, oldSha, "c".repeat(64), {
           scope: "system",
           unit: "fixture.service",
           account: "fixture",
           stateDir: path.join(parent, "state"),
           configPath: path.join(parent, "state", "config.json"),
           profile: null,
-        },
-        source: "https://github.com/openclaw/openclaw.git",
+        }),
+        version: 2,
+        activationEnabled: true,
+        runtime: { path: runtime, identity: "fixture-runtime" },
       };
       const write = (activation: unknown, legacy = false) => {
         fs.mkdirSync(control, { mode: 0o755, recursive: true });
-        const db = new DatabaseSync(journal);
-        try {
+        withDatabase(journal, (db) => {
           db.exec(
             `CREATE TABLE IF NOT EXISTS immutable_installation (slot INTEGER PRIMARY KEY, revision INTEGER NOT NULL, descriptor_json TEXT NOT NULL, prepared_json TEXT NOT NULL${legacy ? "" : ", activation_json TEXT NOT NULL"}) STRICT`,
           );
@@ -165,9 +155,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
               ? "INSERT OR REPLACE INTO immutable_installation VALUES (1, 0, ?, 'null')"
               : "INSERT OR REPLACE INTO immutable_installation VALUES (1, 0, ?, 'null', ?)",
           ).run(JSON.stringify(descriptor), ...(legacy ? [] : [JSON.stringify(activation)]));
-        } finally {
-          db.close();
-        }
+        });
         fs.chmodSync(journal, 0o644);
       };
       const select = (sha: string) => {
@@ -189,6 +177,17 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         },
       });
       const launch = () => spawnSync(launcher, [], { encoding: "utf8", timeout: 5000 });
+      const expectLaunch = (stdout = "", context = "") => {
+        const result = launch();
+        expect(
+          { status: result.status, stdout: stdout ? result.stdout.trim() : result.stdout },
+          `${context}: ${result.stderr}`,
+        ).toEqual({ status: stdout ? 0 : 78, stdout });
+      };
+      const seedLauncher = (previous: string) => {
+        fs.writeFileSync(launcher, previous, { mode: 0o755 });
+        fs.mkdirSync(control, { mode: 0o755 });
+      };
       const upgrade = (version: 1 | 2, assertCurrent = () => {}) =>
         installImmutableLauncher({
           root,
@@ -207,6 +206,8 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         select,
         operation,
         launch,
+        expectLaunch,
+        seedLauncher,
         upgrade,
       };
     }
@@ -228,9 +229,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
       ] as const) {
         f.select(selected);
         f.write(f.operation(phase));
-        const result = f.launch();
-        expect(result.status, `${phase}: ${result.stderr}`).toBe(allowed ? 0 : 78);
-        expect(result.stdout.trim(), phase).toBe(allowed ? selected : "");
+        f.expectLaunch(allowed ? selected : "", phase);
       }
     });
 
@@ -258,13 +257,9 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         f.write(f.operation("stopping"));
         original.stdin.end();
         expect(await closed).toBe(0);
-        const replacement = f.launch();
-        expect(replacement.status, replacement.stderr).toBe(78);
-        expect(replacement.stdout).toBe("");
+        f.expectLaunch();
         f.write(f.operation("rollback-starting"));
-        const authorized = f.launch();
-        expect(authorized.status, authorized.stderr).toBe(0);
-        expect(authorized.stdout.trim()).toBe("Gateway admitted");
+        f.expectLaunch("Gateway admitted");
       } finally {
         if (original.exitCode === null) {
           original.kill("SIGKILL");
@@ -281,9 +276,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
       f.write(null, true);
       fs.unlinkSync(path.join(f.root, "current"));
       fs.symlinkSync(`releases/${f.nextSha}`, path.join(f.root, "current"));
-      const result = f.launch();
-      expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout.trim()).toBe(f.nextSha);
+      f.expectLaunch(f.nextSha);
     });
 
     it("admits a version-3 bridge while the published v2 launcher refuses before execution", async () => {
@@ -296,9 +289,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         pins: [],
       };
       f.write(null);
-      const unsupported = f.launch();
-      expect(unsupported.status).toBe(78);
-      expect(unsupported.stdout).toBe("");
+      f.expectLaunch();
       fs.writeFileSync(
         path.join(f.descriptor.current.path, "package.json"),
         JSON.stringify({
@@ -306,15 +297,11 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
           openclaw: { immutableInstallDescriptorVersion: 3 },
         }),
       );
-      const supported = f.launch();
-      expect(supported.status, supported.stderr).toBe(0);
-      expect(supported.stdout.trim()).toBe(f.oldSha);
+      f.expectLaunch(f.oldSha);
       fs.writeFileSync(f.launcher, previousLauncher(2));
-      const before = fs.readFileSync(f.journal);
-      const refused = f.launch();
-      expect(refused.status).toBe(78);
-      expect(refused.stdout).toBe("");
-      expect(fs.readFileSync(f.journal)).toEqual(before);
+      const before = readBytes(f.journal);
+      f.expectLaunch();
+      expect(readBytes(f.journal)).toEqual(before);
     });
 
     it("refuses malformed, unknown and mismatched version-2 startup state", async () => {
@@ -327,18 +314,14 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         f.operation("starting"),
       ]) {
         f.write(activation);
-        const result = f.launch();
-        expect(result.status, result.stderr).toBe(78);
-        expect(result.stdout).toBe("");
+        f.expectLaunch();
       }
       f.write(null);
       fs.unlinkSync(path.join(f.root, "current"));
       fs.symlinkSync(`releases/${f.nextSha}`, path.join(f.root, "current"));
       expect(f.launch().status).toBe(78);
       fs.unlinkSync(f.journal);
-      const missing = f.launch();
-      expect(missing.status, missing.stderr).toBe(78);
-      expect(missing.stdout).toBe("");
+      f.expectLaunch();
     });
 
     it("refuses a hot activation journal without replaying or changing its source bytes", async () => {
@@ -348,11 +331,9 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         path: f.journal,
         mutationSql: "UPDATE immutable_installation SET activation_json='null'",
       });
-      const before = [fs.readFileSync(f.journal), fs.readFileSync(`${f.journal}-journal`)];
-      const result = f.launch();
-      expect(result.status, result.stderr).toBe(78);
-      expect(result.stdout).toBe("");
-      expect([fs.readFileSync(f.journal), fs.readFileSync(`${f.journal}-journal`)]).toEqual(before);
+      const before = [readBytes(f.journal), readBytes(`${f.journal}-journal`)];
+      f.expectLaunch();
+      expect([readBytes(f.journal), readBytes(`${f.journal}-journal`)]).toEqual(before);
     });
 
     it.each([1, 2] as const)(
@@ -360,22 +341,19 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
       async (version) => {
         const f = await setup(false);
         const previous = previousLauncher(version);
-        fs.writeFileSync(f.launcher, previous, { mode: 0o755 });
-        fs.mkdirSync(f.control, { mode: 0o755 });
+        f.seedLauncher(previous);
         await expect(
           installImmutableLauncher({ root: f.root, runtimePath: runtime }),
         ).rejects.toThrow("conflicts");
         const oldIdentity = fileIdentity(f.launcher);
         await f.upgrade(version);
         expect(fileIdentity(f.launcher)).not.toBe(oldIdentity);
-        expect(fs.readFileSync(path.join(f.control, `openclaw-gateway.v${version}`), "utf8")).toBe(
-          previous,
-        );
+        expect(readText(f.control, `openclaw-gateway.v${version}`)).toBe(previous);
         f.write(f.operation("stopping"));
         expect(f.launch().status).toBe(78);
-        const current = fs.readFileSync(f.launcher);
+        const current = readBytes(f.launcher);
         await f.upgrade(version);
-        expect(fs.readFileSync(f.launcher)).toEqual(current);
+        expect(readBytes(f.launcher)).toEqual(current);
       },
     );
 
@@ -384,10 +362,9 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
       async (version) => {
         const f = await setup(false);
         const previous = `#!${runtime}\n// custom operator launcher\n`;
-        fs.writeFileSync(f.launcher, previous, { mode: 0o755 });
-        fs.mkdirSync(f.control, { mode: 0o755 });
+        f.seedLauncher(previous);
         await expect(f.upgrade(version)).rejects.toThrow(`known v${version} upgrade`);
-        expect(fs.readFileSync(f.launcher, "utf8")).toBe(previous);
+        expect(readText(f.launcher)).toBe(previous);
         expect(fs.readdirSync(f.control)).toEqual([]);
       },
     );
@@ -395,8 +372,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
     it("keeps the original launcher when upgrade authority is revoked after backup publication", async () => {
       const f = await setup(false);
       const previous = previousLauncher(1);
-      fs.writeFileSync(f.launcher, previous, { mode: 0o755 });
-      fs.mkdirSync(f.control, { mode: 0o755 });
+      f.seedLauncher(previous);
       let current = true;
       const rename = fs.renameSync;
       vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
@@ -412,8 +388,8 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
           }
         }),
       ).rejects.toThrow("upgrade authority ended");
-      expect(fs.readFileSync(f.launcher, "utf8")).toBe(previous);
-      expect(fs.readFileSync(path.join(f.control, "openclaw-gateway.v1"), "utf8")).toBe(previous);
+      expect(readText(f.launcher)).toBe(previous);
+      expect(readText(f.control, "openclaw-gateway.v1")).toBe(previous);
     });
   },
 );

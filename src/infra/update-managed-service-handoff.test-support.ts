@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import fs from "node:fs";
@@ -26,7 +27,6 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
   let handoff: typeof import("./update-managed-service-handoff.js");
   let receipts: FixtureReceiptChannel;
   beforeAll(async () => {
-    // Compile the child runtime before the case deadline starts.
     handoff = await import("./update-managed-service-handoff.js");
     receipts = await openFixtureReceiptChannel();
   });
@@ -114,13 +114,9 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
       try {
         const original = await start();
         latest = original;
-        if (original.status !== "started") {
-          throw new Error("original helper did not start");
-        }
+        assert(original.status === "started", "original helper did not start");
         const originalHelper = helpers[0];
-        if (!originalHelper) {
-          throw new Error("missing original helper handle");
-        }
+        assert(originalHelper, "missing original helper handle");
         const { prepared, store } = await readPrepared(originalHelper.child);
         originalStore = store;
         await transfer({ kind: "managed-update-handoff", ...original });
@@ -139,9 +135,7 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
         );
         executorPid = Number(await fs.promises.readFile(pidPath, "utf8"));
         const bound = originalStore.read(root);
-        if (bound.kind !== "current") {
-          throw new Error("original executor lease was not published");
-        }
+        assert(bound.kind === "current", "original executor lease was not published");
         expect(bound.lease).toMatchObject({
           helper: { pid: original.pid },
           executor: { pid: executorPid },
@@ -182,10 +176,7 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
         expect(originalStore.read(root)).toEqual(bound);
         expect(originalStore.hasUnsettledChildren(bound.lease)).toBe(false);
         latest = await start();
-        expect(latest.status).toBe("started");
-        if (latest.status !== "started") {
-          throw new Error("settled original owner pinned admission");
-        }
+        assert(latest.status === "started", "settled original owner pinned admission");
         expect(helpers).toHaveLength(2);
         const replacement = helpers[1]!;
         const { prepared: replacementPrepared, store: admittedStore } = await readPrepared(
@@ -218,26 +209,18 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
           failures.push(error);
         }
       };
-      await cleanup(async () => {
-        if (moved) {
-          await fs.promises.rename(displaced, coordinator);
-        }
-      });
+      await cleanup(() => moved && fs.promises.rename(displaced, coordinator));
       await cleanup(() => fs.promises.writeFile(releasePath, "fixture cleanup"));
-      await cleanup(async () => {
-        if (executorPid) {
-          // Cleanup hang guard after the owner released the updater, not a readiness race.
-          await waitForDead(executorPid, AbortSignal.timeout(EXECUTOR_CLEANUP_GUARD_MS));
-        }
-      });
-      await cleanup(async () => {
-        if (latest?.status === "started") {
-          await handoff.cancelManagedServiceUpdateHandoff({
-            kind: "managed-update-handoff",
-            ...latest,
-          });
-        }
-      });
+      // This deadline guards cleanup after release, not updater readiness.
+      await cleanup(
+        () =>
+          executorPid && waitForDead(executorPid, AbortSignal.timeout(EXECUTOR_CLEANUP_GUARD_MS)),
+      );
+      await cleanup(
+        () =>
+          latest?.status === "started" &&
+          handoff.cancelManagedServiceUpdateHandoff({ kind: "managed-update-handoff", ...latest }),
+      );
       await cleanup(cleanupHelpers);
       await cleanup(() => Promise.all(helpers.map(({ closed }) => withTimeout(closed, 15000))));
       await cleanup(() => {
@@ -249,13 +232,12 @@ export function registerPreparedCoordinatorAdmissionTest(params: {
           expect(originalStore.read(root)).toEqual({ kind: "absent" });
         }
       });
-      if (failures.length > 1) {
-        throw new AggregateError(failures, "Prepared coordinator assertion and cleanup failed", {
-          cause: failures[0],
-        });
-      }
-      if (failures.length === 1) {
-        throw failures[0];
+      if (failures.length) {
+        throw failures.length === 1
+          ? failures[0]
+          : new AggregateError(failures, "Prepared coordinator assertion and cleanup failed", {
+              cause: failures[0],
+            });
       }
     },
     60_000,
@@ -321,17 +303,14 @@ export function signalMockManagedUpdateHandoffReady(params: {
       fs.chmodSync(lease.updateLeaseDatabasePath, 0o600);
     }
     db.exec("PRAGMA busy_timeout = 5000;");
-    db.exec(
-      "CREATE TABLE IF NOT EXISTS managed_update_handoffs " +
-        "(install_root TEXT NOT NULL PRIMARY KEY, owner TEXT NOT NULL, " +
-        "payload_json TEXT NOT NULL, updated_at INTEGER NOT NULL) STRICT",
-    );
+    db.exec(`CREATE TABLE IF NOT EXISTS managed_update_handoffs (
+      install_root TEXT NOT NULL PRIMARY KEY, owner TEXT NOT NULL,
+      payload_json TEXT NOT NULL, updated_at INTEGER NOT NULL) STRICT`);
     if (failure !== "absent") {
       db.prepare(
-        "INSERT INTO managed_update_handoffs " +
-          "(install_root, owner, payload_json, updated_at) VALUES (?, ?, ?, ?) " +
-          "ON CONFLICT(install_root) DO UPDATE SET updated_at = excluded.updated_at " +
-          "WHERE owner = excluded.owner AND payload_json = excluded.payload_json",
+        `INSERT INTO managed_update_handoffs (install_root, owner, payload_json, updated_at)
+          VALUES (?, ?, ?, ?) ON CONFLICT(install_root) DO UPDATE SET updated_at = excluded.updated_at
+          WHERE owner = excluded.owner AND payload_json = excluded.payload_json`,
       ).run(lease.updateLeaseKey, owner, payload, Date.now());
     }
   } finally {
@@ -345,8 +324,7 @@ export function signalMockManagedUpdateHandoffReady(params: {
         cleanupDb.exec("PRAGMA busy_timeout = 5000;");
         cleanupDb
           .prepare(
-            "DELETE FROM managed_update_handoffs " +
-              "WHERE install_root = ? AND owner = ? AND payload_json = ?",
+            "DELETE FROM managed_update_handoffs WHERE install_root = ? AND owner = ? AND payload_json = ?",
           )
           .run(lease.updateLeaseKey, owner, payload);
       } finally {
@@ -386,28 +364,21 @@ export async function writeConcurrentManagedHandoffParams(
   }
   const paramsPath = path.join(params.tmpDir, `${params.name}.json`);
   handoffParents.set(paramsPath, parent);
-  await fs.promises.writeFile(
-    paramsPath,
-    `${JSON.stringify(
-      {
-        ...params.baseParams,
-        parentPid,
-        parentStartIdentity: String(startIdentity),
-        parentExitTimeoutMs: 5_000,
-        handoffId: params.owner,
-        updateLeaseOwner: params.owner,
-        stateDatabasePath: params.stateDatabasePath ?? params.baseParams.stateDatabasePath,
-        updateLeaseDatabasePath:
-          params.leaseDatabasePath ?? params.baseParams.updateLeaseDatabasePath,
-        commandArgv: params.commandArgv,
-        triageCommandArgv: [testNodeExecPath, "-e", "process.exit(0)", "--"],
-        triageContextPath: path.join(params.tmpDir, `${params.name}-failure.json`),
-        logPath: path.join(params.tmpDir, `${params.name}.log`),
-        sensitivePaths: [],
-      },
-      null,
-      2,
-    )}\n`,
-  );
+  const prepared = {
+    ...params.baseParams,
+    parentPid,
+    parentStartIdentity: String(startIdentity),
+    parentExitTimeoutMs: 5_000,
+    handoffId: params.owner,
+    updateLeaseOwner: params.owner,
+    stateDatabasePath: params.stateDatabasePath ?? params.baseParams.stateDatabasePath,
+    updateLeaseDatabasePath: params.leaseDatabasePath ?? params.baseParams.updateLeaseDatabasePath,
+    commandArgv: params.commandArgv,
+    triageCommandArgv: [testNodeExecPath, "-e", "process.exit(0)", "--"],
+    triageContextPath: path.join(params.tmpDir, `${params.name}-failure.json`),
+    logPath: path.join(params.tmpDir, `${params.name}.log`),
+    sensitivePaths: [],
+  };
+  await fs.promises.writeFile(paramsPath, `${JSON.stringify(prepared, null, 2)}\n`);
   return paramsPath;
 }

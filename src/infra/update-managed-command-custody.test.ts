@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
@@ -38,6 +39,11 @@ function fixture() {
   const roots = ["original", "candidate", "retained", "slot"].map((name) =>
     path.join(directory, name),
   );
+  const acquire = (...args: Parameters<typeof store.acquire>) => {
+    const result = store.acquire(...args);
+    assert(result.kind === "acquired", "Missing fixture lease");
+    return result.lease;
+  };
   const rows = () =>
     createManagedHandoffLeaseDatabase(databasePath)(
       false,
@@ -54,40 +60,36 @@ function fixture() {
   };
   const releaseNext = () => {
     for (const root of roots) {
-      const acquired = store.acquire(root, "next", { kind: "update" });
-      expect(acquired.kind).toBe("acquired");
-      if (acquired.kind === "acquired") {
-        expect(store.release(acquired.lease)).toBe(true);
-      }
+      expect(store.release(acquire(root, "next", { kind: "update" }))).toBe(true);
     }
   };
-  return { directory, privateTmp, databasePath, store, roots, rows, expectBusy, releaseNext };
+  return {
+    directory,
+    privateTmp,
+    databasePath,
+    store,
+    roots,
+    rows,
+    expectBusy,
+    releaseNext,
+    acquire,
+  };
 }
 
 describe.skipIf(process.platform === "win32")("managed command process custody", () => {
   it("retains live authority while a managed command binds and releases every reservation on normal completion", async () => {
     const f = fixture();
-    const parents = f.roots.map((root) => {
-      const result = f.store.acquire(root, "command", { kind: "update" });
-      if (result.kind !== "acquired") {
-        throw new Error("Missing parent fixture");
-      }
-      return result.lease;
-    });
-    const delegated = parents.map((parent) => {
-      const result = f.store.acquire(
+    const parents = f.roots.map((root) => f.acquire(root, "command", { kind: "update" }));
+    const delegated = parents.map((parent) =>
+      f.acquire(
         `${parent.key}/.openclaw-update-child-delegated`,
         "command",
         { kind: "update" },
         false,
         undefined,
         parent,
-      );
-      if (result.kind !== "acquired") {
-        throw new Error("Missing delegated fixture");
-      }
-      return result.lease;
-    });
+      ),
+    );
     const retained = await createManagedCommandProcessCustody({
       roots: delegated.map((parent) => parent.key),
       parents: delegated,
@@ -124,8 +126,7 @@ describe.skipIf(process.platform === "win32")("managed command process custody",
       undefined,
       retained.custody,
     );
-    expect(result.code).toBe(0);
-    expect(result.stdout).toBe("owned");
+    expect(result).toMatchObject({ code: 0, stdout: "owned" });
     expect(f.rows().filter((row) => row.install_root.endsWith("-command"))).toEqual([]);
     retained.releaseAnchors();
     for (const parent of [...parents, ...delegated]) {
@@ -147,9 +148,7 @@ describe.skipIf(process.platform === "win32")("managed command process custody",
     expect(f.rows()).toHaveLength(f.roots.length * 2);
     for (const row of f.rows()) {
       const current = f.store.read(row.install_root);
-      if (current.kind !== "current") {
-        throw new Error("Missing command reservation");
-      }
+      assert(current.kind === "current", "Missing command reservation");
       expect(f.store.release(current.lease)).toBe(false);
       expect(f.store.bind(current.lease, process.pid)).toBeNull();
     }
@@ -211,9 +210,7 @@ describe.skipIf(process.platform === "win32")("managed command process custody",
     const closed = once(holder, "close");
     try {
       await once(holder, "spawn");
-      if (!holder.pid) {
-        throw new Error("Missing tracked child PID");
-      }
+      assert(holder.pid, "Missing tracked child PID");
       const pendingRoot = path.join(f.directory, "pending");
       const namespaces = f.roots
         .slice(0, -1)
@@ -279,9 +276,7 @@ process.kill(process.pid, "SIGKILL");
       const pending = f.rows().find((row) => row.owner === "pending-owner");
       expect(pending).toBeDefined();
       const retained = f.store.read(pending!.install_root);
-      if (retained.kind !== "current") {
-        throw new Error("Missing pending reservation");
-      }
+      assert(retained.kind === "current", "Missing pending reservation");
       expect(f.store.releaseCommandReservation(retained.lease)).toBe(false);
 
       holder.kill("SIGKILL");

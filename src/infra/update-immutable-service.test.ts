@@ -10,6 +10,7 @@ import * as lifecycle from "../daemon/systemd-lifecycle.js";
 import * as systemd from "../daemon/systemd-service-files.js";
 import * as identity from "../daemon/systemd-service-identity.js";
 import { mockProcessPlatform } from "../test-utils/vitest-spies.js";
+import { immutableDescriptor } from "./package-update-activation-fixtures.test-support.js";
 import type { ImmutableInstallDescriptor } from "./update-immutable-install-schema.js";
 import {
   assertImmutableServiceProcessCurrent,
@@ -33,6 +34,17 @@ let root: string;
 let generation: string;
 let node: string;
 let service: ImmutableInstallDescriptor["service"];
+const setCommand = (command: GatewayServiceCommandConfig) => {
+  vi.spyOn(systemd, "readSystemdServiceCommandLocation").mockImplementation(async () => ({
+    kind: "command",
+    command,
+  }));
+  vi.spyOn(systemd, "readSystemdServiceExecStartAsRoot").mockImplementation(async () => command);
+};
+const serviceEnvironment = () => ({
+  OPENCLAW_STATE_DIR: service.stateDir,
+  OPENCLAW_CONFIG_PATH: service.configPath,
+});
 
 beforeEach(async () => {
   const home = dirs.make("immutable-service-");
@@ -51,19 +63,11 @@ beforeEach(async () => {
     configPath: "/etc/example/openclaw.json",
     profile: null,
   };
-  const command = {
+  setCommand({
     programArguments: [node, path.join(root, "current", "dist", "index.js"), "gateway"],
     sourcePath: "/etc/systemd/system/example.service",
-    environment: {
-      OPENCLAW_STATE_DIR: service.stateDir,
-      OPENCLAW_CONFIG_PATH: service.configPath,
-    },
-  };
-  vi.spyOn(systemd, "readSystemdServiceCommandLocation").mockResolvedValue({
-    kind: "command",
-    command,
+    environment: serviceEnvironment(),
   });
-  vi.spyOn(systemd, "readSystemdServiceExecStartAsRoot").mockResolvedValue(command);
   vi.spyOn(systemctl, "execSystemctl").mockResolvedValue({
     code: 0,
     termination: "exit",
@@ -167,16 +171,9 @@ describe("immutable activation service", () => {
     command = {
       programArguments: [launcher],
       sourcePath,
-      environment: {
-        OPENCLAW_STATE_DIR: service.stateDir,
-        OPENCLAW_CONFIG_PATH: service.configPath,
-      },
+      environment: serviceEnvironment(),
     };
-    vi.mocked(systemd.readSystemdServiceCommandLocation).mockImplementation(async () => ({
-      kind: "command",
-      command,
-    }));
-    vi.mocked(systemd.readSystemdServiceExecStartAsRoot).mockImplementation(async () => command);
+    setCommand(command);
     vi.mocked(systemctl.execSystemctl).mockImplementation(async () => ({
       code: 0,
       termination: "exit",
@@ -249,22 +246,10 @@ describe("immutable activation service", () => {
       args.assertCurrent?.();
     });
     descriptor = {
+      ...immutableDescriptor(root, "a".repeat(40), "a".repeat(64), service),
       version: 2,
       activationEnabled: true,
-      kind: "immutable",
-      root,
-      rootIdentity: "1:1",
-      releasesIdentity: "1:2",
-      current: {
-        sha: "a".repeat(40),
-        path: generation,
-        identity: "1:3",
-        pointerIdentity: "1:4",
-        buildDigest: "a".repeat(64),
-      },
-      service,
       runtime: { path: node, identity: "synthetic" },
-      source: "https://github.com/openclaw/openclaw.git",
     };
   });
 
@@ -273,15 +258,11 @@ describe("immutable activation service", () => {
     async (outcome) => {
       const expected = await inspect();
       const stopping = control(expected, "stop", async () => {
-        alive = false;
-        populated = false;
-        if (outcome === "auto-restart") {
-          activating = true;
-        } else if (outcome === "queued job") {
-          pendingJob = 7;
-        } else if (outcome === "replacement") {
-          alive = true;
-          populated = true;
+        alive = outcome === "replacement";
+        populated = alive;
+        activating = outcome === "auto-restart";
+        pendingJob = outcome === "queued job" ? 7 : 0;
+        if (alive) {
           currentPid++;
           ticks++;
         }
@@ -291,8 +272,10 @@ describe("immutable activation service", () => {
       } else {
         await expect(stopping).rejects.toThrow();
       }
-      expect(alive).toBe(outcome === "replacement");
-      expect(populated).toBe(outcome === "replacement");
+      expect({ alive, populated }).toEqual({
+        alive: outcome === "replacement",
+        populated: outcome === "replacement",
+      });
     },
   );
 

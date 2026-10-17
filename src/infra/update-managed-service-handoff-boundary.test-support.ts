@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -59,6 +60,10 @@ import { createUpdateRun, getUpdateRun } from "./update-run-ledger.js";
 
 async function readLines(file: string) {
   return (await fs.readFile(file, "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
+}
+
+async function expectFile(file: string, exists = false) {
+  await expect(pathExists(file)).resolves.toBe(exists);
 }
 
 export function createManagedServiceManagerBoundary({
@@ -157,7 +162,7 @@ export function createManagedServiceManagerBoundary({
       options,
     });
     await options?.prepareState?.({ env, recoveryModulePath, sourceRuntimeImport });
-    let helper: import("node:child_process").ChildProcess | undefined;
+    let helper: ChildProcess | undefined;
     let helperCompletion: Promise<number | null> | undefined;
     let helperLogPath: string | undefined;
     const cleanup = createManagedServiceBoundaryCleanup(() => [helper, parent]);
@@ -193,26 +198,17 @@ export function createManagedServiceManagerBoundary({
         unknown
       >;
       helperLogPath = String(generated.logPath);
-      const mockedChild = spawnMock.mock.results.at(-1)
-        ?.value as import("node:child_process").ChildProcess;
+      const readLog = () => fs.readFile(String(generated.logPath), "utf8").catch(() => "");
+      const mockedChild = spawnMock.mock.results.at(-1)?.value as ChildProcess;
       mockedChild.emit("exit", 0, null);
       const paramsPath = path.join(root, "manager-helper.json");
-      const commandFixture = createManagedServiceCommandFixture({
-        kind,
-        root,
-        statePath,
-        stateDatabasePath,
-        options,
-      });
+      const fixtureContext = { kind, root, statePath, stateDatabasePath, options };
+      const commandFixture = createManagedServiceCommandFixture(fixtureContext);
       let updaterScript = createManagedServiceUpdaterFixtureScript({
-        kind,
-        root,
-        statePath,
+        ...fixtureContext,
         updaterPath,
-        logPath: String(generated.logPath),
-        stateDatabasePath,
+        logPath: helperLogPath,
         consumeNotification,
-        options,
       });
       if (run && options?.rollbackRestoration) {
         updaterScript = `void (async () => {
@@ -343,10 +339,19 @@ export function createManagedServiceManagerBoundary({
         triageInputPath: String(generated.triageInputPath),
       });
       let helperEnv = spawnFixture.env;
+      const preload = async (name: string, source: string, append = false) => {
+        const preloadPath = path.join(root, `${name}-preload.cjs`);
+        await fs.writeFile(preloadPath, source);
+        helperEnv = {
+          ...helperEnv,
+          NODE_OPTIONS:
+            `${append ? (helperEnv.NODE_OPTIONS ?? "") : ""} --require ${preloadPath}`.trim(),
+        };
+      };
       if (options?.launchdTeardown?.clockEachCommandMs || options?.recoveryClockAdvanceMs) {
-        const preloadPath = path.join(root, "launchd-clock-preload.cjs");
-        await fs.writeFile(
-          preloadPath,
+        helperEnv = childEnv;
+        await preload(
+          "launchd-clock",
           createManagedServiceLaunchdClockPreload({
             commandTimingsPath,
             clockEachCommandMs: options.launchdTeardown?.clockEachCommandMs ?? 0,
@@ -354,29 +359,21 @@ export function createManagedServiceManagerBoundary({
             recoveryCommandArgv: commandFixture.recoveryCommandArgv,
           }),
         );
-        helperEnv = { ...childEnv, NODE_OPTIONS: `--require ${preloadPath}` };
       }
       if (options?.runnerFallback) {
-        const preloadPath = path.join(root, "spawn-fallback-preload.cjs");
-        await fs.writeFile(preloadPath, "process.execve = undefined;\n");
-        helperEnv = { ...helperEnv, NODE_OPTIONS: `--require ${preloadPath}` };
+        await preload("spawn-fallback", "process.execve = undefined;\n");
       }
       if (options?.validationClockAdvanceMs) {
-        const preloadPath = path.join(root, "validation-clock-preload.cjs");
-        await fs.writeFile(
-          preloadPath,
+        await preload(
+          "validation-clock",
           `const fs = require("node:fs"); const now = Date.now;
           Date.now = () => now() + (fs.existsSync(${JSON.stringify(validationStartedPath)}) ? ${options.validationClockAdvanceMs} : 0);`,
+          true,
         );
-        helperEnv = {
-          ...helperEnv,
-          NODE_OPTIONS: `${helperEnv.NODE_OPTIONS ?? ""} --require ${preloadPath}`.trim(),
-        };
       }
       if (options?.cancelAtActivation) {
-        const preloadPath = path.join(root, "cancel-activation-preload.cjs");
-        await fs.writeFile(
-          preloadPath,
+        await preload(
+          "cancel-activation",
           createManagedServiceCancellationPreload({
             scriptPath,
             updaterPidPath,
@@ -386,7 +383,6 @@ export function createManagedServiceManagerBoundary({
             gateInspection: options.cancelAtActivation === "inspection",
           }),
         );
-        helperEnv = { ...helperEnv, NODE_OPTIONS: `--require ${preloadPath}` };
       }
       helperEnv = await prepareManagedServiceParentPreloads({
         root,
@@ -394,7 +390,7 @@ export function createManagedServiceManagerBoundary({
         statePath,
         parentPid,
         parentStartIdentity,
-        logPath: String(generated.logPath),
+        logPath: helperLogPath,
         parentExitTimeoutMs: Number(generated.parentExitTimeoutMs),
         stopSettlementPath,
         env: helperEnv,
@@ -438,12 +434,14 @@ export function createManagedServiceManagerBoundary({
         helper: { pid: runningHelper.pid, startIdentity: expect.any(String) },
         action: { kind: "update" },
       });
-      await expect(pathExists(commandsPath)).resolves.toBe(false);
+      const expectParentAlive = () =>
+        expect(parent).toMatchObject({ exitCode: null, signalCode: null });
+      await expectFile(commandsPath);
       if (options?.controlDisconnect) {
         await options.beforeDisconnect?.(run, env);
         if (options.controlDisconnect === "transferred") {
           await request("transfer", "transferred");
-          await expect(pathExists(commandsPath)).resolves.toBe(false);
+          await expectFile(commandsPath);
         }
         if (options.controlDisconnect === "dead-parent") {
           parent.stdin?.end();
@@ -472,7 +470,7 @@ export function createManagedServiceManagerBoundary({
             ]),
             signal,
           );
-          await expect(pathExists(commandsPath)).resolves.toBe(false);
+          await expectFile(commandsPath);
           const validationClockAdvanceMs = options.validationClockAdvanceMs;
           if (validationClockAdvanceMs) {
             // The receipt follows both writes, including the fake-clock elapsed value.
@@ -481,8 +479,8 @@ export function createManagedServiceManagerBoundary({
             );
           }
           // A real updater child is now validating, but the service has received no stop.
-          expect(parent).toMatchObject({ exitCode: null, signalCode: null });
-          await expect(pathExists(commandsPath)).resolves.toBe(false);
+          expectParentAlive();
+          await expectFile(commandsPath);
           if (options.cancelDuringValidation) {
             await request("cancel", options.systemScope ? "cancel-unavailable" : "cancelled");
             if (options.systemScope) {
@@ -501,8 +499,8 @@ export function createManagedServiceManagerBoundary({
             await fs.writeFile(validationReleasePath, "activate");
             if (selectedDriverPath) {
               await waitForFile(statePath + ".park-prefix", signal);
-              await expect(pathExists(commandsPath)).resolves.toBe(false);
-              expect(parent).toMatchObject({ exitCode: null, signalCode: null });
+              await expectFile(commandsPath);
+              expectParentAlive();
               await fs.writeFile(statePath + ".park-tail", "complete request");
             }
             if (notice) {
@@ -524,12 +522,7 @@ export function createManagedServiceManagerBoundary({
               }
             }
             if (options.cancelAtActivation) {
-              await vi.waitFor(
-                async () => {
-                  await expect(pathExists(activationGatePath)).resolves.toBe(true);
-                },
-                { timeout: 5_000 },
-              );
+              await vi.waitFor(() => expectFile(activationGatePath, true), { timeout: 5_000 });
               await request("cancel", "cancelled");
               await fs.writeFile(activationReleasePath, "continue");
               await vi.waitFor(
@@ -538,8 +531,8 @@ export function createManagedServiceManagerBoundary({
                 },
                 { timeout: 5_000 },
               );
-              await expect(pathExists(mutationPath)).resolves.toBe(false);
-              expect(parent).toMatchObject({ exitCode: null, signalCode: null });
+              await expectFile(mutationPath);
+              expectParentAlive();
             }
           }
         }
@@ -571,8 +564,7 @@ export function createManagedServiceManagerBoundary({
           options.profileRequester && !activated
             ? await observeManagedServiceProfileRefusal(completion, commandsPath)
             : await completion;
-        const helperLog = await fs.readFile(String(generated.logPath), "utf8").catch(() => "");
-        expect(code, `${stderr}\n${helperLog}`).toBe(options.helperExitCode ?? 0);
+        expect(code, `${stderr}\n${await readLog()}`).toBe(options.helperExitCode ?? 0);
         await expect(pathExists(updaterPath)).resolves.toBe(
           (activated && !options.expireParentWhileStopPending) ||
             options.validationResult === "child-result",
@@ -596,32 +588,31 @@ export function createManagedServiceManagerBoundary({
         } finally {
           clearTimeout(timer);
         }
-        expect(parent).toMatchObject({ exitCode: null, signalCode: null });
-        await expect(pathExists(commandsPath)).resolves.toBe(false);
+        expectParentAlive();
+        await expectFile(commandsPath);
         expect(stdout).not.toContain("committed\n");
-        await expect(pathExists(updaterPath)).resolves.toBe(false);
+        await expectFile(updaterPath);
       } else if (options?.launchdFault === "wrong-parent" || options?.overdueCommit) {
         await request("park", "cancelled");
         expect(await completion, stderr).toBe(0);
-        expect(parent).toMatchObject({ exitCode: null, signalCode: null });
-        await expect(pathExists(updaterPath)).resolves.toBe(false);
+        expectParentAlive();
+        await expectFile(updaterPath);
       } else {
         await request("park", "parked");
         expect(parent.exitCode).toBeNull();
-        await expect(pathExists(updaterPath)).resolves.toBe(false);
+        await expectFile(updaterPath);
         if (options?.cancelAfterPark) {
           await request("cancel", "restore-after-exit");
           expect(stdout).not.toContain("committed\n");
           parent.stdin?.end();
           expect(await completion, stderr).toBe(0);
-          await expect(pathExists(updaterPath)).resolves.toBe(false);
+          await expectFile(updaterPath);
         } else {
           await request("commit", "committed");
           parent.stdin?.end();
           const code = await completion;
-          const helperLog = await fs.readFile(String(generated.logPath), "utf8").catch(() => "");
           expect
-            .soft(code, `${stderr}\n${helperLog}`)
+            .soft(code, `${stderr}\n${await readLog()}`)
             .toBe(
               options?.helperExitCode ??
                 (options?.systemdHandoffFailure ? 1 : (options?.updaterExitCode ?? 7)),

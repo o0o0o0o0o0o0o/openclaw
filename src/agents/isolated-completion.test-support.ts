@@ -13,9 +13,6 @@ import { createZeroUsageFixture } from "./test-helpers/usage-fixtures.js";
 
 export type IsolatedCliRunParams = RunCliAgentParams & {
   preparedRunAdmission: PreparedAgentRunAdmission;
-  prompt: string;
-  runId: string;
-  sessionId: string;
 };
 
 // Vitest can hoist a local declaration, but rejects an exported declaration.
@@ -108,20 +105,6 @@ vi.mock("./runtime-plan/prepare-auth.js", async () => {
   );
   return { ...actual, prepareAgentRuntimeAuth: isolatedCompletionMocks.prepareAgentRuntimeAuth };
 });
-vi.mock("./runtime-plan/resolve-auth.js", () => ({
-  scopeAuthProfileStoreToPreparedPlan: (
-    store: { version: number; profiles: Record<string, unknown> },
-    plan: { forwardedAuthProfileCandidateIds?: string[] },
-  ) => ({
-    ...store,
-    profiles: Object.fromEntries(
-      (plan.forwardedAuthProfileCandidateIds ?? []).flatMap((profileId) => {
-        const profile = store.profiles[profileId];
-        return profile ? [[profileId, profile]] : [];
-      }),
-    ),
-  }),
-}));
 vi.mock("./cli-runner.runtime.js", () => ({ runCliAgent: isolatedCompletionMocks.runCliAgent }));
 vi.mock("@openclaw/fs-safe/temp", () => ({
   withTempWorkspace: async (_options: unknown, run: (value: { dir: string }) => unknown) =>
@@ -181,8 +164,9 @@ export const nativeAuthPlan = {
 };
 
 export function resetIsolatedCompletionTestState(): void {
+  const mocks = isolatedCompletionMocks;
   vi.clearAllMocks();
-  isolatedCompletionMocks.hasAvailableAuthForProvider.mockResolvedValue(false);
+  mocks.hasAvailableAuthForProvider.mockResolvedValue(false);
   preparedModelRuntime = {
     config: {},
     agentDir: "/tmp/agent",
@@ -192,32 +176,30 @@ export function resetIsolatedCompletionTestState(): void {
     createStores: () => ({ modelRegistry: {} }),
   };
   releaseRuntimeLease = vi.fn(async () => {});
-  isolatedCompletionMocks.acquireAgentRunPreparedModelRuntime.mockResolvedValue({
+  mocks.acquireAgentRunPreparedModelRuntime.mockResolvedValue({
     snapshot: preparedModelRuntime,
     [Symbol.asyncDispose]: releaseRuntimeLease,
   });
-  isolatedCompletionMocks.isCliRuntimeAliasForProvider.mockReturnValue(false);
-  isolatedCompletionMocks.cliBackendAcceptsAuthProfileForwarding.mockReturnValue(false);
-  isolatedCompletionMocks.resolveCliExecutionAuthProfileId.mockResolvedValue(undefined);
-  isolatedCompletionMocks.resolveCliBackendConfig.mockReturnValue({
-    config: { command: "test-cli" },
-  });
-  isolatedCompletionMocks.resolveCliRuntimeCanonicalProvider.mockReturnValue(undefined);
-  isolatedCompletionMocks.resolveAgentHarnessSelectionDecision.mockReturnValue({
+  mocks.isCliRuntimeAliasForProvider.mockReturnValue(false);
+  mocks.cliBackendAcceptsAuthProfileForwarding.mockReturnValue(false);
+  mocks.resolveCliExecutionAuthProfileId.mockResolvedValue(undefined);
+  mocks.resolveCliBackendConfig.mockReturnValue({ config: { command: "test-cli" } });
+  mocks.resolveCliRuntimeCanonicalProvider.mockReturnValue(undefined);
+  mocks.resolveAgentHarnessSelectionDecision.mockReturnValue({
     policy: { runtime: "openclaw" },
     selectedHarnessId: "openclaw",
     selectedReason: "forced_openclaw",
     candidates: [],
     builtIn: true,
   });
-  isolatedCompletionMocks.resolveCliRuntimeExecutionProvider.mockReturnValue(undefined);
-  isolatedCompletionMocks.resolveEmbeddedCliBackendDispatchEligibility.mockReturnValue(undefined);
-  isolatedCompletionMocks.prepareSimpleCompletionModel.mockResolvedValue({
+  mocks.resolveCliRuntimeExecutionProvider.mockReturnValue(undefined);
+  mocks.resolveEmbeddedCliBackendDispatchEligibility.mockReturnValue(undefined);
+  mocks.prepareSimpleCompletionModel.mockResolvedValue({
     model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
     auth: { apiKey: "secret", source: "profile:openai:test", mode: "oauth" },
     sourceAuthFingerprint: "fingerprint",
   });
-  isolatedCompletionMocks.resolveModelAsync.mockResolvedValue({
+  mocks.resolveModelAsync.mockResolvedValue({
     model: {
       provider: "openai",
       id: "gpt-test",
@@ -225,8 +207,8 @@ export function resetIsolatedCompletionTestState(): void {
       baseUrl: nativeAuthPlan.modelRoute.baseUrl,
     },
   });
-  isolatedCompletionMocks.ensureAuthProfileStore.mockReturnValue({ version: 1, profiles: {} });
-  isolatedCompletionMocks.prepareAgentRuntimeAuth.mockReturnValue({
+  mocks.ensureAuthProfileStore.mockReturnValue({ version: 1, profiles: {} });
+  mocks.prepareAgentRuntimeAuth.mockReturnValue({
     plan: nativeAuthPlan,
     attempts: [{ kind: "implicit", plan: nativeAuthPlan }],
   });

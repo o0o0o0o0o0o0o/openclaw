@@ -9,6 +9,7 @@ import {
   shouldRetryBaselineFindings,
   shouldRetryCacheProbeText,
   type BaselineFindings,
+  type CacheRun,
 } from "./live-cache-regression-policy.js";
 import {
   LiveCachePrerequisiteSkip,
@@ -16,31 +17,27 @@ import {
 } from "./live-cache-test-support.js";
 import { ProviderAuthError } from "./model-auth-runtime-shared.js";
 
+function cacheRun(usage: CacheRun["usage"], hitRate = 0.999): CacheRun {
+  return { hitRate, usage, suffix: "hit", text: "CACHE-OK hit" };
+}
+
 describe("live cache regression runner", () => {
   it("keeps OpenAI text cache floor misses advisory", () => {
-    const regressions: string[] = [];
-    const warnings: string[] = [];
+    const findings: BaselineFindings = { regressions: [], warnings: [] };
 
     assertAgainstBaseline({
       lane: "stable",
       provider: "openai",
       result: {
-        best: {
-          hitRate: 0,
-          suffix: "stable-hit",
-          text: "CACHE-OK stable-hit",
-          usage: { cacheRead: 0, cacheWrite: 0, input: 5_034 },
-        },
+        best: cacheRun({ cacheRead: 0, cacheWrite: 0, input: 5_034 }, 0),
       },
-      regressions,
-      warnings,
+      ...findings,
     });
 
-    expect(regressions).toStrictEqual([]);
-    expect(warnings).toEqual([
-      "openai:stable cacheRead=0 < min=4608",
-      "openai:stable hitRate=0.000 < min=0.900",
-    ]);
+    expect(findings).toStrictEqual({
+      regressions: [],
+      warnings: ["openai:stable cacheRead=0 < min=4608", "openai:stable hitRate=0.000 < min=0.900"],
+    });
   });
 
   it("retries hard cache baseline misses once", () => {
@@ -81,7 +78,7 @@ describe("live cache regression runner", () => {
     "classifies missing %s prerequisites",
     async (provider) => {
       const { regressions, warnings, message } = await missingPrerequisite(provider);
-      expect({ regressions, warnings }).toEqual(
+      expect({ regressions, warnings }).toStrictEqual(
         provider === "openai"
           ? { regressions: [], warnings: [message] }
           : { regressions: [message], warnings: [] },
@@ -153,18 +150,8 @@ describe("live cache regression runner", () => {
         lane: "image",
         provider: "anthropic",
         result: {
-          best: {
-            hitRate: 0.999,
-            suffix: "image-hit",
-            text: "CACHE-OK image-hit",
-            usage: { cacheRead: 5_742, cacheWrite: 0, input: 3 },
-          },
-          warmup: {
-            hitRate,
-            suffix: "image-warmup",
-            text: "CACHE-OK image-warmup",
-            usage,
-          },
+          best: cacheRun({ cacheRead: 5_742, cacheWrite: 0, input: 3 }),
+          warmup: cacheRun(usage, hitRate),
         },
       });
 

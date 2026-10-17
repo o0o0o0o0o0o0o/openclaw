@@ -22,15 +22,6 @@ const TRANSPORTS = ["performMatrixRequest JSON", "SDK fetch"] as const;
 
 const withRead = <T>(run: () => Promise<T>) => withChannelReadAuthority(() => undefined, run);
 
-// Capture a pending request in its original scope, then close that scope before releasing I/O.
-function pendingRead(read: () => Promise<unknown>, started: Promise<void>) {
-  return withRead(async () => {
-    const request = read();
-    await started;
-    return { request };
-  });
-}
-
 function deferDns() {
   const started = createDeferred<void>();
   const result = createDeferred<LookupAddress[]>();
@@ -43,12 +34,9 @@ function deferDns() {
 
 class TransportMatrixClient extends MatrixClient {
   async readTransport(transport: (typeof TRANSPORTS)[number], path: string): Promise<unknown> {
-    if (transport === "SDK fetch") {
-      // The SDK adapter invokes the fetch installed by MatrixClientBase.
-      const response = await this.client.http.fetch(`${HOMESERVER}${path}`);
-      return await response.text();
-    }
-    return await this.doRequest("GET", path);
+    return transport === "SDK fetch"
+      ? (await this.client.http.fetch(`${HOMESERVER}${path}`)).text()
+      : this.doRequest("GET", path);
   }
 }
 
@@ -73,17 +61,12 @@ function createReader(
     ssrfPolicy: { allowPrivateNetwork: true },
   });
   clients.push(client);
-  return {
-    client,
-    runtimeFetch,
-    read: (path: string) => client.readTransport(transport, path),
-  };
+  return { client, runtimeFetch, read: client.readTransport.bind(client, transport) };
 }
 
 beforeEach(() => {
   vi.unstubAllGlobals();
-  lookup.mockReset();
-  lookup.mockResolvedValue(DNS_ANSWER);
+  lookup.mockReset().mockResolvedValue(DNS_ANSWER);
 });
 
 afterEach(async () => {
@@ -96,10 +79,11 @@ afterEach(async () => {
 
 describe.each(TRANSPORTS)("%s read authority", (transport) => {
   it.each([
-    { name: "initial DNS", redirect: false },
-    { name: "redirect DNS", redirect: true },
-  ])("stops the next physical request when the read closes during $name", async ({ redirect }) => {
-    const { read, runtimeFetch } = createReader(transport);
+    { name: "read closing during initial DNS", redirect: false, closeClient: false },
+    { name: "read closing during redirect DNS", redirect: true, closeClient: false },
+    { name: "client closing during DNS", redirect: false, closeClient: true },
+  ])("stops physical I/O after $name", async ({ redirect, closeClient }) => {
+    const { client, read, runtimeFetch } = createReader(transport);
     if (redirect) {
       lookup.mockResolvedValueOnce(DNS_ANSWER);
       runtimeFetch.mockResolvedValueOnce(
@@ -108,13 +92,25 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
     }
     const dns = deferDns();
 
-    const pending = await pendingRead(() => read(redirect ? "/redirect" : READ_PATH), dns.started);
-    const rejected = expect(pending.request).rejects.toThrow(CLOSED_AUTHORITY);
-
-    await withRead(async () => {
-      dns.release();
-      await rejected;
+    const pending = await withRead(async () => {
+      const request = read(redirect ? "/redirect" : READ_PATH);
+      const rejected = expect(request).rejects.toThrow(
+        closeClient ? "Matrix client generation is no longer active." : CLOSED_AUTHORITY,
+      );
+      await dns.started;
+      if (closeClient) {
+        await client.stopWithoutPersist();
+        dns.release();
+        await rejected;
+      }
+      return { rejected };
     });
+    if (!closeClient) {
+      await withRead(async () => {
+        dns.release();
+        await pending.rejected;
+      });
+    }
     expect(runtimeFetch.mock.calls.map(([url]) => url)).toEqual(
       redirect ? [`${HOMESERVER}/redirect`] : [],
     );
@@ -147,29 +143,17 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
         body,
         consumingBody ? undefined : pause,
       );
-      const pending = await pendingRead(() => read(READ_PATH), started.promise);
+      const pending = await withRead(async () => {
+        const request = read(READ_PATH);
+        await started.promise;
+        return { request };
+      });
       const rejected = expect(pending.request).rejects.toThrow(CLOSED_AUTHORITY);
       finish.resolve();
       await rejected;
       expect(runtimeFetch.mock.calls.map(([url]) => url)).toEqual([`${HOMESERVER}${READ_PATH}`]);
     },
   );
-
-  it("stops physical I/O when the client closes during DNS with read authority still active", async () => {
-    const dns = deferDns();
-    const { client, read, runtimeFetch } = createReader(transport);
-
-    await withRead(async () => {
-      const rejected = expect(read(READ_PATH)).rejects.toThrow(
-        "Matrix client generation is no longer active.",
-      );
-      await dns.started;
-      await client.stopWithoutPersist();
-      dns.release();
-      await rejected;
-    });
-    expect(runtimeFetch).not.toHaveBeenCalled();
-  });
 });
 
 it("reuses an SDK fetch without poisoning a valid read or reviving its closed first read", async () => {

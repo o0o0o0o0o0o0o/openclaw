@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { afterAll, describe, expect, it } from "vitest";
 import { REDACTED_SENTINEL } from "../src/config/redact-snapshot.js";
+import type { OpenClawConfig } from "../src/config/types.js";
 import { extractFirstTextBlock } from "../src/shared/chat-message-content.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../src/utils/message-channel.js";
 import { connectProofClient } from "./helpers/gateway-integration-fixtures.js";
@@ -37,19 +38,7 @@ const serverArgs = (redacted = false) => [
 ];
 
 async function readServer(instance: OpenClawTestInstance) {
-  const config = JSON.parse(await fs.readFile(instance.configPath, "utf8")) as {
-    mcp?: {
-      servers?: Record<
-        string,
-        {
-          command?: string;
-          args?: string[];
-          headers?: Record<string, string>;
-          env?: Record<string, string>;
-        }
-      >;
-    };
-  };
+  const config = JSON.parse(await fs.readFile(instance.configPath, "utf8")) as OpenClawConfig;
   return config.mcp?.servers?.[SERVER_NAME];
 }
 

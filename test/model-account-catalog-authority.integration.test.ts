@@ -19,6 +19,7 @@ import {
   WITHOUT_OPENAI_ENV_AUTH,
 } from "../src/gateway/server-methods/models-list-result.openai-routes.test-support.js";
 import { modelsHandlers } from "../src/gateway/server-methods/models.js";
+import { roleConfig } from "../src/gateway/server-methods/sessions-reactions.test-support.js";
 import type { RespondFn } from "../src/gateway/server-methods/types.js";
 import { usersAuthConnectHandlers } from "../src/gateway/server-methods/users-auth-connect.js";
 import {
@@ -85,12 +86,10 @@ const resolvedAuth = (selected: string) => ({
 const authenticatedRequest = { path: "/models", authorization: `Bearer ${credential.token}` };
 const requests: Array<{ path: string | undefined; authorization: string | undefined }> = [];
 let server: Awaited<ReturnType<typeof reserveTestPortListener>>;
-let generationCurrent = true;
-let principal = "owner";
-let authorized = true;
+let authority = { generationCurrent: true, principal: "owner", authorized: true };
 
 function assertCurrent() {
-  if (!authorized || principal !== "owner") {
+  if (!authority.authorized || authority.principal !== "owner") {
     throw new Error("Selected personal account authority revoked");
   }
 }
@@ -122,7 +121,7 @@ function load() {
     config: {},
     agentDir: "/unused/catalog-authority-agent",
     workspaceDir: "/unused/catalog-authority-workspace",
-    isCurrent: () => generationCurrent,
+    isCurrent: () => authority.generationCurrent,
     assertCurrent,
   });
 }
@@ -145,9 +144,7 @@ afterAll(async () => {
 beforeEach(() => {
   clearLiveCatalogCacheForTests();
   requests.length = 0;
-  generationCurrent = true;
-  principal = "owner";
-  authorized = true;
+  authority = { generationCurrent: true, principal: "owner", authorized: true };
   transport.preflight.mockReset().mockResolvedValue(undefined);
   transport.resolveAuth.mockReset().mockResolvedValue(resolvedAuth(profileId));
   vi.stubEnv("OPENCLAW_PROXY_ACTIVE", "0");
@@ -160,44 +157,25 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-it.each(["owner", "foreign"])(
-  "dispatches credentials only for the authorized principal: %s",
-  async (requester) => {
-    principal = requester;
-    if (requester === "foreign") {
-      await expect(load()).rejects.toThrow("authority revoked");
-      expect(transport.resolveAuth).not.toHaveBeenCalled();
-      expect(requests).toEqual([]);
-    } else {
-      expect(await load()).toMatchObject([{ provider: "openai", profileId, status: "ready" }]);
-      expect(requests).toEqual([authenticatedRequest]);
-    }
-  },
-);
+it("rejects a foreign principal before resolving credentials", async () => {
+  authority.principal = "foreign";
+  await expect(load()).rejects.toThrow("authority revoked");
+  expect(transport.resolveAuth).not.toHaveBeenCalled();
+  expect(requests).toEqual([]);
+});
 
-it.each(["auth", "transport", "generation"])(
-  "sends zero requests when revoked during deferred %s",
-  async (boundary) => {
-    const gate = deferDispatch(boundary === "auth");
-    const result = load();
-    const settled = result.catch((error: unknown) => error);
-    await gate.entered;
-    if (boundary === "generation") {
-      generationCurrent = false;
-    } else {
-      authorized = false;
-    }
-    gate.release();
-    await settled;
-    expect(requests).toEqual([]);
-    if (boundary !== "generation") {
-      await expect(result).rejects.toThrow("authority revoked");
-    }
-  },
-);
+it("sends zero requests when the catalog generation changes during DNS", async () => {
+  const gate = deferDispatch(false);
+  const settled = load().catch((error: unknown) => error);
+  await gate.entered;
+  authority.generationCurrent = false;
+  gate.release();
+  await settled;
+  expect(requests).toEqual([]);
+});
 
 it("does not revoke unrelated ambient discovery", async () => {
-  authorized = false;
+  authority.authorized = false;
   const result = await fetchWithSsrFGuard({
     url: "http://127.0.0.1:" + server.claim.port + "/ambient",
     policy: { allowPrivateNetwork: true },
@@ -207,17 +185,17 @@ it("does not revoke unrelated ambient discovery", async () => {
   expect(requests).toEqual([{ path: "/ambient", authorization: undefined }]);
 });
 it.each([
-  "allowed",
-  "unlink-during-dns",
-  "unlink-during-auth",
-  "snapshot",
-  "saved-allowed",
-  "saved-visibility-during-dns",
-  "saved-account-during-dns",
+  ["allowed", false, null, null],
+  ["unlink-during-dns", false, "dns", null],
+  ["unlink-during-auth", false, "auth", null],
+  ["snapshot", false, "snapshot", null],
+  ["saved-allowed", true, null, null],
+  ["saved-visibility-during-dns", true, "dns", { visibility: "draft" }],
+  ["saved-account-during-dns", true, "dns", { authProfileOverride: "openai:changed-account" }],
 ] as const)(
   "binds models.list discovery to current account and session authority: %s",
-  async (scenario) => {
-    await withOpenClawTestState(
+  (_scenario, saved, boundary, sessionChange) =>
+    withOpenClawTestState(
       {
         layout: "state-only",
         prefix: "catalog-link-authority-",
@@ -232,7 +210,6 @@ it.each([
           credential,
           assertCurrent() {},
         }).authProfileId;
-        const saved = scenario.startsWith("saved-");
         const viewer = saved ? ensureProfileForEmail("catalog-viewer@example.test") : person;
         using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
         const sessionKey = "agent:main:catalog-authority-saved";
@@ -244,18 +221,7 @@ it.each([
               models: { "openai/gpt-5.4": { agentRuntime: { id: "codex" } } },
             },
           },
-          gateway: {
-            roles: {
-              default: "reader",
-              definitions: {
-                reader: {
-                  agents: "*",
-                  scopes: ["operator.read", "operator.write"],
-                  sessions: { others: saved ? "view" : "none" },
-                },
-              },
-            },
-          },
+          ...roleConfig(saved ? "view" : "none"),
         };
         await state.writeConfig(cfg);
         setRuntimeConfigSnapshot(cfg);
@@ -352,10 +318,10 @@ it.each([
           return respond;
         };
         transport.resolveAuth.mockResolvedValue(resolvedAuth(selected));
-        const allowed = scenario === "allowed" || scenario === "saved-allowed";
+        const allowed = boundary === null;
         const gate =
-          !allowed && scenario !== "snapshot"
-            ? deferDispatch(scenario === "unlink-during-auth", selected)
+          boundary === "dns" || boundary === "auth"
+            ? deferDispatch(boundary === "auth", selected)
             : undefined;
         const readModels = (params: Record<string, unknown> = {}) =>
           request("models.list", {
@@ -366,7 +332,7 @@ it.each([
             ...params,
           });
         const pending =
-          scenario === "snapshot"
+          boundary === "snapshot"
             ? withOpenClawStateDatabaseReadSnapshot(readModels)
             : readModels();
         try {
@@ -376,13 +342,8 @@ it.each([
               pending,
               "Catalog completed before dispatch gate",
             );
-            if (saved) {
-              await upsertSessionEntryCore(
-                { agentId: "main", sessionKey },
-                scenario === "saved-visibility-during-dns"
-                  ? { visibility: "draft" }
-                  : { authProfileOverride: "openai:changed-account" },
-              );
+            if (sessionChange) {
+              await upsertSessionEntryCore({ agentId: "main", sessionKey }, sessionChange);
             } else {
               const unlinked = await request("users.unlinkAuthProfile", {
                 profileId: person.id,
@@ -394,7 +355,7 @@ it.each([
             }
             gate.release();
           }
-          if (scenario === "snapshot") {
+          if (boundary === "snapshot") {
             // Direct handlers reject here; the transport owns the error response.
             await expect(pending).rejects.toThrow(
               "Profile authority requires live state, not a discovery snapshot",
@@ -426,6 +387,5 @@ it.each([
           await service.stop();
         }
       },
-    );
-  },
+    ),
 );

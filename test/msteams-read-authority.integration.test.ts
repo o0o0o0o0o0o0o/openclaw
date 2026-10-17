@@ -14,10 +14,21 @@ import {
   createTeamsReadConfig,
   createReadPluginRegistration,
 } from "./channel-read.test-support.js";
-import { closeHttpServer, listenLoopback } from "./helpers/gateway-integration-fixtures.js";
+import {
+  closeHttpServer,
+  listenLoopback,
+  readRequestText,
+  respondJson,
+} from "./helpers/gateway-integration-fixtures.js";
 
 type GraphRequest = { method: string; url: URL; body: unknown };
 type GraphReply = { status?: number; headers?: Record<string, string>; body?: unknown };
+type ActionCase<Request> = [
+  action: ChannelMessageActionName,
+  params: Record<string, unknown>,
+  expected: Record<string, unknown>,
+  request: Request,
+];
 
 const graph = vi.hoisted(() => ({
   origin: "",
@@ -77,7 +88,6 @@ const message = {
   from: { user: { id: memberId, displayName: "Member" } },
   reactions: [{ reactionType: "👍", user: { user: { id: memberId } } }],
 };
-type Origin = "bundled" | "global";
 const cleanups: Array<() => Promise<void>> = [];
 
 beforeEach(() => {
@@ -100,7 +110,7 @@ afterEach(async () => {
 
 async function createFixture(
   options: {
-    origin?: Origin;
+    origin?: "bundled" | "global";
     self?: boolean;
     narrowTeam?: boolean;
     senderIsOwner?: boolean;
@@ -108,7 +118,6 @@ async function createFixture(
     missingRequester?: boolean;
   } = {},
 ) {
-  const origin = options.origin ?? "global";
   const cfg = createTeamsReadConfig({
     groupPolicy: options.narrowTeam || options.botFrameworkTeam ? "allowlist" : "open",
     teams: {
@@ -119,7 +128,11 @@ async function createFixture(
       },
     },
   });
-  const { record, api, activate } = createReadPluginRegistration(cfg, "msteams", origin);
+  const { record, api, activate } = createReadPluginRegistration(
+    cfg,
+    "msteams",
+    options.origin ?? "global",
+  );
   const providerActions = msteamsPlugin.actions!;
   const providerSettlements: Array<{
     action: ChannelMessageActionName;
@@ -168,68 +181,50 @@ async function createFixture(
   );
   const requests: string[] = [];
   const nativeRequests: GraphRequest[] = [];
-  const server = createServer((request, response) => {
+  const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://fixture.invalid");
     requests.push(`${request.method} ${decodeURIComponent(url.pathname)}`);
     expect(request.headers.authorization).toBe(`Bearer ${token}`);
-    let requestBody = "";
-    request.setEncoding("utf8");
-    request.on("data", (chunk: string) => {
-      requestBody += chunk;
-    });
-    request.on("end", () => {
-      const nativeRequest = {
-        method: request.method ?? "GET",
-        url,
-        body: requestBody ? (JSON.parse(requestBody) as unknown) : undefined,
+    const requestBody = await readRequestText(request);
+    const nativeRequest = {
+      method: request.method ?? "GET",
+      url,
+      body: requestBody ? (JSON.parse(requestBody) as unknown) : undefined,
+    };
+    nativeRequests.push(nativeRequest);
+    graph.onRequest?.(nativeRequest);
+    const reply = graph.reply?.(nativeRequest);
+    if (reply) {
+      response.writeHead(reply.status ?? 200, {
+        "content-type": "application/json",
+        ...reply.headers,
+      });
+      response.end(reply.body === undefined ? undefined : JSON.stringify(reply.body));
+      return;
+    }
+    let body: unknown = message;
+    if (url.pathname.endsWith("/members")) {
+      body = { value: [{ id: membershipId, userId: memberId }] };
+    } else if (url.pathname.endsWith("/channels")) {
+      body = {
+        value: [{ id: targetChannel, displayName: "Target", membershipType: "standard" }],
       };
-      nativeRequests.push(nativeRequest);
-      graph.onRequest?.(nativeRequest);
-      const reply = graph.reply?.(nativeRequest);
-      if (reply) {
-        response.writeHead(reply.status ?? 200, {
-          "content-type": "application/json",
-          ...reply.headers,
-        });
-        response.end(reply.body === undefined ? undefined : JSON.stringify(reply.body));
-        return;
-      }
-      let body: unknown = message;
-      if (url.pathname.endsWith("/members")) {
-        body = {
-          value: [
-            {
-              id: membershipId,
-              userId: memberId,
-              displayName: "Member",
-              email: "member@example.test",
-              roles: [],
-            },
-          ],
-        };
-      } else if (url.pathname.endsWith("/channels")) {
-        body = {
-          value: [{ id: targetChannel, displayName: "Target", membershipType: "standard" }],
-        };
-      } else if (url.pathname.includes("/channels/") && !url.pathname.includes("/messages")) {
-        body = {
-          id: decodeURIComponent(url.pathname.split("/").at(-1)!),
-          membershipType: graph.membershipType,
-        };
-      } else if (url.pathname.endsWith("/pinnedMessages")) {
-        body = request.method === "POST" ? { id: "pin-1" } : { value: [{ id: "pin-1", message }] };
-      } else if (url.pathname.endsWith("/messages")) {
-        body = { value: [message] };
-      }
-      response.setHeader("content-type", "application/json");
-      response.end(JSON.stringify(body));
-    });
+    } else if (url.pathname.includes("/channels/") && !url.pathname.includes("/messages")) {
+      body = {
+        id: decodeURIComponent(url.pathname.split("/").at(-1)!),
+        membershipType: graph.membershipType,
+      };
+    } else if (url.pathname.endsWith("/pinnedMessages")) {
+      body = request.method === "POST" ? { id: "pin-1" } : { value: [{ id: "pin-1", message }] };
+    } else if (url.pathname.endsWith("/messages")) {
+      body = { value: [message] };
+    }
+    respondJson(response, body);
   });
   cleanups.push(async () => {
     caller.dispose();
     await closeHttpServer(server);
-    const disposal = await getPluginInstance(record)?.dispose();
-    expect(disposal?.errors).toEqual([]);
+    expect((await getPluginInstance(record)?.dispose())?.errors).toEqual([]);
   });
   graph.origin = `http://msteams-proof.invalid:${new URL(await listenLoopback(server)).port}`;
 
@@ -269,72 +264,39 @@ function preparationGate() {
     entered: entered.promise,
     release: () => released.resolve(),
     wait,
-    token: async () => {
-      await wait();
-      return token;
-    },
+    token: () => wait().then(() => token),
   };
 }
 
 describe("Teams Graph mutation currentness", () => {
   const chatPath = `/v1.0/chats/${chatId}`;
-  const mutationCases: Array<{
-    name: string;
-    action: ChannelMessageActionName;
-    params: Record<string, unknown>;
-    details: Record<string, unknown>;
-    requests: string[];
-  }> = [
-    {
-      name: "pin",
-      action: "pin",
-      params: { messageId },
-      details: { pinnedMessageId: "pin-1" },
-      requests: [`POST ${chatPath}/pinnedMessages`],
-    },
-    {
-      name: "unpin",
-      action: "unpin",
-      params: { pinnedMessageId: "pin-1" },
-      details: {},
-      requests: [`DELETE ${chatPath}/pinnedMessages/pin-1`],
-    },
-    {
-      name: "reaction addition",
-      action: "react",
-      params: { messageId, emoji: "like" },
-      details: { reactionType: "like" },
-      requests: [`POST /beta/chats/${chatId}/messages/${messageId}/setReaction`],
-    },
-    {
-      name: "reaction removal",
-      action: "react",
-      params: { messageId, emoji: "like", remove: true },
-      details: { reactionType: "like", removed: true },
-      requests: [`POST /beta/chats/${chatId}/messages/${messageId}/unsetReaction`],
-    },
-    {
-      name: "participant addition",
-      action: "addParticipant",
-      params: { userId: memberId },
-      details: { added: { userId: memberId, chatId } },
-      requests: [`POST ${chatPath}/members`],
-    },
-    {
-      name: "participant removal",
-      action: "removeParticipant",
-      params: { userId: memberId },
-      details: { removed: { userId: memberId, chatId } },
-      requests: [`GET ${chatPath}/members`, `DELETE ${chatPath}/members/${membershipId}`],
-    },
-    {
-      name: "rename",
-      action: "renameGroup",
-      params: { name: "Renamed chat" },
-      details: { renamed: { chatId, newName: "Renamed chat" } },
-      requests: [`PATCH ${chatPath}`],
-    },
+  const reactionPath = `/beta/chats/${chatId}/messages/${messageId}`;
+  const member = { userId: memberId };
+  const pin = { pinnedMessageId: "pin-1" };
+  const reaction = { messageId, emoji: "like" };
+  const removed = { removed: { ...member, chatId } };
+  const renamed = { renamed: { chatId, newName: "Renamed chat" } };
+  const removalRequests = [`GET ${chatPath}/members`, `DELETE ${chatPath}/members/${membershipId}`];
+  const cases: Array<ActionCase<string | string[]>> = [
+    ["pin", { messageId }, pin, `POST ${chatPath}/pinnedMessages`],
+    ["unpin", pin, {}, `DELETE ${chatPath}/pinnedMessages/pin-1`],
+    ["react", reaction, { reactionType: "like" }, `POST ${reactionPath}/setReaction`],
+    [
+      "react",
+      { ...reaction, remove: true },
+      { reactionType: "like", removed: true },
+      `POST ${reactionPath}/unsetReaction`,
+    ],
+    ["addParticipant", member, { added: { ...member, chatId } }, `POST ${chatPath}/members`],
+    ["removeParticipant", member, removed, removalRequests],
+    ["renameGroup", { name: "Renamed chat" }, renamed, `PATCH ${chatPath}`],
   ];
+  const mutationCases = cases.map(([action, params, details, requests]) => ({
+    action,
+    params,
+    details,
+    requests: typeof requests === "string" ? [requests] : requests,
+  }));
 
   it.each([
     ...mutationCases.flatMap((testCase) =>
@@ -344,7 +306,7 @@ describe("Teams Graph mutation currentness", () => {
       [false, true].map((revoked) => ({ testCase: mutationCases[0]!, revoked, stage })),
     ),
   ])(
-    "checks the admitted $testCase.name after $stage preparation (revoked=$revoked)",
+    "checks admitted $testCase.action $testCase.params after $stage preparation (revoked=$revoked)",
     async ({ testCase: { action, params, details, requests }, revoked, stage }) => {
       const fixture = await createFixture({
         origin: "bundled",
@@ -565,9 +527,7 @@ describe("Teams Graph mutation currentness", () => {
         fixture.invoke("tool", action, { target: chatId, messageId, userId: memberId }),
       );
       expect(fixture.requests).toEqual(
-        action === "pin"
-          ? [`POST ${chatPath}/pinnedMessages`]
-          : [`GET ${chatPath}/members`, `DELETE ${chatPath}/members/${membershipId}`],
+        action === "pin" ? [`POST ${chatPath}/pinnedMessages`] : removalRequests,
       );
       if (outcome === "failure") {
         const providerFailure = { message: expect.stringMatching(/403.*Graph fixture refused/s) };
@@ -587,7 +547,7 @@ describe("Teams Graph mutation currentness", () => {
     mutationCases.filter(({ action }) =>
       ["addParticipant", "removeParticipant", "renameGroup"].includes(action),
     ),
-  )("keeps the owner requirement for $name", async ({ action, params }) => {
+  )("keeps the owner requirement for $action", async ({ action, params }) => {
     const fixture = await createFixture({ origin: "bundled", self: true });
     await expect(
       fixture.invoke("tool", action, { target: chatId, ...params }),
@@ -598,6 +558,9 @@ describe("Teams Graph mutation currentness", () => {
     expect(graph.acquireToken).not.toHaveBeenCalled();
   });
 
+  const owner = { self: true, senderIsOwner: true };
+  const chatMember = { target: chatId, ...member };
+  const channelPin = { target, messageId, ...pin };
   it.each<
     [
       ChannelMessageActionName,
@@ -606,18 +569,8 @@ describe("Teams Graph mutation currentness", () => {
       RegExp,
     ]
   >([
-    [
-      "addParticipant",
-      { self: true, senderIsOwner: true },
-      { target: chatId, userId: memberId, role: "administrator" },
-      /role must be/,
-    ],
-    [
-      "addParticipant",
-      { self: true, senderIsOwner: true, missingRequester: true },
-      { target: chatId, userId: memberId },
-      /requester|sender/i,
-    ],
+    ["addParticipant", owner, { ...chatMember, role: "administrator" }, /role must be/],
+    ["addParticipant", { ...owner, missingRequester: true }, chatMember, /requester|sender/i],
     ["pin", { self: true }, { target: chatId, messageId, accountId: "other" }, /account/i],
     [
       "react",
@@ -625,18 +578,8 @@ describe("Teams Graph mutation currentness", () => {
       { target: currentTarget, messageId, emoji: "like" },
       /not allowed/i,
     ],
-    [
-      "pin",
-      {},
-      { target, messageId, pinnedMessageId: "pin-1" },
-      /not supported for channel messages/,
-    ],
-    [
-      "unpin",
-      {},
-      { target, messageId, pinnedMessageId: "pin-1" },
-      /not supported for channel messages/,
-    ],
+    ["pin", {}, channelPin, /not supported for channel messages/],
+    ["unpin", {}, channelPin, /not supported for channel messages/],
   ])("rejects %s with %j before Graph", async (action, options, params, error) => {
     const fixture = await createFixture({ origin: "bundled", ...options });
     await expect(fixture.invoke("tool", action, params)).rejects.toThrow(error);
@@ -649,55 +592,30 @@ describe.each(surfaces)("Teams %s reads with a %s registration", (route, origin)
   it("reads messages, reactions, pins and channel metadata", async () => {
     const fixture = await createFixture({ origin });
     const messagePath = `/v1.0/teams/${teamId}/channels/${targetChannel}/messages/${messageId}`;
-    const cases: Array<{
-      action: ChannelMessageActionName;
-      params: Record<string, unknown>;
-      payload: Record<string, unknown>;
-      requests: string[];
-    }> = [
-      {
-        action: "read",
-        params: { target, messageId },
-        payload: { message: { id: messageId, text: message.body.content } },
-        requests: [`GET ${messagePath}`],
-      },
-      {
-        action: "reactions",
-        params: { target, messageId },
-        payload: { reactions: [{ reactionType: "👍", count: 1, users: [{ id: memberId }] }] },
-        requests: [`GET ${messagePath}`],
-      },
-      {
-        action: "list-pins",
-        params: { target: chatId },
-        payload: { pins: [{ pinnedMessageId: "pin-1", messageId, text: message.body.content }] },
-        requests: [`GET /v1.0/chats/${chatId}/pinnedMessages`],
-      },
-      {
-        action: "channel-info",
-        params: { teamId, channelId: targetChannel },
-        payload: { channelInfo: { id: targetChannel, membershipType: "standard" } },
-        requests: [`GET /v1.0/teams/${teamId}/channels/${targetChannel}`],
-      },
-      {
-        action: "channel-list",
-        params: { teamId },
-        payload: { channels: [{ id: targetChannel, displayName: "Target" }], truncated: false },
-        requests: [`GET /v1.0/teams/${teamId}/channels`],
-      },
+    const channelPath = `/v1.0/teams/${teamId}/channels/${targetChannel}`;
+    const expected = {
+      read: { message: { id: messageId, text: message.body.content } },
+      reactions: { reactions: [{ reactionType: "👍", count: 1, users: [{ id: memberId }] }] },
+      pins: { pins: [{ pinnedMessageId: "pin-1", messageId, text: message.body.content }] },
+      info: { channelInfo: { id: targetChannel, membershipType: "standard" } },
+      channels: { channels: [{ id: targetChannel, displayName: "Target" }], truncated: false },
+    };
+    const cases: Array<ActionCase<string>> = [
+      ["read", { target, messageId }, expected.read, messagePath],
+      ["reactions", { target, messageId }, expected.reactions, messagePath],
+      ["list-pins", { target: chatId }, expected.pins, `/v1.0/chats/${chatId}/pinnedMessages`],
+      ["channel-info", { teamId, channelId: targetChannel }, expected.info, channelPath],
+      ["channel-list", { teamId }, expected.channels, `/v1.0/teams/${teamId}/channels`],
     ];
-    for (const testCase of cases) {
+    for (const [action, params, payload, path] of cases) {
       const before = fixture.requests.length;
-      await expect(
-        fixture.invoke(route, testCase.action, testCase.params),
-        testCase.action,
-      ).resolves.toMatchObject({
+      await expect(fixture.invoke(route, action, params), action).resolves.toMatchObject({
         ok: true,
         channel: "msteams",
-        action: testCase.action,
-        ...testCase.payload,
+        action,
+        ...payload,
       });
-      expect(fixture.requests.slice(before), testCase.action).toEqual(testCase.requests);
+      expect(fixture.requests.slice(before), action).toEqual([`GET ${path}`]);
     }
   });
 
@@ -731,11 +649,7 @@ describe.each(surfaces)("Teams %s reads with a %s registration", (route, origin)
         gate.release();
       }
       await rejected;
-      if (stage === "run-response") {
-        expect(fixture.requests).toHaveLength(1);
-      } else {
-        expect(fixture.requests).toEqual([]);
-      }
+      expect(fixture.requests).toHaveLength(stage === "run-response" ? 1 : 0);
       if (local) {
         expect(graph.acquireToken).not.toHaveBeenCalled();
       }

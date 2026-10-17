@@ -11,12 +11,13 @@ import {
   type ReplyPayload,
 } from "../../auto-reply/reply-payload.js";
 import type { DispatchReplyWithBufferedBlockDispatcher } from "../../auto-reply/reply/provider-dispatcher.types.js";
-import { resetDiagnosticEventsForTest } from "../../infra/diagnostic-events.js";
 import { createStructuredOutboundPayloadPlan } from "../../infra/outbound/payloads.js";
 import type { OutboundPayloadPlan } from "../../infra/outbound/reply-payload-parts.js";
-import { resetLogger, setLoggerOverride } from "../../logging/logger.js";
+import type {
+  PluginHookMessageSendingEvent,
+  PluginHookMessageSendingResult,
+} from "../../plugins/hook-types.js";
 import { createSuiteTempRootTracker } from "../../test-helpers/temp-dir.js";
-import { outboundMessageIdentities } from "../message/outbound-echo-state.js";
 import {
   readAgentRunTerminalOutcome,
   recordAgentRunTerminalOutcome,
@@ -36,7 +37,13 @@ import {
   expectDispatched,
   expectNonVisibleFinalReceipt,
 } from "./run-channel-turn.delivery.test-helpers.js";
-import type { ChannelDeliveryInfo, ChannelTurnDeliveryAdapter, ChannelTurnPlan } from "./types.js";
+import { resetTurnLogger, resetTurnState } from "./turn-state.test-support.js";
+import type {
+  AssembledChannelTurn,
+  ChannelDeliveryInfo,
+  ChannelTurnDeliveryAdapter,
+  ChannelTurnPlan,
+} from "./types.js";
 
 const settlePendingFinalDelivery = vi.hoisted(() =>
   vi.fn(async (_completion: unknown, state: string) => ({ state })),
@@ -60,14 +67,7 @@ const {
 const tempDirs = createSuiteTempRootTracker({ prefix: "openclaw-channel-turn-delivery-" });
 let storePath: string;
 
-function runAssembled(
-  overrides: Partial<
-    Omit<
-      Parameters<typeof dispatchAssembledChannelTurn>[0],
-      "cfg" | "agentId" | "storePath" | "recordInboundSession"
-    >
-  >,
-) {
+function runAssembled(overrides: Partial<AssembledChannelTurn>) {
   return dispatchAssembledChannelTurn({
     cfg: {},
     agentId: "main",
@@ -81,6 +81,19 @@ function runAssembled(
     delivery: { deliver: vi.fn(), durable: { replyToMode: "first" } },
     ...overrides,
   });
+}
+
+function messageSending(
+  handler: (
+    event: PluginHookMessageSendingEvent,
+  ) => Promise<PluginHookMessageSendingResult | undefined> = async () => undefined,
+) {
+  const runMessageSending = vi.fn(handler);
+  getGlobalHookRunner.mockReturnValue({
+    hasHooks: (name: string) => name === "message_sending",
+    runMessageSending,
+  });
+  return runMessageSending;
 }
 
 function runRouted(
@@ -104,23 +117,11 @@ describe("channel turn delivery", () => {
   afterAll(() => tempDirs.cleanup());
   beforeEach(async () => {
     storePath = path.join(await tempDirs.make(), "sessions.json");
-    vi.clearAllMocks();
+    resetTurnState();
     dispatchReplyWithRoutedChannelDispatcherCore.mockImplementation(createDispatch());
-    outboundMessageIdentities.clear();
-    resetDiagnosticEventsForTest();
-    resetLogger();
-    setLoggerOverride({ level: "info" });
     resolveOutboundDurableFinalDeliverySupport.mockResolvedValue({ ok: true });
-    createMessageSentEmitter.mockImplementation(() => ({
-      emitMessageSent,
-      hasMessageSentHooks: true,
-    }));
-    getGlobalHookRunner.mockReturnValue(null);
   });
-  afterEach(() => {
-    setLoggerOverride(null);
-    resetLogger();
-  });
+  afterEach(resetTurnLogger);
 
   it("preserves prepared payload custody and literals through preparation and message hooks", async () => {
     const order: string[] = [];
@@ -146,13 +147,9 @@ describe("channel turn delivery", () => {
       );
       return { queuedFinal: true, counts: { tool: 0, block: 0, final: 1 } };
     });
-    const runMessageSending = vi.fn(async ({ content }: { content: string }) => ({
+    const runMessageSending = messageSending(async ({ content }) => ({
       content: content + " + hook",
     }));
-    getGlobalHookRunner.mockReturnValue({
-      hasHooks: (name: string) => name === "message_sending",
-      runMessageSending,
-    });
     const entered = createDeferred();
     const pending = createDeferred();
     settlePendingFinalDelivery.mockImplementationOnce(async (_completion, state: string) => {
@@ -274,11 +271,7 @@ describe("channel turn delivery", () => {
   );
 
   it("does not let message hooks resurrect payloads suppressed during preparation", async () => {
-    const runMessageSending = vi.fn(async () => ({ content: "resurrected" }));
-    getGlobalHookRunner.mockReturnValue({
-      hasHooks: (name: string) => name === "message_sending",
-      runMessageSending,
-    });
+    const runMessageSending = messageSending(async () => ({ content: "resurrected" }));
     const durable = vi.fn(),
       deliver = vi.fn(),
       onDelivered = vi.fn();
@@ -303,13 +296,9 @@ describe("channel turn delivery", () => {
   });
 
   it("preserves visible siblings and failure outcomes when hooks cancel a media-only final", async () => {
-    const runMessageSending = vi.fn(async ({ content }: { content: string }) =>
+    const runMessageSending = messageSending(async ({ content }) =>
       content ? undefined : { cancel: true, cancelReason: "policy", metadata: { source: "test" } },
     );
-    getGlobalHookRunner.mockReturnValue({
-      hasHooks: (name: string) => name === "message_sending",
-      runMessageSending,
-    });
     const payload = { mediaUrls: ["media://only"] };
     dispatchReplyWithRoutedChannelDispatcherCore.mockImplementationOnce(async (params) => {
       await params.dispatcherOptions.deliver({ text: "deliver me" }, { kind: "block" });
@@ -360,35 +349,43 @@ describe("channel turn delivery", () => {
   });
 
   it("maps durable hook cancellation to typed routed suppression", async () => {
+    const suppression = {
+      reason: "cancelled_by_message_sending_hook",
+      cancelReason: "policy",
+      metadata: { source: "test" },
+    } as const;
     sendDurableMessageBatch.mockResolvedValueOnce({
       status: "suppressed",
       results: [],
       receipt: { platformMessageIds: [], parts: [], sentAt: 1 },
-      reason: "cancelled_by_message_sending_hook",
+      reason: suppression.reason,
       payloadOutcomes: [
         {
           index: 0,
           status: "suppressed",
-          reason: "cancelled_by_message_sending_hook",
-          hookEffect: { cancelReason: "policy", metadata: { source: "test" } },
+          reason: suppression.reason,
+          hookEffect: { cancelReason: suppression.cancelReason, metadata: suppression.metadata },
         },
       ],
     });
     const onDelivered = vi.fn();
+    const capture = createDeliveryResultCapture();
+    dispatchReplyWithRoutedChannelDispatcherCore.mockImplementationOnce(capture.dispatch);
     const result = await runRouted(
       { deliver: vi.fn(), durable: { replyToMode: "first" }, onDelivered },
       { To: "chat-1" },
     );
+    expect(capture.getResult()).toEqual({
+      receipt: { platformMessageIds: [], parts: [], sentAt: 1 },
+      visibleReplySent: false,
+      suppression,
+    });
     expect(onDelivered).toHaveBeenCalledWith(
       { text: "reply" },
       { kind: "final" },
       expect.objectContaining({
         visibleReplySent: false,
-        suppression: {
-          reason: "cancelled_by_message_sending_hook",
-          cancelReason: "policy",
-          metadata: { source: "test" },
-        },
+        suppression,
       }),
     );
     expectDispatched(result);
@@ -420,12 +417,8 @@ describe("channel turn delivery", () => {
   it("prepares durable payloads while leaving hooks and visible delivery with the durable owner", async () => {
     sendDurableMessageBatch.mockResolvedValueOnce(createDurableSendResult(["tlon-1"]));
     const onDelivered = vi.fn(),
-      deliver = vi.fn(),
-      runMessageSending = vi.fn();
-    getGlobalHookRunner.mockReturnValue({
-      hasHooks: (name: string) => name === "message_sending",
-      runMessageSending,
-    });
+      deliver = vi.fn();
+    const runMessageSending = messageSending();
     const capture = createDeliveryResultCapture();
     dispatchReplyWithRoutedChannelDispatcherCore.mockImplementationOnce(capture.dispatch);
     await runRouted(
@@ -488,13 +481,9 @@ describe("channel turn delivery", () => {
       ok: false,
       reason: "missing_outbound_handler",
     });
-    const runMessageSending = vi.fn(async ({ content }: { content: string }) => ({
+    const runMessageSending = messageSending(async ({ content }) => ({
       content: content + " + direct-hook",
     }));
-    getGlobalHookRunner.mockReturnValue({
-      hasHooks: (name: string) => name === "message_sending",
-      runMessageSending,
-    });
     const deliver = vi.fn(async () => ({ messageIds: ["legacy-1"], visibleReplySent: true }));
     await runRouted(
       { deliver, durable: { replyToMode: "first" } },

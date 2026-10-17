@@ -6,14 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bindTestChannelParticipantAdmissionEvidence } from "../../../test/helpers/channel-admission-evidence.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { HistoryEntry } from "../../auto-reply/reply/history.types.js";
-import { resetDiagnosticEventsForTest } from "../../infra/diagnostic-events.js";
-import { resetLogger, setLoggerOverride } from "../../logging/logger.js";
 import {
   createChannelAdmissionAudit,
   consumeChannelAdmissionEvidence,
   readChannelContextAdmissionEvidence,
 } from "../message-access/admission-evidence.js";
-import { outboundMessageIdentities } from "../message/outbound-echo-state.js";
 import { recordOutboundMessageIdentity } from "../message/outbound-echo.js";
 import {
   hasVisibleChannelTurnDispatch,
@@ -27,6 +24,7 @@ import {
   expectDispatched,
 } from "./run-channel-turn.delivery.test-helpers.js";
 import { runChannelTurn } from "./run-channel-turn.js";
+import { resetTurnLogger, resetTurnState } from "./turn-state.test-support.js";
 import type {
   ChannelTurnHistoryFinalizeOptions,
   ChannelTurnPlan,
@@ -37,9 +35,6 @@ import type {
 const {
   recordInboundSessionCore,
   dispatchReplyWithRoutedChannelDispatcherCore,
-  emitMessageSent,
-  getGlobalHookRunner,
-  createMessageSentEmitter,
   readRecentUserAssistantTextForSession,
 } = channelTurnMocks;
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -88,24 +83,12 @@ const ingest = () => ({ id: "msg-1", rawText: "hello" });
 describe("channel turn finalize", () => {
   beforeEach(() => {
     storePath = path.join(tempDirs.make("openclaw-channel-turn-finalize-"), "sessions.json");
-    vi.clearAllMocks();
+    resetTurnState();
     recordInboundSessionCore.mockResolvedValue(undefined);
     dispatchReplyWithRoutedChannelDispatcherCore.mockImplementation(createDispatch());
-    outboundMessageIdentities.clear();
-    resetDiagnosticEventsForTest();
-    resetLogger();
-    setLoggerOverride({ level: "info" });
-    createMessageSentEmitter.mockImplementation(() => ({
-      emitMessageSent,
-      hasMessageSentHooks: true,
-    }));
-    getGlobalHookRunner.mockReturnValue(null);
     readRecentUserAssistantTextForSession.mockResolvedValue([]);
   });
-  afterEach(() => {
-    setLoggerOverride(null);
-    resetLogger();
-  });
+  afterEach(resetTurnLogger);
 
   it("drops repeated bot-pair turns before recording and releases prepared resources", async () => {
     const history = pendingHistory();

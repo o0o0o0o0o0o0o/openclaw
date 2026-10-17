@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import { persistPendingFinalDeliveryMarker } from "../../agents/pending-final-delivery-marker.js";
 import { clearPendingFinalDeliveryAfterSuccess } from "../../auto-reply/reply/dispatch-from-config.pending-final.js";
@@ -44,6 +44,22 @@ vi.mock("../../utils/sleep.js", async (importOriginal) => ({
 }));
 
 const cfg: OpenClawConfig = { channels: { telegram: { enabled: true } } };
+const connectionReset = () => Object.assign(new Error("socket reset"), { code: "ECONNRESET" });
+
+function setConfig(
+  registry: Parameters<typeof setPluginRuntimeLoadContext>[0],
+  config: OpenClawConfig,
+) {
+  setPluginRuntimeLoadContext(registry, {
+    rawConfig: config,
+    config,
+    activationSourceConfig: config,
+    autoEnabledReasons: {},
+    workspaceDir: undefined,
+    env: {},
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+  });
+}
 
 async function replacementFixture(options?: {
   newChannel?: boolean;
@@ -94,17 +110,7 @@ async function replacementFixture(options?: {
   if (!options?.newChannel) {
     old.channels.push(...current.channels);
   }
-  const setConfig = (config: OpenClawConfig) =>
-    setPluginRuntimeLoadContext(current, {
-      rawConfig: config,
-      config,
-      activationSourceConfig: config,
-      autoEnabledReasons: {},
-      workspaceDir: undefined,
-      env: {},
-      logger: { info() {}, warn() {}, error() {}, debug() {} },
-    });
-  setConfig(cfg);
+  setConfig(current, cfg);
   const publication: { current: typeof current | undefined } = { current };
   const owner = { current: () => publication.current };
   bindPluginRegistryGatewayOwner(old, owner);
@@ -145,7 +151,7 @@ async function replacementFixture(options?: {
     turn,
     current,
     publication,
-    setConfig,
+    setConfig: (config: OpenClawConfig) => setConfig(current, config),
     sendText,
     beforeSendAttempt,
     deliver,
@@ -155,13 +161,13 @@ async function replacementFixture(options?: {
 
 describe("final delivery after plugin replacement", () => {
   const state = installDeliveryQueueTmpDirHooks();
+  beforeEach(() => vi.stubEnv("OPENCLAW_STATE_DIR", state.tmpDir()));
   afterEach(() => {
     resetPluginRuntimeStateForTest();
     vi.unstubAllEnvs();
   });
 
   it("keeps the final caller pending until saved rich text is recovered", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", state.tmpDir());
     const fixture = await replacementFixture({ sameGeneration: true });
     fixture.request.payload = { text: "**Saved final** with [a link](https://example.com)" };
     const retryStarted = createDeferred();
@@ -169,7 +175,7 @@ describe("final delivery after plugin replacement", () => {
     fixture.sendText
       .mockRejectedValueOnce(
         new Error("network request failed", {
-          cause: Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
+          cause: connectionReset(),
         }),
       )
       .mockImplementationOnce(async () => {
@@ -207,10 +213,9 @@ describe("final delivery after plugin replacement", () => {
   });
 
   it("retains the accepted chunk when the final retry fails without replaying it", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", state.tmpDir());
     const fixture = await replacementFixture({ sameGeneration: true });
     fixture.sendText
-      .mockRejectedValueOnce(Object.assign(new Error("socket reset"), { code: "ECONNRESET" }))
+      .mockRejectedValueOnce(connectionReset())
       .mockImplementationOnce(async (ctx) => {
         await ctx.onDeliveryResult?.({
           messageId: "accepted-retry-chunk",
@@ -242,11 +247,8 @@ describe("final delivery after plugin replacement", () => {
   it.each(["backoff", "preparation"] as const)(
     "blocks the retry when its runtime is superseded during %s",
     async (phase) => {
-      vi.stubEnv("OPENCLAW_STATE_DIR", state.tmpDir());
       const fixture = await replacementFixture({ sameGeneration: true });
-      fixture.sendText.mockRejectedValueOnce(
-        Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
-      );
+      fixture.sendText.mockRejectedValueOnce(connectionReset());
       const supersede = async () => {
         fixture.publication.current = undefined;
       };
@@ -270,12 +272,9 @@ describe("final delivery after plugin replacement", () => {
     { text: "A photo", mediaUrl: "https://example.com/photo.png" },
     { text: "Choose", channelData: { buttons: [["yes"]] } },
   ])("does not replay side-effect or media finals: $text", async (payload) => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", state.tmpDir());
     const fixture = await replacementFixture({ sameGeneration: true });
     fixture.request.payload = payload;
-    fixture.sendText.mockRejectedValue(
-      Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
-    );
+    fixture.sendText.mockRejectedValue(connectionReset());
     await expect(fixture.deliver()).resolves.toMatchObject({ status: "failed" });
     expect(fixture.sendText).toHaveBeenCalledTimes(1);
   });
@@ -286,7 +285,6 @@ describe("final delivery after plugin replacement", () => {
   ])(
     "preserves final custody (sameGeneration=$sameGeneration, structured=$structured, retry=$retry, tool=$tool)",
     async ({ sameGeneration, structured, retry, tool }) => {
-      vi.stubEnv("OPENCLAW_STATE_DIR", state.tmpDir());
       const fixture = await replacementFixture({ sameGeneration });
       const successorConfig: OpenClawConfig = { ...cfg, logging: { level: "debug" } };
       fixture.setConfig(successorConfig);
@@ -316,9 +314,7 @@ describe("final delivery after plugin replacement", () => {
         { id: completion.deliveryId, state: "prepared" },
       ]);
       if (retry) {
-        fixture.sendText.mockRejectedValueOnce(
-          Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
-        );
+        fixture.sendText.mockRejectedValueOnce(connectionReset());
       }
       if (tool) {
         const result = await withPluginRuntimeRegistryScope(fixture.current, () =>
@@ -381,7 +377,6 @@ describe("final delivery after plugin replacement", () => {
     "superseded-live-send",
     "superseded-prepared-send",
   ] as const)("does not send or borrow the process root when %s", async (stateChange) => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", state.tmpDir());
     const fixture = await replacementFixture({
       newChannel: stateChange === "new-channel",
       sameGeneration: stateChange === "superseded-prepared-send",
@@ -440,7 +435,6 @@ describe("final delivery after plugin replacement", () => {
   });
 
   it("uses publication settings through prepared views and current policy for delivery", async () => {
-    vi.stubEnv("OPENCLAW_STATE_DIR", state.tmpDir());
     const fixture = await replacementFixture();
     fixture.request.cfg = {
       ...cfg,
@@ -451,15 +445,7 @@ describe("final delivery after plugin replacement", () => {
       tools: { fs: { workspaceOnly: true } },
     };
     fixture.setConfig(currentConfig);
-    setPluginRuntimeLoadContext(fixture.turn, {
-      rawConfig: fixture.request.cfg,
-      config: fixture.request.cfg,
-      activationSourceConfig: fixture.request.cfg,
-      autoEnabledReasons: {},
-      workspaceDir: undefined,
-      env: {},
-      logger: { info() {}, warn() {}, error() {}, debug() {} },
-    });
+    setConfig(fixture.turn, fixture.request.cfg);
     fixture.request.prepareRuntimeHandoff = (current) => ({
       ...current,
       channels: { telegram: { ...current.channels?.telegram, responsePrefix: "[ACCOUNT]" } },
@@ -569,15 +555,7 @@ describe("Telegram final sender after registry replacement", () => {
               },
               onDispatch(dispatchConfig) {
                 for (const registry of [old, next]) {
-                  setPluginRuntimeLoadContext(registry, {
-                    rawConfig: dispatchConfig,
-                    config: dispatchConfig,
-                    activationSourceConfig: dispatchConfig,
-                    autoEnabledReasons: {},
-                    workspaceDir: undefined,
-                    env: {},
-                    logger: { info() {}, warn() {}, error() {}, debug() {} },
-                  });
+                  setConfig(registry, dispatchConfig);
                 }
                 owner = createPluginRegistryOwner(old);
               },

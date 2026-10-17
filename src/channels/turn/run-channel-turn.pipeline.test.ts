@@ -9,10 +9,7 @@ import { noteDispatchProcessedOutcome } from "../../auto-reply/reply/dispatch-pr
 import type { DispatchReplyWithBufferedBlockDispatcher } from "../../auto-reply/reply/provider-dispatcher.types.js";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
 import { getReplySystemEventContext } from "../../auto-reply/reply/system-event-session-key.js";
-import { resetDiagnosticEventsForTest } from "../../infra/diagnostic-events.js";
 import { PlatformMessageNotDispatchedError } from "../../infra/outbound/deliver-types.js";
-import { resetLogger, setLoggerOverride } from "../../logging/logger.js";
-import { outboundMessageIdentities } from "../message/outbound-echo-state.js";
 import { runPreparedChannelTurn } from "./execution.js";
 import { dispatchAssembledChannelTurn } from "./lifecycle.js";
 import {
@@ -22,6 +19,7 @@ import {
   createReplyDispatchReceipt,
   expectDispatched,
 } from "./run-channel-turn.delivery.test-helpers.js";
+import { resetTurnLogger, resetTurnState } from "./turn-state.test-support.js";
 import type { AssembledChannelTurn, PreparedChannelTurn } from "./types.js";
 
 const subsystemWarn = vi.hoisted(() => vi.fn());
@@ -46,12 +44,7 @@ vi.mock("../../logging/subsystem.js", async (importOriginal) => {
   };
 });
 
-const {
-  emitMessageSent,
-  getGlobalHookRunner,
-  createMessageSentEmitter,
-  readRecentUserAssistantTextForSession,
-} = channelTurnMocks;
+const { emitMessageSent, readRecentUserAssistantTextForSession } = channelTurnMocks;
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 let storePath: string;
@@ -86,23 +79,11 @@ function runTestPreparedChannelTurn<TDispatchResult>(
 describe("channel turn pipeline", () => {
   beforeEach(() => {
     storePath = path.join(tempDirs.make("openclaw-channel-turn-pipeline-"), "sessions.json");
-    vi.clearAllMocks();
-    outboundMessageIdentities.clear();
-    resetDiagnosticEventsForTest();
-    resetLogger();
-    setLoggerOverride({ level: "info" });
-    createMessageSentEmitter.mockImplementation(() => ({
-      emitMessageSent,
-      hasMessageSentHooks: true,
-    }));
-    getGlobalHookRunner.mockReturnValue(null);
+    resetTurnState();
     readRecentUserAssistantTextForSession.mockResolvedValue([]);
   });
 
-  afterEach(() => {
-    setLoggerOverride(null);
-    resetLogger();
-  });
+  afterEach(resetTurnLogger);
 
   it("does not emit a second failure when a post-send observer throws", async () => {
     const observerError = new Error("observer failed");

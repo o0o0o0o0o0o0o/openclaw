@@ -29,6 +29,7 @@ vi.mock("../../infra/device-pairing-store-readonly.js", async (importOriginal) =
   return { ...actual, readDevicePairingNodeSnapshot: mocks.snapshot };
 });
 
+// mock-isolation: Node inventory uses a synthetic local identity, not the host identity.
 vi.mock("../../node-host/local-id.js", () => ({
   resolveLocalNodeId: mocks.localId,
 }));

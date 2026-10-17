@@ -7,7 +7,11 @@ import {
   createPluginStateKeyedStoreV2,
   createPluginStateSyncKeyedStore,
 } from "../../plugin-state/plugin-state-store.js";
-import type { PluginStateSyncKeyedStore } from "../../plugin-state/plugin-state-store.types.js";
+import type {
+  OpenAsyncKeyedStoreOptions,
+  OpenKeyedStoreOptions,
+  PluginStateSyncKeyedStore,
+} from "../../plugin-state/plugin-state-store.types.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import {
   markPluginRegistryActive,
@@ -47,6 +51,7 @@ export type NativeBindingTestApi = {
 
 export type NativeBindingClientTestApi = {
   attachNativeBindingDeletionClient(
+    this: void,
     store: PluginStateSyncKeyedStore<Record<string, unknown>>,
     key: string,
   ): Promise<{
@@ -118,12 +123,14 @@ export async function createNativeBindingFixture(
   });
   const runtime = createPluginRuntimeMock({
     state: {
-      openSyncKeyedStore: <Value>(options) =>
+      openSyncKeyedStore: <Value>(options: OpenKeyedStoreOptions) =>
         createPluginStateSyncKeyedStore<Value>(kind, { ...options, env }),
-      openKeyedStore: <Value>(options) =>
+      openKeyedStore: <Value>(options: OpenAsyncKeyedStoreOptions) =>
         createPluginStateKeyedStore<Value>(kind, { ...options, env }),
-      openKeyedStoreV2: <Value>(options, authority = { assertCurrent() {} }) =>
-        createPluginStateKeyedStoreV2<Value>(kind, { ...options, env }, authority),
+      openKeyedStoreV2: <Value>(
+        options: OpenAsyncKeyedStoreOptions,
+        authority = { assertCurrent() {} },
+      ) => createPluginStateKeyedStoreV2<Value>(kind, { ...options, env }, authority),
     },
   });
   const { createNativeBindingDeletionFixture } =

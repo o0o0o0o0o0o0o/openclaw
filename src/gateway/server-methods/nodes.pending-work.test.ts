@@ -23,9 +23,12 @@ const { pairing, work, wakeState, wake } = vi.hoisted(() => ({
     waitForNodeReconnect: vi.fn(),
   },
 }));
+// mock-isolation: Pending work is owned by this fixture, not persistent Gateway state.
 vi.mock("../node-pending-work.js", () => work);
+// mock-isolation: Pairing generations are synthetic and must not read host pairings.
 vi.mock("../../infra/device-pairing-node-state.js", () => pairing);
 vi.mock("../node-wake-state.js", () => wakeState);
+// mock-isolation: Exercise wake decisions without sending APNs or waking real nodes.
 vi.mock("./nodes.wake.js", () => wake);
 
 const nodeId = "node-1";

@@ -57,7 +57,7 @@ function operator(initial?: Partial<ModelPolicy>) {
   return {
     authority,
     listeners,
-    setPolicy(overrides: Partial<ModelPolicy>) {
+    setPolicy(this: void, overrides: Partial<ModelPolicy>) {
       policy = prepare(overrides);
       listeners.forEach((listener) => listener());
       return policy;

@@ -156,6 +156,16 @@ describe("channel delivery results", () => {
     expect(result.receipt).toBe(conflicting);
   });
 
+  it("preserves suppressed receipt results without synthetic message ids", () => {
+    const emptyReceipt = receipt();
+    expect(
+      createChannelDeliveryResultFromReceipt({
+        receipt: emptyReceipt,
+        visibleReplySent: false,
+      }),
+    ).toEqual({ receipt: emptyReceipt, visibleReplySent: false });
+  });
+
   it("normalizes visible dispatch checks", () => {
     const toolDispatch = {
       settledReceipt: {

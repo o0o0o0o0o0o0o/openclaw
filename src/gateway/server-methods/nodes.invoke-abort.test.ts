@@ -107,7 +107,7 @@ afterEach(() => {
 });
 
 function startNodeInvoke(options: {
-  invoke: ReturnType<typeof vi.fn>;
+  invoke: NodeRegistry["invoke"];
   signal?: AbortSignal;
   command?: string;
   config?: Record<string, unknown>;

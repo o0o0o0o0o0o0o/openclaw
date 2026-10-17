@@ -72,7 +72,7 @@ async function fixture(childAgent = "main") {
     sessionId: "parent-session",
     lifecycleRevision: "parent-lifecycle",
     updatedAt: 1,
-    incognito: true,
+    incognito: true as const,
   };
   const events = [
     {

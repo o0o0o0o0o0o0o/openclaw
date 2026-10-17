@@ -7,7 +7,10 @@ import {
   readAgentDeletionJournal as readJournal,
   removeAgentDeletionJournal as removeJournal,
 } from "../test-utils/agent-deletion-journal.js";
-import { retireAgentDeletionJournalInDatabase as retireJournal } from "./agent-deletion-journal-authority.worker.js";
+import {
+  completeAgentDeletionJournalInDatabase,
+  retireAgentDeletionJournalInDatabase as retireJournal,
+} from "./agent-deletion-journal-authority.worker.js";
 import type { AgentDeletionJournalInput } from "./agent-deletion-journal.types.js";
 import {
   assertNoOpenClawAgentDatabaseLeases as assertDrained,
@@ -77,6 +80,9 @@ it("admits settlement leases while draining and fences them once retirement begi
   const lease = claimLease(claim);
   try {
     expect(() => claimLease({ ...claim, agentId: "survivor" })).toThrow("deletion owns");
+    expect(
+      writeState((db) => completeAgentDeletionJournalInDatabase(db, agentId, operationId), { env }),
+    ).toBe(false);
     expect(writeState((db) => retireJournal(db, agentId, operationId), { env })).toBe(true);
     expect(() => claimLease(claim)).toThrow("while agent deleted is deleted");
   } finally {

@@ -248,7 +248,7 @@ it.each([
   "normalizes $side headers before upstream reads",
   async ({ side, key, value, extra }) => {
     const transport = await getGoogleAuthTransport();
-    const add = transport.interceptors[side].add as unknown as ReturnType<typeof vi.fn>;
+    const add = vi.mocked(transport.interceptors[side].add);
     const interceptor = mockCallArg(add) as {
       resolved: (
         input: { headers: Record<string, string> } & ({ url: URL } | { data: object }),

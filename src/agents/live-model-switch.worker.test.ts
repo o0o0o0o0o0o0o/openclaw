@@ -35,7 +35,7 @@ describe("live model switch worker persistence", () => {
       const entry = snapshot.entry!;
       const reducer = selectReducer(entry);
       if (!reducer) {
-        return;
+        return undefined;
       }
       const outcome = await actor.completeTurn(
         {

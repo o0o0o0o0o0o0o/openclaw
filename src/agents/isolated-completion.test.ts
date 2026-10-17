@@ -122,7 +122,7 @@ function pausedHarness(stage: PreparationStage, version: "v1" | "v2" = "v2") {
     retire() {
       current = false;
     },
-    assertCurrent() {
+    assertCurrent(this: void) {
       if (!current) {
         throw expired;
       }

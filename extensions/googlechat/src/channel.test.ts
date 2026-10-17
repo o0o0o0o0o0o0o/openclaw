@@ -196,9 +196,14 @@ describe("googlechatPlugin outbound resolveTarget", () => {
   });
 
   it("errors on invalid targets", () => {
-    expect(resolveTarget({ to: "   " })).toEqual({
+    expect(resolveTarget({ to: "   " })).toMatchObject({
       ok: false,
-      error: new Error("Delivering to Google Chat requires target <spaces/{space}|users/{user}>"),
+      error: {
+        name: "MessageActionDeniedError",
+        message: "Delivering to Google Chat requires target <spaces/{space}|users/{user}>",
+        reasonCode: "message_target_missing",
+        policyRef: "message-target:required",
+      },
     });
   });
 });

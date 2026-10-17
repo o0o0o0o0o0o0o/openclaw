@@ -15,7 +15,7 @@ const parentEnv = {
 function files(root: string) {
   return {
     read: (name: string) => fs.readFileSync(join(root, name), "utf8"),
-    write(name: string, content: string) {
+    write(this: void, name: string, content: string) {
       const path = join(root, name);
       fs.writeFileSync(path, content);
       return path;

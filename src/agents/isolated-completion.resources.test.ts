@@ -189,11 +189,14 @@ it.for(["overlap", "callback-tail", "cancel-tail", "auth-tail", "auth-failure"] 
                       // The rejected response hook must cancel this unread body.
                       async cancel(reason) {
                         workStarted.resolve();
-                        const pending = finishWork.promise
-                          .then(() => {
+                        const pending = (async () => {
+                          try {
+                            await finishWork.promise;
                             throw cancelFailure;
-                          })
-                          .finally(() => body.cancel(reason));
+                          } finally {
+                            await body.cancel(reason);
+                          }
+                        })();
                         actualWork.push(pending);
                         return await pending;
                       },

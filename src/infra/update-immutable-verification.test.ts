@@ -9,7 +9,6 @@ import {
   restoreRestartHealthMocks,
 } from "../cli/daemon-cli/restart-health.test-helpers.js";
 import { gatewayHealthResponse } from "../gateway/health-response.test-support.js";
-import { syntheticImmutableServiceObservation } from "./update-immutable-activation.test-support.js";
 import type { ImmutableInstallDescriptor } from "./update-immutable-install-schema.js";
 import type { ImmutableServiceObservation } from "./update-immutable-service.js";
 import { waitForImmutableGateway } from "./update-immutable-verification.js";
@@ -63,14 +62,33 @@ const descriptor: ImmutableInstallDescriptor = {
   source: "https://github.com/openclaw/openclaw.git",
 };
 function serviceObservation(): ImmutableServiceObservation {
-  const observed = syntheticImmutableServiceObservation(descriptor, {
+  return {
+    phase: "running",
+    definitionDigest: "d".repeat(64),
     pid: 8000,
+    processStartTicks: "100",
     generationPath: generation.path,
-  });
-  observed.processStartTicks = "100";
-  observed.controlGroup = "/system.slice/synthetic.service";
-  observed.state.env = {};
-  return observed;
+    runtimePath: descriptor.runtime.path,
+    controlGroup: "/system.slice/synthetic.service",
+    state: {
+      installed: true,
+      loadState: { status: "loaded" },
+      running: true,
+      command: null,
+      env: {},
+      runtime: { status: "running", pid: 8000 },
+    },
+    identity: {
+      scope: "system",
+      unitName: "synthetic.service",
+      unitPath: "/synthetic/service",
+      bus: { address: "synthetic" },
+      busId: "bus",
+      managerOwner: "manager",
+      managerUid: 0,
+      serviceUser: "synthetic",
+    },
+  };
 }
 const health = (overrides: Parameters<typeof gatewayHealthResponse>[0] = {}) => {
   const respond = gatewayHealthResponse({
@@ -98,12 +116,6 @@ const health = (overrides: Parameters<typeof gatewayHealthResponse>[0] = {}) => 
 };
 const observe = (assertCurrent = () => {}) =>
   waitForImmutableGateway({ descriptor, generation, timeoutMs: 120_000, assertCurrent });
-const busyPort = (port = 18789) => ({
-  status: "busy" as const,
-  port,
-  listeners: [{ pid: 8000 }],
-  hints: [],
-});
 
 beforeEach(() => {
   resetRestartHealthMocks();
@@ -112,7 +124,12 @@ beforeEach(() => {
   mocks.current.mockReset();
   mocks.runtime.mockReset().mockResolvedValue({ status: "running", pid: 8000 });
   mocks.http.mockReset().mockResolvedValue({ healthz: 200, readyz: 200 });
-  inspectPortUsage.mockResolvedValue(busyPort());
+  inspectPortUsage.mockResolvedValue({
+    status: "busy",
+    port: 18789,
+    listeners: [{ pid: 8000 }],
+    hints: [],
+  });
   callGateway.mockImplementation(health());
 });
 afterEach(() => {
@@ -127,7 +144,12 @@ it("verifies the preserved service's explicit port instead of the config default
     programArguments: ["/synthetic/install/bin/openclaw-gateway", "--port", "19678"],
   };
   mocks.inspect.mockResolvedValue(service);
-  inspectPortUsage.mockImplementation(async (port) => busyPort(port));
+  inspectPortUsage.mockImplementation(async (port) => ({
+    port,
+    status: "busy",
+    listeners: [{ pid: 8000 }],
+    hints: [],
+  }));
 
   const result = await observe();
 
@@ -175,12 +197,15 @@ it.each([90_000, 150_000])(
   },
 );
 
-it("reports a definitive version failure without a verification receipt", async () => {
-  callGateway.mockImplementation(health({ server: { version: "previous-version" } }));
-  const result = await observe();
-  expect(result.outcome).toBe("failed");
-  expect(result.verification).toBeUndefined();
-});
+it.each([{ name: "version", server: { version: "previous-version" } }])(
+  "reports a definitive $name failure without a verification receipt",
+  async (failure) => {
+    callGateway.mockImplementation(health(failure));
+    const result = await observe();
+    expect(result.outcome).toBe("failed");
+    expect(result.verification).toBeUndefined();
+  },
+);
 
 it("leaves an unavailable health RPC unverified rather than authorizing rollback", async () => {
   callGateway.mockRejectedValue(new Error("connection refused"));

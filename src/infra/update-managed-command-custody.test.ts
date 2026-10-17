@@ -1,4 +1,3 @@
-import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
@@ -39,11 +38,6 @@ function fixture() {
   const roots = ["original", "candidate", "retained", "slot"].map((name) =>
     path.join(directory, name),
   );
-  const acquire = (...args: Parameters<typeof store.acquire>) => {
-    const result = store.acquire(...args);
-    assert(result.kind === "acquired", "Missing fixture lease");
-    return result.lease;
-  };
   const rows = () =>
     createManagedHandoffLeaseDatabase(databasePath)(
       false,
@@ -53,43 +47,33 @@ function fixture() {
           leaseQueries(db).selectFrom("managed_update_handoffs").selectAll(),
         ).rows,
     );
-  const expectBusy = (targets = roots) => {
-    for (const root of targets) {
-      expect(store.acquire(root, "next", { kind: "update" }).kind).toBe("busy");
-    }
-  };
-  const releaseNext = () => {
-    for (const root of roots) {
-      expect(store.release(acquire(root, "next", { kind: "update" }))).toBe(true);
-    }
-  };
-  return {
-    directory,
-    privateTmp,
-    databasePath,
-    store,
-    roots,
-    rows,
-    expectBusy,
-    releaseNext,
-    acquire,
-  };
+  return { directory, privateTmp, databasePath, store, roots, rows };
 }
 
 describe.skipIf(process.platform === "win32")("managed command process custody", () => {
   it("retains live authority while a managed command binds and releases every reservation on normal completion", async () => {
     const f = fixture();
-    const parents = f.roots.map((root) => f.acquire(root, "command", { kind: "update" }));
-    const delegated = parents.map((parent) =>
-      f.acquire(
+    const parents = f.roots.map((root) => {
+      const result = f.store.acquire(root, "command", { kind: "update" });
+      if (result.kind !== "acquired") {
+        throw new Error("Missing parent fixture");
+      }
+      return result.lease;
+    });
+    const delegated = parents.map((parent) => {
+      const result = f.store.acquire(
         `${parent.key}/.openclaw-update-child-delegated`,
         "command",
         { kind: "update" },
         false,
         undefined,
         parent,
-      ),
-    );
+      );
+      if (result.kind !== "acquired") {
+        throw new Error("Missing delegated fixture");
+      }
+      return result.lease;
+    });
     const retained = await createManagedCommandProcessCustody({
       roots: delegated.map((parent) => parent.key),
       parents: delegated,
@@ -126,7 +110,8 @@ describe.skipIf(process.platform === "win32")("managed command process custody",
       undefined,
       retained.custody,
     );
-    expect(result).toMatchObject({ code: 0, stdout: "owned" });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("owned");
     expect(f.rows().filter((row) => row.install_root.endsWith("-command"))).toEqual([]);
     retained.releaseAnchors();
     for (const parent of [...parents, ...delegated]) {
@@ -148,17 +133,29 @@ describe.skipIf(process.platform === "win32")("managed command process custody",
     expect(f.rows()).toHaveLength(f.roots.length * 2);
     for (const row of f.rows()) {
       const current = f.store.read(row.install_root);
-      assert(current.kind === "current", "Missing command reservation");
+      if (current.kind !== "current") {
+        throw new Error("Missing command reservation");
+      }
       expect(f.store.release(current.lease)).toBe(false);
       expect(f.store.bind(current.lease, process.pid)).toBeNull();
     }
-    f.expectBusy();
+    for (const root of f.roots) {
+      expect(f.store.acquire(root, "next", { kind: "update" }).kind).toBe("busy");
+    }
     reservation.settled();
     expect(f.rows()).toHaveLength(f.roots.length);
-    f.expectBusy();
+    for (const root of f.roots) {
+      expect(f.store.acquire(root, "next", { kind: "update" }).kind).toBe("busy");
+    }
     retained.releaseAnchors();
     expect(f.rows()).toEqual([]);
-    f.releaseNext();
+    for (const root of f.roots) {
+      const acquired = f.store.acquire(root, "next", { kind: "update" });
+      expect(acquired.kind).toBe("acquired");
+      if (acquired.kind === "acquired") {
+        expect(f.store.release(acquired.lease)).toBe(true);
+      }
+    }
   });
 
   it.each(["current", "legacy"])(
@@ -210,7 +207,9 @@ describe.skipIf(process.platform === "win32")("managed command process custody",
     const closed = once(holder, "close");
     try {
       await once(holder, "spawn");
-      assert(holder.pid, "Missing tracked child PID");
+      if (!holder.pid) {
+        throw new Error("Missing tracked child PID");
+      }
       const pendingRoot = path.join(f.directory, "pending");
       const namespaces = f.roots
         .slice(0, -1)
@@ -272,17 +271,27 @@ process.kill(process.pid, "SIGKILL");
           executor: { pid: holder.pid },
         });
       }
-      f.expectBusy([...f.roots, pendingRoot]);
+      for (const root of [...f.roots, pendingRoot]) {
+        expect(f.store.acquire(root, "next", { kind: "update" }).kind).toBe("busy");
+      }
       const pending = f.rows().find((row) => row.owner === "pending-owner");
       expect(pending).toBeDefined();
       const retained = f.store.read(pending!.install_root);
-      assert(retained.kind === "current", "Missing pending reservation");
+      if (retained.kind !== "current") {
+        throw new Error("Missing pending reservation");
+      }
       expect(f.store.releaseCommandReservation(retained.lease)).toBe(false);
 
       holder.kill("SIGKILL");
       await closed;
-      f.releaseNext();
-      f.expectBusy([pendingRoot]);
+      for (const root of f.roots) {
+        const acquired = f.store.acquire(root, "next", { kind: "update" });
+        expect(acquired.kind).toBe("acquired");
+        if (acquired.kind === "acquired") {
+          expect(f.store.release(acquired.lease)).toBe(true);
+        }
+      }
+      expect(f.store.acquire(pendingRoot, "next", { kind: "update" }).kind).toBe("busy");
     } finally {
       holder.kill("SIGKILL");
       await closed;

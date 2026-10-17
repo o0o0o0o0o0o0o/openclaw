@@ -61,9 +61,12 @@ vi.mock("openclaw/plugin-sdk/routing", async (importOriginal) => ({
   resolveAgentRoute: inboundMocks.resolveAgentRoute,
 }));
 
+// mock-isolation: Network responses come only from the monitor fixture.
 vi.mock("./api.js", () => apiMocks);
+// mock-isolation: The fixture supplies access decisions without pairing state.
 vi.mock("./monitor-access.js", () => accessMocks);
 
+// mock-isolation: Capture ingress directly without installing HTTP webhook routes.
 vi.mock("./monitor-routing.js", () => ({
   registerGoogleChatWebhookTarget: vi.fn(),
   setGoogleChatWebhookEventProcessor: vi.fn((processEvent: EventProcessor) => {

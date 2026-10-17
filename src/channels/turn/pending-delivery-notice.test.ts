@@ -1,5 +1,5 @@
 import path from "node:path";
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, assert, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
@@ -83,9 +83,10 @@ describe("pending delivery notice", () => {
 
   it("does not cross an account or thread route", async () => {
     const current = entry();
+    assert(current.delivery?.kind === "external");
     await replaceSessionEntry(locator(), {
       ...current,
-      delivery: { ...current.delivery!, context: { ...context, accountId: "other" } },
+      delivery: { ...current.delivery, context: { ...context, accountId: "other" } },
     });
 
     await deliver();

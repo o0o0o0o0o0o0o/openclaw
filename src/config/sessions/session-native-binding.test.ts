@@ -11,47 +11,25 @@ import { createPluginStateKeyedStoreV2 } from "../../plugin-state/plugin-state-s
 import { capturePluginStateNativeBindingStore } from "../../plugin-state/plugin-state-store.native-binding.js";
 import { onSessionIdentityMutation } from "../../sessions/session-lifecycle-events.js";
 import { readSessionArchiveContentSync } from "./archive-compression.js";
+import { bindingWrites } from "./session-native-binding.execution.test-support.js";
 import { withNativeBindingFixture } from "./session-native-binding.test-support.js";
 
 const delivery = vi.hoisted(() => ({ afterExecution: undefined as (() => void) | undefined }));
 vi.mock("../../state/openclaw-agent-execution.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../state/openclaw-agent-execution.js")>();
-  const withDelivery = (
-    owner: ReturnType<typeof actual.captureOpenClawAgentDatabaseExecution>,
-  ): typeof owner => {
-    return {
-      ...owner,
-      get fileIdentity() {
-        return owner.fileIdentity;
-      },
-      runExisting: (source, operation, options) =>
-        owner.runExisting(
-          source,
-          (worker) =>
-            operation({
-              execute: async (command, commandOptions) => {
-                try {
-                  return await worker.execute(command, commandOptions);
-                } finally {
-                  if (command.type === "session.nativeBindings.delete") {
-                    delivery.afterExecution?.();
-                  }
-                }
-              },
-            }),
-          options,
-        ),
-    };
-  };
-  return {
-    ...actual,
-    captureOpenClawAgentDatabaseExecution: (
-      ...args: Parameters<typeof actual.captureOpenClawAgentDatabaseExecution>
-    ) => withDelivery(actual.captureOpenClawAgentDatabaseExecution(...args)),
-    captureOpenClawAgentDatabasePreparationExecution: (
-      ...args: Parameters<typeof actual.captureOpenClawAgentDatabasePreparationExecution>
-    ) => withDelivery(actual.captureOpenClawAgentDatabasePreparationExecution(...args)),
-  };
+  const { instrumentAgentExecutions } =
+    await import("./session-native-binding.execution.test-support.js");
+  return instrumentAgentExecutions(actual, (worker) => ({
+    execute: async (command, options) => {
+      try {
+        return await worker.execute(command, options);
+      } finally {
+        if (command.type === "session.nativeBindings.delete") {
+          delivery.afterExecution?.();
+        }
+      }
+    },
+  }));
 });
 
 afterEach(() => {
@@ -72,11 +50,6 @@ function observeNativeGrants(
     admit(request, grant);
   });
 }
-
-const bindingWrites = (queries: readonly string[]) =>
-  queries.filter((sql) =>
-    /\b(?:delete\s+from|insert(?:\s+or\s+\w+)?\s+into)\s+["`]?plugin_state_entries\b/i.test(sql),
-  );
 
 it("deletes only the requested Codex binding owner through the host worker", async () => {
   await withNativeBindingFixture("codex", async (fixture) => {

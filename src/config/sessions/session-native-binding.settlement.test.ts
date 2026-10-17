@@ -21,44 +21,21 @@ const delivery = vi.hoisted(() => ({
 }));
 vi.mock("../../state/openclaw-agent-execution.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../state/openclaw-agent-execution.js")>();
-  const withDelivery = (
-    owner: ReturnType<typeof actual.captureOpenClawAgentDatabaseExecution>,
-  ): typeof owner => {
-    return {
-      ...owner,
-      get fileIdentity() {
-        return owner.fileIdentity;
-      },
-      runExisting: (source, operation, options) =>
-        owner.runExisting(
-          source,
-          (worker) =>
-            operation({
-              async execute(command, commandOptions) {
-                if (command.type === "session.nativeBindings.delete") {
-                  delivery.beforeExecution?.();
-                  delivery.dispatched++;
-                }
-                const result = await worker.execute(command, commandOptions);
-                if (command.type === "session.nativeBindings.delete") {
-                  delivery.afterExecution?.(result);
-                }
-                return result;
-              },
-            }),
-          options,
-        ),
-    };
-  };
-  return {
-    ...actual,
-    captureOpenClawAgentDatabaseExecution: (
-      ...args: Parameters<typeof actual.captureOpenClawAgentDatabaseExecution>
-    ) => withDelivery(actual.captureOpenClawAgentDatabaseExecution(...args)),
-    captureOpenClawAgentDatabasePreparationExecution: (
-      ...args: Parameters<typeof actual.captureOpenClawAgentDatabasePreparationExecution>
-    ) => withDelivery(actual.captureOpenClawAgentDatabasePreparationExecution(...args)),
-  };
+  const { instrumentAgentExecutions } =
+    await import("./session-native-binding.execution.test-support.js");
+  return instrumentAgentExecutions(actual, (worker) => ({
+    async execute(command, options) {
+      if (command.type === "session.nativeBindings.delete") {
+        delivery.beforeExecution?.();
+        delivery.dispatched++;
+      }
+      const result = await worker.execute(command, options);
+      if (command.type === "session.nativeBindings.delete") {
+        delivery.afterExecution?.(result);
+      }
+      return result;
+    },
+  }));
 });
 
 afterEach(() => {

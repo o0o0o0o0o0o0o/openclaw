@@ -13,6 +13,7 @@ import {
   runWithSessionActorStorage,
   type SessionActorStorageBinding,
 } from "./session-actor-storage-binding.js";
+import type { SessionActorStorageWrites } from "./session-actor-storage-contract.js";
 import type { InternalSessionEntry } from "./types.js";
 
 // The real adapters must never open native storage or allocate database workers.
@@ -52,7 +53,16 @@ async function acquire(agentId: string, sessionKey: string) {
   );
   actors.push(actor);
   const binding: SessionActorStorageBinding = { actor, authority, agentId, path: owner.path };
-  return { actor, owner, binding };
+  return {
+    actor,
+    owner,
+    binding,
+    readEntry: () => actor.storage!.read({ type: "session.entry.read", input: {} }, authority),
+    readHistory: (sessionId?: string) =>
+      actor.storage!.read({ type: "session.history.hydrate", input: { sessionId } }, authority),
+    create: (input: SessionActorStorageWrites["session.entry.create"]["input"]) =>
+      actor.storage!.mutate({ type: "session.entry.create", input }, authority),
+  };
 }
 
 async function fixture(childAgent = "main", parentPatch: Partial<InternalSessionEntry> = {}) {
@@ -80,15 +90,9 @@ async function fixture(childAgent = "main", parentPatch: Partial<InternalSession
       message: { role: "assistant", content: "First answer", stopReason: "stop" },
     },
   ];
-  expect(
-    await parent.actor.storage!.mutate(
-      {
-        type: "session.entry.create",
-        input: { entry, transcriptEvents: events },
-      },
-      authority,
-    ),
-  ).toMatchObject({ kind: "committed" });
+  expect(await parent.create({ entry, transcriptEvents: events })).toMatchObject({
+    kind: "committed",
+  });
   const childKey = `agent:${childAgent}:dashboard:incognito-child-fork`;
   const child = await acquire(childAgent, childKey);
   return { parent, child, childKey, entry };
@@ -164,24 +168,14 @@ it.each([
         }),
       ]),
     );
+    expect(await child.readEntry()).toBeUndefined();
     expect(
-      await child.actor.storage!.read({ type: "session.entry.read", input: {} }, authority),
-    ).toBeUndefined();
-    expect(
-      await child.actor.storage!.mutate(
-        {
-          type: "session.entry.create",
-          input: {
-            entry: { sessionId: prepared.transcript.sessionId, updatedAt: 2 },
-            transcriptEvents: prepared.events,
-          },
-        },
-        authority,
-      ),
+      await child.create({
+        entry: { sessionId: prepared.transcript.sessionId, updatedAt: 2 },
+        transcriptEvents: prepared.events,
+      }),
     ).toMatchObject({ kind: "committed" });
-    expect(
-      await child.actor.storage!.read({ type: "session.history.hydrate", input: {} }, authority),
-    ).toMatchObject({
+    expect(await child.readHistory()).toMatchObject({
       kind: "full",
       snapshot: { events: prepared.events },
     });
@@ -244,10 +238,7 @@ it.each(["main", "research"])(
     });
     expect(fork.status).toBe("created");
     expect(child.owner.readSession(childKey, authority)?.entry).toBeUndefined();
-    const pending = await child.actor.storage!.read(
-      { type: "session.history.hydrate", input: { sessionId: "pending-child-transcript" } },
-      authority,
-    );
+    const pending = await child.readHistory("pending-child-transcript");
     expect(pending).toMatchObject({
       kind: "full",
       snapshot: { events: expect.arrayContaining([expect.objectContaining({ id: "a1" })]) },
@@ -256,9 +247,7 @@ it.each(["main", "research"])(
       { agentId: childAgent, sessionKey: childKey, storePath: child.owner.path },
       { sessionId: "pending-child-transcript", updatedAt: 2 },
     );
-    expect(
-      await child.actor.storage!.read({ type: "session.history.hydrate", input: {} }, authority),
-    ).toMatchObject({
+    expect(await child.readHistory()).toMatchObject({
       kind: "full",
       snapshot: { events: pending.kind === "full" ? pending.snapshot.events : [] },
     });

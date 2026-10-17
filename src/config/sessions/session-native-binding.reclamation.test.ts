@@ -21,6 +21,11 @@ import { replaceSessionEntrySync } from "./session-accessor.sqlite-entry.js";
 import { applySessionEntryLifecycleMutation } from "./session-accessor.sqlite-projection.js";
 import { loadTranscriptEventsSync } from "./session-accessor.sqlite-read.js";
 import { applySessionEntryCanonicalReplacements } from "./session-accessor.sqlite-replacement-projection.js";
+import {
+  bindingWrites,
+  expectNoSql,
+  wrapAgentExecution,
+} from "./session-native-binding.execution.test-support.js";
 import { withNativeBindingFixture } from "./session-native-binding.test-support.js";
 
 afterEach(() => vi.restoreAllMocks());
@@ -72,18 +77,8 @@ it.each([false, true])(
           await expect(replacement).resolves.toBe("replaced");
         }
         expect(admitted).toBe(true);
-        expect(
-          sql.queries.filter((query) =>
-            /\b(?:session_nodes|session_windows|transcript_events)\b/i.test(query),
-          ),
-        ).toEqual([]);
-        expect(
-          sql.queries.filter((query) =>
-            /\b(?:delete\s+from|insert(?:\s+or\s+\w+)?\s+into)\s+["`]?plugin_state_entries\b/i.test(
-              query,
-            ),
-          ),
-        ).toEqual([]);
+        expectNoSql(sql.queries, /\b(?:session_nodes|session_windows|transcript_events)\b/i);
+        expect(bindingWrites(sql.queries)).toEqual([]);
       } finally {
         sql.restore();
       }
@@ -122,29 +117,16 @@ it.each([false, true])(
       if (successor) {
         const capture = execution.captureOpenClawAgentDatabaseExecution;
         const capturePreparation = execution.captureOpenClawAgentDatabasePreparationExecution;
-        const withDelivery = (owner: ReturnType<typeof capture>): typeof owner => {
-          return {
-            ...owner,
-            get fileIdentity() {
-              return owner.fileIdentity;
+        const withDelivery = (owner: ReturnType<typeof capture>) =>
+          wrapAgentExecution(owner, (worker) => ({
+            execute: async (command, options) => {
+              const result = await worker.execute(command, options);
+              if (command.type === "session.nativeBindings.delete") {
+                inject();
+              }
+              return result;
             },
-            runExisting: (source, operation, options) =>
-              owner.runExisting(
-                source,
-                (worker) =>
-                  operation({
-                    execute: async (command, commandOptions) => {
-                      const result = await worker.execute(command, commandOptions);
-                      if (command.type === "session.nativeBindings.delete") {
-                        inject();
-                      }
-                      return result;
-                    },
-                  }),
-                options,
-              ),
-          };
-        };
+          }));
         vi.spyOn(execution, "captureOpenClawAgentDatabaseExecution").mockImplementation((...args) =>
           withDelivery(capture(...args)),
         );
@@ -189,13 +171,10 @@ it.each([false, true])(
           ),
         ).resolves.toMatchObject({ removedSessionKeys: [fixture.scope.sessionKey] });
         if (sql) {
-          expect(
-            sql.queries.filter((query) =>
-              /\b(?:session_nodes|session_windows|transcript_events|session_progress_cards)\b/i.test(
-                query,
-              ),
-            ),
-          ).toEqual([]);
+          expectNoSql(
+            sql.queries,
+            /\b(?:session_nodes|session_windows|transcript_events|session_progress_cards)\b/i,
+          );
         }
       } finally {
         sql?.restore();
@@ -245,18 +224,8 @@ it("reclaims lifecycle artifacts with the native veto off the caller thread", as
       await expect(fixture.cleanup()).resolves.toMatchObject({ removedEntries: 1 });
       expect(granted).toBe(true);
       // Other-owner live authority reads remain outside the moved A transaction.
-      expect(
-        sql.queries.filter((query) =>
-          /\b(?:session_nodes|session_windows|transcript_events)\b/i.test(query),
-        ),
-      ).toEqual([]);
-      expect(
-        sql.queries.filter((query) =>
-          /\b(?:delete\s+from|insert(?:\s+or\s+\w+)?\s+into)\s+["`]?plugin_state_entries\b/i.test(
-            query,
-          ),
-        ),
-      ).toEqual([]);
+      expectNoSql(sql.queries, /\b(?:session_nodes|session_windows|transcript_events)\b/i);
+      expect(bindingWrites(sql.queries)).toEqual([]);
     } finally {
       sql.restore();
       stop();
@@ -282,56 +251,12 @@ it.each([false, true])(
       const sql = observeHostDataSql();
       try {
         await expect(fixture.maintain(before)).resolves.toMatchObject({ pruned: changed ? 0 : 1 });
-        expect(
-          sql.queries.filter((query) =>
-            /\b(?:session_nodes|session_windows|transcript_events)\b/i.test(query),
-          ),
-        ).toEqual([]);
+        expectNoSql(sql.queries, /\b(?:session_nodes|session_windows|transcript_events)\b/i);
       } finally {
         sql.restore();
       }
       expect(fixture.readEntry()).toEqual(changed ? successor : undefined);
       expect(fixture.readBinding()).toEqual(changed ? binding : undefined);
-    });
-  },
-);
-
-it.each([false, true])(
-  "rolls back initialization off the caller thread (binding: %s)",
-  async (withBinding) => {
-    await withNativeBindingFixture("agentsapi", async (fixture) => {
-      if (!withBinding) {
-        fixture.registry.agentHarnesses.length = 0;
-      }
-      const entry = fixture.readEntry();
-      assert(entry);
-      const initializer = createSessionInitialization(
-        { ...fixture.scope, lifecycleRevision: entry.lifecycleRevision },
-        () => {},
-        { config: {}, agentId: fixture.scope.agentId, entry },
-      );
-      const sql = observeHostDataSql();
-      try {
-        await expect(initializer.rollback(() => fixture.remove())).resolves.toMatchObject({
-          deleted: true,
-        });
-        expect(
-          sql.queries.filter((query) =>
-            /\b(?:session_nodes|session_windows|transcript_events|session_transcript_archives)\b/i.test(
-              query,
-            ),
-          ),
-        ).toEqual([]);
-        expect(() => initializer.handle.assertCurrent()).toThrow(
-          "Session initialization is rolling back",
-        );
-      } finally {
-        sql.restore();
-        initializer.close();
-      }
-      expect(fixture.readEntry()).toBeUndefined();
-      expect(loadTranscriptEventsSync(fixture.scope)).toEqual([]);
-      expect(fixture.readBinding() === undefined).toBe(withBinding);
     });
   },
 );
@@ -349,6 +274,7 @@ it.each([false, true])(
       let grantDatabasePath: string | undefined;
       let agentGrants = 0;
       let authorityReads = 0;
+      let fixtureRead = false;
       let revoked = true;
       const refusal = new Error("synthetic rollback authority revoked");
       const create = admission.createSqliteWorkerOperationAdmission;
@@ -392,7 +318,12 @@ it.each([false, true])(
         { ...fixture.scope, lifecycleRevision: entry.lifecycleRevision },
         () => {
           expect(grantDatabasePath).not.toBe(fixture.database.path);
-          fixture.readEntry();
+          fixtureRead = true;
+          try {
+            fixture.readEntry();
+          } finally {
+            fixtureRead = false;
+          }
           authorityReads++;
           if (revoked) {
             throw refusal;
@@ -412,24 +343,28 @@ it.each([false, true])(
         expect(fixture.readEntry()).toEqual(entry);
         expect(fixture.readBinding()).toBeDefined();
         refuse = false;
-        const sql = observeHostDataSql();
+        const measured: string[] = [];
+        // Exclude only the test's explicit authority read, not any owner work.
+        const sql = observeHostDataSql((query) => {
+          if (!fixtureRead) {
+            measured.push(query);
+          }
+        });
         try {
           await expect(initializer.rollback(() => fixture.remove())).resolves.toMatchObject({
             deleted: true,
           });
-          expect(
-            sql.queries.filter((query) =>
-              /\b(?:delete\s+from|insert\s+into|update)\s+"?(?:session_nodes|session_windows|transcript_events)\b/i.test(
-                query,
-              ),
-            ),
-          ).toEqual([]);
+          expectNoSql(
+            measured,
+            /\b(?:session_nodes|session_windows|transcript_events|session_transcript_archives)\b/i,
+          );
         } finally {
           sql.restore();
         }
         expect(authorityReads).toBeGreaterThan(0);
         expect(agentGrants).toBeGreaterThan(0);
         expect(fixture.readEntry()).toBeUndefined();
+        expect(loadTranscriptEventsSync(fixture.scope)).toEqual([]);
         expect(() => initializer.handle.assertCurrent()).toThrow(
           "Session initialization is rolling back",
         );

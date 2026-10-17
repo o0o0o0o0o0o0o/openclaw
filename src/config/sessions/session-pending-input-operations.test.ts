@@ -59,16 +59,22 @@ const message = (runId: string) => ({
   timestamp: 1,
   idempotencyKey: `${runId}:user`,
 });
+const sessionEntry = () => ({ sessionId: scope.sessionId, updatedAt: 1 });
+
+function makeRecorder(runId: string, storePath?: string, trackInputCompletion?: boolean) {
+  return createUserTurnTranscriptRecorder({
+    message: message(runId),
+    target: { ...scope, storePath, sessionEntry: sessionEntry() },
+    trackInputCompletion,
+  });
+}
 
 it("accepts supplied legacy completion callbacks without falling back from async completion", async () => {
   setRuntimeConfigSnapshot({});
   const outcome = buildAgentRunTerminalOutcome({ status: "ok" });
   const legacy = vi.fn(() => outcome);
   const recorder = {
-    ...createUserTurnTranscriptRecorder({
-      message: message("legacy"),
-      target: { ...scope, sessionEntry: { sessionId: scope.sessionId, updatedAt: 1 } },
-    }),
+    ...makeRecorder("legacy"),
     completeProcessingAsync: undefined,
     completeProcessing: legacy,
   };
@@ -110,7 +116,7 @@ it("accepts supplied legacy completion callbacks without falling back from async
 function createFixture() {
   setRuntimeConfigSnapshot({});
   const database = openOpenClawAgentDatabase({ agentId: scope.agentId });
-  writeSessionEntry(database, scope.sessionKey, { sessionId: scope.sessionId, updatedAt: 1 });
+  writeSessionEntry(database, scope.sessionKey, sessionEntry());
   return {
     database,
     stage: async (runId: string, assertCurrent = () => {}, trackCompletion = false) =>
@@ -133,11 +139,7 @@ function createFixture() {
 it("keeps host-created synchronous completion usable through the SDK compatibility window", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
     const { database, pending } = createFixture();
-    const recorder = createUserTurnTranscriptRecorder({
-      message: message("host-legacy"),
-      target: { ...scope, sessionEntry: { sessionId: scope.sessionId, updatedAt: 1 } },
-      trackInputCompletion: true,
-    });
+    const recorder = makeRecorder("host-legacy", undefined, true);
     expect(await recorder.stageApproved!({ runId: "host-legacy", assertCurrent: () => {} })).toBe(
       true,
     );
@@ -280,15 +282,7 @@ it("shares transaction rows without retaining stale custody and returns the pers
 it("stages and settles an agent user-turn recorder without caller-thread SQL", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
     const fixture = createFixture();
-    const recorder = createUserTurnTranscriptRecorder({
-      message: message("completed"),
-      trackInputCompletion: true,
-      target: {
-        ...scope,
-        storePath: fixture.database.path,
-        sessionEntry: { sessionId: scope.sessionId, updatedAt: 1 },
-      },
-    });
+    const recorder = makeRecorder("completed", fixture.database.path, true);
     let cancelled: SessionPendingInputReceipt | undefined;
     const sql = observeHostDataSql();
     try {
@@ -326,14 +320,7 @@ it.each(["cancelled", "consumed", "failed"] as const)(
   async (result) => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       const fixture = createFixture();
-      const recorder = createUserTurnTranscriptRecorder({
-        message: message(result),
-        target: {
-          ...scope,
-          storePath: fixture.database.path,
-          sessionEntry: { sessionId: scope.sessionId, updatedAt: 1 },
-        },
-      });
+      const recorder = makeRecorder(result, fixture.database.path);
       await recorder.stageApproved?.({ runId: result, assertCurrent: () => {} });
       const pending = expectDefined(
         (await listSessionPendingInputs(scope)).items[0],

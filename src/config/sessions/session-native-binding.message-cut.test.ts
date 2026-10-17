@@ -25,44 +25,21 @@ const delivery = vi.hoisted(() => ({
 }));
 vi.mock("../../state/openclaw-agent-execution.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../state/openclaw-agent-execution.js")>();
-  const withDelivery = (
-    owner: ReturnType<typeof actual.captureOpenClawAgentDatabaseExecution>,
-  ): typeof owner => {
-    return {
-      ...owner,
-      get fileIdentity() {
-        return owner.fileIdentity;
-      },
-      runExisting: (source, operation, options) =>
-        owner.runExisting(
-          source,
-          (worker) =>
-            operation({
-              async execute(command, commandOptions) {
-                const dispatch =
-                  command.type === "session.messageCut.commit" ? ++delivery.dispatched : undefined;
-                try {
-                  return await worker.execute(command, commandOptions);
-                } finally {
-                  if (dispatch !== undefined && dispatch === delivery.acceptedDispatch) {
-                    await delivery.afterExecution?.();
-                  }
-                }
-              },
-            }),
-          options,
-        ),
-    };
-  };
-  return {
-    ...actual,
-    captureOpenClawAgentDatabaseExecution: (
-      ...args: Parameters<typeof actual.captureOpenClawAgentDatabaseExecution>
-    ) => withDelivery(actual.captureOpenClawAgentDatabaseExecution(...args)),
-    captureOpenClawAgentDatabasePreparationExecution: (
-      ...args: Parameters<typeof actual.captureOpenClawAgentDatabasePreparationExecution>
-    ) => withDelivery(actual.captureOpenClawAgentDatabasePreparationExecution(...args)),
-  };
+  const { instrumentAgentExecutions } =
+    await import("./session-native-binding.execution.test-support.js");
+  return instrumentAgentExecutions(actual, (worker) => ({
+    async execute(command, options) {
+      const dispatch =
+        command.type === "session.messageCut.commit" ? ++delivery.dispatched : undefined;
+      try {
+        return await worker.execute(command, options);
+      } finally {
+        if (dispatch !== undefined && dispatch === delivery.acceptedDispatch) {
+          await delivery.afterExecution?.();
+        }
+      }
+    },
+  }));
 });
 
 // Load the plugin graph during collection; each fixture still owns its storage and runtime.

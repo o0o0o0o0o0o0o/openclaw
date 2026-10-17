@@ -15,15 +15,14 @@ const findDeliveryIntentOwner = vi.hoisted(() => vi.fn());
 vi.mock("../../gateway/server-recovery-runtime-context.js", () => ({
   getGatewayRecoveryRuntime: () => ({ sendRecoveryNotice }),
 }));
-vi.mock("../../config/sessions/transcript.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../config/sessions/transcript.js")>();
-  return { ...actual, appendAssistantMessageToSessionTranscript };
-});
-vi.mock("../../infra/outbound/delivery-queue-storage.js", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("../../infra/outbound/delivery-queue-storage.js")>();
-  return { ...actual, findDeliveryIntentOwner };
-});
+vi.mock("../../config/sessions/transcript.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../config/sessions/transcript.js")>()),
+  appendAssistantMessageToSessionTranscript,
+}));
+vi.mock("../../infra/outbound/delivery-queue-storage.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../infra/outbound/delivery-queue-storage.js")>()),
+  findDeliveryIntentOwner,
+}));
 
 describe("pending delivery notice", () => {
   const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-pending-notice-");
@@ -47,10 +46,6 @@ describe("pending delivery notice", () => {
       return result.promise;
     });
     return { started: started.promise, ...result };
-  }
-  function failNotice(status: string) {
-    sendRecoveryNotice.mockRejectedValue(new Error("notice send failed"));
-    findDeliveryIntentOwner.mockReturnValue({ status });
   }
 
   beforeEach(async () => {
@@ -112,23 +107,18 @@ describe("pending delivery notice", () => {
     expectNotice("unresolved");
   });
 
-  it("retains unresolved debt after a terminal notice delivery failure", async () => {
-    failNotice("failed");
+  it.each([
+    ["failed", "unresolved"],
+    ["completed", "acknowledged"],
+    ["pending", "owed"],
+  ])("preserves %s durable notice status after a send error", async (status, state) => {
+    sendRecoveryNotice.mockRejectedValue(new Error("notice send failed"));
+    findDeliveryIntentOwner.mockReturnValue({ status });
     await deliver();
-    expectNotice("unresolved");
-  });
-
-  it("records acknowledgment when the stable notice receipt completed before an error", async () => {
-    failNotice("completed");
-    await deliver();
-    expectTranscript();
-    expectNotice("acknowledged");
-  });
-
-  it("retains owed debt while the durable notice remains pending", async () => {
-    failNotice("pending");
-    await deliver();
-    expectNotice("owed");
+    if (status === "completed") {
+      expectTranscript();
+    }
+    expectNotice(state);
   });
   it.each([false, true])(
     "keeps acknowledgment when suppression finishes first=%s",

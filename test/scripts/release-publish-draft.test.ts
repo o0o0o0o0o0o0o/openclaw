@@ -1,13 +1,5 @@
 import { spawnSync } from "node:child_process";
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import * as fs from "node:fs";
 import { join, resolve } from "node:path";
 import { expect, it } from "vitest";
 import { parse } from "yaml";
@@ -22,10 +14,10 @@ const parentEnv = {
 };
 function files(root: string) {
   return {
-    read: (name: string) => readFileSync(join(root, name), "utf8"),
+    read: (name: string) => fs.readFileSync(join(root, name), "utf8"),
     write(name: string, content: string) {
       const path = join(root, name);
-      writeFileSync(path, content);
+      fs.writeFileSync(path, content);
       return path;
     },
     json: (name: string, content: unknown) => writeJsonFile(join(root, name), content),
@@ -38,33 +30,24 @@ function runBash(root: string, script: string, env: NodeJS.ProcessEnv, shell = "
     env: { ...env, RUNNER_TEMP: root, ...parentEnv },
   });
 }
-const publicationWorkflow = () =>
-  parse(readFileSync(".github/workflows/openclaw-release-publish.yml", "utf8"));
+const workflow = parse(fs.readFileSync(".github/workflows/openclaw-release-publish.yml", "utf8"));
+const frozenNotes = (version: string) => `## ${version}\n\n### Fixes\n\n- Frozen release fix.`;
 
-function publicationFixture({
-  releaseVersion = "2026.9.4",
-  toolingVersion = "2026.9.5",
-}: { releaseVersion?: string; toolingVersion?: string } = {}) {
-  const root = realpathSync(createTempDir("release-publish-historical-tooling-"));
+function publicationFixture(releaseVersion = "2026.9.4") {
+  const root = fs.realpathSync(createTempDir("release-publish-historical-tooling-"));
   const io = files(root);
   const repository = resolve(".");
-  mkdirSync(join(root, "scripts"));
-  io.write(
-    "scripts/render-github-release-notes.mts",
-    'throw new Error("frozen target renderer must not execute");\n',
-  );
-  io.write(
-    "CHANGELOG.md",
-    `# Changelog\n\n## ${releaseVersion}\n\n### Fixes\n\n- Frozen release fix.\n`,
-  );
+  fs.mkdirSync(join(root, "scripts"));
+  io.write("scripts/render-github-release-notes.mts", 'throw Error("frozen target");\n');
+  io.write("CHANGELOG.md", "# Changelog\n\n" + frozenNotes(releaseVersion) + "\n");
   const git = fixtureGit(root, "OpenClaw Test", "test@openclaw.invalid");
   git("init", "-q");
   git("add", ".");
   git("commit", "-qm", "historical release");
   const targetSha = git("rev-parse", "HEAD");
   io.write("CHANGELOG.md", "Working tree content must not be published.\n");
-  mkdirSync(join(root, ".release-harness/scripts/lib"), { recursive: true });
-  io.json(".release-harness/package.json", { version: toolingVersion });
+  fs.mkdirSync(join(root, ".release-harness/scripts/lib"), { recursive: true });
+  io.json(".release-harness/package.json", { version: "2026.9.5" });
   for (const source of [
     "scripts/render-github-release-notes.mts",
     "scripts/tsx.mjs",
@@ -79,30 +62,33 @@ function publicationFixture({
     "scripts/lib/release-version.mjs",
     "scripts/lib/release-publish-children.sh",
   ]) {
-    copyFileSync(join(repository, source), join(root, ".release-harness", source));
+    fs.copyFileSync(join(repository, source), join(root, ".release-harness", source));
   }
-  symlinkSync(
+  fs.symlinkSync(
     join(repository, "scripts/full-release-validation-policy.mjs"),
     join(root, ".release-harness/scripts/full-release-validation-policy.mjs"),
   );
   // Publication installs tooling in the harness, then links the frozen target cwd to it.
-  symlinkSync(join(repository, "node_modules"), join(root, ".release-harness/node_modules"), "dir");
-  symlinkSync(".release-harness/node_modules", join(root, "node_modules"), "dir");
-  const run = (script: string, env: NodeJS.ProcessEnv = {}, shell = "bash") =>
-    runBash(
-      root,
-      script,
-      {
-        ...createNestedGitEnv(),
-        GITHUB_WORKSPACE: root,
-        GITHUB_REPOSITORY: "fixture/repository",
-        RELEASE_TAG: `v${releaseVersion}`,
-        TARGET_SHA: targetSha,
-        ...env,
-      },
-      shell,
-    );
-  return { root, targetSha, ...io, run };
+  fs.symlinkSync(
+    join(repository, "node_modules"),
+    join(root, ".release-harness/node_modules"),
+    "dir",
+  );
+  fs.symlinkSync(".release-harness/node_modules", join(root, "node_modules"), "dir");
+  const env = {
+    ...createNestedGitEnv(),
+    GITHUB_WORKSPACE: root,
+    GITHUB_REPOSITORY: "fixture/repository",
+    RELEASE_TAG: `v${releaseVersion}`,
+    TARGET_SHA: targetSha,
+  };
+  return {
+    root,
+    targetSha,
+    ...io,
+    run: (script: string, overrides: NodeJS.ProcessEnv = {}, shell = "bash") =>
+      runBash(root, script, { ...env, ...overrides }, shell),
+  };
 }
 
 it.each([
@@ -113,8 +99,7 @@ it.each([
   "renders pinned $releaseVersion with manifest=$hasManifest",
   ({ releaseVersion, hasManifest }) => {
     const extended = releaseVersion === "2026.8.35";
-    const { root, targetSha, read, write, json, run } = publicationFixture({ releaseVersion });
-    const workflow = publicationWorkflow();
+    const { root, targetSha, read, write, json, run } = publicationFixture(releaseVersion);
     const prepare = workflow.jobs.publish.steps.find(
       (step: { name?: string }) => step.name === "Prepare GitHub release notes",
     );
@@ -181,19 +166,22 @@ canonical_release_body_matches "$NOTES_FILE"
   },
 );
 
-it.each([
-  { existing: "draft", distTag: "latest", command: "edit" },
-  { existing: "draft", distTag: "beta", command: "edit" },
-  { existing: "missing", distTag: "latest", command: "create" },
-  { existing: "public", distTag: "latest", command: undefined },
-  { existing: "diverged-public", distTag: "latest", command: undefined },
+it.each<[string, string, string?, string?]>([
+  ["draft", "latest", "edit"],
+  ["draft", "beta", "edit"],
+  ["missing", "latest", "create"],
+  ["public", "latest"],
+  ["diverged-public", "latest"],
+  ["docs", "latest", undefined, "create_or_update_github_release"],
+  ["docs", "latest", undefined, "append_release_proof_to_github_release"],
 ])(
-  "prepares $existing release on $distTag without promoting a draft",
-  ({ existing, distTag, command }) => {
+  "prepares %s release on %s without promoting a draft",
+  (existing, distTag, command, operation = "create_or_update_github_release") => {
+    const docsOwned = existing === "docs";
     const root = createTempDir("release-publish-draft-");
     const commands = join(root, "command");
     const notes = join(root, "notes.md");
-    writeFileSync(notes, "Canonical release notes\n");
+    fs.writeFileSync(notes, "Canonical release notes\n");
     const result = runBash(
       root,
       `
@@ -203,7 +191,7 @@ canonical_release_body_matches() { [[ "$EXISTING" != diverged-public ]]; }
 gh() {
   if [[ "$1 $2" == "release view" ]]; then
     [[ "$EXISTING" != missing ]] || return 1
-    printf '{"isDraft":%s,"body":"canonical"}\\n' "$([[ "$EXISTING" == draft ]] && echo true || echo false)"
+    printf '{"isDraft":%s,"body":"%s"}\\n' "$([[ "$EXISTING" == draft ]] && echo true || echo false)" "$RELEASE_BODY"
     return
   fi
   printf '%s\\n' "$@" > "$COMMAND_FILE"
@@ -213,26 +201,31 @@ gh() {
   fi
 }
 prepared_release_notes_file="$NOTES_FILE"
-create_or_update_github_release
+"$OPERATION"
 `,
       {
-        PATH: process.env.PATH,
+        ...(docsOwned ? process.env : { PATH: process.env.PATH }),
         OWNER_SCRIPT: resolve("scripts/lib/release-publish-children.sh"),
         EXISTING: existing,
+        OPERATION: operation,
+        RELEASE_BODY: docsOwned ? "<!-- openclaw-release-publication:docs-v1 -->" : "canonical",
         COMMAND_FILE: commands,
         NOTES_FILE: notes,
         GITHUB_STEP_SUMMARY: join(root, "summary"),
         GITHUB_REPOSITORY: "fixture/repository",
-        RELEASE_TAG: "v2026.9.2",
+        RELEASE_TAG: docsOwned ? "v2026.9.4" : "v2026.9.2",
         RELEASE_NPM_DIST_TAG: distTag,
       },
     );
-    expect(result.status, result.stderr).toBe(existing === "diverged-public" ? 1 : 0);
+    expect(result.status, result.stderr).toBe(existing === "diverged-public" || docsOwned ? 1 : 0);
+    if (docsOwned) {
+      expect(result.stderr).toContain("Release body belongs to post-docs publication");
+    }
     if (!command) {
-      expect(existsSync(commands)).toBe(false);
+      expect(fs.existsSync(commands)).toBe(false);
       return;
     }
-    const args = readFileSync(commands, "utf8").trim().split("\n");
+    const args = fs.readFileSync(commands, "utf8").trim().split("\n");
     expect(args.slice(0, 3)).toEqual(["release", command, "v2026.9.2"]);
     expect(args).toContain(notes);
     expect(args).not.toContain("--draft=false");
@@ -245,41 +238,6 @@ create_or_update_github_release
   },
 );
 
-it.each(["create_or_update_github_release", "append_release_proof_to_github_release"])(
-  "%s refuses a docs-publication release body",
-  (operation) => {
-    const root = createTempDir("release-publish-docs-stage-");
-    const commands = join(root, "commands");
-    const result = runBash(
-      root,
-      `
-source "$OWNER_SCRIPT"
-verify_release_tag_target() { :; }
-gh() {
-  if [[ "$1 $2" == "release view" ]]; then
-    printf '%s' '{"isDraft":false,"body":"<!-- openclaw-release-publication:docs-v1 -->"}'
-    return
-  fi
-  printf '%s\\n' "$@" > "$COMMAND_FILE"
-}
-"$OPERATION"
-`,
-      {
-        ...process.env,
-        OWNER_SCRIPT: resolve("scripts/lib/release-publish-children.sh"),
-        COMMAND_FILE: commands,
-        RELEASE_TAG: "v2026.9.4",
-        RELEASE_NPM_DIST_TAG: "latest",
-        GITHUB_REPOSITORY: "fixture/repository",
-        OPERATION: operation,
-      },
-    );
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain("Release body belongs to post-docs publication");
-    expect(existsSync(commands)).toBe(false);
-  },
-);
-
 it.each([
   { state: "missing", body: "canonical", error: undefined },
   { state: "matching", body: "proof", error: undefined },
@@ -288,7 +246,7 @@ it.each([
   { state: "missing", body: "wrong-sha", error: "does not match" },
 ])("resumes a public release with $state evidence and $body notes", ({ state, body, error }) => {
   const { root, targetSha, read, write, json, run } = publicationFixture();
-  const notes = "## 2026.9.4\n\n### Fixes\n\n- Frozen release fix.";
+  const notes = frozenNotes("2026.9.4");
   const releaseBody =
     body === "different"
       ? "Unrelated release notes"
@@ -343,6 +301,6 @@ attach_or_verify_release_asset "$RUNNER_TEMP/manifest.json" "$ASSET_NAME"
   if (error) {
     expect(result.stderr).toContain(error);
   }
-  expect(existsSync(join(root, "uploads"))).toBe(state === "missing" && !error);
+  expect(fs.existsSync(join(root, "uploads"))).toBe(state === "missing" && !error);
   expect(JSON.parse(read("release.json")).body).toBe(releaseBody);
 });

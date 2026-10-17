@@ -69,32 +69,29 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe("release publication state", () => {
   const selectorRepair = { status: "FAIL", remediation: expect.stringContaining("dist-tag") };
-  it.each<[ReturnType<typeof distTags>, string[], Record<string, unknown>, number?]>([
-    [distTags("2026.9.4", version), [version], selectorRepair],
-    [distTags(version, "2026.9.4"), [version], selectorRepair],
-    [
-      distTags("2026.9.7"),
-      ["2026.9.7", version],
-      {
-        status: "WARN",
-        message: expect.stringContaining(
-          "already published; dist-tag latest stays at 2026.9.7 (superseded)",
-        ),
-      },
-      1,
-    ],
-    [
-      distTags("2026.9.7"),
-      ["2026.9.7"],
-      {
-        status: "FAIL",
-        message: expect.stringContaining('cannot be safely moved to "2026.9.5" (ahead)'),
-      },
-      0,
-    ],
-  ])(
-    "gates plugin publication against existing registry selectors: %j",
-    async (tags, versions, expected, published) => {
+  const selectorMessage = (status: string, message: string) => ({
+    status,
+    message: expect.stringContaining(message),
+  });
+  it.each`
+    tags                             | versions                 | expected                                                                                        | published
+    ${distTags("2026.9.4", version)} | ${[version]}             | ${selectorRepair}                                                                               | ${undefined}
+    ${distTags(version, "2026.9.4")} | ${[version]}             | ${selectorRepair}                                                                               | ${undefined}
+    ${distTags("2026.9.7")}          | ${["2026.9.7", version]} | ${selectorMessage("WARN", "already published; dist-tag latest stays at 2026.9.7 (superseded)")} | ${1}
+    ${distTags("2026.9.7")}          | ${["2026.9.7"]}          | ${selectorMessage("FAIL", 'cannot be safely moved to "2026.9.5" (ahead)')}                      | ${0}
+  `(
+    "gates plugin publication against existing registry selectors: $tags",
+    async ({
+      tags,
+      versions,
+      expected,
+      published,
+    }: {
+      tags: ReturnType<typeof distTags>;
+      versions: string[];
+      expected: Record<string, unknown>;
+      published?: number;
+    }) => {
       vi.stubGlobal(
         "fetch",
         vi.fn(async () => registry("@openclaw/example", versions, tags)),
@@ -167,28 +164,21 @@ describe("release publication state", () => {
     writePublishablePluginFixture(rootDir, { version: "2026.9.6", publishTo: "both" });
     writePackage("ai", "2026.9.6");
 
-    const result = readReleasePublicationPackages({
-      rootDir,
-      sourceSha: sha,
-      npmDistTag: "latest",
-      pluginPublishScope: "all-publishable",
-    });
-    expect(result).toEqual(
-      expect.objectContaining({
-        version,
-        corePackages,
-        npmPlugins: [expect.objectContaining(pkg("@openclaw/demo-plugin"))],
-        clawhubPlugins: [expect.objectContaining(pkg("@openclaw/demo-plugin"))],
-      }),
-    );
-    expect(() =>
+    const readPackages = (commit: string) =>
       readReleasePublicationPackages({
         rootDir,
-        sourceSha,
+        sourceSha: commit,
         npmDistTag: "latest",
         pluginPublishScope: "all-publishable",
-      }),
-    ).toThrow(`git fetch --no-tags origin ${sourceSha}`);
+      });
+    const packages = readPackages(sha);
+    expect(packages.corePackages).toEqual(corePackages);
+    expect(packages).toMatchObject({
+      version,
+      npmPlugins: [pkg("@openclaw/demo-plugin")],
+      clawhubPlugins: [pkg("@openclaw/demo-plugin")],
+    });
+    expect(() => readPackages(sourceSha)).toThrow(`git fetch --no-tags origin ${sourceSha}`);
   });
 
   it.each(["beta", "latest"])(
@@ -208,17 +198,11 @@ describe("release publication state", () => {
         npmDistTag,
         corePackages,
       });
-      expect(requested.toSorted()).toEqual([
-        "@openclaw/ai",
-        "@openclaw/gateway-protocol",
-        "openclaw",
-      ]);
-      expect(result).toEqual(
-        expect.objectContaining({
-          corePublished: true,
-          publishedPackages: [pkg("openclaw"), ...corePackages],
-        }),
+      expect(requested.toSorted()).toEqual(
+        ["openclaw", ...corePackages.map((entry) => entry.packageName)].toSorted(),
       );
+      expect(result.corePublished).toBe(true);
+      expect(result.publishedPackages).toEqual([pkg("openclaw"), ...corePackages]);
       expect(result.gates.some((gate) => gate.status === "FAIL")).toBe(false);
     },
   );
@@ -363,60 +347,57 @@ describe("release concurrency observations", () => {
     });
   });
 
-  const targetLog = `2026-09-18T01:02:03Z   TARGET_REF: ${sourceSha}`;
-  it.each([
-    {
-      evidence: "exact npm preflight title",
-      workflow: "plugin-npm-release.yml",
-      title: `Plugin NPM Artifact Preflight [default] ${sourceSha}`,
-      status: "FAIL",
-      message: "exact workflow run title",
-    },
-    {
-      evidence: "waiting ClawHub target with terminal parent",
-      log: `${targetLog}\n2026-09-18T01:02:03Z   DRY_RUN: false\n2026-09-18T01:02:03Z   RELEASE_PUBLISH_RUN_ID: 789`,
-      status: "FAIL",
-      message: "Parent 789 is terminal (failure)",
-      parent: true,
-    },
-    { evidence: "missing job log", status: "WARN" },
-    { evidence: "missing dry-run input", log: targetLog, status: "WARN" },
-    {
-      evidence: "conflicting input evidence",
-      log: `${targetLog}\n2026-09-18T01:02:04Z   TARGET_REF: ${"b".repeat(40)}\n2026-09-18T01:02:05Z   DRY_RUN: false`,
-      status: "WARN",
-    },
-    {
-      evidence: "isolated ClawHub dry run",
-      log: `${targetLog}\n2026-09-18T01:02:03Z   DRY_RUN: true`,
-      status: "PASS",
-    },
-    {
-      evidence: "truncated active-run inventory",
-      workflow: "plugin-npm-release.yml",
-      title: `Plugin NPM Release [default] ${"b".repeat(40)}`,
-      count: 101,
-      status: "WARN",
-      message: "bounded first page",
-    },
-  ])("qualifies concurrency evidence: $evidence", (scenario) => {
-    const progress: string[] = [];
-    const gates = observeRuns({
-      ...scenario,
-      workflow: scenario.workflow ?? "plugin-clawhub-release.yml",
-      onProgress: (message) => progress.push(message),
-    });
-    expect(gates).toMatchObject([
-      {
-        status: scenario.status,
-        ...(scenario.message ? { message: expect.stringContaining(scenario.message) } : {}),
-      },
-    ]);
-    if (scenario.parent) {
-      expect(progress.join("\n")).toContain("release lookup page 1");
-      expect(progress.join("\n")).toContain("workflow plugin-clawhub-release.yml inventory");
-      expect(progress.join("\n")).toContain("inspecting candidate run 123 1/1 via job log");
-      expect(gates[0]?.remediation).toContain("checking parent ownership");
-    }
+  const log = (...lines: string[]) =>
+    [`TARGET_REF: ${sourceSha}`, ...lines]
+      .map((line) => `2026-09-18T01:02:03Z   ${line}`)
+      .join("\n");
+  const npmRun = (title: string, count = 1) => ({
+    workflow: "plugin-npm-release.yml",
+    title,
+    count,
   });
+  const conflictingLog = `${log()}\n2026-09-18T01:02:04Z   TARGET_REF: ${"b".repeat(40)}\n2026-09-18T01:02:05Z   DRY_RUN: false`;
+  it.each`
+    evidence                        | status    | scenario                                                          | message
+    ${"exact npm preflight title"}  | ${"FAIL"} | ${npmRun(`Plugin NPM Artifact Preflight [default] ${sourceSha}`)} | ${"exact workflow run title"}
+    ${"terminal parent"}            | ${"FAIL"} | ${{ log: log("DRY_RUN: false", "RELEASE_PUBLISH_RUN_ID: 789") }}  | ${"Parent 789 is terminal (failure)"}
+    ${"missing job log"}            | ${"WARN"} | ${{}}                                                             | ${undefined}
+    ${"missing dry-run input"}      | ${"WARN"} | ${{ log: log() }}                                                 | ${undefined}
+    ${"conflicting input evidence"} | ${"WARN"} | ${{ log: conflictingLog }}                                        | ${undefined}
+    ${"isolated ClawHub dry run"}   | ${"PASS"} | ${{ log: log("DRY_RUN: true") }}                                  | ${undefined}
+    ${"truncated active inventory"} | ${"WARN"} | ${npmRun(`Plugin NPM Release [default] ${"b".repeat(40)}`, 101)}  | ${"bounded first page"}
+  `(
+    "qualifies concurrency evidence: $evidence",
+    ({
+      evidence,
+      status,
+      scenario,
+      message,
+    }: {
+      evidence: string;
+      status: string;
+      scenario: Partial<Parameters<typeof observeRuns>[0]>;
+      message?: string;
+    }) => {
+      const progress: string[] = [];
+      const gates = observeRuns({
+        ...scenario,
+        workflow: scenario.workflow ?? "plugin-clawhub-release.yml",
+        onProgress: (update) => progress.push(update),
+      });
+      expect(gates).toMatchObject([
+        { status, ...(message ? { message: expect.stringContaining(message) } : {}) },
+      ]);
+      if (evidence === "terminal parent") {
+        for (const text of [
+          "release lookup page 1",
+          "workflow plugin-clawhub-release.yml inventory",
+          "inspecting candidate run 123 1/1 via job log",
+        ]) {
+          expect(progress.join("\n")).toContain(text);
+        }
+        expect(gates[0]?.remediation).toContain("checking parent ownership");
+      }
+    },
+  );
 });

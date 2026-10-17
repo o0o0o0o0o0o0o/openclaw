@@ -41,17 +41,8 @@ export function request(
       release_profile: "beta",
       rerun_group: "all",
       mode: "both",
-      plugin_prerelease_node_exclude_patterns_json: "[]",
-      skip_package_telegram_e2e: "false",
       codex_plugin_spec: "",
       trusted_workflow_json: JSON.stringify({
-        trustedWorkflow: {
-          ref: transportRef,
-          fullRef: "refs/heads/" + transportRef,
-          sha: candidateSha,
-        },
-        validationPurpose: "publish",
-        publicationSelection: { npmDistTag: "beta" },
         laneInputs: { qualification_baselines_json: qualificationBaselinesJson },
       }),
       ...overrides,
@@ -153,7 +144,6 @@ export function fixture(
     total_count: 1,
     jobs: [
       {
-        id: 60,
         name: QUALIFICATION_ADMISSION_JOB,
         run_id: 40,
         run_attempt: 1,
@@ -175,14 +165,11 @@ export function fixture(
   const calls: string[] = [];
   const runGh = (args: string[]) => {
     const endpoint = args.find((arg) => arg.startsWith("repos/"));
-    if (!endpoint) {
-      throw new Error("Unexpected command");
+    const prefix = "repos/" + repository + "/";
+    if (!endpoint?.startsWith(prefix)) {
+      throw new Error("Expected API command for " + repository);
     }
     calls.push(endpoint);
-    const prefix = "repos/" + repository + "/";
-    if (!endpoint.startsWith(prefix)) {
-      throw new Error("Wrong repository");
-    }
     const path = endpoint.slice(prefix.length);
     const routes: Record<string, unknown> = {
       ["compare/" + publisherSha + "...main"]: { status: authority.ancestry },

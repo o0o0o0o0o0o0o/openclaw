@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
-import JSZip from "jszip";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import corePackagePolicy from "../../scripts/lib/npm-core-release-packages.json" with { type: "json" };
 import {
@@ -16,6 +15,7 @@ import {
 import { createPluginSdkApiReleaseEvidence } from "../../scripts/plugin-sdk-api-release-evidence.mjs";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import { writeJsonFile } from "../helpers/temp-repo.js";
+import { makeStoredZip } from "./actions-artifact-zip.test-support.js";
 import { fixtureGit } from "./release-publish.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -48,8 +48,8 @@ describe("protected tooling tag resolution", () => {
     return runGh;
   };
 
-  it.each(["ahead", "identical"])(
-    "reuses the newest lightweight tag on %s main ancestry",
+  it.each(["ahead", "identical", "behind", "diverged"])(
+    "qualifies %s main ancestry before selecting the newest lightweight tag",
     (ancestry) => {
       const runGh = scriptedGh(
         `${ancestry}\n`,
@@ -64,11 +64,14 @@ describe("protected tooling tag resolution", () => {
           null,
         ]),
       );
-      expect(ensureReleasePublishToolingTag({ runGh, repo, toolingSha })).toEqual({
-        tag: `${prefix}10`,
-        created: false,
-      });
-      expect(runGh.mock.calls.map(([args]) => args)).toEqual([compare, inventory]);
+      const ensure = () => ensureReleasePublishToolingTag({ runGh, repo, toolingSha });
+      if (["behind", "diverged"].includes(ancestry)) {
+        expect(ensure).toThrow(`Tooling SHA ${toolingSha} is not reachable from trusted main.`);
+        expect(runGh.mock.calls.map(([args]) => args)).toEqual([compare]);
+      } else {
+        expect(ensure()).toEqual({ tag: `${prefix}10`, created: false });
+        expect(runGh.mock.calls.map(([args]) => args)).toEqual([compare, inventory]);
+      }
     },
   );
 
@@ -104,17 +107,6 @@ describe("protected tooling tag resolution", () => {
         ],
         api(`git/ref/tags/${tag}`),
       ]);
-    },
-  );
-
-  it.each(["behind", "diverged"])(
-    "refuses %s ancestry before tag inventory or mutation",
-    (ancestry) => {
-      const runGh = scriptedGh(ancestry);
-      expect(() => ensureReleasePublishToolingTag({ runGh, repo, toolingSha })).toThrow(
-        `Tooling SHA ${toolingSha} is not reachable from trusted main.`,
-      );
-      expect(runGh.mock.calls.map(([args]) => args)).toEqual([compare]);
     },
   );
 
@@ -211,28 +203,26 @@ describe("publish preflight optional Telegram evidence", () => {
   const inspect = (runGh: PublishPreflightGh, runId = "123") =>
     inspectPublishPreflightTelegramEvidence({ repo, runId, workflowRef, runGh });
 
-  it.each([
-    { head_branch: "main", conclusion: "success", expected: "PASS" },
-    { head_branch: workflowRef, conclusion: "success", expected: "PASS" },
-    { head_branch: "main", conclusion: "failure", expected: "WARN" },
-    { head_branch: workflowRef, conclusion: "cancelled", expected: "WARN" },
-  ])("retains $head_branch/$conclusion evidence as $expected", (entry) => {
-    const runGh = vi.fn(() => JSON.stringify({ ...completedRun, ...entry }));
-    const gate = inspect(runGh);
-    expect(gate.status).toBe(entry.expected);
-    expect(runGh.mock.calls).toEqual([[api("actions/runs/123")]]);
-  });
-
-  it.each([
-    { name: "CI" },
-    { event: "push" },
-    { head_branch: "release-publish/bbbbbbbbbbbb-123" },
-    { status: "in_progress", conclusion: null },
-  ])("rejects supplied evidence that the postpublish verifier refuses: %j", (overrides) => {
-    expect(inspect(() => JSON.stringify({ ...completedRun, ...overrides }))).toMatchObject({
-      status: "FAIL",
-      remediation: expect.stringContaining("omit the optional npm_telegram_run_id"),
+  it.each<
+    [Partial<Omit<typeof completedRun, "conclusion">> & { conclusion?: string | null }, string]
+  >([
+    [{ head_branch: "main", conclusion: "success" }, "PASS"],
+    [{ head_branch: workflowRef, conclusion: "success" }, "PASS"],
+    [{ head_branch: "main", conclusion: "failure" }, "WARN"],
+    [{ head_branch: workflowRef, conclusion: "cancelled" }, "WARN"],
+    [{ name: "CI" }, "FAIL"],
+    [{ event: "push" }, "FAIL"],
+    [{ head_branch: "release-publish/bbbbbbbbbbbb-123" }, "FAIL"],
+    [{ status: "in_progress", conclusion: null }, "FAIL"],
+  ])("qualifies optional Telegram evidence: %j", (overrides, expected) => {
+    const runGh = vi.fn(() => JSON.stringify({ ...completedRun, ...overrides }));
+    expect(inspect(runGh)).toMatchObject({
+      status: expected,
+      ...(expected === "FAIL"
+        ? { remediation: expect.stringContaining("omit the optional npm_telegram_run_id") }
+        : {}),
     });
+    expect(runGh.mock.calls).toEqual([[api("actions/runs/123")]]);
   });
 
   it("does not query an invalid run id and reports an unavailable valid run", () => {
@@ -436,7 +426,7 @@ describe("publish preflight immutable npm evidence", () => {
 
   it.skipIf(process.platform === "win32")(
     "downloads each exact validation attempt once and verifies its artifact digest",
-    async () => {
+    () => {
       const directory = tempDirs.make("publish-preflight-manifest-");
       const bin = join(directory, "bin");
       mkdirSync(bin);
@@ -448,23 +438,21 @@ describe("publish preflight immutable npm evidence", () => {
         runId: "123",
         runAttempt: String(attempt),
       }));
-      const artifacts = await Promise.all(
-        manifests.map(async (manifest, index) => {
-          const archive = await new JSZip()
-            .file("full-release-validation-manifest.json", JSON.stringify(manifest))
-            .generateAsync({ type: "nodebuffer", compression: "STORE", platform: "UNIX" });
-          const id = 90 + index;
-          writeFileSync(join(directory, `${id}.zip`), archive);
-          return {
-            id,
-            name: `full-release-validation-123-${index + 1}`,
-            expired: false,
-            digest: `sha256:${sha256(archive)}`,
-            size_in_bytes: archive.length,
-            workflow_run: { id: 123 },
-          };
-        }),
-      );
+      const artifacts = manifests.map((manifest, index) => {
+        const archive = makeStoredZip({
+          "full-release-validation-manifest.json": JSON.stringify(manifest),
+        });
+        const id = 90 + index;
+        writeFileSync(join(directory, `${id}.zip`), archive);
+        return {
+          id,
+          name: `full-release-validation-123-${index + 1}`,
+          expired: false,
+          digest: `sha256:${sha256(archive)}`,
+          size_in_bytes: archive.length,
+          workflow_run: { id: 123 },
+        };
+      });
       writeFileSync(
         join(bin, "gh"),
         `#!${process.execPath}

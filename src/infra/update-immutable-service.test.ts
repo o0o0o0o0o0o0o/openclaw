@@ -34,17 +34,7 @@ let root: string;
 let generation: string;
 let node: string;
 let service: ImmutableInstallDescriptor["service"];
-const setCommand = (command: GatewayServiceCommandConfig) => {
-  vi.spyOn(systemd, "readSystemdServiceCommandLocation").mockImplementation(async () => ({
-    kind: "command",
-    command,
-  }));
-  vi.spyOn(systemd, "readSystemdServiceExecStartAsRoot").mockImplementation(async () => command);
-};
-const serviceEnvironment = () => ({
-  OPENCLAW_STATE_DIR: service.stateDir,
-  OPENCLAW_CONFIG_PATH: service.configPath,
-});
+let command: GatewayServiceCommandConfig;
 
 beforeEach(async () => {
   const home = dirs.make("immutable-service-");
@@ -63,11 +53,16 @@ beforeEach(async () => {
     configPath: "/etc/example/openclaw.json",
     profile: null,
   };
-  setCommand({
+  command = {
     programArguments: [node, path.join(root, "current", "dist", "index.js"), "gateway"],
     sourcePath: "/etc/systemd/system/example.service",
-    environment: serviceEnvironment(),
-  });
+    environment: { OPENCLAW_STATE_DIR: service.stateDir, OPENCLAW_CONFIG_PATH: service.configPath },
+  };
+  vi.spyOn(systemd, "readSystemdServiceCommandLocation").mockImplementation(async () => ({
+    kind: "command",
+    command,
+  }));
+  vi.spyOn(systemd, "readSystemdServiceExecStartAsRoot").mockImplementation(async () => command);
   vi.spyOn(systemctl, "execSystemctl").mockResolvedValue({
     code: 0,
     termination: "exit",
@@ -111,7 +106,6 @@ vi.mock("../daemon/service-operation-lock.js", () => ({
 
 describe("immutable activation service", () => {
   let descriptor: ImmutableInstallDescriptor;
-  let command: GatewayServiceCommandConfig;
   let alive: boolean;
   let activating: boolean;
   let launcherPending: boolean;
@@ -168,12 +162,8 @@ describe("immutable activation service", () => {
     const launcher = path.join(root, "bin", "openclaw-gateway");
     await fs.mkdir(path.dirname(launcher));
     await fs.writeFile(launcher, `#!${node}\n// Synthetic packaged launcher.\n`);
-    command = {
-      programArguments: [launcher],
-      sourcePath,
-      environment: serviceEnvironment(),
-    };
-    setCommand(command);
+    command.programArguments = [launcher];
+    command.sourcePath = sourcePath;
     vi.mocked(systemctl.execSystemctl).mockImplementation(async () => ({
       code: 0,
       termination: "exit",
@@ -227,24 +217,21 @@ describe("immutable activation service", () => {
       rootServiceAccount: service.account,
     };
     vi.spyOn(identity, "captureSystemdServiceIdentity").mockResolvedValue(native);
-    vi.spyOn(lifecycle, "stopSystemdService").mockImplementation(async (args) => {
-      await args.beforeMutation?.();
-      await args.prepareEffect?.();
-      stopEffect?.();
-      args.beforeEffect?.();
-      args.assertCurrent?.();
-      alive = false;
-      populated = false;
-      args.assertCurrent?.();
-    });
-    vi.spyOn(lifecycle, "startSystemdService").mockImplementation(async (args) => {
-      await args.beforeMutation?.();
-      args.beforeEffect?.();
-      args.assertCurrent?.();
-      alive = true;
-      populated = true;
-      args.assertCurrent?.();
-    });
+    const effect =
+      (running: boolean) => async (args: Parameters<typeof lifecycle.stopSystemdService>[0]) => {
+        await args.beforeMutation?.();
+        if (!running) {
+          await args.prepareEffect?.();
+          stopEffect?.();
+        }
+        args.beforeEffect?.();
+        args.assertCurrent?.();
+        alive = running;
+        populated = running;
+        args.assertCurrent?.();
+      };
+    vi.spyOn(lifecycle, "stopSystemdService").mockImplementation(effect(false));
+    vi.spyOn(lifecycle, "startSystemdService").mockImplementation(effect(true));
     descriptor = {
       ...immutableDescriptor(root, "a".repeat(40), "a".repeat(64), service),
       version: 2,

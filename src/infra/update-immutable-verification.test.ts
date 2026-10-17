@@ -98,6 +98,12 @@ const health = (overrides: Parameters<typeof gatewayHealthResponse>[0] = {}) => 
 };
 const observe = (assertCurrent = () => {}) =>
   waitForImmutableGateway({ descriptor, generation, timeoutMs: 120_000, assertCurrent });
+const busyPort = (port = 18789) => ({
+  status: "busy" as const,
+  port,
+  listeners: [{ pid: 8000 }],
+  hints: [],
+});
 
 beforeEach(() => {
   resetRestartHealthMocks();
@@ -106,12 +112,7 @@ beforeEach(() => {
   mocks.current.mockReset();
   mocks.runtime.mockReset().mockResolvedValue({ status: "running", pid: 8000 });
   mocks.http.mockReset().mockResolvedValue({ healthz: 200, readyz: 200 });
-  inspectPortUsage.mockResolvedValue({
-    status: "busy",
-    port: 18789,
-    listeners: [{ pid: 8000 }],
-    hints: [],
-  });
+  inspectPortUsage.mockResolvedValue(busyPort());
   callGateway.mockImplementation(health());
 });
 afterEach(() => {
@@ -126,12 +127,7 @@ it("verifies the preserved service's explicit port instead of the config default
     programArguments: ["/synthetic/install/bin/openclaw-gateway", "--port", "19678"],
   };
   mocks.inspect.mockResolvedValue(service);
-  inspectPortUsage.mockImplementation(async (port) => ({
-    port,
-    status: "busy",
-    listeners: [{ pid: 8000 }],
-    hints: [],
-  }));
+  inspectPortUsage.mockImplementation(async (port) => busyPort(port));
 
   const result = await observe();
 

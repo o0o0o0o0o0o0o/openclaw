@@ -15,6 +15,7 @@ import { withinTest } from "../../test/helpers/promise.js";
 import { getFileLockProcessStartTime } from "../shared/pid-alive.js";
 import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 import { readManagedHandoffArtifacts } from "./update-managed-service-handoff-artifacts.test-support.js";
+import { createManagedServiceBoundaryParent } from "./update-managed-service-handoff-process.test-support.js";
 
 const testNodeExecPath = resolveTestNodeExecPath();
 const EXECUTOR_CLEANUP_GUARD_MS = 15_000;
@@ -351,23 +352,13 @@ export async function writeConcurrentManagedHandoffParams(
 ): Promise<string> {
   const { spawn } =
     await vi.importActual<typeof import("node:child_process")>("node:child_process");
-  const { getFileLockProcessStartTime: readParentStartTime } =
-    await import("../shared/pid-alive.js");
-  const parent = spawn(testNodeExecPath, ["-e", "process.stdin.resume()"], {
-    stdio: ["pipe", "ignore", "ignore"],
-  });
-  const parentPid = parent.pid;
-  const startIdentity = parentPid ? readParentStartTime(parentPid) : null;
-  if (!parentPid || startIdentity === null) {
-    parent.kill("SIGKILL");
-    throw new Error("expected a parent process with a stable start identity");
-  }
+  const { parent, parentPid, parentStartIdentity } = createManagedServiceBoundaryParent(spawn);
   const paramsPath = path.join(params.tmpDir, `${params.name}.json`);
   handoffParents.set(paramsPath, parent);
   const prepared = {
     ...params.baseParams,
     parentPid,
-    parentStartIdentity: String(startIdentity),
+    parentStartIdentity: String(parentStartIdentity),
     parentExitTimeoutMs: 5_000,
     handoffId: params.owner,
     updateLeaseOwner: params.owner,

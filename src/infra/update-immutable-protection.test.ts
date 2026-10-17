@@ -51,83 +51,78 @@ async function fixture() {
     assertCurrent,
   };
   const context = { env, assertCurrent, candidate };
-  const verify = (before = snapshot) => verifyImmutableProtection(before, context);
-  const unchanged = () => assertImmutableProtectionUnchanged(snapshot, context);
-  const migrate = async (
-    next: unknown,
-    options: {
-      pid?: number;
-      cwd?: string;
-      audited?: boolean;
-      brokenHash?: boolean;
-      foreignOrigin?: boolean;
-    } = {},
-  ) => {
-    const previousRaw = fs.readFileSync(configPath, "utf8");
-    const previousMetadata = resolveConfigStatMetadata(fs.statSync(configPath));
-    const raw = JSON.stringify(next);
-    const stage = `${configPath}.candidate`;
-    fs.writeFileSync(stage, raw, { mode: 0o600 });
-    fs.renameSync(stage, configPath);
-    if (options.audited === false) {
-      return;
-    }
-    await appendConfigAuditRecord({
-      env,
-      homedir: () => root,
-      record: finalizeConfigWriteAuditRecord({
-        base: createConfigWriteAuditRecordBase({
-          configPath,
-          env,
-          existsBefore: true,
-          previousHash: options.brokenHash ? "f".repeat(64) : hashConfigRaw(previousRaw),
-          nextHash: hashConfigRaw(raw),
-          previousBytes: Buffer.byteLength(previousRaw),
-          nextBytes: Buffer.byteLength(raw),
-          previousMetadata,
-          changedPathCount: 1,
-          hasMetaBefore: true,
-          hasMetaAfter: true,
-          gatewayModeBefore: "local",
-          gatewayModeAfter: "local",
-          suspicious: [],
-          origin: options.foreignOrigin ? "config-rpc" : "doctor",
-          processInfo: {
-            pid: options.pid ?? candidate.pid,
-            ppid: 1,
-            cwd: options.cwd ?? candidate.generationPath,
-            argv: ["node", path.join(candidate.generationPath, "dist/index.js"), "gateway"],
-            execArgv: [],
-          },
-        }),
-        result: "rename",
-        nextMetadata: resolveConfigStatMetadata(fs.statSync(configPath)),
-      }),
-    });
-  };
-  const additive = () => ({
-    ...config,
-    channels: {
-      telegram: { ...config.channels.telegram, legacyWebhook: { port: 8787, host: "127.0.0.1" } },
-    },
-    meta: {
-      lastTouchedVersion: "2026.9.9",
-      migrations: { webhookListeners: { telegram: [["channels", "telegram", "legacyWebhook"]] } },
-    },
-  });
-  const read = () => JSON.parse(fs.readFileSync(configPath, "utf8"));
   return {
     root,
     configPath,
     config,
     snapshot,
     context,
-    migrate,
-    additive,
     capture,
-    verify,
-    unchanged,
-    read,
+    verify: (before = snapshot) => verifyImmutableProtection(before, context),
+    unchanged: () => assertImmutableProtectionUnchanged(snapshot, context),
+    async migrate(
+      next: unknown,
+      options: {
+        pid?: number;
+        cwd?: string;
+        audited?: boolean;
+        brokenHash?: boolean;
+        foreignOrigin?: boolean;
+      } = {},
+    ) {
+      const previousRaw = fs.readFileSync(configPath, "utf8");
+      const previousMetadata = resolveConfigStatMetadata(fs.statSync(configPath));
+      const raw = JSON.stringify(next);
+      const stage = `${configPath}.candidate`;
+      fs.writeFileSync(stage, raw, { mode: 0o600 });
+      fs.renameSync(stage, configPath);
+      if (options.audited === false) {
+        return;
+      }
+      await appendConfigAuditRecord({
+        env,
+        homedir: () => root,
+        record: finalizeConfigWriteAuditRecord({
+          base: createConfigWriteAuditRecordBase({
+            configPath,
+            env,
+            existsBefore: true,
+            previousHash: options.brokenHash ? "f".repeat(64) : hashConfigRaw(previousRaw),
+            nextHash: hashConfigRaw(raw),
+            previousBytes: Buffer.byteLength(previousRaw),
+            nextBytes: Buffer.byteLength(raw),
+            previousMetadata,
+            changedPathCount: 1,
+            hasMetaBefore: true,
+            hasMetaAfter: true,
+            gatewayModeBefore: "local",
+            gatewayModeAfter: "local",
+            suspicious: [],
+            origin: options.foreignOrigin ? "config-rpc" : "doctor",
+            processInfo: {
+              pid: options.pid ?? candidate.pid,
+              ppid: 1,
+              cwd: options.cwd ?? candidate.generationPath,
+              argv: ["node", path.join(candidate.generationPath, "dist/index.js"), "gateway"],
+              execArgv: [],
+            },
+          }),
+          result: "rename",
+          nextMetadata: resolveConfigStatMetadata(fs.statSync(configPath)),
+        }),
+      });
+    },
+    additive: () => ({
+      ...config,
+      channels: {
+        telegram: { ...config.channels.telegram, legacyWebhook: { port: 8787, host: "127.0.0.1" } },
+      },
+      meta: {
+        lastTouchedVersion: "2026.9.9",
+        migrations: { webhookListeners: { telegram: [["channels", "telegram", "legacyWebhook"]] } },
+      },
+    }),
+    read: () => JSON.parse(fs.readFileSync(configPath, "utf8")),
   };
 }
 

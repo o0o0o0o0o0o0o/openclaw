@@ -19,69 +19,11 @@ import { installImmutableLauncher } from "./update-immutable-generation.js";
 import type { ImmutableInstallDescriptor } from "./update-immutable-install-schema.js";
 
 const temporary = useAutoCleanupTempDirTracker(afterEach);
-const writeGenerationFile = (generation: string, name: string, source: string, mode = 0o444) => {
+const writeGenerationFile = (generation: string, name: string, source: string) => {
   fs.mkdirSync(path.join(generation, "dist"), { recursive: true, mode: 0o755 });
   fs.writeFileSync(path.join(generation, "package.json"), '{"type":"module"}');
-  fs.writeFileSync(path.join(generation, "dist", name), source, { mode });
+  fs.writeFileSync(path.join(generation, "dist", name), source, { mode: 0o444 });
 };
-const copyRuntime = (directory: string) => {
-  const runtime = path.join(directory, "node");
-  fs.copyFileSync(process.execPath, runtime);
-  fs.chownSync(runtime, 0, 0);
-  fs.chmodSync(runtime, 0o755);
-  return runtime;
-};
-
-it.runIf(process.platform === "linux" && process.getuid?.() === 0)(
-  "execs one physical generation and keeps lazy imports pinned after current changes, refusing an escaping pointer",
-  async () => {
-    const fixture = temporary.make("openclaw-immutable-launcher-");
-    const root = path.join(fixture, "installation");
-    fs.mkdirSync(root, { mode: 0o755 });
-    const runtime = copyRuntime(fixture);
-    const previous = path.join(root, "releases", "a".repeat(40));
-    const next = path.join(root, "releases", "b".repeat(40));
-    for (const { generation, value } of [
-      { generation: previous, value: "previous" },
-      { generation: next, value: "next" },
-    ]) {
-      writeGenerationFile(generation, "lazy.js", `export default ${JSON.stringify(value)};`, 0o666);
-    }
-    fs.symlinkSync(previous, path.join(root, "current"));
-    const payload = `
-import fs from "node:fs";
-fs.symlinkSync(${JSON.stringify(next)}, ${JSON.stringify(path.join(root, "replacement"))});
-fs.renameSync(${JSON.stringify(path.join(root, "replacement"))}, ${JSON.stringify(path.join(root, "current"))});
-console.log(JSON.stringify({cwd: process.cwd(), entry: process.argv[1], args: process.argv.slice(2), lazy: (await import("./lazy.js")).default}));
-`;
-    fs.writeFileSync(path.join(previous, "dist", "index.js"), payload, { mode: 0o444 });
-    const launcher = await installImmutableLauncher({ root, runtimePath: runtime });
-    expect(await installImmutableLauncher({ root, runtimePath: runtime })).toBe(launcher);
-    const launched = spawnSync(launcher, ["--port", "19547"], { encoding: "utf8" });
-    expect(launched.stderr).not.toContain("Cannot start");
-    expect(launched.status).toBe(0);
-    expect(JSON.parse(launched.stdout)).toEqual({
-      cwd: previous,
-      entry: path.join(previous, "dist", "index.js"),
-      args: ["gateway", "--port", "19547"],
-      lazy: "previous",
-    });
-    expect(fs.realpathSync(path.join(root, "current"))).toBe(next);
-
-    fs.unlinkSync(path.join(root, "current"));
-    fs.symlinkSync(path.dirname(root), path.join(root, "current"));
-    const refused = spawnSync(launcher, [], { encoding: "utf8" });
-    expect(refused.status).toBe(78);
-    expect(refused.stderr).toContain("direct releases/<full-sha>");
-
-    fs.writeFileSync(launcher, "foreign launcher\n");
-    await expect(installImmutableLauncher({ root, runtimePath: runtime })).rejects.toThrow(
-      "conflicts",
-    );
-    expect(readText(launcher)).toBe("foreign launcher\n");
-  },
-);
-
 const suiteTemporary = useAutoCleanupTempDirTracker(afterAll);
 
 describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
@@ -91,7 +33,10 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
     beforeAll(() => {
       runtime = fs.realpathSync(process.execPath);
       if (fs.statSync(runtime).uid !== 0) {
-        runtime = copyRuntime(suiteTemporary.make("immutable-launcher-runtime-"));
+        runtime = path.join(suiteTemporary.make("immutable-launcher-runtime-"), "node");
+        fs.copyFileSync(process.execPath, runtime);
+        fs.chownSync(runtime, 0, 0);
+        fs.chmodSync(runtime, 0o755);
       }
     });
     afterEach(() => vi.restoreAllMocks());
@@ -120,8 +65,9 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
       const control = resolvePackageActivationControl(resolvePackageActivationAnchor(root));
       const journal = path.join(control, "operation.sqlite");
       const launcher = path.join(root, "bin", "openclaw-gateway");
+      const installLauncher = () => installImmutableLauncher({ root, runtimePath: runtime });
       if (install) {
-        await installImmutableLauncher({ root, runtimePath: runtime });
+        await installLauncher();
       } else {
         fs.mkdirSync(path.dirname(launcher), { mode: 0o755 });
       }
@@ -209,8 +155,53 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         expectLaunch,
         seedLauncher,
         upgrade,
+        installLauncher,
       };
     }
+
+    it("pins lazy imports to one generation and refuses escaping pointers or foreign launchers", async () => {
+      const f = await setup();
+      const { root, launcher } = f;
+      const previous = f.descriptor.current.path;
+      const next = path.join(root, "releases", f.nextSha);
+      for (const [generation, value] of [
+        [previous, "previous"],
+        [next, "next"],
+      ] as const) {
+        fs.writeFileSync(
+          path.join(generation, "dist", "lazy.js"),
+          `export default ${JSON.stringify(value)};`,
+        );
+      }
+      fs.unlinkSync(path.join(root, "current"));
+      fs.symlinkSync(previous, path.join(root, "current"));
+      const payload = `
+import fs from "node:fs";
+fs.symlinkSync(${JSON.stringify(next)}, ${JSON.stringify(path.join(root, "replacement"))});
+fs.renameSync(${JSON.stringify(path.join(root, "replacement"))}, ${JSON.stringify(path.join(root, "current"))});
+console.log(JSON.stringify({cwd: process.cwd(), entry: process.argv[1], args: process.argv.slice(2), lazy: (await import("./lazy.js")).default}));
+`;
+      fs.writeFileSync(path.join(previous, "dist", "index.js"), payload, { mode: 0o444 });
+      expect(await f.installLauncher()).toBe(launcher);
+      const launched = spawnSync(launcher, ["--port", "19547"], { encoding: "utf8" });
+      expect(launched.stderr).not.toContain("Cannot start");
+      expect(launched.status).toBe(0);
+      expect(JSON.parse(launched.stdout)).toEqual({
+        cwd: previous,
+        entry: path.join(previous, "dist", "index.js"),
+        args: ["gateway", "--port", "19547"],
+        lazy: "previous",
+      });
+      expect(fs.realpathSync(path.join(root, "current"))).toBe(next);
+      fs.unlinkSync(path.join(root, "current"));
+      fs.symlinkSync(path.dirname(root), path.join(root, "current"));
+      const refused = spawnSync(launcher, [], { encoding: "utf8" });
+      expect(refused.status).toBe(78);
+      expect(refused.stderr).toContain("direct releases/<full-sha>");
+      fs.writeFileSync(launcher, "foreign launcher\n");
+      await expect(f.installLauncher()).rejects.toThrow("conflicts");
+      expect(readText(launcher)).toBe("foreign launcher\n");
+    });
 
     it("gates supervisor replacements through durable stop phases until the owner authorizes startup", async () => {
       const f = await setup();
@@ -342,9 +333,7 @@ describe.runIf(process.platform === "linux" && process.getuid?.() === 0)(
         const f = await setup(false);
         const previous = previousLauncher(version);
         f.seedLauncher(previous);
-        await expect(
-          installImmutableLauncher({ root: f.root, runtimePath: runtime }),
-        ).rejects.toThrow("conflicts");
+        await expect(f.installLauncher()).rejects.toThrow("conflicts");
         const oldIdentity = fileIdentity(f.launcher);
         await f.upgrade(version);
         expect(fileIdentity(f.launcher)).not.toBe(oldIdentity);

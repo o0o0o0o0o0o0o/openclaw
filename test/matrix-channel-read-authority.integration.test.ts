@@ -323,15 +323,6 @@ async function withHarness(
   }
 }
 
-function expectReadRequests(requests: MatrixHarness["requests"]) {
-  expect(
-    requests.every(
-      ({ method, authorization }) => method === "GET" && authorization === `Bearer ${accessToken}`,
-    ),
-  ).toBe(true);
-  expect(requests.filter(({ path }) => responseFor(path) === undefined)).toEqual([]);
-}
-
 const reads = [
   {
     action: "read",
@@ -440,7 +431,15 @@ describe("Matrix member info CLI", () => {
           `/_matrix/client/v3/profile/${memberId}`,
         ]),
       );
-      expectReadRequests(fixture.requests);
+      expect(
+        fixture.requests.every(
+          (request) =>
+            request.method === "GET" && request.authorization === `Bearer ${accessToken}`,
+        ),
+      ).toBe(true);
+      expect(fixture.requests.filter((request) => responseFor(request.path) === undefined)).toEqual(
+        [],
+      );
     });
   });
 });
@@ -453,7 +452,15 @@ describe("registered installed Matrix reads", () => {
         const outcome = await fixture.invoke(action, params);
         expect(outcome?.details).toMatchObject({ ok: true, ...result });
         expect(fixture.requests.map((request) => request.path)).toContain(path);
-        expectReadRequests(fixture.requests);
+        expect(
+          fixture.requests.every(
+            (request) =>
+              request.method === "GET" && request.authorization === `Bearer ${accessToken}`,
+          ),
+        ).toBe(true);
+        expect(
+          fixture.requests.filter((request) => responseFor(request.path) === undefined),
+        ).toEqual([]);
       });
     },
   );

@@ -7,13 +7,14 @@ import type {
   ChannelMessageActionName,
 } from "../src/channels/plugins/types.js";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../src/config/config.js";
-import type { OpenClawConfig } from "../src/config/types.js";
 import { getPluginInstance } from "../src/plugins/plugin-instance-scope.js";
-import { createPluginRegistry } from "../src/plugins/registry.js";
-import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../src/plugins/runtime.js";
-import type { PluginRuntime } from "../src/plugins/runtime/types.js";
-import { createPluginRecord } from "../src/plugins/status.test-fixtures.js";
-import { createTeamsReadCaller } from "./msteams-read.test-support.js";
+import { resetPluginRuntimeStateForTest } from "../src/plugins/runtime.js";
+import {
+  createTeamsReadCaller,
+  createTeamsReadConfig,
+  createReadPluginRegistration,
+} from "./channel-read.test-support.js";
+import { closeHttpServer, listenLoopback } from "./helpers/gateway-integration-fixtures.js";
 
 type GraphRequest = { method: string; url: URL; body: unknown };
 type GraphReply = { status?: number; headers?: Record<string, string>; body?: unknown };
@@ -108,37 +109,17 @@ async function createFixture(
   } = {},
 ) {
   const origin = options.origin ?? "global";
-  const cfg: OpenClawConfig = {
-    channels: {
-      msteams: {
-        enabled: true,
-        authType: "secret",
-        appId: "44444444-4444-4444-4444-444444444444",
-        appPassword: "synthetic-app-password",
-        tenantId: "55555555-5555-5555-5555-555555555555",
-        dmPolicy: "open",
-        allowFrom: ["*"],
-        groupPolicy: options.narrowTeam || options.botFrameworkTeam ? "allowlist" : "open",
-        teams: {
-          [options.botFrameworkTeam ? currentChannel : teamId]: {
-            channels: {
-              [options.narrowTeam || options.botFrameworkTeam ? targetChannel : "*"]: {},
-            },
-          },
+  const cfg = createTeamsReadConfig({
+    groupPolicy: options.narrowTeam || options.botFrameworkTeam ? "allowlist" : "open",
+    teams: {
+      [options.botFrameworkTeam ? currentChannel : teamId]: {
+        channels: {
+          [options.narrowTeam || options.botFrameworkTeam ? targetChannel : "*"]: {},
         },
       },
     },
-  };
-  const owner = createPluginRegistry({
-    logger: { info() {}, warn() {}, error() {}, debug() {} },
-    runtime: {} as PluginRuntime,
-    activateGlobalSideEffects: false,
   });
-  const record = createPluginRecord({
-    id: "msteams",
-    origin,
-    trustedOfficialInstall: origin === "global",
-  });
+  const { record, api, activate } = createReadPluginRegistration(cfg, "msteams", origin);
   const providerActions = msteamsPlugin.actions!;
   const providerSettlements: Array<{
     action: ChannelMessageActionName;
@@ -164,9 +145,8 @@ async function createFixture(
       },
     },
   };
-  owner.registry.plugins.push(record);
-  owner.createApi(record, { config: cfg, registrationMode: "full" }).registerChannel({ plugin });
-  setActivePluginRegistry(owner.registry);
+  api.registerChannel({ plugin });
+  activate();
   setRuntimeConfigSnapshot(cfg, cfg);
 
   const toolContext = {
@@ -247,21 +227,11 @@ async function createFixture(
   });
   cleanups.push(async () => {
     caller.dispose();
-    server.closeAllConnections();
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => (error ? reject(error) : resolve()));
-    });
+    await closeHttpServer(server);
     const disposal = await getPluginInstance(record)?.dispose();
     expect(disposal?.errors).toEqual([]);
   });
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Expected loopback server address");
-  }
-  graph.origin = `http://msteams-proof.invalid:${address.port}`;
+  graph.origin = `http://msteams-proof.invalid:${new URL(await listenLoopback(server)).port}`;
 
   return {
     requests,
@@ -286,6 +256,24 @@ function settle<T>(pending: Promise<T>) {
     (value) => ({ value }),
     (error: unknown) => ({ error }),
   );
+}
+
+function preparationGate() {
+  const entered = createDeferred<void>();
+  const released = createDeferred<void>();
+  const wait = () => {
+    entered.resolve();
+    return released.promise;
+  };
+  return {
+    entered: entered.promise,
+    release: () => released.resolve(),
+    wait,
+    token: async () => {
+      await wait();
+      return token;
+    },
+  };
 }
 
 describe("Teams Graph mutation currentness", () => {
@@ -363,28 +351,20 @@ describe("Teams Graph mutation currentness", () => {
         self: true,
         senderIsOwner: stage === "token" ? true : undefined,
       });
-      const started = createDeferred<void>();
-      const finish = createDeferred<void>();
-      const hold = async () => {
-        started.resolve();
-        await finish.promise;
-      };
+      const gate = preparationGate();
       if (stage === "sdk") {
-        graph.prepareSdk.mockImplementation(hold);
+        graph.prepareSdk.mockImplementation(gate.wait);
       } else if (stage === "dns") {
-        graph.beforeLookup = hold;
+        graph.beforeLookup = gate.wait;
       } else {
-        graph.acquireToken.mockImplementation(async () => {
-          await hold();
-          return token;
-        });
+        graph.acquireToken.mockImplementation(gate.token);
       }
       const result = settle(fixture.invoke("tool", action, { target: chatId, ...params }));
-      await started.promise;
+      await gate.entered;
       if (revoked) {
         fixture.revokeTurn();
       }
-      finish.resolve();
+      gate.release();
       const settled = await result;
 
       // The outer tool can reject after Graph has written; observe the native request itself.
@@ -491,13 +471,8 @@ describe("Teams Graph mutation currentness", () => {
   it("isolates one caller's cancellation from a concurrent valid operation", async () => {
     const fixture = await createFixture({ origin: "bundled", self: true });
     const caller = new AbortController();
-    const started = createDeferred<void>();
-    const finish = createDeferred<void>();
-    graph.acquireToken.mockImplementationOnce(async () => {
-      started.resolve();
-      await finish.promise;
-      return token;
-    });
+    const gate = preparationGate();
+    graph.acquireToken.mockImplementationOnce(gate.token);
     const canceled = settle(
       fixture.invoke(
         "tool",
@@ -506,12 +481,12 @@ describe("Teams Graph mutation currentness", () => {
         caller.signal,
       ),
     );
-    await started.promise;
+    await gate.entered;
     caller.abort(new Error("Caller canceled"));
     await expect(
       fixture.invoke("tool", "pin", { target: chatId, messageId: "valid-message" }),
     ).resolves.toMatchObject({ pinnedMessageId: "pin-1" });
-    finish.resolve();
+    gate.release();
     expect(await canceled).toMatchObject({ error: expect.any(Error) });
     expect(fixture.requests).toEqual([`POST ${chatPath}/pinnedMessages`]);
     expect(fixture.nativeRequests[0]?.body).toEqual({
@@ -599,17 +574,11 @@ describe("Teams Graph mutation currentness", () => {
         expect(fixture.providerSettlements).toMatchObject([{ action, error: providerFailure }]);
         expect(result).toMatchObject({ error: revoked ? expect.any(Error) : providerFailure });
       } else {
-        expect(fixture.providerSettlements).toMatchObject([
-          {
-            action,
-            result: {
-              details:
-                action === "pin"
-                  ? { ok: true, pinnedMessageId: "accepted-pin" }
-                  : { ok: true, removed: { userId: memberId, chatId } },
-            },
-          },
-        ]);
+        const details =
+          action === "pin"
+            ? { ok: true, pinnedMessageId: "accepted-pin" }
+            : { ok: true, removed: { userId: memberId, chatId } };
+        expect(fixture.providerSettlements).toMatchObject([{ action, result: { details } }]);
       }
     },
   );
@@ -737,15 +706,10 @@ describe.each(surfaces)("Teams %s reads with a %s registration", (route, origin)
     async (stage) => {
       const local = stage === "plugin-entry";
       const fixture = await createFixture({ origin, self: local });
-      const started = createDeferred<void>();
-      const finish = createDeferred<void>();
+      const gate = preparationGate();
       const heldToken = stage === "turn-token" || stage === "plugin-token";
       if (heldToken) {
-        graph.acquireToken.mockImplementation(async () => {
-          started.resolve();
-          await finish.promise;
-          return token;
-        });
+        graph.acquireToken.mockImplementation(gate.token);
       } else if (local) {
         graph.afterEntry = fixture.retirePlugin;
       } else {
@@ -758,13 +722,13 @@ describe.each(surfaces)("Teams %s reads with a %s registration", (route, origin)
       );
       const rejected = expect(result).rejects.toThrow(/no longer active|authority/i);
       if (heldToken) {
-        await started.promise;
+        await gate.entered;
         if (stage === "turn-token") {
           fixture.revokeTurn();
         } else {
           fixture.retirePlugin();
         }
-        finish.resolve();
+        gate.release();
       }
       await rejected;
       if (stage === "run-response") {

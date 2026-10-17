@@ -1,18 +1,14 @@
-// E2E: ephemeral gateway must not leak MCP secrets via /mcp show replies.
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { afterAll, describe, expect, it } from "vitest";
 import { REDACTED_SENTINEL } from "../src/config/redact-snapshot.js";
-import { connectGatewayClient } from "../src/gateway/test-helpers.e2e.js";
 import { extractFirstTextBlock } from "../src/shared/chat-message-content.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../src/utils/message-channel.js";
+import { connectProofClient } from "./helpers/gateway-integration-fixtures.js";
 import {
   createOpenClawTestInstance,
   type OpenClawTestInstance,
 } from "./helpers/openclaw-test-instance.js";
-
-const E2E_TIMEOUT_MS = 180_000;
-const CHAT_FINAL_TIMEOUT_MS = 45_000;
 
 const HEADER_SECRET = "Bearer e2e-live-mcp-header-secret-value";
 const ENV_SECRET = "e2e-live-mcp-env-secret-value";
@@ -20,6 +16,11 @@ const ARG_SECRET = "e2e-live-mcp-argv-secret-value";
 const ARG_INLINE_SECRET = "e2e-live-mcp-inline-argv-secret-value";
 const ARG_POSITIONAL_SECRET = "ghp_e2elivemcpargvtoken1234567890ABCD";
 const SERVER_NAME = "billing-server";
+const serverConnection = {
+  command: "uvx",
+  transport: "streamable-http",
+  url: "https://billing.example.com/mcp",
+} as const;
 
 const serverSecrets = (redacted = false) => ({
   headers: { Authorization: redacted ? REDACTED_SENTINEL : HEADER_SECRET },
@@ -84,9 +85,8 @@ function collectFinalText(payload: ChatEventPayload): string {
 async function waitForChatFinal(
   events: Array<{ event?: string; payload?: unknown }>,
   runId: string,
-  timeoutMs = CHAT_FINAL_TIMEOUT_MS,
 ): Promise<ChatEventPayload> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     for (const event of events) {
       if (event.event !== "chat" || !event.payload || typeof event.payload !== "object") {
@@ -102,11 +102,7 @@ async function waitForChatFinal(
     });
   }
   throw new Error(
-    `timed out waiting for chat final runId=${runId}; events=${JSON.stringify(
-      events.slice(-12),
-      null,
-      2,
-    )}`,
+    `timed out waiting for chat final runId=${runId}; events=${JSON.stringify(events.slice(-12))}`,
   );
 }
 
@@ -121,7 +117,7 @@ describe("mcp show redaction e2e", () => {
 
   it(
     "starts an ephemeral gateway and redacts MCP secrets from /mcp show chat replies",
-    { timeout: E2E_TIMEOUT_MS },
+    { timeout: 180_000 },
     async () => {
       const instance = await createOpenClawTestInstance({
         name: "mcp-show-redact",
@@ -131,18 +127,14 @@ describe("mcp show redaction e2e", () => {
           mcp: {
             servers: {
               [SERVER_NAME]: {
-                command: "uvx",
+                ...serverConnection,
                 args: serverArgs(),
-                transport: "streamable-http",
-                url: "https://billing.example.com/mcp",
                 ...serverSecrets(),
               },
               "local-tools": {
                 command: "uvx",
                 args: ["local-mcp"],
-                env: {
-                  TOOL_API_KEY: "second-env-secret-value",
-                },
+                env: { TOOL_API_KEY: "second-env-secret-value" },
               },
             },
           },
@@ -154,9 +146,7 @@ describe("mcp show redaction e2e", () => {
       expect((await readServer(instance))?.headers?.Authorization).toBe(HEADER_SECRET);
 
       const events: Array<{ event?: string; payload?: unknown }> = [];
-      const client = await connectGatewayClient({
-        url: instance.url,
-        token: instance.gatewayToken,
+      const client = await connectProofClient(instance, {
         clientName: GATEWAY_CLIENT_NAMES.CLI,
         mode: GATEWAY_CLIENT_MODES.CLI,
         role: "operator",
@@ -202,23 +192,17 @@ describe("mcp show redaction e2e", () => {
         expectRedacted(listText);
         expect(listText).not.toContain("second-env-secret-value");
 
-        // CLI show → set can safely round-trip redacted argv because it preserves JSON arrays.
-        // The chat set below intentionally omits args to avoid chat body bracket normalization.
+        // CLI preserves JSON argv arrays; chat normalization requires the array-free payload below.
         const argvRestored = await cliSet({
           command: "uvx",
           args: serverArgs(true),
           ...serverSecrets(true),
         });
-        expect(argvRestored?.args).toEqual(serverArgs());
-        expect(argvRestored).toMatchObject(serverSecrets());
+        expect(argvRestored).toMatchObject({ args: serverArgs(), ...serverSecrets() });
         expect(JSON.stringify(argvRestored)).not.toContain(REDACTED_SENTINEL);
 
-        // show → set with redacted secrets must restore live values, not write the sentinel.
-        // Keep the JSON free of array brackets so chat body normalization cannot mangle it.
         const setPayload = {
-          command: "uvx",
-          transport: "streamable-http",
-          url: "https://billing.example.com/mcp",
+          ...serverConnection,
           ...serverSecrets(true),
         };
         const setText = await chat(`/mcp set ${SERVER_NAME}=${JSON.stringify(setPayload)}`);
@@ -228,7 +212,6 @@ describe("mcp show redaction e2e", () => {
         expect(saved).toMatchObject({ command: "uvx", ...serverSecrets() });
         expect(JSON.stringify(saved)).not.toContain(REDACTED_SENTINEL);
 
-        // Same process, same config: CLI set with sentinel also restores (write path e2e).
         expect(await cliSet({ command: "uvx", ...serverSecrets(true) })).toMatchObject(
           serverSecrets(),
         );

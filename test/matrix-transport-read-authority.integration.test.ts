@@ -13,7 +13,6 @@ vi.mock("node:dns/promises", async (importOriginal) => ({
   lookup,
 }));
 
-const TEST_UNDICI_RUNTIME_DEPS_KEY = "__OPENCLAW_TEST_UNDICI_RUNTIME_DEPS__";
 const HOMESERVER = "http://127.0.0.1:8008";
 const READ_PATH = "/_matrix/client/v3/rooms/%21room%3Amatrix.test/messages";
 const PAYLOAD = JSON.stringify({ chunk: [{ event_id: "$fixture", content: { body: "context" } }] });
@@ -53,27 +52,30 @@ class TransportMatrixClient extends MatrixClient {
   }
 }
 
-const clients = new Set<TransportMatrixClient>();
+const clients: TransportMatrixClient[] = [];
 
-function stubRuntimeFetch(fetchImpl: typeof fetch, close?: () => Promise<void>): void {
-  vi.stubGlobal(TEST_UNDICI_RUNTIME_DEPS_KEY, {
+function createReader(
+  transport: (typeof TRANSPORTS)[number],
+  body: BodyInit = PAYLOAD,
+  close?: () => Promise<void>,
+) {
+  const runtimeFetch = vi.fn<typeof fetch>(async () => new Response(body));
+  vi.stubGlobal("__OPENCLAW_TEST_UNDICI_RUNTIME_DEPS__", {
     Agent: class MockAgent {
       close = close;
     },
     EnvHttpProxyAgent: function MockEnvHttpProxyAgent() {},
     ProxyAgent: function MockProxyAgent() {},
-    fetch: fetchImpl,
+    fetch: runtimeFetch,
   });
-}
-
-function createReader(transport: (typeof TRANSPORTS)[number]) {
   const client = new TransportMatrixClient(HOMESERVER, "fixture-token", {
     localTimeoutMs: 5000,
     ssrfPolicy: { allowPrivateNetwork: true },
   });
-  clients.add(client);
+  clients.push(client);
   return {
     client,
+    runtimeFetch,
     read: (path: string) => client.readTransport(transport, path),
   };
 }
@@ -85,10 +87,8 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  const ownedClients = [...clients];
-  clients.clear();
   try {
-    await Promise.all(ownedClients.map((client) => client.stopWithoutPersist()));
+    await Promise.all(clients.splice(0).map((client) => client.stopWithoutPersist()));
   } finally {
     vi.unstubAllGlobals();
   }
@@ -99,7 +99,7 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
     { name: "initial DNS", redirect: false },
     { name: "redirect DNS", redirect: true },
   ])("stops the next physical request when the read closes during $name", async ({ redirect }) => {
-    const runtimeFetch = vi.fn<typeof fetch>(async () => new Response(PAYLOAD));
+    const { read, runtimeFetch } = createReader(transport);
     if (redirect) {
       lookup.mockResolvedValueOnce(DNS_ANSWER);
       runtimeFetch.mockResolvedValueOnce(
@@ -107,8 +107,6 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
       );
     }
     const dns = deferDns();
-    stubRuntimeFetch(runtimeFetch);
-    const { read } = createReader(transport);
 
     const pending = await pendingRead(() => read(redirect ? "/redirect" : READ_PATH), dns.started);
     const rejected = expect(pending.request).rejects.toThrow(CLOSED_AUTHORITY);
@@ -122,37 +120,44 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
     );
   });
 
-  it("rejects its own late result after the read closes during body consumption", async () => {
-    const bodyStarted = createDeferred<void>();
-    const deliverBody = createDeferred<void>();
-    const stream = new ReadableStream<Uint8Array>(
-      {
-        async pull(controller) {
-          bodyStarted.resolve();
-          await deliverBody.promise;
-          controller.enqueue(Buffer.from(PAYLOAD));
-          controller.close();
-        },
-      },
-      { highWaterMark: 0 },
-    );
-    const runtimeFetch = vi.fn<typeof fetch>(async () => new Response(stream));
-    stubRuntimeFetch(runtimeFetch);
-    const { read } = createReader(transport);
-
-    const pending = await pendingRead(() => read(READ_PATH), bodyStarted.promise);
-    const rejected = expect(pending.request).rejects.toThrow(CLOSED_AUTHORITY);
-    deliverBody.resolve();
-
-    await rejected;
-    expect(runtimeFetch.mock.calls.map(([url]) => url)).toEqual([`${HOMESERVER}${READ_PATH}`]);
-  });
+  it.each(["body consumption", "dispatcher cleanup"])(
+    "rejects a closed read after %s",
+    async (phase) => {
+      const started = createDeferred<void>();
+      const finish = createDeferred<void>();
+      const pause = async () => {
+        started.resolve();
+        await finish.promise;
+      };
+      const consumingBody = phase === "body consumption";
+      const body = consumingBody
+        ? new ReadableStream<Uint8Array>(
+            {
+              async pull(controller) {
+                await pause();
+                controller.enqueue(Buffer.from(PAYLOAD));
+                controller.close();
+              },
+            },
+            { highWaterMark: 0 },
+          )
+        : PAYLOAD;
+      const { read, runtimeFetch } = createReader(
+        transport,
+        body,
+        consumingBody ? undefined : pause,
+      );
+      const pending = await pendingRead(() => read(READ_PATH), started.promise);
+      const rejected = expect(pending.request).rejects.toThrow(CLOSED_AUTHORITY);
+      finish.resolve();
+      await rejected;
+      expect(runtimeFetch.mock.calls.map(([url]) => url)).toEqual([`${HOMESERVER}${READ_PATH}`]);
+    },
+  );
 
   it("stops physical I/O when the client closes during DNS with read authority still active", async () => {
     const dns = deferDns();
-    const runtimeFetch = vi.fn<typeof fetch>(async () => new Response(PAYLOAD));
-    stubRuntimeFetch(runtimeFetch);
-    const { client, read } = createReader(transport);
+    const { client, read, runtimeFetch } = createReader(transport);
 
     await withRead(async () => {
       const rejected = expect(read(READ_PATH)).rejects.toThrow(
@@ -165,48 +170,25 @@ describe.each(TRANSPORTS)("%s read authority", (transport) => {
     });
     expect(runtimeFetch).not.toHaveBeenCalled();
   });
-
-  it("rechecks result authority after dispatcher cleanup", async () => {
-    const cleanupStarted = createDeferred<void>();
-    const finishCleanup = createDeferred<void>();
-    const runtimeFetch = vi.fn<typeof fetch>(async () => new Response(PAYLOAD));
-    stubRuntimeFetch(runtimeFetch, async () => {
-      cleanupStarted.resolve();
-      await finishCleanup.promise;
-    });
-    const { read } = createReader(transport);
-
-    const pending = await pendingRead(() => read(READ_PATH), cleanupStarted.promise);
-    const rejected = expect(pending.request).rejects.toThrow(CLOSED_AUTHORITY);
-    finishCleanup.resolve();
-    await rejected;
-    expect(runtimeFetch.mock.calls.map(([url]) => url)).toEqual([`${HOMESERVER}${READ_PATH}`]);
-  });
 });
 
 it("reuses an SDK fetch without poisoning a valid read or reviving its closed first read", async () => {
   const dns = deferDns();
-  const runtimeFetch = vi.fn<typeof fetch>(async () => new Response(PAYLOAD));
-  stubRuntimeFetch(runtimeFetch);
-
   const first = await withRead(async () => {
-    const { read } = createReader("SDK fetch");
-    const result = Promise.allSettled([read(`${READ_PATH}?limit=1`)]);
+    const { read, runtimeFetch } = createReader("SDK fetch");
+    const rejected = expect(read(`${READ_PATH}?limit=1`)).rejects.toMatchObject({
+      message: CLOSED_AUTHORITY,
+    });
     await dns.started;
-    return { read, result };
+    return { read, runtimeFetch, rejected };
   });
 
   await withRead(async () => {
-    const second = await Promise.allSettled([first.read(`${READ_PATH}?limit=2`)]);
+    await expect(first.read(`${READ_PATH}?limit=2`)).resolves.toBe(PAYLOAD);
     dns.release();
-    const firstResult = await first.result;
-
-    expect(second).toEqual([{ status: "fulfilled", value: PAYLOAD }]);
-    expect(firstResult).toEqual([
-      { status: "rejected", reason: expect.objectContaining({ message: CLOSED_AUTHORITY }) },
-    ]);
+    await first.rejected;
   });
-  expect(runtimeFetch.mock.calls.map(([url]) => url)).toEqual([
+  expect(first.runtimeFetch.mock.calls.map(([url]) => url)).toEqual([
     `${HOMESERVER}${READ_PATH}?limit=2`,
   ]);
 });

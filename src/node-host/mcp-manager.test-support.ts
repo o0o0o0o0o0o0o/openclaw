@@ -1,5 +1,6 @@
 import type {
   RequestOptions,
+  StandardSchemaV1,
   CallToolRequest,
   CallToolResult,
   ListToolsRequest,
@@ -60,10 +61,16 @@ export function startNodeHostMcpManager(
       set onclose(callback: ClientFixture["onclose"]) {
         Object.assign(client, { onclose: callback });
       },
-      request(request: ListToolsRequest | CallToolRequest, requestOptions?: RequestOptions) {
+      request(
+        request: ListToolsRequest | CallToolRequest,
+        schemaOrOptions?: StandardSchemaV1 | RequestOptions,
+        requestOptions?: RequestOptions,
+      ) {
+        const forwardedOptions =
+          schemaOrOptions && "~standard" in schemaOrOptions ? requestOptions : schemaOrOptions;
         return request.method === "tools/call"
-          ? client.callTool(request.params, requestOptions)
-          : client.request(request, requestOptions);
+          ? client.callTool(request.params, forwardedOptions)
+          : client.request(request, forwardedOptions);
       },
     };
   });

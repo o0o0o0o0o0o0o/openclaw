@@ -40,6 +40,10 @@ import { createMcpJsonSchemaValidator } from "./mcp-json-schema-validator.js";
 import { buildMcpClientCapabilities, summarizeServerCapabilities } from "./mcp-metadata.js";
 import { collectMcpPaginatedItems } from "./mcp-pagination.js";
 import {
+  mcpCallToolResultSchema,
+  mcpGetPromptResultSchema,
+  mcpListResourceTemplatesResultSchema,
+  mcpListToolsResultSchema,
   toLegacyMcpCallToolResult,
   toLegacyMcpGetPromptResult,
   toLegacyMcpListResourceTemplatesResult,
@@ -916,6 +920,7 @@ function createServerMcpRuntime(
                   ...(options?._meta ? { _meta: options._meta } : {}),
                 },
               },
+              mcpCallToolResultSchema,
               {
                 // The local deadline owns active work; the SDK bounds the total
                 // call, including one shared allowance for pending human input.
@@ -939,6 +944,7 @@ function createServerMcpRuntime(
         await runGuardedMcpRequest(session, (signal) =>
           session.client.request(
             { method: "tools/list", params: requestParams },
+            mcpListToolsResultSchema,
             { timeout: session.requestTimeoutMs, signal },
           ),
         ),
@@ -973,6 +979,7 @@ function createServerMcpRuntime(
         await runGuardedMcpRequest(session, (signal) =>
           session.client.request(
             { method: "resources/templates/list", params: requestParams },
+            mcpListResourceTemplatesResultSchema,
             {
               timeout: session.requestTimeoutMs,
               signal,
@@ -991,8 +998,9 @@ function createServerMcpRuntime(
       const session = await getActiveSession(requestedServer);
       return toLegacyMcpGetPromptResult(
         await runGuardedMcpRequest(session, (signal) =>
-          session.client.getPrompt(
-            { name, ...(args ? { arguments: args } : {}) },
+          session.client.request(
+            { method: "prompts/get", params: { name, ...(args ? { arguments: args } : {}) } },
+            mcpGetPromptResultSchema,
             { timeout: session.requestTimeoutMs, signal },
           ),
         ),

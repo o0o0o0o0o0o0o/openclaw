@@ -8,7 +8,10 @@ import {
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { validateSystemRunExecutionContext } from "../../packages/gateway-protocol/src/system-run-execution-context.js";
-import { toLegacyMcpCallToolResult } from "../agents/mcp-sdk-compatibility.js";
+import {
+  McpSdkCompatibilityError,
+  toLegacyMcpCallToolResult,
+} from "../agents/mcp-sdk-compatibility.js";
 import { DEFAULT_ASK, DEFAULT_SECURITY } from "../infra/exec-approvals-config.js";
 import {
   analyzeArgvCommand,
@@ -688,7 +691,7 @@ async function handleMcpToolsCall(
       payload: boundMcpToolResultPayload(toLegacyMcpCallToolResult(result)),
     });
   } catch (error) {
-    if (error instanceof NodeHostMcpError) {
+    if (error instanceof NodeHostMcpError || error instanceof McpSdkCompatibilityError) {
       await response.error(error.code, error.message);
       return;
     }

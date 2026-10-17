@@ -17,6 +17,10 @@ import { redactMcpDiagnosticError } from "../agents/mcp-error.js";
 import { createMcpJsonSchemaValidator } from "../agents/mcp-json-schema-validator.js";
 import { sanitizeMcpMetadataText } from "../agents/mcp-metadata.js";
 import { collectMcpPaginatedItems } from "../agents/mcp-pagination.js";
+import {
+  McpSdkCompatibilityError,
+  mcpCallToolResultSchema,
+} from "../agents/mcp-sdk-compatibility.js";
 import { isMcpToolAllowed } from "../agents/mcp-tool-filter.js";
 import {
   normalizeMcpToolCatalog,
@@ -517,6 +521,7 @@ export async function startNodeHostMcpManager(
             method: "tools/call",
             params: { name: params.tool, arguments: params.arguments ?? {} },
           },
+          mcpCallToolResultSchema,
           {
             timeout: Math.min(requestedTimeoutMs, session.toolCallTimeoutMs),
             ...(params.signal ? { signal: params.signal } : {}),
@@ -525,6 +530,9 @@ export async function startNodeHostMcpManager(
         validateResult?.(result);
         return result;
       } catch (error) {
+        if (error instanceof McpSdkCompatibilityError) {
+          throw error;
+        }
         const sessionExpired = isMcpHttpSessionExpired(session, error);
         if (sessionExpired && invalidateCurrent(state, session)) {
           enqueueWork(state, async () => {

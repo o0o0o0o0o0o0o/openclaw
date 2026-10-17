@@ -13,15 +13,17 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (message.method === "initialize") {
     send(message.id, { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo: { name: "cancellation", version: "1" } });
   } else if (message.method === "tools/list") {
-    send(message.id, { tools: ["pending", "seen"].map(name => ({ name, inputSchema: { type: "object" } })) });
+    send(message.id, { tools: ["pending", "seen", "lossy"].map(name => ({ name, inputSchema: { type: "object" } })) });
   } else if (message.method === "tools/call" && message.params.name === "seen") {
     send(message.id, { content: [], structuredContent: { seen } });
+  } else if (message.method === "tools/call" && message.params.name === "lossy") {
+    send(message.id, { content: [{ type: "text", text: "answer", "fixture/extension": true }] });
   }
 });
 `;
 
-describe("node MCP cancellation over stdio", () => {
-  it("preserves caller cancellation without reporting a tool timeout or retiring the session", async () => {
+describe("node MCP errors over stdio", () => {
+  it("preserves cancellation and compatibility errors without retiring the session", async () => {
     const home = await createTempHomeEnv("openclaw-node-mcp-cancel-");
     const manager = await startNodeHostMcpManager({
       docs: { command: resolveTestNodeExecPath(), args: ["-e", server] },
@@ -43,6 +45,10 @@ describe("node MCP cancellation over stdio", () => {
       const result = await manager.callMcpTool({ server: "docs", tool: "seen" });
       expect(result.structuredContent).toEqual({
         seen: expect.arrayContaining(["notifications/cancelled"]),
+      });
+      await expect(manager.callMcpTool({ server: "docs", tool: "lossy" })).rejects.toMatchObject({
+        code: "MCP_SDK_RESULT_UNREPRESENTABLE",
+        method: "tools/call",
       });
     } finally {
       await manager.close();

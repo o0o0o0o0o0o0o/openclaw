@@ -1,4 +1,3 @@
-import type { Worker } from "node:worker_threads";
 import { expectDefined } from "@openclaw/normalization-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, it, vi } from "vitest";
@@ -45,10 +44,7 @@ vi.mock("../infra/worker-cpu.js", async (importOriginal) => {
   `;
   return {
     ...actual,
-    createCpuTrackedWorker(
-      filename: string | URL,
-      options: ConstructorParameters<typeof Worker>[1],
-    ) {
+    createCpuTrackedWorker(filename, options) {
       return actual.createCpuTrackedWorker(filename, {
         ...options,
         execArgv: [
@@ -59,7 +55,7 @@ vi.mock("../infra/worker-cpu.js", async (importOriginal) => {
         workerData: { ...options?.workerData, testStartupJournalReads: journalReads },
       });
     },
-  };
+  } satisfies typeof actual;
 });
 
 it.each(["normal-startup-normal", "deletion-before-commit"] as const)(
@@ -96,28 +92,26 @@ it.each(["normal-startup-normal", "deletion-before-commit"] as const)(
       let afterAuthorize: ((request: SqliteWorkerAdmissionRequest) => void) | undefined;
       const source: AgentDatabaseRequestExecutionSource = {
         assertCurrent: () => execution.assertCurrent(),
-        createAdmission(binding) {
-          return () => ({
-            nativeLocations: binding.nativeLocations,
-            admission: createSqliteWorkerOperationAdmission((request, grant) => {
-              binding.authorize(request);
-              execution.assertCurrent();
-              if (isRecord(request.facts) && isRecord(request.facts.identity)) {
-                const identity = request.facts.identity;
-                if (typeof identity.incarnation === "string") {
-                  incarnations.add(identity.incarnation);
-                }
+        createAdmission: (binding) => () => ({
+          nativeLocations: binding.nativeLocations,
+          admission: createSqliteWorkerOperationAdmission((request, grant) => {
+            binding.authorize(request);
+            execution.assertCurrent();
+            if (isRecord(request.facts) && isRecord(request.facts.identity)) {
+              const identity = request.facts.identity;
+              if (typeof identity.incarnation === "string") {
+                incarnations.add(identity.incarnation);
               }
-              if (binding.attachment.startupJournal) {
-                startupStages.add(request.stage);
-              }
-              afterAuthorize?.(request);
-              if (!grant()) {
-                throw new Error("Startup journal fixture lost native admission");
-              }
-            }, binding.attachment),
-          });
-        },
+            }
+            if (binding.attachment.startupJournal) {
+              startupStages.add(request.stage);
+            }
+            afterAuthorize?.(request);
+            if (!grant()) {
+              throw new Error("Startup journal fixture lost native admission");
+            }
+          }, binding.attachment),
+        }),
       };
       const replace = async (label: string) => {
         const previous = expectDefined(readSessionRow(database, sessionKey), "Missing seeded row");

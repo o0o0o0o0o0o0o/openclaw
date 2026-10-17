@@ -8,7 +8,6 @@ import {
   removeAgentDeletionJournal as removeJournal,
 } from "../test-utils/agent-deletion-journal.js";
 import { retireAgentDeletionJournalInDatabase as retireJournal } from "./agent-deletion-journal-authority.worker.js";
-import { completeAgentDeletionJournalInDatabase as completeJournal } from "./agent-deletion-journal.js";
 import type { AgentDeletionJournalInput } from "./agent-deletion-journal.types.js";
 import {
   assertNoOpenClawAgentDatabaseLeases as assertDrained,
@@ -78,13 +77,7 @@ it("admits settlement leases while draining and fences them once retirement begi
   const lease = claimLease(claim);
   try {
     expect(() => claimLease({ ...claim, agentId: "survivor" })).toThrow("deletion owns");
-    writeState(
-      (database) => {
-        expect(completeJournal(database, agentId, operationId)).toBe(false);
-        expect(retireJournal(database, agentId, operationId)).toBe(true);
-      },
-      { env },
-    );
+    expect(writeState((db) => retireJournal(db, agentId, operationId), { env })).toBe(true);
     expect(() => claimLease(claim)).toThrow("while agent deleted is deleted");
   } finally {
     releaseLease(lease, { env });
@@ -103,7 +96,7 @@ it.each([
       : "Invalid agent deletion cleanup path journal.";
   const { env, claim, begin } = fixture();
   let leaseId = caller === "lease drain" ? claimLease(claim) : undefined;
-  const deletion = begin();
+  const { agentId, operationId } = begin();
   const writer = new DatabaseSync(stateSqlitePath(env));
   const registrations = writer.prepare("SELECT * FROM agent_databases ORDER BY agent_id, path");
   const leases = writer.prepare("SELECT * FROM agent_database_leases ORDER BY lease_id");
@@ -112,7 +105,7 @@ it.each([
   try {
     writer
       .prepare(`UPDATE agent_deletion_journal SET ${column} = ? WHERE agent_id = ?`)
-      .run(value, deletion.agentId);
+      .run(value, agentId);
     expect(readJournal(claim.agentId, { env })).toBeUndefined();
     const operate = () => {
       if (caller === "registration") {
@@ -120,7 +113,7 @@ it.each([
       } else if (caller === "lease claim") {
         leaseId = claimLease(claim);
       } else {
-        assertDrained(deletion.agentId, { env });
+        assertDrained(agentId, { env });
       }
     };
     const refuses = caller === "lease drain";
@@ -136,7 +129,7 @@ it.each([
     expect({
       registrations: registrations.all(),
       leases: leases.all(),
-      journal: journal.get(deletion.agentId),
+      journal: journal.get(agentId),
     }).toEqual({
       registrations:
         !refuses && caller === "registration"
@@ -153,7 +146,7 @@ it.each([
     if (leaseId) {
       releaseLease(leaseId, { env });
     }
-    removeJournal(deletion.agentId, deletion.operationId, { env });
+    removeJournal(agentId, operationId, { env });
   }
 });
 

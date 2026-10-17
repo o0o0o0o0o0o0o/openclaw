@@ -40,6 +40,10 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const makeEnv = () => ({ OPENCLAW_STATE_DIR: tempDirs.make("journal-initialization-") });
 const legacy = (env: NodeJS.ProcessEnv) =>
   createLegacyDatabaseFixture({ env, eventsBySession: {}, schemaVersion: 19 });
+const configPath = (env: { OPENCLAW_STATE_DIR: string }) =>
+  path.join(env.OPENCLAW_STATE_DIR, "openclaw.json");
+const writeConfig = (env: { OPENCLAW_STATE_DIR: string }, config: unknown) =>
+  fs.writeFileSync(configPath(env), JSON.stringify(config));
 const journalTable = (db: EngineConnection) =>
   db.prepare("SELECT name FROM sqlite_schema WHERE name = 'agent_deletion_journal'").get();
 function removeState(env: NodeJS.ProcessEnv) {
@@ -244,11 +248,11 @@ it("captures checkpoint freshness after earlier config publication and process o
   const customPath = path.join(tempDirs.make("journal-checkpoint-custom-"), "history.sqlite");
   fs.renameSync(originalAgentPath, customPath);
   const bytes = fs.readFileSync(customPath);
-  const configPath = path.join(env.OPENCLAW_STATE_DIR, "openclaw.json");
-  fs.writeFileSync(configPath, "{}");
+  const pathname = configPath(env);
+  writeConfig(env, {});
   const config = JSON.stringify({ session: { store: customPath } });
   await using preparedFile = await prepareConfigFileWrite({
-    configPath,
+    configPath: pathname,
     content: config,
     previousRaw: "{}",
     fsModule: fs,
@@ -265,7 +269,7 @@ it("captures checkpoint freshness after earlier config publication and process o
   try {
     const journal = withCheckpoint(journalTable, { env });
     expect(journal).toBeUndefined();
-    expect(fs.readFileSync(configPath, "utf8")).toBe(config);
+    expect(fs.readFileSync(pathname, "utf8")).toBe(config);
     expect(discover(env, customPath).targets).toEqual([]);
     expect(fs.readFileSync(customPath)).toEqual(bytes);
   } finally {
@@ -292,11 +296,7 @@ it.each(["missing-table", "missing-database-session-store"])(
       const customPath = path.join(agentDir, "history.main.sqlite");
       fs.renameSync(agentPath, customPath);
       agentPath = customPath;
-      const configPath = path.join(env.OPENCLAW_STATE_DIR, "openclaw.json");
-      fs.writeFileSync(
-        configPath,
-        JSON.stringify({ session: { store: path.join(agentDir, "history.json") } }),
-      );
+      writeConfig(env, { session: { store: path.join(agentDir, "history.json") } });
     }
     const bytes = fs.readFileSync(agentPath);
     for (let operation = 0; operation < 2; operation += 1) {
@@ -321,13 +321,10 @@ it.each(["missing-table", "missing-database-session-store"])(
 
 it("creates a known-empty journal for fresh state with an included config", () => {
   const env = makeEnv();
-  fs.writeFileSync(
-    path.join(env.OPENCLAW_STATE_DIR, "openclaw.json"),
-    JSON.stringify({
-      env: { L1072_AGENT_DIR: path.join(env.OPENCLAW_STATE_DIR, "custom-agent") },
-      agents: { $include: "./agents.json5" },
-    }),
-  );
+  writeConfig(env, {
+    env: { L1072_AGENT_DIR: path.join(env.OPENCLAW_STATE_DIR, "custom-agent") },
+    agents: { $include: "./agents.json5" },
+  });
   fs.writeFileSync(
     path.join(env.OPENCLAW_STATE_DIR, "agents.json5"),
     "{ entries: { main: { agentDir: '${L1072_AGENT_DIR}' } } }",
@@ -352,7 +349,7 @@ it.each(["empty-agent-wal", "unresolved-storage-env"] as const)(
       fs.writeFileSync(`${pathname}-wal`, Buffer.alloc(64));
     } else {
       const config = "{ agents: { entries: { main: { agentDir: '${L1072_ABSENT_AGENT_DIR}' } } } }";
-      fs.writeFileSync(path.join(env.OPENCLAW_STATE_DIR, "openclaw.json"), config);
+      fs.writeFileSync(configPath(env), config);
     }
     for (let operation = 0; operation < 2; operation += 1) {
       const opened = openStateDb({ env });

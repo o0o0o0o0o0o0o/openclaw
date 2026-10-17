@@ -50,6 +50,10 @@ function closeDatabases() {
   closeAgentDbsForTest();
   closeStateDbForTest();
 }
+function mutateDatabase(pathname: string, sql: string) {
+  using database = new (requireNodeSqlite().DatabaseSync)(pathname);
+  database.exec(sql);
+}
 function agentConfig(first: string, second: string, systemAgent = first): OpenClawConfig {
   return {
     agents: {
@@ -97,8 +101,7 @@ it.each([
     closeStateDbForTest();
     for (const pathname of [workerPath, retainedPath]) {
       revokeSqliteDatabaseAdmissionsForPath(pathname);
-      using database = new (requireNodeSqlite().DatabaseSync)(pathname);
-      database.exec(`PRAGMA journal_mode=DELETE; PRAGMA user_version=${version};`);
+      mutateDatabase(pathname, `PRAGMA journal_mode=DELETE; PRAGMA user_version=${version};`);
     }
     const workerBytes = fs.readFileSync(workerPath);
     const retainedBytes = fs.readFileSync(retainedPath);
@@ -144,9 +147,7 @@ it("does not let an unavailable required agent hide a newer required database", 
   // The registered path exists but cannot be opened as a database; no schema fact is available.
   fs.unlinkSync(unavailablePath);
   fs.mkdirSync(unavailablePath);
-  const database = new (requireNodeSqlite().DatabaseSync)(newerPath);
-  database.exec(`PRAGMA user_version = ${OPENCLAW_AGENT_SCHEMA_VERSION + 1}`);
-  database.close();
+  mutateDatabase(newerPath, `PRAGMA user_version = ${OPENCLAW_AGENT_SCHEMA_VERSION + 1}`);
   await withStartupAdmission(
     async () => {
       const failure = await assertDatabasesReady({
@@ -173,9 +174,7 @@ it("keeps a secondary with malformed ownership isolated while required agents st
   await closeAgentDbs();
   closeStateDbForTest();
   invalidateOpenClawAgentDatabaseIntegrityBeforeMutation(pathname);
-  const database = new (requireNodeSqlite().DatabaseSync)(pathname);
-  database.exec("UPDATE schema_meta SET agent_id = NULL WHERE meta_key = 'primary'");
-  database.close();
+  mutateDatabase(pathname, "UPDATE schema_meta SET agent_id = NULL WHERE meta_key = 'primary'");
   const before = fs.readFileSync(pathname);
   await withStartupAdmission(async (admission) => {
     await expect(
@@ -353,11 +352,7 @@ it.each([
     const target = path.join(stateDir, "agents", agentId, "agent", "openclaw-agent.sqlite");
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
-    const { DatabaseSync } = requireNodeSqlite();
-    {
-      using database = new DatabaseSync(target);
-      database.prepare("UPDATE schema_meta SET app_version = ?").run("divergent-fixture");
-    }
+    mutateDatabase(target, "UPDATE schema_meta SET app_version = 'divergent-fixture'");
     const copyBytes = fs.readFileSync(target);
     const admission = await preflightSchemas({
       env,

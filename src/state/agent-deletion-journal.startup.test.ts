@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
-import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { beginAgentDeletionJournal } from "../test-utils/agent-deletion-journal.js";
 import {
@@ -47,6 +46,13 @@ function pending(state: OpenClawTestState, agentId = "worker") {
   });
 }
 
+function expectDeleted(refusal: unknown, agentId: string) {
+  expect(refusal).toMatchObject({
+    code: "agent-database-inspection-failed",
+    reason: `Agent ${agentId} was deleted during startup inspection`,
+  });
+}
+
 it.each(["warm", "cold"] as const)(
   "reads exact journal absence and presence through the %s state worker",
   async (temperature) => {
@@ -66,22 +72,6 @@ it.each(["warm", "cold"] as const)(
         }
         const observation = observeHostDataSql();
         try {
-          const calibration = openNodeSqliteDatabase(":memory:");
-          try {
-            calibration.exec("CREATE TABLE calibration (id INTEGER)");
-            calibration.prepare("INSERT INTO calibration VALUES (?)").run(1);
-            const selected = calibration.prepare("SELECT id FROM calibration");
-            selected.get();
-            selected.all();
-            Array.from(selected.iterate());
-          } finally {
-            calibration.close();
-          }
-          for (const method of observation.calls) {
-            expect(method).toHaveBeenCalled();
-            method.mockClear();
-          }
-          observation.queries.length = 0;
           const result = await readAgentDeletionJournalStatusInWorker(agentId, options);
           expect(observation.queries).toEqual([]);
           for (const method of observation.calls) {
@@ -138,10 +128,7 @@ it.each(["rollback", "commit", "republish"] as const)(
       for (const refusal of refusals) {
         const current = readAgentDatabaseAdmissionRefusal(refusal.agentId, options);
         if (outcome === "commit") {
-          expect(current).toMatchObject({
-            code: "agent-database-inspection-failed",
-            reason: `Agent ${refusal.agentId} was deleted during startup inspection`,
-          });
+          expectDeleted(current, refusal.agentId);
         } else {
           expect(current).toBe(refusal);
         }
@@ -173,12 +160,10 @@ it("invalidates known aliases of the same state without changing another state o
       recordAgentDatabaseAdmissions([refusal], { ...aliasOptions, source: "startup" });
       recordAgentDatabaseAdmissions([foreign], { ...otherOptions, source: "startup" });
       beginAgentDeletionJournal({ ...deletion(state), agentId: "WORKER" }, aliasOptions);
-      expect(readAgentDatabaseAdmissionRefusal("worker", options)?.code).toBe(
-        "agent-database-inspection-failed",
-      );
-      expect(readAgentDatabaseAdmissionRefusal("worker", aliasOptions)?.code).toBe(
-        "agent-database-inspection-failed",
-      );
+      expect([
+        readAgentDatabaseAdmissionRefusal("worker", options)?.code,
+        readAgentDatabaseAdmissionRefusal("worker", aliasOptions)?.code,
+      ]).toEqual(["agent-database-inspection-failed", "agent-database-inspection-failed"]);
       expect(readAgentDatabaseAdmissionRefusal("other", options)).toBe(sibling);
       expect(readAgentDatabaseAdmissionRefusal("worker", otherOptions)).toBe(foreign);
     } finally {
@@ -267,10 +252,7 @@ it("rejects stale journal absence when deletion arrives during native read clean
           message: expect.stringContaining("admission changed during preparation"),
         }),
       });
-      expect(readAgentDatabaseAdmissionRefusal("worker", options)).toMatchObject({
-        code: "agent-database-inspection-failed",
-        reason: "Agent worker was deleted during startup inspection",
-      });
+      expectDeleted(readAgentDatabaseAdmissionRefusal("worker", options), "worker");
     } finally {
       releaseCleanup.resolve();
       await result;

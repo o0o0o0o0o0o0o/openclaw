@@ -214,7 +214,8 @@ export function createMcpStdioClient(params: McpStdioClientParams): McpStdioClie
         fail(errors.unavailable(`${method} timed out after ${timeoutMs}ms`));
       }
       if (!failure && error instanceof ProtocolError) {
-        throw errors.protocol(`request failed: ${error.message}`, error);
+        // V2 leaves the numeric code out of message; strict-proxy callers retain that diagnostic.
+        throw errors.protocol(`request failed: MCP error ${error.code}: ${error.message}`, error);
       }
       throw failure ?? error;
     } finally {

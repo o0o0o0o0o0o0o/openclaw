@@ -2,12 +2,11 @@
 // loopback. The in-process RSA key is synthetic; no live credentials are used.
 import { generateKeyPairSync } from "node:crypto";
 import { isChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { withServer } from "openclaw/plugin-sdk/test-env";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import type { ResolvedGoogleChatAccount } from "./accounts.js";
 import { deliverGoogleChatReply } from "./monitor-reply-delivery.js";
-import type { GoogleChatCoreRuntime, GoogleChatRuntimeEnv } from "./monitor-types.js";
+import type { GoogleChatCoreRuntime } from "./monitor-types.js";
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 
@@ -28,17 +27,19 @@ const account = {
   config: {},
 } as unknown as ResolvedGoogleChatAccount;
 
-const CHUNKS = [
-  "First chunk of the assistant reply.",
-  "Second chunk of the assistant reply.",
-  "Third chunk of the assistant reply.",
-] as const;
+const CHUNKS = ["First chunk.", "Second chunk.", "Third chunk."] as const;
+const thread = "spaces/AAA/threads/root";
+const typingMessage = {
+  placement: "thread" as const,
+  name: "spaces/AAA/messages/typing",
+  requestedThreadName: thread,
+  deliveredThreadName: thread,
+};
 
 const core = {
   channel: {
     text: {
       resolveChunkMode: () => "markdown",
-      // Only chunk splitting is faked; per-chunk delivery stays real.
       chunkMarkdownTextWithMode: () => CHUNKS,
     },
   },
@@ -99,186 +100,132 @@ function createStubHandler(params: { failCreateIndexes: Set<number>; patchStatus
   return { handler, createAttempts, patchAttempts };
 }
 
-function stubGoogleHostsFetch() {
-  const realFetch = globalThis.fetch;
-  let stubBaseUrl: string | undefined;
-  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const rawUrl = input instanceof Request ? input.url : String(input);
-    const url = new URL(rawUrl);
-    if (url.hostname === "chat.googleapis.com" || url.hostname === "oauth2.googleapis.com") {
-      if (!stubBaseUrl) {
-        throw new Error("stub server base URL not installed");
-      }
-      return await realFetch(`${stubBaseUrl}${url.pathname}${url.search}`, init);
-    }
-    return await realFetch(input, init);
-  });
-  vi.stubGlobal("fetch", fetchMock);
-  return {
-    fetchMock,
-    pointAtStub: (baseUrl: string) => {
-      stubBaseUrl = baseUrl;
-    },
-  };
-}
-
-type DeliveryOutcome = {
-  outcome: "delivered" | "failed-deliver";
-  deliverError?: unknown;
-  errorLines: string[];
-};
-
-async function runDelivery(params: {
-  withTypingMessage?: boolean;
-  statusSink?: Parameters<typeof deliverGoogleChatReply>[0]["statusSink"];
-}): Promise<DeliveryOutcome> {
-  const errorLines: string[] = [];
-  const runtime: GoogleChatRuntimeEnv = {
-    error: (line: string) => {
-      errorLines.push(line);
-    },
-  };
-  // A rejected deliver callback is the reply dispatcher's failure boundary.
-  try {
-    await deliverGoogleChatReply({
-      payload: { text: CHUNKS.join("\n\n"), replyToId: "spaces/AAA/threads/root" },
-      account,
-      spaceId: "spaces/AAA",
-      runtime,
-      core,
-      config: {} as OpenClawConfig,
-      ...(params.statusSink ? { statusSink: params.statusSink } : {}),
-      ...(params.withTypingMessage
-        ? {
-            typingMessage: {
-              placement: "thread",
-              name: "spaces/AAA/messages/typing",
-              requestedThreadName: "spaces/AAA/threads/root",
-              deliveredThreadName: "spaces/AAA/threads/root",
-            },
-          }
-        : {}),
-    });
-    return { outcome: "delivered", errorLines };
-  } catch (err) {
-    return { outcome: "failed-deliver", deliverError: err, errorLines };
-  }
-}
-
 function expectPartialDelivery(
   error: unknown,
   deliveryResult: { messageIds: string[]; content: string; visibleReplySent: true },
 ) {
-  expect(isChannelPartialDeliveryError(error)).toBe(true);
   if (!isChannelPartialDeliveryError(error)) {
     throw new Error("expected partial delivery error");
   }
   expect(error.deliveryResult).toEqual(deliveryResult);
 }
 
-describe("Google Chat reply delivery failure propagation (integration)", () => {
-  let fetchControl: ReturnType<typeof stubGoogleHostsFetch>;
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
-  beforeEach(() => {
-    fetchControl = stubGoogleHostsFetch();
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  async function deliver(
-    failures: number[],
-    options: Parameters<typeof runDelivery>[0] = {},
-    patchStatus?: number,
-  ) {
-    const stub = createStubHandler({ failCreateIndexes: new Set(failures), patchStatus });
-    let result: DeliveryOutcome | undefined;
-    await withServer(stub.handler, async (baseUrl) => {
-      fetchControl.pointAtStub(baseUrl);
-      result = await runDelivery(options);
+async function deliver(
+  failures: number[],
+  options: {
+    withTypingMessage?: boolean;
+    statusSink?: Parameters<typeof deliverGoogleChatReply>[0]["statusSink"];
+  } = {},
+  patchStatus?: number,
+) {
+  const stub = createStubHandler({ failCreateIndexes: new Set(failures), patchStatus });
+  const errorLines: string[] = [],
+    requestedUrls: string[] = [];
+  let outcome: "delivered" | "failed-deliver" = "delivered",
+    deliverError: unknown;
+  const realFetch = globalThis.fetch;
+  await withServer(stub.handler, async (baseUrl) => {
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl = input instanceof Request ? input.url : String(input);
+      requestedUrls.push(rawUrl);
+      const url = new URL(rawUrl);
+      return realFetch(
+        ["chat.googleapis.com", "oauth2.googleapis.com"].includes(url.hostname)
+          ? baseUrl + url.pathname + url.search
+          : input,
+        init,
+      );
     });
-    if (!result) {
-      throw new Error("stub did not run delivery");
+    await deliverGoogleChatReply({
+      payload: { text: CHUNKS.join("\n\n"), replyToId: thread },
+      account,
+      spaceId: "spaces/AAA",
+      core,
+      config: {},
+      runtime: {
+        error: (line) => {
+          errorLines.push(line);
+        },
+      },
+      statusSink: options.statusSink,
+      typingMessage: options.withTypingMessage ? typingMessage : undefined,
+    }).catch((error: unknown) => {
+      outcome = "failed-deliver";
+      deliverError = error;
+    });
+  });
+  return { result: { outcome, deliverError, errorLines }, stub, requestedUrls };
+}
+
+it("surfaces a failed non-first chunk send as a dispatcher-visible delivery failure", async () => {
+  const { result, stub, requestedUrls } = await deliver([2]);
+
+  expect(result.outcome).toBe("failed-deliver");
+  expect(result.deliverError).toBeInstanceOf(Error);
+  expect((result.deliverError as Error).message).toContain("Google Chat API 500");
+  expect((result.deliverError as Error).message).toContain("stub: backend unavailable");
+  expectPartialDelivery(result.deliverError, {
+    messageIds: ["spaces/AAA/messages/stub-m1"],
+    content: CHUNKS[0],
+    visibleReplySent: true,
+  });
+  // The failing create rejects the whole delivery: the third chunk is never attempted.
+  expect(stub.createAttempts.map((attempt) => attempt.status)).toEqual([200, 500]);
+  expect(stub.createAttempts.map((attempt) => attempt.text)).toEqual([CHUNKS[0], CHUNKS[1]]);
+  // Both Google hosts went through the production fetch path.
+  expect(requestedUrls.some((url) => url.startsWith("https://oauth2.googleapis.com/"))).toBe(true);
+  expect(
+    requestedUrls.filter((url) => url.startsWith("https://chat.googleapis.com/")),
+  ).toHaveLength(2);
+});
+
+it.each([200, 404])(
+  "preserves delivery state when create fails after typing PATCH %i",
+  async (patchStatus) => {
+    const { result, stub } = await deliver([1], { withTypingMessage: true }, patchStatus);
+    expect(result.outcome).toBe("failed-deliver");
+    expect((result.deliverError as Error).message).toContain("Google Chat API 500");
+    expect(stub.patchAttempts).toEqual(["spaces/AAA/messages/typing"]);
+    expect(stub.createAttempts.map((attempt) => attempt.status)).toEqual([500]);
+    if (patchStatus === 200) {
+      expectPartialDelivery(result.deliverError, {
+        messageIds: ["spaces/AAA/messages/typing"],
+        content: CHUNKS[0],
+        visibleReplySent: true,
+      });
+    } else {
+      expect(isChannelPartialDeliveryError(result.deliverError)).toBe(false);
+      expect(result.errorLines.some((line) => line.includes("Google Chat API 404"))).toBe(true);
     }
-    return { result, stub };
-  }
+  },
+);
 
-  it("surfaces a failed non-first chunk send as a dispatcher-visible delivery failure", async () => {
-    const { result, stub } = await deliver([2]);
+it("recovers from a missing typing placeholder without duplicating any chunk", async () => {
+  const { result, stub } = await deliver([], { withTypingMessage: true }, 404);
 
-    expect(result.outcome).toBe("failed-deliver");
-    expect(result.deliverError).toBeInstanceOf(Error);
-    expect((result.deliverError as Error).message).toContain("Google Chat API 500");
-    expect((result.deliverError as Error).message).toContain("stub: backend unavailable");
-    expectPartialDelivery(result.deliverError, {
-      messageIds: ["spaces/AAA/messages/stub-m1"],
-      content: CHUNKS[0],
-      visibleReplySent: true,
-    });
-    // The failing create rejects the whole delivery: the third chunk is never attempted.
-    expect(stub.createAttempts.map((attempt) => attempt.status)).toEqual([200, 500]);
-    expect(stub.createAttempts.map((attempt) => attempt.text)).toEqual([CHUNKS[0], CHUNKS[1]]);
-    // Both Google hosts went through the production fetch path.
-    const requestedUrls = fetchControl.fetchMock.mock.calls.map((call) => {
-      const input = call[0] as RequestInfo | URL;
-      return input instanceof Request ? input.url : String(input);
-    });
-    expect(requestedUrls.some((url) => url.startsWith("https://oauth2.googleapis.com/"))).toBe(
-      true,
-    );
-    expect(
-      requestedUrls.filter((url) => url.startsWith("https://chat.googleapis.com/")),
-    ).toHaveLength(2);
+  expect(result.outcome).toBe("delivered");
+  expect(stub.patchAttempts).toEqual(["spaces/AAA/messages/typing"]);
+  expect(stub.createAttempts.map((attempt) => attempt.status)).toEqual([200, 200, 200]);
+  expect(stub.createAttempts.map((attempt) => attempt.text)).toEqual(CHUNKS);
+  expect(result.errorLines.some((line) => line.includes("Google Chat API 404"))).toBe(true);
+});
+
+it("does not resend a delivered chunk when outbound status reporting fails", async () => {
+  const statusSink = vi.fn(() => {
+    throw new Error("status unavailable");
   });
+  const { result, stub } = await deliver([], { withTypingMessage: true, statusSink });
 
-  it("preserves a successful typing-placeholder update when a later create fails", async () => {
-    const { result, stub } = await deliver([1], { withTypingMessage: true });
-
-    expect(result.outcome).toBe("failed-deliver");
-    expectPartialDelivery(result.deliverError, {
-      messageIds: ["spaces/AAA/messages/typing"],
-      content: CHUNKS[0],
-      visibleReplySent: true,
-    });
-    expect(stub.patchAttempts).toEqual(["spaces/AAA/messages/typing"]);
-    expect(stub.createAttempts.map((attempt) => attempt.status)).toEqual([500]);
-  });
-
-  it("rejects when the resend after a typing-placeholder update failure also fails", async () => {
-    const { result, stub } = await deliver([1], { withTypingMessage: true }, 404);
-
-    expect(result.outcome).toBe("failed-deliver");
-    expect(isChannelPartialDeliveryError(result.deliverError)).toBe(false);
-    expect((result.deliverError as Error).message).toContain("Google Chat API 500");
-    expect(stub.patchAttempts).toEqual(["spaces/AAA/messages/typing"]);
-    expect(stub.createAttempts.map((attempt) => attempt.status)).toEqual([500]);
-    expect(result.errorLines.some((line) => line.includes("Google Chat API 404"))).toBe(true);
-  });
-
-  it("recovers from a missing typing placeholder without duplicating any chunk", async () => {
-    const { result, stub } = await deliver([], { withTypingMessage: true }, 404);
-
-    expect(result.outcome).toBe("delivered");
-    expect(stub.patchAttempts).toEqual(["spaces/AAA/messages/typing"]);
-    expect(stub.createAttempts.map((attempt) => attempt.status)).toEqual([200, 200, 200]);
-    expect(stub.createAttempts.map((attempt) => attempt.text)).toEqual(CHUNKS);
-    expect(result.errorLines.some((line) => line.includes("Google Chat API 404"))).toBe(true);
-  });
-
-  it("does not resend a delivered chunk when outbound status reporting fails", async () => {
-    const statusSink = vi.fn(() => {
-      throw new Error("status unavailable");
-    });
-    const { result, stub } = await deliver([], { withTypingMessage: true, statusSink });
-
-    expect(result.outcome).toBe("delivered");
-    expect(stub.patchAttempts).toEqual(["spaces/AAA/messages/typing"]);
-    expect(stub.createAttempts.map((attempt) => attempt.status)).toEqual([200, 200]);
-    expect(stub.createAttempts.map((attempt) => attempt.text)).toEqual(CHUNKS.slice(1));
-    expect(statusSink).toHaveBeenCalledTimes(CHUNKS.length);
-    expect(result.errorLines).toEqual(
-      Array(3).fill("Google Chat outbound status update failed: Error: status unavailable"),
-    );
-  });
+  expect(result.outcome).toBe("delivered");
+  expect(stub.patchAttempts).toEqual(["spaces/AAA/messages/typing"]);
+  expect(stub.createAttempts.map((attempt) => attempt.status)).toEqual([200, 200]);
+  expect(stub.createAttempts.map((attempt) => attempt.text)).toEqual(CHUNKS.slice(1));
+  expect(statusSink).toHaveBeenCalledTimes(CHUNKS.length);
+  expect(result.errorLines).toEqual(
+    Array(3).fill("Google Chat outbound status update failed: Error: status unavailable"),
+  );
 });

@@ -1,6 +1,6 @@
 // Real SSRF guard and deadline, with fetch redirected to a hanging loopback.
 // DNS pinning/dispatcher construction are bypassed; JWT verification is hermetic.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { startHangingLoopbackServer } from "../../test-support/hanging-loopback-server.js";
 
 const GOOGLECHAT_CERT_FETCH_TIMEOUT_MS = 30_000;
@@ -58,54 +58,52 @@ function captureCertFetchTimeout() {
   };
 }
 
-describe("googlechat cert-fetch — real guard proof", () => {
-  it("times out a stalled cert fetch through the real production guard", async () => {
-    const realFetch = globalThis.fetch;
-    const server = await startHangingLoopbackServer();
-    vi.useFakeTimers({ toFake: ["setTimeout"] });
-    const certFetchTimeout = captureCertFetchTimeout();
-    let pendingVerify: Promise<{ ok: boolean; reason?: string }> | undefined;
+it("times out a stalled cert fetch through the real production guard", async () => {
+  const realFetch = globalThis.fetch;
+  const server = await startHangingLoopbackServer();
+  vi.useFakeTimers({ toFake: ["setTimeout"] });
+  const certFetchTimeout = captureCertFetchTimeout();
+  let pendingVerify: Promise<{ ok: boolean; reason?: string }> | undefined;
 
-    // Keep the guard's composed timeout signal while redirecting transport.
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
-      realFetch(`${server.origin}${CHAT_CERTS_PATH}`, {
-        method: (init?.method as string | undefined) ?? "GET",
-        signal: init?.signal,
-      }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
+  // Keep the guard's composed timeout signal while redirecting transport.
+  const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+    realFetch(`${server.origin}${CHAT_CERTS_PATH}`, {
+      method: (init?.method as string | undefined) ?? "GET",
+      signal: init?.signal,
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
 
-    try {
-      pendingVerify = verifyGoogleChatRequest({
-        bearer: "token",
-        audienceType: "project-number",
-        audience: "12345",
-      });
+  try {
+    pendingVerify = verifyGoogleChatRequest({
+      bearer: "token",
+      audienceType: "project-number",
+      audience: "12345",
+    });
 
-      await server.waitForRequestCount(1);
-      expect(certFetchTimeout.scheduled()).toBe(true);
-      expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+    await server.waitForRequestCount(1);
+    expect(certFetchTimeout.scheduled()).toBe(true);
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
 
-      // Only the production deadline may settle the pending request.
-      let verifySettled = false;
-      const markSettled = () => {
-        verifySettled = true;
-      };
-      void pendingVerify.then(markSettled, markSettled);
-      await vi.advanceTimersByTimeAsync(500);
-      expect(verifySettled).toBe(false);
+    // Only the production deadline may settle the pending request.
+    let verifySettled = false;
+    const markSettled = () => {
+      verifySettled = true;
+    };
+    void pendingVerify.then(markSettled, markSettled);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(verifySettled).toBe(false);
 
-      certFetchTimeout.fire();
+    certFetchTimeout.fire();
 
-      await expect(pendingVerify).resolves.toMatchObject({
-        ok: false,
-        reason: expect.stringMatching(/aborted|timed out|timeout/i),
-      });
-      expect(server.requests).toContain(CHAT_CERTS_PATH);
-      expect(mockVerifySignedJwt).not.toHaveBeenCalled();
-    } finally {
-      await server.close();
-      await pendingVerify?.catch(() => undefined);
-    }
-  });
+    await expect(pendingVerify).resolves.toMatchObject({
+      ok: false,
+      reason: expect.stringMatching(/aborted|timed out|timeout/i),
+    });
+    expect(server.requests).toContain(CHAT_CERTS_PATH);
+    expect(mockVerifySignedJwt).not.toHaveBeenCalled();
+  } finally {
+    await server.close();
+    await pendingVerify?.catch(() => undefined);
+  }
 });

@@ -1,4 +1,3 @@
-// Verifies live cache regression baseline classification without live providers.
 import { describe, expect, it } from "vitest";
 import {
   assertAgainstBaseline,
@@ -78,17 +77,17 @@ describe("live cache regression runner", () => {
     return { ...findings, message: provider + " skipped: " + message };
   }
 
-  it("keeps missing optional live-cache prerequisites non-blocking", async () => {
-    const { regressions, warnings, message } = await missingPrerequisite("openai");
-    expect(regressions).toStrictEqual([]);
-    expect(warnings).toEqual([message]);
-  });
-
-  it("keeps missing Anthropic live-cache prerequisites blocking", async () => {
-    const { regressions, warnings, message } = await missingPrerequisite("anthropic");
-    expect(regressions).toEqual([message]);
-    expect(warnings).toStrictEqual([]);
-  });
+  it.each(["openai", "anthropic"] as const)(
+    "classifies missing %s prerequisites",
+    async (provider) => {
+      const { regressions, warnings, message } = await missingPrerequisite(provider);
+      expect({ regressions, warnings }).toEqual(
+        provider === "openai"
+          ? { regressions: [], warnings: [message] }
+          : { regressions: [message], warnings: [] },
+      );
+    },
+  );
 
   it("classifies missing provider auth as a live-cache prerequisite", () => {
     const skip = toLiveCachePrerequisiteSkip(
@@ -140,54 +139,36 @@ describe("live cache regression runner", () => {
     expect(accept({})).toBe(false);
   });
 
-  it("accepts a warmup that already hits the provider cache", () => {
-    const findings = evaluateAgainstBaseline({
-      lane: "image",
-      provider: "anthropic",
-      result: {
-        best: {
-          hitRate: 0.999,
-          suffix: "image-hit",
-          text: "CACHE-OK image-hit",
-          usage: { cacheRead: 5_742, cacheWrite: 0, input: 3 },
-        },
-        warmup: {
-          hitRate: 0.999,
-          suffix: "image-warmup",
-          text: "CACHE-OK image-warmup",
-          usage: { cacheRead: 5_741, cacheWrite: 0, input: 3 },
-        },
-      },
-    });
-
-    expect(findings).toEqual({ regressions: [], warnings: [] });
-  });
-
-  it("still rejects warmups with no cache write or cache hit evidence", () => {
-    // A successful best probe is not enough: warmup must prove either cache
-    // write or read evidence so the measured hit is meaningful.
-    const findings = evaluateAgainstBaseline({
-      lane: "image",
-      provider: "anthropic",
-      result: {
-        best: {
-          hitRate: 0.999,
-          suffix: "image-hit",
-          text: "CACHE-OK image-hit",
-          usage: { cacheRead: 5_742, cacheWrite: 0, input: 3 },
-        },
-        warmup: {
-          hitRate: 0,
-          suffix: "image-warmup",
-          text: "CACHE-OK image-warmup",
-          usage: { cacheRead: 0, cacheWrite: 0, input: 5_741 },
-        },
-      },
-    });
-
-    expect(findings).toEqual({
+  it.each([
+    { hitRate: 0.999, usage: { cacheRead: 5_741, cacheWrite: 0, input: 3 }, regressions: [] },
+    {
+      hitRate: 0,
+      usage: { cacheRead: 0, cacheWrite: 0, input: 5_741 },
       regressions: ["anthropic:image warmup cacheWrite=0 < min=1"],
-      warnings: [],
-    });
-  });
+    },
+  ])(
+    "requires cache evidence in the warmup ($hitRate hit rate)",
+    ({ hitRate, usage, regressions }) => {
+      const findings = evaluateAgainstBaseline({
+        lane: "image",
+        provider: "anthropic",
+        result: {
+          best: {
+            hitRate: 0.999,
+            suffix: "image-hit",
+            text: "CACHE-OK image-hit",
+            usage: { cacheRead: 5_742, cacheWrite: 0, input: 3 },
+          },
+          warmup: {
+            hitRate,
+            suffix: "image-warmup",
+            text: "CACHE-OK image-warmup",
+            usage,
+          },
+        },
+      });
+
+      expect(findings).toEqual({ regressions, warnings: [] });
+    },
+  );
 });

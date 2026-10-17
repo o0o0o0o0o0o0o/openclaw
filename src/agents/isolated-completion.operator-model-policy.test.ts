@@ -30,18 +30,49 @@ const { createDeferredCore } = await import("../shared/deferred.js");
 const config = {
   agents: { entries: { main: {} }, defaults: { model: "test-provider/allowed" } },
 };
-function operator() {
-  return createAdmittedRunOperatorAuthority({
+type ModelPolicy = NonNullable<Parameters<typeof prepareOperatorModelPolicy>[0]["policy"]>;
+function operator(initial?: Partial<ModelPolicy>) {
+  const prepare = (overrides: Partial<ModelPolicy>) =>
+    prepareOperatorModelPolicy({
+      cfg: config,
+      policy: { sourceAgent: "main", ...overrides },
+      manifestPlugins: [],
+    });
+  let policy = prepare(initial ?? {});
+  const listeners = new Set<() => void>();
+  const authority = createAdmittedRunOperatorAuthority({
     profileId: "isolated-reader",
     scopes: ["operator.write"],
     assertCurrent: () => {},
-    modelPolicy: prepareOperatorModelPolicy({
-      cfg: config,
-      policy: { sourceAgent: "main" },
-      manifestPlugins: [],
-    }),
+    get modelPolicy() {
+      return policy;
+    },
+    onModelPolicyChanged: initial
+      ? (listener) => {
+          listeners.add(listener);
+          return () => {
+            listeners.delete(listener);
+          };
+        }
+      : undefined,
   });
+  return {
+    authority,
+    listeners,
+    setPolicy(overrides: Partial<ModelPolicy>) {
+      policy = prepare(overrides);
+      for (const listener of listeners) {
+        listener();
+      }
+      return policy;
+    },
+  };
 }
+const denied = {
+  message: expect.stringContaining("cannot use this model"),
+  name: "LlmCompleteError",
+  code: "LLM_COMPLETION_NOT_AUTHORIZED",
+};
 function request() {
   return {
     ...isolatedRequest(),
@@ -52,7 +83,11 @@ function request() {
   };
 }
 
-function runPluginCompletion(authority: ReturnType<typeof operator>, model = "allowed") {
+function runPluginCompletion(
+  authority: ReturnType<typeof operator>["authority"],
+  model = "allowed",
+  provider = "test-provider",
+) {
   return runIsolatedAgentRuntimeCompletion({
     request: {
       messages: [{ role: "user", content: "Answer the synthetic question." }],
@@ -60,7 +95,7 @@ function runPluginCompletion(authority: ReturnType<typeof operator>, model = "al
     },
     cfg: config,
     agentId: "main",
-    provider: "test-provider",
+    provider,
     model,
     operatorAuthority: authority,
   });
@@ -88,27 +123,8 @@ beforeEach(() => {
 
 describe("isolated completion requester model policy", () => {
   it("cancels a removed model while another model and the source remain active", async () => {
-    const preparePolicy = (allow: string[]) =>
-      prepareOperatorModelPolicy({
-        cfg: config,
-        policy: { sourceAgent: "main", allow },
-        manifestPlugins: [],
-      });
-    let policy = preparePolicy(["test-provider/model-a", "test-provider/model-b"]);
-    const observers = new Set<() => void>();
-    const authority = createAdmittedRunOperatorAuthority({
-      profileId: "isolated-reader",
-      scopes: ["operator.write"],
-      assertCurrent: () => {},
-      get modelPolicy() {
-        return policy;
-      },
-      onModelPolicyChanged: (listener) => {
-        observers.add(listener);
-        return () => {
-          observers.delete(listener);
-        };
-      },
+    const { authority, listeners, setPolicy } = operator({
+      allow: ["test-provider/model-a", "test-provider/model-b"],
     });
     mocks.resolveModelAsync.mockImplementation(async (provider, model) => ({
       logicalRef: { provider, model },
@@ -148,19 +164,12 @@ describe("isolated completion requester model policy", () => {
           throw new Error("isolated completions settled before policy changed");
         }),
       ]);
-      policy = preparePolicy(["test-provider/model-b"]);
-      for (const listener of observers) {
-        listener();
-      }
+      setPolicy({ allow: ["test-provider/model-b"] });
       expect(signals.get("model-a")?.aborted).toBe(true);
       expect(signals.get("model-b")?.aborted).toBe(false);
       expect(() => authority.assertCurrent()).not.toThrow();
       finishA.resolve();
-      await expect(first).rejects.toMatchObject({
-        message: expect.stringContaining("cannot use this model"),
-        name: "LlmCompleteError",
-        code: "LLM_COMPLETION_NOT_AUTHORIZED",
-      });
+      await expect(first).rejects.toMatchObject(denied);
       finishB.resolve();
       await expect(second).resolves.toMatchObject({ text: "Allowed answer." });
     } finally {
@@ -169,7 +178,7 @@ describe("isolated completion requester model policy", () => {
       await Promise.allSettled([first, second]);
       await work.drain();
     }
-    expect(observers.size).toBe(0);
+    expect(listeners.size).toBe(0);
   });
   it.each(["host", "harness"] as const)(
     "rejects a denied model resolved during %s preparation",
@@ -180,11 +189,7 @@ describe("isolated completion requester model policy", () => {
         ...(owner === "harness" ? { authBootstrap: "harness" as const } : {}),
         runIsolatedCompletionV2: dispatch,
       });
-      await expect(runPluginCompletion(operator())).rejects.toMatchObject({
-        message: expect.stringContaining("cannot use this model"),
-        name: "LlmCompleteError",
-        code: "LLM_COMPLETION_NOT_AUTHORIZED",
-      });
+      await expect(runPluginCompletion(operator().authority)).rejects.toMatchObject(denied);
       expect(dispatch).not.toHaveBeenCalled();
       expect(mocks.runCliAgent).not.toHaveBeenCalled();
     },
@@ -204,7 +209,7 @@ describe("isolated completion requester model policy", () => {
         {
           agentId: "main",
           sessionKey: "agent:main:reader",
-          operatorAuthority: operator(),
+          operatorAuthority: operator().authority,
         },
         () => runIsolatedCompletion(request()),
       ),
@@ -213,26 +218,7 @@ describe("isolated completion requester model policy", () => {
   });
 
   it("preserves a retired CLI model denial after the model policy is restored", async () => {
-    const preparePolicy = (deny: string[]) =>
-      prepareOperatorModelPolicy({
-        cfg: config,
-        policy: { sourceAgent: "main", deny },
-        manifestPlugins: [],
-      });
-    let policy = preparePolicy([]);
-    const listeners = new Set<() => void>();
-    const authority = createAdmittedRunOperatorAuthority({
-      profileId: "isolated-reader",
-      scopes: ["operator.write"],
-      assertCurrent: () => {},
-      get modelPolicy() {
-        return policy;
-      },
-      onModelPolicyChanged: (listener) => {
-        listeners.add(listener);
-        return () => listeners.delete(listener);
-      },
-    });
+    const { authority, listeners, setPolicy } = operator({ deny: [] });
     const context = buildPreparedCliRunContext({
       provider: "google-gemini-cli",
       model: "transport-alias",
@@ -270,17 +256,7 @@ describe("isolated completion requester model policy", () => {
     mocks.resolveCliRuntimeCanonicalProvider.mockReturnValue("test-provider");
     mocks.isCliRuntimeAliasForProvider.mockReturnValue(true);
     mocks.runCliAgent.mockImplementation(runRealCliAgent);
-    const pending = runIsolatedAgentRuntimeCompletion({
-      request: {
-        messages: [{ role: "user", content: "Answer the synthetic question." }],
-        execution: { mode: "isolated-agent-runtime" },
-      },
-      cfg: config,
-      agentId: "main",
-      provider: "test-cli",
-      model: "allowed",
-      operatorAuthority: authority,
-    });
+    const pending = runPluginCompletion(authority, "allowed", "test-cli");
     const outcome = pending.catch((error: unknown) => error);
     try {
       const signal = await Promise.race([
@@ -289,26 +265,16 @@ describe("isolated completion requester model policy", () => {
           throw new Error("CLI settled before dispatch");
         }),
       ]);
-      policy = preparePolicy(["test-provider/allowed"]);
-      for (const listener of listeners) {
-        listener();
-      }
+      setPolicy({ deny: ["test-provider/allowed"] });
       expect(signal?.aborted).toBe(true);
-      policy = preparePolicy([]);
-      for (const listener of listeners) {
-        listener();
-      }
+      const policy = setPolicy({ deny: [] });
       expect(() => authority.assertCurrent()).not.toThrow();
       if (!policy) {
         throw new Error("Restored CLI model policy was not prepared");
       }
       expect(policy.allows({ provider: "test-provider", model: "allowed" })).toBe(true);
       finish.resolve();
-      expect(await outcome).toMatchObject({
-        name: "LlmCompleteError",
-        code: "LLM_COMPLETION_NOT_AUTHORIZED",
-        message: expect.stringContaining("cannot use this model"),
-      });
+      expect(await outcome).toMatchObject(denied);
       expect(cleanup).toHaveBeenCalledOnce();
       expect(listeners.size).toBe(0);
     } finally {

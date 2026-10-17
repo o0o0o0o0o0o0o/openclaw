@@ -9,6 +9,7 @@ import type {
   AgentHarnessSelectionDecisionParams,
 } from "./harness/selection-decision.js";
 import type { AgentHarness } from "./harness/types.js";
+import { createZeroUsageFixture } from "./test-helpers/usage-fixtures.js";
 
 export type IsolatedCliRunParams = RunCliAgentParams & {
   preparedRunAdmission: PreparedAgentRunAdmission;
@@ -24,23 +25,21 @@ const isolatedCompletionMocks = vi.hoisted(() => ({
   resolveAgentHarnessSelectionDecision:
     vi.fn<(params: AgentHarnessSelectionDecisionParams) => AgentHarnessSelectionDecision>(),
   ensureAuthProfileStore: vi.fn(),
-  cliBackendAcceptsAuthProfileForwarding: vi.fn<() => boolean>(() => false),
-  resolveCliExecutionAuthProfileId: vi.fn<() => Promise<string | undefined>>(async () => undefined),
-  hasAvailableAuthForProvider: vi.fn(async () => false),
-  isCliRuntimeAliasForProvider: vi.fn<(params: { runtime?: string; provider?: string }) => boolean>(
-    () => false,
-  ),
+  cliBackendAcceptsAuthProfileForwarding: vi.fn<() => boolean>(),
+  resolveCliExecutionAuthProfileId: vi.fn<() => Promise<string | undefined>>(),
+  hasAvailableAuthForProvider: vi.fn<() => Promise<boolean>>(),
+  isCliRuntimeAliasForProvider:
+    vi.fn<(params: { runtime?: string; provider?: string }) => boolean>(),
   prepareSimpleCompletionModel: vi.fn(),
   prepareAgentRuntimeAuth: vi.fn(),
   resolveModelAsync: vi.fn(),
-  resolveCliRuntimeCanonicalProvider: vi.fn<() => string | undefined>(() => undefined),
-  resolveCliBackendConfig: vi.fn<
-    () => { config: { command: string; modelAliases?: Record<string, string> } } | undefined
-  >(() => ({ config: { command: "test-cli" } })),
-  resolveCliRuntimeExecutionProvider: vi.fn<() => string | undefined>(() => undefined),
-  resolveEmbeddedCliBackendDispatchEligibility: vi.fn<() => { provider: string } | undefined>(
-    () => undefined,
-  ),
+  resolveCliRuntimeCanonicalProvider: vi.fn<() => string | undefined>(),
+  resolveCliBackendConfig:
+    vi.fn<
+      () => { config: { command: string; modelAliases?: Record<string, string> } } | undefined
+    >(),
+  resolveCliRuntimeExecutionProvider: vi.fn<() => string | undefined>(),
+  resolveEmbeddedCliBackendDispatchEligibility: vi.fn<() => { provider: string } | undefined>(),
   runCliAgent: vi.fn<(params: IsolatedCliRunParams) => Promise<unknown>>(),
 }));
 
@@ -132,7 +131,7 @@ vi.mock("../infra/tmp-openclaw-dir.js", () => ({
   resolvePreferredOpenClawTmpDir: () => "/tmp",
 }));
 
-// Static re-exports bypass Vitest's import hoisting and can load runtime before mocks.
+// Static re-exports can load runtime before mocks.
 const { runIsolatedCompletion } = await import("./isolated-completion.js");
 export { runIsolatedCompletion };
 
@@ -149,14 +148,7 @@ export function isolatedAssistant(
     api: "openai-responses" as const,
     provider: "openai",
     model: "gpt-test",
-    usage: {
-      input: 1,
-      output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 2,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
+    usage: { ...createZeroUsageFixture(), input: 1, output: 1, totalTokens: 2 },
     stopReason,
     timestamp: Date.now(),
   };
@@ -225,18 +217,18 @@ export function resetIsolatedCompletionTestState(): void {
     auth: { apiKey: "secret", source: "profile:openai:test", mode: "oauth" },
     sourceAuthFingerprint: "fingerprint",
   });
-  const runtimeModel = {
-    provider: "openai",
-    id: "gpt-test",
-    api: "openai-chatgpt-responses",
-    baseUrl: nativeAuthPlan.modelRoute.baseUrl,
-  };
-  isolatedCompletionMocks.resolveModelAsync.mockResolvedValue({ model: runtimeModel });
+  isolatedCompletionMocks.resolveModelAsync.mockResolvedValue({
+    model: {
+      provider: "openai",
+      id: "gpt-test",
+      api: "openai-chatgpt-responses",
+      baseUrl: nativeAuthPlan.modelRoute.baseUrl,
+    },
+  });
   isolatedCompletionMocks.ensureAuthProfileStore.mockReturnValue({ version: 1, profiles: {} });
-  const plan = nativeAuthPlan;
   isolatedCompletionMocks.prepareAgentRuntimeAuth.mockReturnValue({
-    plan,
-    attempts: [{ kind: "implicit", plan }],
+    plan: nativeAuthPlan,
+    attempts: [{ kind: "implicit", plan: nativeAuthPlan }],
   });
 }
 

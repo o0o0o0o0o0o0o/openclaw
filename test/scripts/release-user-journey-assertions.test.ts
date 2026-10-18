@@ -1,4 +1,4 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo, type Socket } from "node:net";
@@ -33,28 +33,25 @@ function assertChannel(command: string, status: unknown) {
   return runReleaseUserJourneyAssertion(command, ["clickclack", statusPath]);
 }
 
-function nodeOptionsWithoutExperimentalWarnings(): string {
+function runAssertion(home: string, args: string[]) {
   const current = process.env.NODE_OPTIONS ?? "";
-  return current.includes(DISABLE_EXPERIMENTAL_WARNING)
+  const nodeOptions = current.includes(DISABLE_EXPERIMENTAL_WARNING)
     ? current
     : [current, DISABLE_EXPERIMENTAL_WARNING].filter(Boolean).join(" ");
-}
-
-function writeJson(filePath: string, value: unknown) {
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
-function runAssertion(home: string, args: string[]) {
   return spawnSync(testNodeExecPath, [ASSERTIONS_SCRIPT, ...args], {
     encoding: "utf8",
     env: {
       ...process.env,
       HOME: home,
-      NODE_OPTIONS: nodeOptionsWithoutExperimentalWarnings(),
+      NODE_OPTIONS: nodeOptions,
     },
     killSignal: "SIGKILL",
   });
+}
+
+function writeJson(filePath: string, value: unknown) {
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
 async function waitUntil(matches: () => boolean | Promise<boolean>, label: string): Promise<void> {
@@ -68,20 +65,6 @@ async function waitUntil(matches: () => boolean | Promise<boolean>, label: strin
     });
   }
   throw new Error(`timed out waiting for ${label}`);
-}
-
-async function reserveTcpPort(): Promise<number> {
-  const server = await startTcpFixtureServer(() => {});
-  await server.stop();
-  return server.port;
-}
-
-async function stopChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null) {
-    return;
-  }
-  child.kill("SIGTERM");
-  await once(child, "exit");
 }
 
 async function openClickClackSocket(port: number, token: string): Promise<WebSocket> {
@@ -108,9 +91,8 @@ async function startTcpFixtureServer(handler: (socket: Socket) => void) {
   await new Promise<void>((resolve) => {
     server.listen(0, "127.0.0.1", resolve);
   });
-  const address = server.address() as AddressInfo;
   return {
-    port: address.port,
+    port: (server.address() as AddressInfo).port,
     stop: async () => {
       for (const socket of sockets) {
         socket.destroy();
@@ -154,25 +136,6 @@ async function httpFixture(handler: (socket: Socket) => void, timeoutMs = 1000, 
 }
 
 describe("release user journey assertions", () => {
-  it("bounds release user journey output assertion diagnostics for large output", () => {
-    const { root, home } = fixture();
-    const outputPath = path.join(root, "output.log");
-
-    writeFileSync(
-      outputPath,
-      `DO_NOT_DUMP_OLD_OUTPUT${"x".repeat(70 * 1024)}\nrecent output tail\n`,
-      "utf8",
-    );
-
-    const result = runAssertion(home, ["assert-file-contains", outputPath, "missing"]);
-    const message = `${outputPath} did not contain missing. Output tail: `;
-
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain(message);
-    expect(result.stderr).toContain("recent output tail");
-    expect(result.stderr).not.toContain("DO_NOT_DUMP_OLD_OUTPUT");
-  });
-
   it("uses each file and needle and restores argv after successful and failed dispatch", async () => {
     const { root } = fixture();
     const fileA = path.join(root, "a.log");
@@ -206,24 +169,31 @@ describe("release user journey assertions", () => {
     }
   });
 
-  it("rejects oversized JSON artifacts before parsing release user journey config", () => {
-    const { home } = fixture();
-    const configPath = path.join(home, ".openclaw", "openclaw.json");
-
-    mkdirSync(path.dirname(configPath), { recursive: true });
+  it.each([false, true])("bounds oversized artifact diagnostics (JSON: %s)", (json) => {
+    const { root, home } = fixture();
+    const file = json ? path.join(home, ".openclaw/openclaw.json") : path.join(root, "output.log");
+    const marker = json ? "DO_NOT_DUMP_OLD_JSON" : "DO_NOT_DUMP_OLD_OUTPUT";
+    const tail = json ? "recent json tail" : "recent output tail";
+    mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(
-      configPath,
-      `DO_NOT_DUMP_OLD_JSON${"x".repeat(2 * 1024 * 1024)}\nrecent json tail`,
-      "utf8",
+      file,
+      `${marker}${"x".repeat(json ? 2 * 1024 * 1024 : 70 * 1024)}\n${tail}${json ? "" : "\n"}`,
     );
-
-    const result = runAssertion(home, ["configure-mock-model", "18080"]);
-
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("JSON artifact exceeded");
-    expect(result.stderr).toContain("recent json tail");
-    expect(result.stderr).not.toContain("DO_NOT_DUMP_OLD_JSON");
-    expect(result.stderr.length).toBeLessThan(80 * 1024);
+    const result = runAssertion(
+      home,
+      json ? ["configure-mock-model", "18080"] : ["assert-file-contains", file, "missing"],
+    );
+    if (json) {
+      expect(result.status).not.toBe(0);
+      expect(result.stderr.length).toBeLessThan(80 * 1024);
+    } else {
+      expect(result.status).toBe(1);
+    }
+    expect(result.stderr).toContain(
+      json ? "JSON artifact exceeded" : `${file} did not contain missing. Output tail: `,
+    );
+    expect(result.stderr).toContain(tail);
+    expect(result.stderr).not.toContain(marker);
   });
 
   it("accepts a configured channel before Gateway startup", async () => {
@@ -232,29 +202,21 @@ describe("release user journey assertions", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("rejects a configured channel that failed after Gateway restart", async () => {
-    await expect(
-      assertChannel("assert-channel-running", {
+  it.each([false, true])(
+    "requires a running default account after restart: %s",
+    async (running) => {
+      const assertion = assertChannel("assert-channel-running", {
         configuredChannels: ["clickclack"],
         channels: { clickclack: { ok: true, label: "configured" } },
-        channelAccounts: {
-          clickclack: [{ accountId: "default", configured: true, running: false }],
-        },
-      }),
-    ).rejects.toThrow("clickclack is not running");
-  });
-
-  it("accepts a running channel after Gateway restart", async () => {
-    await expect(
-      assertChannel("assert-channel-running", {
-        configuredChannels: ["clickclack"],
-        channels: { clickclack: { ok: true } },
-        channelAccounts: {
-          clickclack: [{ accountId: "default", configured: true, running: true }],
-        },
-      }),
-    ).resolves.toBeUndefined();
-  });
+        channelAccounts: { clickclack: [{ accountId: "default", running }] },
+      });
+      if (running) {
+        await expect(assertion).resolves.toBeUndefined();
+      } else {
+        await expect(assertion).rejects.toThrow("clickclack is not running");
+      }
+    },
+  );
 
   it("fails when uninstall leaves the managed plugin directory behind", () => {
     const { root, home } = fixture();
@@ -276,9 +238,10 @@ describe("release user journey assertions", () => {
   });
 
   it("waits for a new ClickClack websocket generation across reconnect", async () => {
-    const { root } = fixture();
-    const statePath = path.join(root, "clickclack.json");
-    const port = await reserveTcpPort();
+    const statePath = path.join(fixture().root, "clickclack.json");
+    const reservation = await startTcpFixtureServer(() => {});
+    const { port } = reservation;
+    await reservation.stop();
     const token = "clickclack-test-token";
     const child = spawn(testNodeExecPath, [CLICKCLACK_FIXTURE_SCRIPT], {
       env: {
@@ -312,42 +275,28 @@ describe("release user journey assertions", () => {
         return current.socketCount === 0 && current.socketGeneration === 1;
       }, "first ClickClack socket close");
 
-      const secondGeneration = waitForClickClackSocket({
-        ...waitOptions,
-        minimumSocketGeneration: 2,
-      });
+      const reconnected = waitForClickClackSocket({ ...waitOptions, minimumSocketGeneration: 2 });
       socket = await openClickClackSocket(port, token);
-      await expect(secondGeneration).resolves.toBeUndefined();
+      await expect(reconnected).resolves.toBeUndefined();
       expect(await state()).toMatchObject({ socketCount: 1, socketGeneration: 2 });
     } finally {
       if (socket) {
         await closeClickClackSocket(socket);
       }
-      await stopChild(child);
+      if (child.exitCode === null) {
+        child.kill("SIGTERM");
+        await once(child, "exit");
+      }
     }
   });
 
   it("preserves runtime state in generated ClickClack status snapshots", async () => {
-    const account = {
-      accountId: "default",
-      enabled: true,
-      configured: true,
-      baseUrl: "http://127.0.0.1:1234",
-    };
-    const runtime = {
-      running: true,
-      lastStartAt: 123,
-      lastStopAt: 45,
-      lastError: "prior disconnect",
-    };
-    type GeneratedClickClackPlugin = {
-      status: {
-        buildAccountSnapshot: (params: {
-          account: typeof account;
-          runtime?: Partial<typeof runtime>;
-        }) => Record<string, unknown>;
-      };
-    };
+    const account = { accountId: "default", enabled: true, configured: true };
+    const runtime = { running: true, lastStartAt: 123, lastStopAt: 45, lastError: "error" };
+    type SnapshotInput = { account: typeof account; runtime?: Partial<typeof runtime> };
+    type Snapshot = (params: SnapshotInput) => Record<string, unknown>;
+    type Registration = { plugin: { status: { buildAccountSnapshot: Snapshot } } };
+    type Api = { registerChannel: (registration: Registration) => void };
 
     const pluginDir = path.join(tempDirs.make("openclaw-release-clickclack-plugin-"), "plugin");
     const writer = spawnSync(testNodeExecPath, [CLICKCLACK_PLUGIN_WRITER_SCRIPT, pluginDir], {
@@ -357,14 +306,8 @@ describe("release user journey assertions", () => {
 
     const generatedModule = (await import(
       pathToFileURL(path.join(pluginDir, "index.mjs")).href
-    )) as {
-      default: {
-        register: (api: {
-          registerChannel: (registration: { plugin: GeneratedClickClackPlugin }) => void;
-        }) => void;
-      };
-    };
-    let plugin: GeneratedClickClackPlugin | undefined;
+    )) as { default: { register: (api: Api) => void } };
+    let plugin: Registration["plugin"] | undefined;
     generatedModule.default.register({
       registerChannel: (registration) => {
         plugin = registration.plugin;
@@ -381,7 +324,7 @@ describe("release user journey assertions", () => {
       running: true,
       lastStartAt: 123,
       lastStopAt: 45,
-      lastError: "prior disconnect",
+      lastError: "error",
     });
   });
 
@@ -410,26 +353,22 @@ describe("release user journey assertions", () => {
     expect(Date.now() - startedAt).toBeLessThan(750);
   });
 
-  it("rejects loose ClickClack wait timeout args instead of parsing prefixes", async () => {
+  it.each([
+    ["socket", "1e3", "websocket"],
+    ["reply", "30s", "reply"],
+  ])("rejects loose ClickClack %s timeout %s", async (kind, timeout, label) => {
     const { root, home } = fixture();
     const statePath = path.join(root, "state.json");
 
+    const args =
+      kind === "socket" ? ["http://127.0.0.1:9", timeout] : [statePath, "OPENCLAW_E2E_OK", timeout];
     await expect(
       withEnvAsync({ HOME: home }, () =>
-        runReleaseUserJourneyAssertion("wait-clickclack-socket", ["http://127.0.0.1:9", "1e3"]),
+        runReleaseUserJourneyAssertion(`wait-clickclack-${kind}`, args),
       ),
     ).rejects.toThrow(
-      'ClickClack websocket timeout seconds must be a positive integer. Got: "1e3"',
+      `ClickClack ${label} timeout seconds must be a positive integer. Got: "${timeout}"`,
     );
-    await expect(
-      withEnvAsync({ HOME: home }, () =>
-        runReleaseUserJourneyAssertion("wait-clickclack-reply", [
-          statePath,
-          "OPENCLAW_E2E_OK",
-          "30s",
-        ]),
-      ),
-    ).rejects.toThrow('ClickClack reply timeout seconds must be a positive integer. Got: "30s"');
   });
 
   it("bounds ClickClack fixture error response bodies", async () => {

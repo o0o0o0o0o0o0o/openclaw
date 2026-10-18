@@ -24,17 +24,7 @@ function writeFixture(): string {
   write("package.json", JSON.stringify({ name: "openclaw", version: "2026.6.11", private: true }));
   write(
     MACOS_INFO,
-    [
-      "<plist>",
-      "<dict>",
-      "  <key>CFBundleShortVersionString</key>",
-      "  <string>2026.6.11</string>",
-      "  <key>CFBundleVersion</key>",
-      "  <string>2026061100</string>",
-      "</dict>",
-      "</plist>",
-      "",
-    ].join("\n"),
+    "<plist>\n<dict>\n  <key>CFBundleShortVersionString</key>\n  <string>2026.6.11</string>\n  <key>CFBundleVersion</key>\n  <string>2026061100</string>\n</dict>\n</plist>\n",
   );
   write(
     "apps/android/version.json",
@@ -63,26 +53,24 @@ it("rejects alpha release preparation before reading or changing packages", () =
   );
 });
 
-describe("release version argument parsing", () => {
-  it("keeps last-value ordering and rejects incomplete options after help", () => {
-    expect(
-      parseReleaseVersionArgs([
-        "--write",
-        "--version",
-        "2026.7.1",
-        "--",
-        "--check",
-        "--version",
-        "2026.7.2",
-      ]),
-    ).toMatchObject({ android: false, mode: "check", version: "2026.7.2" });
-    expect(() => parseReleaseVersionArgs(["--help", "--root", "-h"])).toThrow(
-      "Missing value for --root.",
-    );
-    expect(() => parseReleaseVersionArgs(["--version=2026.7.2"])).toThrow(
-      "Unknown argument: --version=2026.7.2",
-    );
-  });
+it("keeps last-value ordering and rejects incomplete options after help", () => {
+  expect(
+    parseReleaseVersionArgs([
+      "--write",
+      "--version",
+      "2026.7.1",
+      "--",
+      "--check",
+      "--version",
+      "2026.7.2",
+    ]),
+  ).toMatchObject({ android: false, mode: "check", version: "2026.7.2" });
+  expect(() => parseReleaseVersionArgs(["--help", "--root", "-h"])).toThrow(
+    "Missing value for --root.",
+  );
+  expect(() => parseReleaseVersionArgs(["--version=2026.7.2"])).toThrow(
+    "Unknown argument: --version=2026.7.2",
+  );
 });
 
 describe("release version planning", () => {

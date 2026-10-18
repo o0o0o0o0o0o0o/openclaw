@@ -71,6 +71,7 @@ test.each([".clawhub", ".clawdhub"])(
     }
     const scriptPath = path.join(scriptDirectory, "check-update.mjs");
     await writeFile(scriptPath, await readFile(checkerSource));
+    const check = (env?: NodeJS.ProcessEnv) => runChecker(scriptPath, workspace, env);
 
     const fileTreeSha256 = await digestClawHubSkillTree(skillDirectory);
     const skillFile = {
@@ -95,8 +96,7 @@ test.each([".clawhub", ".clawdhub"])(
       writeJson(file, { version: 1, skills: { "release-validation": entry } });
     await writeLock(lockEntry);
 
-    const clean = await runChecker(scriptPath, workspace);
-    expect(clean).toMatchObject({
+    expect(await check()).toMatchObject({
       localModifications: false,
       status: "update-available",
       update: { command: updateCommand },
@@ -112,11 +112,11 @@ test.each([".clawhub", ".clawdhub"])(
       },
       { OPENCLAW_HOME: fixture, OPENCLAW_STATE_DIR: "~/workspace" },
     ]) {
-      expect((await runChecker(scriptPath, workspace, env)).update?.command).toContain("--global");
+      expect((await check(env)).update?.command).toContain("--global");
     }
 
     await writeFile(path.join(skillDirectory, "assets", "worksheet.md"), "locally edited\n");
-    const modified = await runChecker(scriptPath, workspace);
+    const modified = await check();
     expect(modified).toMatchObject({
       localModifications: true,
       status: "update-available",
@@ -128,34 +128,34 @@ test.each([".clawhub", ".clawdhub"])(
       registry: " https://clawhub.ai/ ",
       ownerHandle: " OpenClaw ",
     });
-    const normalized = await runChecker(scriptPath, workspace);
+    const normalized = await check();
     expect(normalized.status).toBe("update-available");
     expect(normalized.update).toBeDefined();
 
     const { ownerHandle: _ownerHandle, ...ownerlessOrigin } = origin;
     await writeJson(originPath, ownerlessOrigin);
-    expectNoUpdate(await runChecker(scriptPath, workspace), "different-source");
+    expectNoUpdate(await check(), "different-source");
 
     await writeJson(originPath, origin);
     await writeLock({ ...lockEntry, ownerHandle: "other-owner" });
-    expectNoUpdate(await runChecker(scriptPath, workspace), "untracked");
+    expectNoUpdate(await check(), "untracked");
 
     const { fileTreeSha256: _tree, skillFile: _skillFile, ...legacyLockEntry } = lockEntry;
     await writeLock(legacyLockEntry);
-    expectNoUpdate(await runChecker(scriptPath, workspace), "untracked");
+    expectNoUpdate(await check(), "untracked");
 
     await writeJson(originPath, origin);
     await writeLock(lockEntry);
     const primaryOriginPath = path.join(skillDirectory, ".clawhub", "origin.json");
     await mkdir(path.dirname(primaryOriginPath), { recursive: true });
     await writeFile(primaryOriginPath, "{not json");
-    expectNoUpdate(await runChecker(scriptPath, workspace), "check-failed");
+    expectNoUpdate(await check(), "check-failed");
 
     await writeJson(primaryOriginPath, origin);
     const primaryLockPath = path.join(workspace, ".clawhub", "lock.json");
     await mkdir(path.dirname(primaryLockPath), { recursive: true });
     await writeJson(primaryLockPath, { version: 2, skills: {} });
-    expectNoUpdate(await runChecker(scriptPath, workspace), "check-failed");
+    expectNoUpdate(await check(), "check-failed");
 
     await writeLock(lockEntry, primaryLockPath);
     await writeFile(path.join(skillDirectory, "assets", "worksheet.md"), "original\n");

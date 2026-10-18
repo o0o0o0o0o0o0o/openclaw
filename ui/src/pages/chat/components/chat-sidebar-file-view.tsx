@@ -104,7 +104,7 @@ function FileAction(props: {
         class={["btn btn--sm sidebar-file-view__action", props.class]}
         type="button"
         // Native refs run unowned; capture the callback in its rendering scope.
-        ref={(element) => props.ref?.(element)}
+        ref={props.ref}
         aria-label={props.label}
         aria-pressed={props.pressed === undefined ? undefined : props.pressed ? "true" : "false"}
         disabled={props.disabled}
@@ -278,7 +278,7 @@ export function SidebarFile(props: {
           <div class="file-view__search" onKeyDown={(event) => controls().onSearchKeydown(event)}>
             <input
               type="search"
-              ref={(element) => controls().searchInputRef?.(element)}
+              ref={controls().searchInputRef}
               aria-label={t("chat.detailPanel.searchInFile")}
               placeholder={t("common.search")}
               value={controls().query}
@@ -356,7 +356,7 @@ export function SidebarFile(props: {
         <Show when={mountIdentity()} keyed>
           {(_identity) => (
             // The editor mount retains its callback through control replacement.
-            <div class="file-view__mount" ref={(element) => props.controls?.editorRef?.(element)} />
+            <div class="file-view__mount" ref={props.controls?.editorRef} />
           )}
         </Show>
         <Show when={props.controls?.loadingEditor}>

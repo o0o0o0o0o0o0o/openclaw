@@ -1,4 +1,4 @@
-import { createEffect, createSignal, onSettled, untrack } from "solid-js";
+import { createSignal, onSettled } from "solid-js";
 import type { SessionObserverDigest } from "../../../../../packages/gateway-protocol/src/schema/sessions.js";
 import type { GatewayEventFrame } from "../../../api/gateway.ts";
 import { pickFreshestObserverDigest } from "../../../lib/observer-digest.ts";
@@ -30,16 +30,15 @@ function matchesRun(row: ChatSubagentActivityRow, digest: SessionObserverDigest)
 /** A view cache of the broad session observer stream, not a child-history subscriber. */
 function SubagentActivityLive(props: SubagentActivityProps) {
   const context = useOptionalApplication();
-  const digests = new Map<string, SessionObserverDigest>();
-  const [revision, setRevision] = createSignal(0);
-  createEffect(
-    () => props.rows,
-    (rows) => {
-      for (const [key, digest] of digests) {
-        if (!rows.some((row) => row.key === key && matchesRun(row, digest))) {
-          digests.delete(key);
-        }
-      }
+  // The cache retains only digests belonging to the currently displayed runs.
+  const [digests, setDigests] = createSignal<Map<string, SessionObserverDigest>>(
+    (previous = new Map()) => {
+      const rows = props.rows;
+      return new Map(
+        [...previous].filter(([key, digest]) =>
+          rows.some((row) => row.key === key && matchesRun(row, digest)),
+        ),
+      );
     },
   );
   onSettled(() => {
@@ -48,13 +47,11 @@ function SubagentActivityLive(props: SubagentActivityProps) {
     }
     const gateway = context.gateway;
     let connection = gateway.snapshot.hello;
-    const changed = () => setRevision((value) => value + 1);
     // Clear prior-connection digests before the next observer frame can be accepted.
     const unsubscribe = gateway.subscribe(() => {
       if (connection !== gateway.snapshot.hello) {
         connection = gateway.snapshot.hello;
-        digests.clear();
-        changed();
+        setDigests(new Map());
       }
     });
     function onSessionObserver(event: GatewayEventFrame) {
@@ -67,24 +64,26 @@ function SubagentActivityLive(props: SubagentActivityProps) {
         return;
       }
       const digest = event.payload;
-      const row = untrack(() => props.rows).find((candidate) => matchesRun(candidate, digest));
-      if (!row || pickFreshestObserverDigest(digests.get(row.key), digest) !== digest) {
+      const row = props.rows.find((candidate) => matchesRun(candidate, digest));
+      if (!row) {
         return;
       }
-      digests.set(row.key, digest);
-      changed();
+      setDigests((previous) =>
+        pickFreshestObserverDigest(previous.get(row.key), digest) === digest
+          ? new Map(previous).set(row.key, digest)
+          : previous,
+      );
     }
     const unsubscribeEvents = gateway.subscribeEvents(onSessionObserver);
     return () => {
       unsubscribe();
       unsubscribeEvents();
-      digests.clear();
     };
   });
   const rows = () => {
-    revision();
+    const liveDigests = digests();
     return props.rows.map((row) => {
-      const live = digests.get(row.key);
+      const live = liveDigests.get(row.key);
       if (!live || !matchesRun(row, live)) {
         return row;
       }

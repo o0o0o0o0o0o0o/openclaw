@@ -65,13 +65,8 @@ describe("discord message context", () => {
         session: { store: state.path("sessions.json") },
         commands: { ownerAllowFrom: [`discord:${senderId}`] },
       };
-      type GatewayContext = NonNullable<
-        ReturnType<
-          NonNullable<
-            Parameters<typeof createHostChannelIngressRuntime>[0]["resolveGatewayContext"]
-          >
-        >
-      >;
+      type Host = Parameters<typeof createHostChannelIngressRuntime>[0];
+      type GatewayContext = NonNullable<ReturnType<NonNullable<Host["resolveGatewayContext"]>>>;
       // SAFETY: Host ingress only reads current config from this synthetic Gateway.
       const gateway = { getRuntimeConfig: () => cfg } as GatewayContext;
       let live = true;
@@ -88,10 +83,9 @@ describe("discord message context", () => {
         const text = "/config show messages.responsePrefix";
         const routeMetadata = Symbol("opaque route metadata");
         const metadata = { capturedAt: "route resolution" };
-        const builder = {
-          build: createHostChannelInboundEventContextBuilder(buildChannelInboundEventContext, host),
-        };
-        const build = vi.spyOn(builder, "build");
+        const build = vi.fn(
+          createHostChannelInboundEventContextBuilder(buildChannelInboundEventContext, host),
+        );
         const ctx = await createBaseDiscordMessageContext(
           {
             cfg,
@@ -100,7 +94,7 @@ describe("discord message context", () => {
             sender: { id: senderId, label: "Ada", name: "ada", isPluralKit: false },
             baseText: text,
             messageText: text,
-            buildContext: builder.build,
+            buildContext: build,
           },
           { storePath: state.path("sessions.json") },
         );
@@ -126,9 +120,11 @@ describe("discord message context", () => {
           throw new Error("expected a built Discord message context");
         }
 
-        expect(result.ctxPayload.NativeChannelId).toBe(ctx.messageChannelId);
-        expect(result.ctxPayload.ConversationRoutePeerId).toBe(ctx.messageChannelId);
-        expect(result.ctxPayload.SenderIsBot).toBe(true);
+        expect(result.ctxPayload).toMatchObject({
+          NativeChannelId: ctx.messageChannelId,
+          ConversationRoutePeerId: ctx.messageChannelId,
+          SenderIsBot: true,
+        });
         expect(build).toHaveBeenCalledTimes(1);
         expect(build.mock.calls[0]?.[0].route).toMatchObject({ [routeMetadata]: metadata });
         expect(result.ctxPayload).toBe(await build.mock.results[0]?.value);
@@ -149,50 +145,34 @@ describe("discord message context", () => {
   });
 
   it.each([
-    {
-      name: "canonical guild id without a configured guild entry",
-      field: "GroupSpace",
-      expected: "guild-id",
-      overrides: {
-        data: { guild: { id: "guild-id", name: "Friendly Guild" } },
-        guildInfo: null,
-        guildSlug: "friendly-guild",
-      },
-    },
-    {
-      name: "no bot marker for PluralKit proxy senders",
-      field: "SenderIsBot",
-      expected: undefined,
-      overrides: {
-        author: { id: "U1", username: "pk", discriminator: "0", globalName: "PK", bot: true },
-        sender: { label: "user", name: "Member", tag: "member", isPluralKit: true },
-      },
-    },
-  ] as const)("preserves $name", async ({ overrides, field, expected }) => {
+    [
+      "GroupSpace",
+      "guild-id",
+      { data: { guild: { id: "guild-id" } }, guildInfo: null, guildSlug: "friendly-guild" },
+    ],
+    [
+      "SenderIsBot",
+      undefined,
+      { author: { id: "U1", username: "pk", bot: true }, sender: { isPluralKit: true } },
+    ],
+  ] as const)("preserves %s for guild and proxy senders", async (field, expected, overrides) => {
     expect((await context(overrides))[field]).toBe(expected);
   });
 
   it("does not duplicate forwarded media already rendered in room-event history text", async () => {
     const guildHistories = new Map();
     const forwardedText = "[Forwarded message]\n<media:image>";
-    const attachment = {
-      id: "forwarded-image",
-      filename: "forwarded.png",
-      content_type: "image/png",
-      url: "https://cdn.discordapp.com/forwarded.png",
-    };
     await context(
       {
         guildHistories,
         historyLimit: 10,
         inboundEventKind: "room_event",
-        sender: { id: "U1", label: "user", name: "alice", isPluralKit: false },
         message: {
           id: "m-forwarded",
           channelId: "c1",
           timestamp: new Date().toISOString(),
           attachments: [],
-          message_snapshots: [{ message: { attachments: [attachment] } }],
+          message_snapshots: [{ message: { attachments: [{ id: "forwarded-image" }] } }],
         },
       },
       forwardedText,

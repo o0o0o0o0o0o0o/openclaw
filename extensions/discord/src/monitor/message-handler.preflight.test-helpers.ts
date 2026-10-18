@@ -7,7 +7,6 @@ import { ChannelType, Message, MessageType } from "../internal/discord.js";
 import { createInternalTestClient } from "../internal/test-builders.test-support.js";
 import type { preflightDiscordMessage } from "./message-handler.preflight.js";
 import { createNoopThreadBindingManager, type ThreadBindingManager } from "./thread-bindings.js";
-type ThreadBindings = ReturnType<typeof createNoopThreadBindingManager>;
 type PreflightArgs = Parameters<typeof preflightDiscordMessage>[0];
 
 export type DiscordConfig = NonNullable<OpenClawConfig["channels"]>["discord"];
@@ -23,9 +22,8 @@ function user(id: string, username = id): APIUser {
 }
 
 function channelClient(channels: Record<string, object>): DiscordClient {
-  const byId = new Map(Object.entries(channels));
   return {
-    fetchChannel: async (id: string) => (byId.has(id) ? { ...byId.get(id) } : null),
+    fetchChannel: async (id: string) => (Object.hasOwn(channels, id) ? { ...channels[id] } : null),
   } as unknown as DiscordClient;
 }
 
@@ -71,20 +69,16 @@ export function createGuildEvent(params: {
 }
 
 export function createDiscordMessage(
-  params: Pick<Message, "id" | "channelId" | "content"> & {
-    author: Pick<APIUser, "id"> & { bot: boolean; username?: string };
-    mentionedUsers?: Array<{ id: string; username?: string }>;
-    mentionedEveryone?: boolean;
-    messageReference?: Message["messageReference"];
-    referencedMessage?: Message;
-    attachments?: Array<Pick<APIAttachment, "id" | "filename" | "url"> & Partial<APIAttachment>>;
-    webhookId?: string;
-    type?: MessageType;
-    timestamp?: string;
-    embeds?: APIMessage["embeds"];
-    components?: APIMessage["components"];
-    stickers?: APIMessage["sticker_items"];
-  },
+  params: Pick<Message, "id" | "channelId" | "content"> &
+    Partial<Pick<Message, "mentionedEveryone" | "messageReference">> &
+    Partial<Pick<APIMessage, "type" | "timestamp" | "embeds" | "components">> & {
+      author: Pick<APIUser, "id"> & { bot: boolean; username?: string };
+      mentionedUsers?: Array<{ id: string; username?: string }>;
+      referencedMessage?: Message;
+      attachments?: Array<Pick<APIAttachment, "id" | "filename" | "url"> & Partial<APIAttachment>>;
+      webhookId?: string;
+      stickers?: APIMessage["sticker_items"];
+    },
   client: DiscordClient = createInternalTestClient(),
 ): Message {
   return new Message(client, {
@@ -97,9 +91,7 @@ export function createDiscordMessage(
     attachments: (params.attachments ?? []).map((attachment) =>
       Object.assign({ size: 1, proxy_url: attachment.url }, attachment),
     ),
-    mentions: (params.mentionedUsers ?? []).map((mentioned) =>
-      user(mentioned.id, mentioned.username),
-    ),
+    mentions: (params.mentionedUsers ?? []).map(({ id, username }) => user(id, username)),
     mention_roles: [],
     mention_everyone: params.mentionedEveryone ?? false,
     message_reference: params.messageReference,
@@ -116,9 +108,9 @@ export function createDiscordMessage(
 
 export function createDiscordPreflightArgs(
   params: Pick<PreflightArgs, "cfg" | "discordConfig" | "data" | "client" | "botUserId"> & {
-    threadBindings?: ThreadBindings;
+    threadBindings?: ThreadBindingManager;
   },
-): PreflightArgs & { threadBindings: ThreadBindings } {
+): PreflightArgs & { threadBindings: ThreadBindingManager } {
   const threadBindings = params.threadBindings ?? createNoopThreadBindingManager("default");
   if (!params.threadBindings) {
     onTestFinished(() => threadBindings.stop());
@@ -161,15 +153,15 @@ export function createThreadBinding(overrides?: Partial<SessionBindingRecord>) {
   } satisfies SessionBindingRecord;
 }
 
-export async function runThreadBoundPreflight(params: {
-  threadId: string;
-  parentId: string;
-  message: Message;
-  threadBinding: SessionBindingRecord;
-  discordConfig: DiscordConfig;
-  threadBindings: ThreadBindings;
-  registerBindingAdapter?: boolean;
-}) {
+export async function runThreadBoundPreflight(
+  params: Parameters<typeof createThreadClient>[0] & {
+    message: Message;
+    threadBinding: SessionBindingRecord;
+    discordConfig: DiscordConfig;
+    threadBindings: ThreadBindingManager;
+    registerBindingAdapter?: boolean;
+  },
+) {
   if (params.registerBindingAdapter) {
     registerSessionBindingAdapter({
       channel: "discord",
@@ -181,11 +173,13 @@ export async function runThreadBoundPreflight(params: {
   }
 
   const { preflightDiscordMessage } = await import("./message-handler.preflight.js");
-  return preflightDiscordMessage({
-    ...createDiscordPreflightArgs({
+  return preflightDiscordMessage(
+    createDiscordPreflightArgs({
       cfg: DEFAULT_PREFLIGHT_CFG,
       discordConfig: params.discordConfig,
-      threadBindings: params.threadBindings,
+      threadBindings: {
+        getByThreadId: (id: string) => (id === params.threadId ? params.threadBinding : undefined),
+      } as ThreadBindingManager,
       data: createGuildEvent({
         channelId: params.threadId,
         guildId: "guild-1",
@@ -194,8 +188,5 @@ export async function runThreadBoundPreflight(params: {
       }),
       client: createThreadClient(params),
     }),
-    threadBindings: {
-      getByThreadId: (id: string) => (id === params.threadId ? params.threadBinding : undefined),
-    } as ThreadBindingManager,
-  });
+  );
 }

@@ -12,6 +12,7 @@ import type { DiscordHistoryEntry } from "./message-handler.history.js";
 import { preflightDiscordMessage } from "./message-handler.preflight.js";
 import {
   createDiscordPreflightArgs,
+  createDiscordMessage,
   createGuildEvent,
   createGuildTextClient,
 } from "./message-handler.preflight.test-helpers.js";
@@ -32,27 +33,16 @@ function nativeMessage(
   content = `discussion-${id}`,
   overrides: Partial<APIMessage> = {},
 ): APIMessage {
-  return {
+  const message = createDiscordMessage({
     id: String(id),
-    channel_id: "c1",
-    author: {
-      id: "111",
-      username: "alice",
-      discriminator: "0",
-      global_name: "Alice",
-      avatar: null,
-    },
+    channelId: "c1",
     content,
+    author: { id: "111", username: "alice", bot: false },
     timestamp: new Date(startedAt + id * 10).toISOString(),
-    edited_timestamp: null,
-    type: 0,
-    tts: false,
-    pinned: false,
-    mentions: [],
-    mention_roles: [],
-    mention_everyone: false,
-    attachments: [],
-    embeds: [],
+  }).rawData;
+  return {
+    ...message,
+    author: { ...message.author, global_name: "Alice" },
     ...overrides,
   };
 }
@@ -67,19 +57,24 @@ function cachedEntry(id: string, body: string): DiscordHistoryEntry {
 }
 
 async function recentContext({
-  get = vi.fn().mockResolvedValue([]),
+  messages = [],
+  get = vi.fn().mockResolvedValue(messages),
   cached = [],
+  messageChannelId = "c1",
   ...overrides
 }: Record<string, unknown> & {
   get?: ReturnType<typeof vi.fn>;
+  messages?: APIMessage[];
   cached?: DiscordHistoryEntry[];
+  messageChannelId?: string;
 } = {}) {
   return await baseContext(
     {
       historyLimit: 20,
+      messageChannelId,
       message: {
         id: "1000",
-        channelId: "c1",
+        channelId: messageChannelId,
         timestamp: new Date(startedAt + 10_000).toISOString(),
         attachments: [],
       },
@@ -91,22 +86,28 @@ async function recentContext({
   );
 }
 
-const buildContext = (ctx: PreflightContext) =>
-  buildProcessContext({ ctx, text: "addressed current turn", mediaList: [] });
+const buildContext = async (ctx: PreflightContext) =>
+  (await buildProcessContext({ ctx, text: "addressed current turn", mediaList: [] }))?.ctxPayload ??
+  null;
 
 async function history(options: Parameters<typeof recentContext>[0]) {
-  return (await buildContext(await recentContext(options)))?.ctxPayload;
+  return buildContext(await recentContext(options));
 }
 
 const writeSession = (
   ctx: PreflightContext,
-  entry: Parameters<typeof upsertSessionEntry>[0]["entry"],
+  entry: Partial<Parameters<typeof upsertSessionEntry>[0]["entry"]> = {},
 ) =>
   upsertSessionEntry({
     agentId: ctx.route.agentId,
     storePath: ctx.cfg.session?.store,
     sessionKey: ctx.boundSessionKey ?? ctx.route.sessionKey,
-    entry,
+    entry: {
+      sessionId: "history-session",
+      updatedAt: startedAt,
+      sessionStartedAt: startedAt,
+      ...entry,
+    },
   });
 
 describe("Discord native recent history through process context", () => {
@@ -116,13 +117,11 @@ describe("Discord native recent history through process context", () => {
 
   it("keeps quiet ingress quiet, then excludes each debounced original without losing its current text", async () => {
     const base = await recentContext();
-    const get = vi
-      .fn()
-      .mockResolvedValue([
-        nativeMessage(999, "interleaved discussion"),
-        nativeMessage(998, "first batch original"),
-        nativeMessage(997, "quiet earlier discussion"),
-      ]);
+    const get = vi.fn(async () => [
+      nativeMessage(999, "interleaved discussion"),
+      nativeMessage(998, "first batch original"),
+      nativeMessage(997, "quiet earlier discussion"),
+    ]);
     const client = createGuildTextClient("c1");
     Object.assign(client, { rest: { get } });
     const quiet = new Message(client, nativeMessage(997, "quiet earlier discussion"));
@@ -202,7 +201,7 @@ describe("Discord native recent history through process context", () => {
         ...ctx.cfg,
         channels: { discord: { contextVisibility: roles ? "allowlist" : "allowlist_quote" } },
       };
-      const result = (await buildContext(ctx))?.ctxPayload;
+      const result = await buildContext(ctx);
       expect(result?.InboundHistory).toEqual([
         expect.objectContaining({ messageId: roles ? "900" : "899", body }),
       ]);
@@ -243,7 +242,7 @@ describe("Discord native recent history through process context", () => {
         ],
       });
       const result = await history({
-        get: vi.fn().mockResolvedValue([fresh]),
+        messages: [fresh],
         cached: [cachedEntry("899", "deleted discussion"), cached],
       });
 
@@ -283,13 +282,9 @@ describe("Discord native recent history through process context", () => {
         cached: [cachedEntry("900", "stale private discussion")],
       });
       if (!failed && !disabled) {
-        await writeSession(ctx, {
-          sessionId: "pending-reset",
-          updatedAt: 0,
-          sessionStartedAt: startedAt,
-        });
+        await writeSession(ctx, { updatedAt: 0 });
       }
-      const result = (await buildContext(ctx))?.ctxPayload;
+      const result = await buildContext(ctx);
       expect(result?.Body).toContain("addressed current turn");
       expect(result?.Body).not.toContain("stale private discussion");
       expect(result?.InboundHistory).toEqual(disabled ? undefined : []);
@@ -304,19 +299,18 @@ describe("Discord native recent history through process context", () => {
   it("excludes pre-reset messages using the bound session rather than the channel route", async () => {
     const ctx = await recentContext({
       boundSessionKey: "agent:main:subagent:bound",
-      get: vi.fn().mockResolvedValue([nativeMessage(900), nativeMessage(899)]),
+      messages: [nativeMessage(900), nativeMessage(899)],
     });
     await writeSession(ctx, {
-      sessionId: "reset-session",
       lifecycleRevision: "reset-revision",
       updatedAt: startedAt + 9_000,
       sessionStartedAt: startedAt + 9_000,
     });
     const result = await buildContext(ctx);
 
-    expect(result?.ctxPayload.InboundHistory?.map((entry) => entry.messageId)).toEqual(["900"]);
-    expect(result?.ctxPayload.Body).not.toContain("discussion-899");
-    expect(result?.ctxPayload.SessionKey).toBe(ctx.boundSessionKey);
+    expect(result?.InboundHistory?.map((entry) => entry.messageId)).toEqual(["900"]);
+    expect(result?.Body).not.toContain("discussion-899");
+    expect(result?.SessionKey).toBe(ctx.boundSessionKey);
   });
 
   it.each(["abort", "policy"] as const)(
@@ -328,12 +322,7 @@ describe("Discord native recent history through process context", () => {
         abortSignal: controller.signal,
         isPolicyCurrent: () => policyCurrent,
       });
-      await writeSession(ctx, {
-        sessionId: "same-session",
-        lifecycleRevision: "before",
-        updatedAt: startedAt,
-        sessionStartedAt: startedAt,
-      });
+      await writeSession(ctx, { lifecycleRevision: "before" });
       const get = vi.fn(async () => {
         if (kind === "abort") {
           controller.abort();
@@ -360,12 +349,6 @@ describe("Discord native recent history through process context", () => {
     ]);
     const ctx = await recentContext({
       messageChannelId: "thread-1",
-      message: {
-        id: "1000",
-        channelId: "thread-1",
-        timestamp: new Date(startedAt + 10_000).toISOString(),
-        attachments: [],
-      },
       threadChannel: { id: "thread-1", name: "Thread" },
       threadParentId: "c1",
       threadParentName: "general",
@@ -375,9 +358,9 @@ describe("Discord native recent history through process context", () => {
     });
     const result = await buildContext(ctx);
 
-    expect(result?.ctxPayload.InboundHistory?.map((entry) => entry.messageId)).toEqual(["900"]);
-    expect(result?.ctxPayload.Body).not.toContain("parent discussion");
-    expect(result?.ctxPayload.Body).not.toContain("future discussion");
+    expect(result?.InboundHistory?.map((entry) => entry.messageId)).toEqual(["900"]);
+    expect(result?.Body).not.toContain("parent discussion");
+    expect(result?.Body).not.toContain("future discussion");
     expect(get).toHaveBeenCalledWith("/channels/thread-1/messages", { before: "1000", limit: 20 });
     expect(get).toHaveBeenCalledTimes(1);
   });

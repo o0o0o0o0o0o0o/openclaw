@@ -170,17 +170,14 @@ export function createPairedAttemptRuntime() {
   const openDuplex = vi.fn<NonNullable<StartupParams["runtime"]>["nodes"]["openDuplex"]>(
     async (request) => {
       const closed = Promise.withResolvers<unknown>();
-      const channel = {
+      const close = vi.fn(() => closed.resolve({ ok: true }));
+      channels.push({ close, sessionId: (request.params as { sessionId: string }).sessionId });
+      return {
         send: vi.fn(async () => undefined),
         onMessage: vi.fn(() => () => undefined),
         closed: closed.promise,
-        close: vi.fn(() => closed.resolve({ ok: true })),
+        close,
       };
-      channels.push({
-        close: channel.close,
-        sessionId: (request.params as { sessionId: string }).sessionId,
-      });
-      return channel;
     },
   );
   return {
@@ -190,12 +187,7 @@ export function createPairedAttemptRuntime() {
   };
 }
 
-export type AttemptPaths = {
-  agentDir: string;
-  cwd: string;
-  sessionFile: string;
-  workspaceDir: string;
-};
+export type AttemptPaths = Record<"agentDir" | "cwd" | "sessionFile" | "workspaceDir", string>;
 
 export function createAttemptPaths(tempRoots: Set<string>): AttemptPaths {
   const root = path.join(os.tmpdir(), `openclaw-codex-attempt-startup-${randomUUID()}`);

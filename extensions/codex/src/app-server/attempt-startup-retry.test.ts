@@ -350,6 +350,10 @@ describe("Codex app-server startup retry", () => {
   it("preserves the shared client and binding on an overloaded resume with a sibling lease", async () => {
     const fixture = { ...(await createStartupFailureFixture("overload")), disableTools: false };
     const sibling = await startFixtureAttempt(fixture);
+    cleanups.push(async () => {
+      sibling.releaseSharedClientLease();
+      await sibling.client.closeAndWait();
+    });
     sibling.turnRoute.release();
     const identity = {
       kind: "session" as const,
@@ -357,43 +361,37 @@ describe("Codex app-server startup retry", () => {
       sessionId: "session-1",
       sessionKey: "agent:agent-1:session-1",
     };
-    try {
-      const binding = testCodexAppServerBindingStore.read(identity);
-      expect(binding?.threadId).toBe("thread-recovered");
-      const requestsBeforeResume = await fs.readFile(fixture.requestLogPath, "utf8");
+    const binding = testCodexAppServerBindingStore.read(identity);
+    expect(binding?.threadId).toBe("thread-recovered");
+    const requestsBeforeResume = await fs.readFile(fixture.requestLogPath, "utf8");
 
-      // An unrelated lease must not hide a native refusal or lose its healthy client.
-      await expect(startFixtureAttempt(fixture)).rejects.toMatchObject({
-        name: "CodexAppServerRpcError",
-        code: -32_001,
-        method: "thread/resume",
-      });
-      const requests = await fs.readFile(fixture.requestLogPath, "utf8");
-      expect(new Set(requests.slice(requestsBeforeResume.length).trim().split("\n"))).toEqual(
-        new Set(["config/read", "configRequirements/read", "thread/read", "thread/resume"]),
-      );
-      expect(testCodexAppServerBindingStore.read(identity)).toEqual(binding);
+    // An unrelated lease must not hide a native refusal or lose its healthy client.
+    await expect(startFixtureAttempt(fixture)).rejects.toMatchObject({
+      name: "CodexAppServerRpcError",
+      code: -32_001,
+      method: "thread/resume",
+    });
+    const requests = await fs.readFile(fixture.requestLogPath, "utf8");
+    expect(new Set(requests.slice(requestsBeforeResume.length).trim().split("\n"))).toEqual(
+      new Set(["config/read", "configRequirements/read", "thread/read", "thread/resume"]),
+    );
+    expect(testCodexAppServerBindingStore.read(identity)).toEqual(binding);
 
-      await expect(
-        sibling.client.request("thread/read", {
-          threadId: "thread-recovered",
-          includeTurns: false,
-        }),
-      ).resolves.toMatchObject({ thread: { id: "thread-recovered" } });
-      sibling.releaseSharedClientLease();
-      expect(sibling.client.getCloseError()).toBeUndefined();
+    await expect(
+      sibling.client.request("thread/read", {
+        threadId: "thread-recovered",
+        includeTurns: false,
+      }),
+    ).resolves.toMatchObject({ thread: { id: "thread-recovered" } });
+    sibling.releaseSharedClientLease();
+    expect(sibling.client.getCloseError()).toBeUndefined();
 
-      const reacquired = await getLeasedSharedCodexAppServerClient(clientOptions(fixture));
-      try {
-        expect(reacquired).toBe(sibling.client);
-        expect(reacquired.getCloseError()).toBeUndefined();
-        expect(await fs.readFile(fixture.spawnCountPath, "utf8")).toBe("1");
-      } finally {
-        releaseLeasedSharedCodexAppServerClient(reacquired);
-      }
-    } finally {
-      sibling.releaseSharedClientLease();
-      await sibling.client.closeAndWait();
-    }
+    const reacquired = await getLeasedSharedCodexAppServerClient(clientOptions(fixture));
+    cleanups.unshift(() => {
+      releaseLeasedSharedCodexAppServerClient(reacquired);
+    });
+    expect(reacquired).toBe(sibling.client);
+    expect(reacquired.getCloseError()).toBeUndefined();
+    expect(await fs.readFile(fixture.spawnCountPath, "utf8")).toBe("1");
   });
 });

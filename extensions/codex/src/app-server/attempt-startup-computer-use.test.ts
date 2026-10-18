@@ -10,7 +10,7 @@ import {
   waitForRequest,
 } from "./attempt-startup.test-support.js";
 import { CodexAppServerClient } from "./client.js";
-import { threadStartResult as createThreadStartResult } from "./codex-app-server.test-fixtures.js";
+import { threadStartResult } from "./codex-app-server.test-fixtures.js";
 import { readCodexComputerUseStatus } from "./computer-use.js";
 import { createComputerUseRequest } from "./computer-use.test-support.js";
 import type { CodexPluginConfig } from "./config.js";
@@ -29,7 +29,6 @@ vi.mock("./desktop-generation.js", async (importOriginal) => ({
 const tempRoots = new Set<string>();
 const pluginConfig: CodexPluginConfig = { appServer: { command: "codex" } };
 const startThreadWithHarness = createAttemptThreadStarter(tempRoots, pluginConfig);
-const threadStartResult = (threadId = "thread-1") => createThreadStartResult(threadId, "/repo");
 
 describe("Computer Use attempt startup", () => {
   beforeEach(async () => {
@@ -117,7 +116,7 @@ describe("Computer Use attempt startup", () => {
               data: [{ name: "computer-use", tools: { list_apps: {} } }],
               nextCursor: null,
             },
-            "thread/start": threadStartResult(),
+            "thread/start": threadStartResult("thread-1", "/repo"),
             "thread/unsubscribe": { status: "unsubscribed" },
           };
           // Leave mcpServer/tool/call unanswered to exercise the real 60s timeout.
@@ -199,25 +198,8 @@ async function statusProbe(
   let elapsedMs = 0;
   vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
   vi.spyOn(Date, "now").mockImplementation(() => elapsedMs);
-  const harness = createStatusClient((method) => {
-    elapsedMs = elapsedByMethod[method] ?? elapsedMs;
-  });
-  vi.spyOn(CodexAppServerClient, "start").mockResolvedValueOnce(harness.client);
-  const requests = vi.spyOn(harness.client, "request");
-  const status = await readCodexComputerUseStatus({
-    agentDir: createAttemptPaths(tempRoots).agentDir,
-    timeoutMs: 1_000,
-    pluginConfig: {
-      ...pluginConfig,
-      computerUse: { enabled: true, marketplaceName: "desktop-tools", ...overrides },
-    },
-  });
-  return { harness, requests, status };
-}
-
-function createStatusClient(afterResponse?: (method: string) => void) {
   const fixture = createComputerUseRequest({ installed: true });
-  return createInferenceReadyClientHarness({
+  const harness = createInferenceReadyClientHarness({
     onWrite(line, send) {
       const frame = JSON.parse(line) as { id?: number; method: string; params?: unknown };
       if (frame.id === undefined) {
@@ -232,10 +214,21 @@ function createStatusClient(afterResponse?: (method: string) => void) {
       void response.then(
         (result) => {
           send({ id: frame.id, result: result ?? null });
-          afterResponse?.(frame.method);
+          elapsedMs = elapsedByMethod[frame.method] ?? elapsedMs;
         },
         (error: unknown) => send({ id: frame.id, error: { code: -32000, message: String(error) } }),
       );
     },
   });
+  vi.spyOn(CodexAppServerClient, "start").mockResolvedValueOnce(harness.client);
+  const requests = vi.spyOn(harness.client, "request");
+  const status = await readCodexComputerUseStatus({
+    agentDir: createAttemptPaths(tempRoots).agentDir,
+    timeoutMs: 1_000,
+    pluginConfig: {
+      ...pluginConfig,
+      computerUse: { enabled: true, marketplaceName: "desktop-tools", ...overrides },
+    },
+  });
+  return { harness, requests, status };
 }

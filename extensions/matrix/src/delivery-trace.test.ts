@@ -1,4 +1,3 @@
-// Wire-level Matrix lifecycle goldens through the real monitor handler.
 import { MatrixEvent, type IEvent } from "matrix-js-sdk/lib/matrix.js";
 import {
   deliveryTraceScenarios,
@@ -22,7 +21,7 @@ import {
 } from "openclaw/plugin-sdk/reply-chunking";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import { convertMarkdownTables } from "openclaw/plugin-sdk/text-chunking";
-import { beforeAll, describe, it, vi } from "vitest";
+import { beforeAll, it, vi } from "vitest";
 import {
   createMatrixHandlerTestHarness,
   createMatrixTextMessageEvent,
@@ -30,9 +29,7 @@ import {
 import type { MatrixClient } from "./matrix/sdk.js";
 import { installMatrixTestRuntime } from "./test-runtime.js";
 
-const ROOM_ID = "!room:example.org";
 const BOT_USER_ID = "@openclaw:example.org";
-const INBOUND_EVENT_ID = "$inbound-1";
 
 beforeAll(() => {
   // Use real text/mention helpers; these scenarios deliberately have no media runtime.
@@ -62,18 +59,20 @@ beforeAll(() => {
 function createRecordingMatrixClient(recorder: WireRecorder): Partial<MatrixClient> {
   // Each wire event (including edits/redactions) consumes a deterministic event ID.
   const eventsById = new Map<string, IEvent>();
+  type WireCall = Parameters<WireRecorder["recordWireCall"]>[0];
+  const record = (method: string, target: string, data: Omit<WireCall, "method" | "target"> = {}) =>
+    recorder.recordWireCall({ method, target, ...data });
   let eventCount = 0;
   const mintEventId = () => {
     eventCount += 1;
     return `$e${eventCount}`;
   };
-  const client: Partial<MatrixClient> = {
+  return {
     getUserId: async () => BOT_USER_ID,
     prepareRoomForMessageSend: async () => "m.room.message",
     sendMessage: async (roomId: string, content: Record<string, unknown>) => {
       const eventId = mintEventId();
-      // Snapshot before recording: edit flows reuse content structures, and the
-      // recorder serializes at compare time.
+      // Edit flows reuse content, so snapshot before deferred serialization.
       const payload = structuredClone(content);
       eventsById.set(eventId, {
         event_id: eventId,
@@ -81,29 +80,17 @@ function createRecordingMatrixClient(recorder: WireRecorder): Partial<MatrixClie
         type: "m.room.message",
         origin_server_ts: Date.now(),
         content: payload,
-        unsigned: {},
       });
-      recorder.recordWireCall({
-        method: "sendMessage",
-        target: roomId,
-        payload,
-        result: { event_id: eventId },
-      });
+      record("sendMessage", roomId, { payload, result: { event_id: eventId } });
       return eventId;
     },
-    // Mention diffing and requested thread validation read the prior event;
-    // quiet previews without a thread skip this otherwise unused round trip.
     getEvent: async (_roomId: string, eventId: string) => {
-      recorder.recordWireCall({
-        method: "getEvent",
-        target: eventId,
-        result: { found: eventsById.has(eventId) },
-      });
+      record("getEvent", eventId, { result: { found: eventsById.has(eventId) } });
       const event = eventsById.get(eventId);
       if (!event) {
         throw new Error(`Unknown recorded Matrix event: ${eventId}`);
       }
-      return { ...structuredClone(event) };
+      return structuredClone(event);
     },
     getRelations: async (_roomId, eventId, relationType, eventType, opts) => {
       const originalEvent = eventsById.get(eventId);
@@ -116,36 +103,22 @@ function createRecordingMatrixClient(recorder: WireRecorder): Partial<MatrixClie
           (relationType !== "m.replace" || event.sender === originalEvent?.sender)
         );
       });
-      recorder.recordWireCall({
-        method: "getRelations",
-        target: eventId,
+      record("getRelations", eventId, {
         payload: { relationType, eventType: eventType ?? null, limit: opts?.limit },
         result: { count: events.length },
       });
       return { originalEvent: originalEvent ?? null, events, nextBatch: null, prevBatch: null };
     },
     redactEvent: async (_roomId: string, eventId: string) => {
-      // Redactions are events too: abandoning a draft consumes an event id.
       const redactionEventId = mintEventId();
-      recorder.recordWireCall({
-        method: "redactEvent",
-        target: eventId,
-        result: { event_id: redactionEventId },
-      });
+      record("redactEvent", eventId, { result: { event_id: redactionEventId } });
       return redactionEventId;
     },
     setTyping: async (roomId: string, typing: boolean, timeoutMs: number) => {
-      recorder.recordWireCall({
-        method: "setTyping",
-        target: roomId,
-        payload: { typing, timeoutMs },
-      });
+      record("setTyping", roomId, { payload: { typing, timeoutMs } });
     },
-    sendReadReceipt: async (_roomId: string, eventId: string) => {
-      recorder.recordWireCall({ method: "sendReadReceipt", target: eventId });
-    },
+    sendReadReceipt: async (_roomId: string, eventId: string) => record("sendReadReceipt", eventId),
   };
-  return client;
 }
 
 type MatrixTraceDeliver = (payload: ReplyPayload, info: { kind: string }) => Promise<void>;
@@ -203,9 +176,9 @@ async function setupMatrixTrace(recorder: WireRecorder) {
   });
 
   const handlerDone = handler(
-    ROOM_ID,
+    "!room:example.org",
     createMatrixTextMessageEvent({
-      eventId: INBOUND_EVENT_ID,
+      eventId: "$inbound-1",
       body: "deploy status?",
       originServerTs: Date.now(),
     }),
@@ -216,11 +189,9 @@ async function setupMatrixTrace(recorder: WireRecorder) {
       throw new Error("matrix handler settled before capturing dispatcher wiring");
     }),
   ]);
-  // Drain the fire-and-forget inbound read receipt so it lands at a fixed
-  // position (before the first scripted step) in every recording.
+  // Drain the inbound read receipt before the scripted steps.
   await vi.advanceTimersByTimeAsync(0);
 
-  // A tool result begins the next assistant message and resets cumulative offsets.
   let assistantMessageIndex = 0;
   const startAssistantMessage = () => {
     assistantMessageIndex += 1;
@@ -249,19 +220,11 @@ async function setupMatrixTrace(recorder: WireRecorder) {
         }
         break;
       case "final":
-        await capturedDeliver?.(
-          {
-            ...(step.text !== undefined ? { text: step.text } : {}),
-            ...(step.mediaUrls ? { mediaUrls: step.mediaUrls } : {}),
-            ...(step.isError ? { isError: true } : {}),
-          },
-          { kind: "final" },
-        );
+        await capturedDeliver?.({ text: step.text }, { kind: "final" });
         releaseRun({ queuedFinal: true, counts: { final: 1, block: 0 } });
         await handlerDone;
         break;
       case "cancel":
-        // Settlement without a final triggers draft cleanup.
         releaseRun({ queuedFinal: false, counts: { final: 0, block: 0 } });
         await handlerDone;
         break;
@@ -293,6 +256,17 @@ function previewSteps(partial: string, complete: string): DeliveryTraceInStep[] 
     { kind: "advance", ms: 700 },
   ];
 }
+function singleGeneration(name: string, partial: string, final: string): DeliveryTraceScenario {
+  return {
+    name,
+    steps: [
+      { kind: "reply-start" },
+      ...previewSteps(partial, final),
+      { kind: "final", text: final },
+      { kind: "idle" },
+    ],
+  };
+}
 const MATRIX_TRACE_SCENARIOS: readonly DeliveryTraceScenario[] = [
   {
     name: "streaming-happy-multi-generation",
@@ -307,36 +281,17 @@ const MATRIX_TRACE_SCENARIOS: readonly DeliveryTraceScenario[] = [
       { kind: "idle" },
     ],
   },
-  {
-    name: "final-in-place",
-    steps: [
-      { kind: "reply-start" },
-      ...previewSteps(IN_PLACE_PARTIAL, IN_PLACE_FINAL),
-      { kind: "final", text: IN_PLACE_FINAL },
-      { kind: "idle" },
-    ],
-  },
-  // Mention-bearing finals must be sent fresh before redacting the inert preview.
-  {
-    name: "final-mentions-fresh",
-    steps: [
-      { kind: "reply-start" },
-      ...previewSteps(MENTION_PARTIAL, MENTION_FINAL),
-      { kind: "final", text: MENTION_FINAL },
-      { kind: "idle" },
-    ],
-  },
+  singleGeneration("final-in-place", IN_PLACE_PARTIAL, IN_PLACE_FINAL),
+  singleGeneration("final-mentions-fresh", MENTION_PARTIAL, MENTION_FINAL),
   deliveryTraceScenarios["cancel-mid-stream"],
 ];
 
-describe("matrix delivery trace goldens", () => {
-  for (const scenario of MATRIX_TRACE_SCENARIOS) {
-    it(`records ${scenario.name}`, async () => {
-      const events = await runDeliveryTraceScenario({ scenario, setup: setupMatrixTrace });
-      expectDeliveryTraceMatchesGolden({
-        goldenUrl: new URL(`./__traces__/${scenario.name}.trace.jsonl`, import.meta.url),
-        events,
-      });
+for (const scenario of MATRIX_TRACE_SCENARIOS) {
+  it(`records ${scenario.name}`, async () => {
+    const events = await runDeliveryTraceScenario({ scenario, setup: setupMatrixTrace });
+    expectDeliveryTraceMatchesGolden({
+      goldenUrl: new URL(`./__traces__/${scenario.name}.trace.jsonl`, import.meta.url),
+      events,
     });
-  }
-});
+  });
+}

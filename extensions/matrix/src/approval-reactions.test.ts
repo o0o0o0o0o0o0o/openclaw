@@ -40,13 +40,6 @@ function resolveTarget(params: Omit<ResolveTargetParams, "accountId"> & { accoun
   return resolveMatrixApprovalReactionTargetWithPersistenceRaw({ ...target, accountId });
 }
 
-async function unregisterTarget(
-  params: Omit<UnregisterTargetParams, "accountId"> & { accountId?: string },
-): Promise<void> {
-  const { accountId = "default", ...target } = params;
-  await unregisterMatrixApprovalReactionTargetRaw({ ...target, accountId });
-}
-
 function createRuntimeLogger(overrides: { warn?: ReturnType<typeof vi.fn> } = {}) {
   // Runtime state survives no-isolate workers, so expose every logger method later files may call.
   return { debug: vi.fn(), info: vi.fn(), warn: overrides.warn ?? vi.fn(), error: vi.fn() };
@@ -76,10 +69,10 @@ describe("matrix approval reactions", () => {
   });
 
   it("does not expose an approval reaction target to another Matrix account", async () => {
+    const shared = { roomId: "!shared:example.org", eventId: "$approval-msg" };
     await registerTarget({
       accountId: "account-a",
-      roomId: "!shared:example.org",
-      eventId: "$approval-msg",
+      ...shared,
       approvalId: "req-account-a",
       approvalKind: "exec",
       allowedDecisions: ["allow-once"],
@@ -88,16 +81,14 @@ describe("matrix approval reactions", () => {
     await expect(
       resolveTarget({
         accountId: "account-b",
-        roomId: "!shared:example.org",
-        eventId: "$approval-msg",
+        ...shared,
         reactionKey: "✅",
       }),
     ).resolves.toBeNull();
     await expect(
       resolveTarget({
         accountId: "account-a",
-        roomId: "!shared:example.org",
-        eventId: "$approval-msg",
+        ...shared,
         reactionKey: "✅",
       }),
     ).resolves.toEqual({
@@ -123,7 +114,7 @@ describe("matrix approval reactions", () => {
       ...approval,
       allowedDecisions: ["allow-once", "allow-always", "deny"],
     });
-    await unregisterTarget({ ...anchor });
+    await unregisterMatrixApprovalReactionTargetRaw({ ...anchor, accountId: "default" });
 
     expect(await resolveTarget({ ...anchor, reactionKey: "✅" })).toBeNull();
   });
@@ -133,14 +124,14 @@ describe("matrix approval reactions", () => {
     const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
     const warn = vi.fn();
     const register = vi.fn().mockResolvedValue(undefined);
+    const persistedAnchor = { roomId: "!ops:example.org", eventId: "$approval-msg-2" };
     const record = {
       version: 1,
       target: {
         accountId: "default",
         approvalId: "req-123",
         approvalKind,
-        roomId: "!ops:example.org",
-        eventId: "$approval-msg-2",
+        ...persistedAnchor,
         allowedDecisions: ["allow-once", "deny"],
       },
     };
@@ -158,14 +149,7 @@ describe("matrix approval reactions", () => {
       logging: { getChildLogger: () => createRuntimeLogger({ warn }) },
     } as never);
 
-    await registerTarget({
-      roomId: "!ops:example.org",
-      eventId: "$approval-msg-2",
-      approvalId: "req-123",
-      approvalKind,
-      allowedDecisions: ["allow-once", "deny"],
-      ttlMs: 1,
-    });
+    await registerTarget({ ...record.target, allowedDecisions: ["allow-once", "deny"], ttlMs: 1 });
 
     expect(register).toHaveBeenCalledTimes(1);
     expect(register).toHaveBeenCalledWith(
@@ -175,13 +159,11 @@ describe("matrix approval reactions", () => {
     );
 
     now.mockReturnValue(1_005);
-    await expect(
-      resolveTarget({
-        roomId: "!ops:example.org",
-        eventId: "$approval-msg-2",
-        reactionKey: "❌",
-      }),
-    ).resolves.toEqual({ approvalId: "req-123", approvalKind, decision: "deny" });
+    await expect(resolveTarget({ ...persistedAnchor, reactionKey: "❌" })).resolves.toEqual({
+      approvalId: "req-123",
+      approvalKind,
+      decision: "deny",
+    });
     expect(openKeyedStore).toHaveBeenCalledOnce();
     expect(lookup).toHaveBeenCalledWith('["default","!ops:example.org","$approval-msg-2"]');
 

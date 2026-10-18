@@ -1,4 +1,7 @@
-import { verifyChannelMessageAdapterCapabilityProofs } from "openclaw/plugin-sdk/channel-outbound";
+import {
+  verifyChannelMessageAdapterCapabilityProofs,
+  type ChannelMessageSendResult,
+} from "openclaw/plugin-sdk/channel-outbound";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../runtime-api.js";
 
@@ -15,13 +18,7 @@ vi.mock("./matrix/send.js", () => ({
 
 vi.mock("./runtime.js", () => ({
   getOptionalMatrixRuntime: () => undefined,
-  getMatrixRuntime: () => ({
-    channel: {
-      text: {
-        chunkMarkdownText: (text: string) => [text],
-      },
-    },
-  }),
+  getMatrixRuntime: () => ({ channel: { text: { chunkMarkdownText: (text: string) => [text] } } }),
 }));
 
 import { matrixPlugin } from "./channel.js";
@@ -37,14 +34,6 @@ const cfg = {
 } as OpenClawConfig;
 
 const sendContext = { cfg, to: "room:!room:example", accountId: "default" };
-function requireSenders() {
-  const send = matrixPlugin.message?.send;
-  if (!send?.text || !send.media) {
-    throw new Error("Expected Matrix text and media senders");
-  }
-  return { text: send.text, media: send.media };
-}
-
 function lastMatrixSendOptions() {
   const options = mocks.sendMessageMatrix.mock.lastCall?.[2];
   if (!options || typeof options !== "object") {
@@ -60,12 +49,29 @@ function expectSend(text: string, options: Record<string, unknown>) {
   expect(lastMatrixSendOptions()).toMatchObject(options);
 }
 
+function sendProof<T extends { text: string }>(
+  send: (input: NoInfer<T> & typeof sendContext) => Promise<ChannelMessageSendResult>,
+  input: T,
+  expectedReceipt: Record<string, unknown>,
+) {
+  return async () => {
+    mocks.sendMessageMatrix.mockClear();
+    const result = await send({ ...sendContext, ...input });
+    const { text, ...options } = input;
+    expectSend(text, { accountId: "default", ...options });
+    expect(result.receipt).toMatchObject(expectedReceipt);
+  };
+}
+
 describe("matrix channel message adapter", () => {
+  const adapter = matrixPlugin.message;
+  if (!adapter?.send?.text || !adapter.send.media) {
+    throw new Error("Expected Matrix text and media senders");
+  }
+  const { text: sendText, media: sendMedia } = adapter.send;
   beforeAll(async () => {
     mocks.sendMessageMatrix.mockResolvedValue({ messageId: "$warmup", roomId: "!room:example" });
-    const { text: sendText } = requireSenders();
-    await sendText({ cfg, to: "room:!room:example", text: "warmup", accountId: "default" });
-    mocks.sendMessageMatrix.mockReset();
+    await sendText({ ...sendContext, text: "warmup" });
   });
 
   it("keeps all owner-provided Matrix receipt parts across the message adapter boundary", async () => {
@@ -86,7 +92,6 @@ describe("matrix channel message adapter", () => {
       receipt,
       content: "image\noverflow",
     });
-    const { media: sendMedia } = requireSenders();
 
     const result = await sendMedia({
       ...sendContext,
@@ -118,75 +123,58 @@ describe("matrix channel message adapter", () => {
   });
 
   it.each([
-    {
-      name: "the current room with reply quoting disabled",
-      to: "room:!room:example",
-      replyToMode: "off" as const,
-      expectedThreadId: "$thread",
-    },
-    {
-      name: "an equivalent room target prefix",
-      to: "matrix:channel:!room:example",
-      replyToMode: "all" as const,
-      expectedThreadId: "$thread",
-    },
-    {
-      name: "a different room",
-      to: "room:!another:example",
-      replyToMode: "all" as const,
-      expectedThreadId: undefined,
-    },
-    {
-      name: "a direct user target without proven room identity",
-      to: "user:@alice:example",
-      replyToMode: "all" as const,
-      expectedThreadId: undefined,
-    },
-  ])("routes a native Matrix message action in $name", async (testCase) => {
-    const threading = matrixPlugin.threading;
-    const handleAction = matrixPlugin.actions?.handleAction;
-    if (!threading?.resolveAutoThreadId || !handleAction) {
-      throw new Error("Expected Matrix threaded message action adapters");
-    }
-    const toolContext = {
-      currentChannelProvider: "matrix" as const,
-      currentChannelId: "room:!room:example",
-      currentThreadTs: "$thread",
-      currentMessageId: "$reply",
-      replyToMode: testCase.replyToMode,
-      hasRepliedRef: { value: true },
-    };
-    const threadId = threading.resolveAutoThreadId({
-      cfg,
-      accountId: "default",
-      to: testCase.to,
-      toolContext,
-      replyToId: "$explicit-reply",
-    });
+    ["room:!room:example", "off", "$thread"],
+    ["matrix:channel:!room:example", "all", "$thread"],
+    ["room:!another:example", "all", undefined],
+    ["user:@alice:example", "all", undefined],
+  ] as const)(
+    "routes a native Matrix message action to %s (%s)",
+    async (to, replyToMode, expectedThreadId) => {
+      const threading = matrixPlugin.threading;
+      const handleAction = matrixPlugin.actions?.handleAction;
+      if (!threading?.resolveAutoThreadId || !handleAction) {
+        throw new Error("Expected Matrix threaded message action adapters");
+      }
+      const toolContext = {
+        currentChannelProvider: "matrix" as const,
+        currentChannelId: "room:!room:example",
+        currentThreadTs: "$thread",
+        currentMessageId: "$reply",
+        replyToMode,
+        hasRepliedRef: { value: true },
+      };
+      const threadId = threading.resolveAutoThreadId({
+        cfg,
+        accountId: "default",
+        to,
+        toolContext,
+        replyToId: "$explicit-reply",
+      });
 
-    await handleAction({
-      cfg,
-      channel: "matrix",
-      action: "send",
-      accountId: "default",
-      toolContext,
-      params: {
-        to: testCase.to,
-        message: "threaded native action",
-        replyTo: "$explicit-reply",
-        ...(threadId ? { threadId } : {}),
-      },
-    });
+      await handleAction({
+        cfg,
+        channel: "matrix",
+        action: "send",
+        accountId: "default",
+        toolContext,
+        params: {
+          to,
+          message: "threaded native action",
+          replyTo: "$explicit-reply",
+          ...(threadId ? { threadId } : {}),
+        },
+      });
 
-    expect(mocks.sendMessageMatrix).toHaveBeenCalledOnce();
-    expect(mocks.sendMessageMatrix.mock.lastCall?.[0]).toBe(testCase.to);
-    expect(lastMatrixSendOptions()).toMatchObject({
-      cfg,
-      accountId: "default",
-      replyToId: "$explicit-reply",
-      threadId: testCase.expectedThreadId,
-    });
-  });
+      expect(mocks.sendMessageMatrix).toHaveBeenCalledOnce();
+      expect(mocks.sendMessageMatrix.mock.lastCall?.[0]).toBe(to);
+      expect(lastMatrixSendOptions()).toMatchObject({
+        cfg,
+        accountId: "default",
+        replyToId: "$explicit-reply",
+        threadId: expectedThreadId,
+      });
+    },
+  );
 
   beforeEach(() => {
     mocks.sendMessageMatrix.mockReset();
@@ -194,60 +182,26 @@ describe("matrix channel message adapter", () => {
   });
 
   it("backs declared durable-final capabilities with runtime outbound proofs", async () => {
-    const adapter = matrixPlugin.message;
-    const { text: sendText, media: sendMedia } = requireSenders();
-    if (!adapter) {
-      throw new Error("Expected Matrix message adapter");
-    }
-
-    const proveText = async () => {
-      mocks.sendMessageMatrix.mockClear();
-      const result = await sendText({
-        ...sendContext,
-        text: "hello",
-        deliveryQueueId: "queue-1",
-        deliveryPartIndex: 2,
-        deliveryPartCount: 3,
-      });
-      expectSend("hello", {
-        accountId: "default",
-        deliveryQueueId: "queue-1",
-        deliveryPartIndex: 2,
-        deliveryPartCount: 3,
-      });
-      expect(result.receipt.platformMessageIds).toEqual(["$event-1"]);
-      expect(result.receipt.parts[0]?.kind).toBe("text");
-    };
-
-    const proveMedia = async () => {
-      mocks.sendMessageMatrix.mockClear();
-      const result = await sendMedia({
-        ...sendContext,
+    const proveText = sendProof(
+      sendText,
+      { text: "hello", deliveryQueueId: "queue-1", deliveryPartIndex: 2, deliveryPartCount: 3 },
+      { platformMessageIds: ["$event-1"], parts: [{ kind: "text" }] },
+    );
+    const proveMedia = sendProof(
+      sendMedia,
+      {
         text: "caption",
         mediaUrl: "file:///tmp/cat.png",
         mediaLocalRoots: ["/tmp/openclaw"],
         audioAsVoice: true,
-      });
-      expectSend("caption", {
-        mediaUrl: "file:///tmp/cat.png",
-        mediaLocalRoots: ["/tmp/openclaw"],
-        audioAsVoice: true,
-      });
-      expect(result.receipt.parts[0]?.kind).toBe("voice");
-    };
-
-    const proveReplyThread = async () => {
-      mocks.sendMessageMatrix.mockClear();
-      const result = await sendText({
-        ...sendContext,
-        text: "threaded",
-        replyToId: "$reply",
-        threadId: "$thread",
-      });
-      expectSend("threaded", { replyToId: "$reply", threadId: "$thread" });
-      expect(result.receipt.replyToId).toBe("$reply");
-      expect(result.receipt.threadId).toBe("$thread");
-    };
+      },
+      { parts: [{ kind: "voice" }] },
+    );
+    const proveReplyThread = sendProof(
+      sendText,
+      { text: "threaded", replyToId: "$reply", threadId: "$thread" },
+      { replyToId: "$reply", threadId: "$thread" },
+    );
 
     await verifyChannelMessageAdapterCapabilityProofs({
       adapterName: "matrixMessageAdapter",
@@ -257,12 +211,8 @@ describe("matrix channel message adapter", () => {
         media: proveMedia,
         replyTo: proveReplyThread,
         thread: proveReplyThread,
-        messageSendingHooks: () => {
-          expect(adapter.send?.text).toBeTypeOf("function");
-        },
-        afterCommit: () => {
-          expect(adapter.send?.lifecycle?.afterCommit).toBeTypeOf("function");
-        },
+        messageSendingHooks: () => void expect(adapter.send?.text).toBeTypeOf("function"),
+        afterCommit: () => void expect(adapter.send?.lifecycle?.afterCommit).toBeTypeOf("function"),
         reconcileUnknownSend: () => {
           expect(adapter.durableFinal?.reconcileUnknownSend).toBeTypeOf("function");
           expect(adapter.durableFinal?.afterUnknownSendTerminal).toBeTypeOf("function");
@@ -287,12 +237,10 @@ describe("matrix channel message adapter", () => {
     const presentation = {
       title: "Select thinking level",
       tone: "info" as const,
-      blocks: [
-        {
-          type: "buttons" as const,
-          buttons: [{ label: "Low", value: "/think low" }],
-        },
-      ],
+      blocks: [{ type: "buttons" as const, buttons: [{ label: "Low", value: "/think low" }] }],
+    };
+    const extraContent = {
+      "com.openclaw.presentation": { ...presentation, version: 1, type: "message.presentation" },
     };
     const rendered = await outbound.renderPresentation({
       payload: { text: "fallback", presentation },
@@ -303,26 +251,17 @@ describe("matrix channel message adapter", () => {
     expect(rendered?.text).toContain("fallback");
     expect(rendered?.text).toContain("Select thinking level");
 
-    const matrixChannelData = rendered?.channelData?.matrix as
-      | { extraContent?: Record<string, unknown> }
-      | undefined;
-    expect(matrixChannelData?.extraContent).toEqual({
-      "com.openclaw.presentation": { ...presentation, version: 1, type: "message.presentation" },
-    });
+    expect(rendered?.channelData?.matrix).toEqual(expect.objectContaining({ extraContent }));
 
     await outbound.sendPayload({
-      cfg,
-      to: "room:!room:example",
+      ...sendContext,
       text: rendered?.text ?? "",
       payload: rendered!,
-      accountId: "default",
       threadId: "$thread",
       replyToId: "$reply",
     });
 
     expectSend(rendered!.text!, { accountId: "default", threadId: "$thread", replyToId: "$reply" });
-    expect(lastMatrixSendOptions().extraContent).toEqual({
-      "com.openclaw.presentation": { ...presentation, version: 1, type: "message.presentation" },
-    });
+    expect(lastMatrixSendOptions().extraContent).toEqual(extraContent);
   });
 });

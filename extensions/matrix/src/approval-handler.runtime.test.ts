@@ -5,15 +5,13 @@ import {
   unregisterMatrixApprovalReactionTargetsForApproval,
 } from "./approval-reactions.js";
 
-type ResolveTargetParams = Parameters<
-  typeof resolveMatrixApprovalReactionTargetWithPersistenceRaw
->[0];
-
-function resolveMatrixApprovalReactionTargetWithPersistence(
-  params: Omit<ResolveTargetParams, "accountId"> & { accountId?: string },
-) {
-  const { accountId = "default", ...target } = params;
-  return resolveMatrixApprovalReactionTargetWithPersistenceRaw({ ...target, accountId });
+function resolveReaction(eventId: string) {
+  return resolveMatrixApprovalReactionTargetWithPersistenceRaw({
+    accountId: "default",
+    roomId: "!room:example.org",
+    eventId,
+    reactionKey: "✅",
+  });
 }
 
 type MatrixDeliverPendingParams = Parameters<
@@ -57,21 +55,7 @@ function singleMessageResult(messageId: string) {
   };
 }
 
-function buildMatrixApprovalRoomTarget(
-  roomId: string,
-): MatrixDeliverPendingParams["plannedTarget"] {
-  return {
-    surface: "approver-dm",
-    target: {
-      to: `room:${roomId}`,
-    },
-    reason: "preferred",
-  };
-}
-
-// Pending approvals expire in the future; the reaction target store TTLs its
-// memory layer from `view.expiresAtMs - now`, so epoch-past fixtures would
-// evict the mapping before assertions run.
+// Keep pending reaction anchors alive for the assertions.
 const TEST_APPROVAL_EXPIRES_AT_MS = Date.now() + 5 * 60_000;
 
 const allowOnceAction = (id: string) => ({
@@ -106,9 +90,7 @@ function buildExecApprovalView(
   };
 }
 
-function buildPluginApprovalView(
-  overrides: Partial<MatrixPendingPluginApprovalView> = {},
-): MatrixPendingPluginApprovalView {
+function buildPluginApprovalView(): MatrixPendingPluginApprovalView {
   return {
     approvalKind: "plugin",
     approvalId: "plugin:req-1",
@@ -122,7 +104,6 @@ function buildPluginApprovalView(
     severity: "critical",
     actions: [allowOnceAction("plugin:req-1")],
     expiresAtMs: TEST_APPROVAL_EXPIRES_AT_MS,
-    ...overrides,
   };
 }
 
@@ -160,7 +141,11 @@ async function deliverPending(
     context: { client: {} as never, deps },
     request: {} as never,
     approvalKind: view.approvalKind,
-    plannedTarget: buildMatrixApprovalRoomTarget("!room:example.org"),
+    plannedTarget: {
+      surface: "approver-dm",
+      target: { to: "room:!room:example.org" },
+      reason: "preferred",
+    },
     preparedTarget: { to: "room:!room:example.org", roomId: "!room:example.org" },
     view,
     pendingPayload,
@@ -225,13 +210,11 @@ describe("matrixApprovalNativeRuntime", () => {
   it("binds Matrix approval reactions before publishing option reactions", async () => {
     const sendSingleTextMessage = vi.fn().mockResolvedValue(singleMessageResult("$approval"));
     const reactMessage = vi.fn().mockImplementation(async () => {
-      expect(
-        await resolveMatrixApprovalReactionTargetWithPersistence({
-          roomId: "!room:example.org",
-          eventId: "$approval",
-          reactionKey: "✅",
-        }),
-      ).toEqual({ approvalId: "req-1", approvalKind: "exec", decision: "allow-once" });
+      expect(await resolveReaction("$approval")).toEqual({
+        approvalId: "req-1",
+        approvalKind: "exec",
+        decision: "allow-once",
+      });
     });
     const view = buildExecApprovalView();
     const pendingPayload = await buildPendingPayload(view);
@@ -302,10 +285,13 @@ describe("matrixApprovalNativeRuntime", () => {
     expect(mockCall(sendMessage)?.[2]).toEqual(
       expect.objectContaining({ accountId: "default", extraContent: pendingPayload.extraContent }),
     );
-    expect(mockCall(reactMessage)?.[0]).toBe("!room:example.org");
-    expect(mockCall(reactMessage)?.[1]).toBe("$primary");
+    expect(mockCall(reactMessage)).toEqual([
+      "!room:example.org",
+      "$primary",
+      expect.any(String),
+      expect.objectContaining({ accountId: "default" }),
+    ]);
     expect(typeof mockCall(reactMessage)?.[2]).toBe("string");
-    expect(mockCall(reactMessage)?.[3]).toEqual(expect.objectContaining({ accountId: "default" }));
     expect(entry).toEqual(
       expect.objectContaining({
         roomId: "!room:example.org",
@@ -331,20 +317,12 @@ describe("matrixApprovalNativeRuntime", () => {
       roomId: "!room:example.org",
       eventId: "$primary",
     });
-    expect(
-      await resolveMatrixApprovalReactionTargetWithPersistence({
-        roomId: "!room:example.org",
-        eventId: "$primary",
-        reactionKey: "✅",
-      }),
-    ).toEqual({ approvalId: "req-1", approvalKind: "exec", decision: "allow-once" });
-    expect(
-      await resolveMatrixApprovalReactionTargetWithPersistence({
-        roomId: "!room:example.org",
-        eventId: "$last",
-        reactionKey: "✅",
-      }),
-    ).toBeNull();
+    expect(await resolveReaction("$primary")).toEqual({
+      approvalId: "req-1",
+      approvalKind: "exec",
+      decision: "allow-once",
+    });
+    expect(await resolveReaction("$last")).toBeNull();
   });
 
   it("preserves the Denied system-agent heading after denial", async () => {
@@ -414,14 +392,7 @@ describe("matrixApprovalNativeRuntime", () => {
 
     expect(result).toEqual({
       kind: "update",
-      payload: [
-        "Exec approval: Allowed once",
-        "",
-        "Command",
-        "````",
-        "echo ```danger```",
-        "````",
-      ].join("\n"),
+      payload: "Exec approval: Allowed once\n\nCommand\n````\necho ```danger```\n````",
     });
   });
 });

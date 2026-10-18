@@ -29,28 +29,21 @@ function authorize(cfg: OpenClawConfig, senderId: string, approvalKind: "plugin"
 }
 
 describe("matrix approval capability", () => {
-  it("describes the correct Matrix exec-approval setup path", () => {
+  it.each([undefined, "work"])("describes the Matrix setup path for account %s", (accountId) => {
     const text = matrixApprovalCapability.describeExecApprovalSetup?.({
       channel: "matrix",
       channelLabel: "Matrix",
+      accountId,
     });
-
-    expect(text).toContain("`channels.matrix.execApprovals.approvers`");
-    expect(text).toContain("Approve it from the Web UI for now.");
-    expect(text).not.toMatch(/terminal UI|\bTUI\b/i);
-    expect(text).toContain("`channels.matrix.dm.allowFrom`");
-  });
-
-  it("describes the named-account Matrix exec-approval setup path", () => {
-    const text = matrixApprovalCapability.describeExecApprovalSetup?.({
-      channel: "matrix",
-      channelLabel: "Matrix",
-      accountId: "work",
-    });
-
-    expect(text).toContain("`channels.matrix.accounts.work.execApprovals.approvers`");
-    expect(text).toContain("`channels.matrix.accounts.work.dm.allowFrom`");
-    expect(text).not.toContain("`channels.matrix.execApprovals.approvers`");
+    const prefix = accountId ? "channels.matrix.accounts.work" : "channels.matrix";
+    expect(text).toContain("`" + prefix + ".execApprovals.approvers`");
+    expect(text).toContain("`" + prefix + ".dm.allowFrom`");
+    if (accountId) {
+      expect(text).not.toContain("`channels.matrix.execApprovals.approvers`");
+    } else {
+      expect(text).toContain("Approve it from the Web UI for now.");
+      expect(text).not.toMatch(/terminal UI|\bTUI\b/i);
+    }
   });
 
   it("resolves approver dm targets", async () => {

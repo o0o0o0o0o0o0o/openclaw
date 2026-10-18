@@ -12,6 +12,9 @@ import type { CoreConfig } from "./types.js";
 function config(matrix: NonNullable<CoreConfig["channels"]>["matrix"]): CoreConfig {
   return { channels: { matrix } };
 }
+function applyAccount(cfg: CoreConfig, accountId: string, input: MatrixSetupInput) {
+  return matrixPlugin.setupContract!.applyAccountConfig({ cfg, accountId, input }) as CoreConfig;
+}
 function warnings(cfg: CoreConfig, accountId = "default") {
   return matrixPlugin.security?.collectWarnings?.({
     cfg,
@@ -36,14 +39,6 @@ function requireMatrixDirectory() {
     throw new Error("expected Matrix directory listPeers/listGroups");
   }
   return { listPeers: directory.listPeers, listGroups: directory.listGroups };
-}
-
-function requireMatrixReplyToModeResolver() {
-  const resolveReplyToMode = matrixPlugin.threading?.resolveReplyToMode;
-  if (!resolveReplyToMode) {
-    throw new Error("expected Matrix replyToMode resolver");
-  }
-  return resolveReplyToMode;
 }
 
 function requireDirectoryEntry(
@@ -98,7 +93,7 @@ describe("matrix directory", () => {
       },
     });
 
-    const resolveReplyToMode = requireMatrixReplyToModeResolver();
+    const resolveReplyToMode = matrixPlugin.threading!.resolveReplyToMode!;
     expect(resolveReplyToMode({ cfg, accountId: "assistant", chatType: "direct" })).toBe("all");
     expect(resolveReplyToMode({ cfg, accountId: "default", chatType: "direct" })).toBe("off");
   });
@@ -199,34 +194,23 @@ describe("matrix directory", () => {
     ).toBe(true);
   });
 
-  it("reports room access warnings against the active Matrix config path", () => {
-    expect(warnings(config({ groupPolicy: "open" }), "default")).toEqual([
-      {
-        checkId: "channels.matrix.groups.open",
-        severity: "warn",
-        title: "Matrix security warning",
-        detail:
-          'Matrix rooms: groupPolicy="open" allows any room to trigger (mention-gated). Set channels.matrix.groupPolicy="allowlist" + channels.matrix.groups (and optionally channels.matrix.groupAllowFrom) to restrict rooms.',
-      },
-    ]);
-
-    expect(
-      warnings(
-        config({
-          defaultAccount: "assistant",
-          accounts: {
-            assistant: { groupPolicy: "open" },
+  it.each(["default", "assistant"])("reports room warnings against account %s", (accountId) => {
+    const cfg = config(
+      accountId === "default"
+        ? { groupPolicy: "open" }
+        : {
+            defaultAccount: "assistant",
+            accounts: { assistant: { groupPolicy: "open" } },
           },
-        }),
-        "assistant",
-      ),
-    ).toEqual([
+    );
+    const prefix =
+      accountId === "default" ? "channels.matrix" : "channels.matrix.accounts.assistant";
+    expect(warnings(cfg, accountId)).toEqual([
       {
         checkId: "channels.matrix.groups.open",
         severity: "warn",
         title: "Matrix security warning",
-        detail:
-          'Matrix rooms: groupPolicy="open" allows any room to trigger (mention-gated). Set channels.matrix.accounts.assistant.groupPolicy="allowlist" + channels.matrix.accounts.assistant.groups (and optionally channels.matrix.accounts.assistant.groupAllowFrom) to restrict rooms.',
+        detail: `Matrix rooms: groupPolicy="open" allows any room to trigger (mention-gated). Set ${prefix}.groupPolicy="allowlist" + ${prefix}.groups (and optionally ${prefix}.groupAllowFrom) to restrict rooms.`,
       },
     ]);
   });
@@ -250,38 +234,41 @@ describe("matrix directory", () => {
       },
     });
 
-    const updated = matrixPlugin.setupContract!.applyAccountConfig({
-      cfg,
-      accountId: "ops",
-      input: {
-        homeserver: "https://matrix.example.org",
-        userId: "@ops:example.org",
-        accessToken: "ops-token",
-      } as MatrixSetupInput,
-    }) as CoreConfig;
-
-    expect(updated.channels?.["matrix"]?.accessToken).toBeUndefined();
-    expect(updated.channels?.["matrix"]?.deviceId).toBeUndefined();
-    expect(updated.channels?.["matrix"]?.avatarUrl).toBeUndefined();
-    const defaultAccount = updated.channels?.["matrix"]?.accounts?.default;
-    expect(defaultAccount?.accessToken).toBe("default-token");
-    expect(defaultAccount?.homeserver).toBe("https://default.example.org");
-    expect(defaultAccount?.deviceId).toBe("DEFAULTDEVICE");
-    expect(defaultAccount?.avatarUrl).toBe("mxc://server/avatar");
-    expect(defaultAccount?.encryption).toBe(true);
-    expect(defaultAccount?.threadReplies).toBe("inbound");
-    expect(defaultAccount?.groups).toEqual({
-      "!room:example.org": { requireMention: true },
+    const updated = applyAccount(cfg, "ops", {
+      homeserver: "https://matrix.example.org",
+      userId: "@ops:example.org",
+      accessToken: "ops-token",
     });
+
+    const matrix = updated.channels?.matrix;
+    expect([matrix?.accessToken, matrix?.deviceId, matrix?.avatarUrl]).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    const defaultAccount = updated.channels?.["matrix"]?.accounts?.default;
+    expect(defaultAccount).toMatchObject({
+      accessToken: "default-token",
+      homeserver: "https://default.example.org",
+      deviceId: "DEFAULTDEVICE",
+      avatarUrl: "mxc://server/avatar",
+      encryption: true,
+      threadReplies: "inbound",
+    });
+    expect(defaultAccount?.groups).toEqual({ "!room:example.org": { requireMention: true } });
     const opsAccount = updated.channels?.["matrix"]?.accounts?.ops;
-    expect(opsAccount?.enabled).toBe(true);
-    expect(opsAccount?.homeserver).toBe("https://matrix.example.org");
-    expect(opsAccount?.userId).toBe("@ops:example.org");
-    expect(opsAccount?.accessToken).toBe("ops-token");
+    expect(opsAccount).toMatchObject({
+      enabled: true,
+      homeserver: "https://matrix.example.org",
+      userId: "@ops:example.org",
+      accessToken: "ops-token",
+    });
     const resolvedOps = resolveMatrixConfigForAccount(updated, "ops", {});
-    expect(resolvedOps.homeserver).toBe("https://matrix.example.org");
-    expect(resolvedOps.userId).toBe("@ops:example.org");
-    expect(resolvedOps.accessToken).toBe("ops-token");
+    expect(resolvedOps).toMatchObject({
+      homeserver: "https://matrix.example.org",
+      userId: "@ops:example.org",
+      accessToken: "ops-token",
+    });
     expect(resolvedOps.deviceId).toBeUndefined();
   });
 
@@ -291,21 +278,19 @@ describe("matrix directory", () => {
       accessToken: "legacy-token",
     });
 
-    const updated = matrixPlugin.setupContract!.applyAccountConfig({
-      cfg,
-      accountId: "default",
-      input: {
-        homeserver: "https://matrix.example.org",
-        userId: "@bot:example.org",
-        accessToken: "bot-token",
-      } as MatrixSetupInput,
-    }) as CoreConfig;
+    const updated = applyAccount(cfg, "default", {
+      homeserver: "https://matrix.example.org",
+      userId: "@bot:example.org",
+      accessToken: "bot-token",
+    });
 
     const matrixConfig = updated.channels?.["matrix"];
-    expect(matrixConfig?.enabled).toBe(true);
-    expect(matrixConfig?.homeserver).toBe("https://matrix.example.org");
-    expect(matrixConfig?.userId).toBe("@bot:example.org");
-    expect(matrixConfig?.accessToken).toBe("bot-token");
+    expect(matrixConfig).toMatchObject({
+      enabled: true,
+      homeserver: "https://matrix.example.org",
+      userId: "@bot:example.org",
+      accessToken: "bot-token",
+    });
     expect(updated.channels?.["matrix"]?.accounts).toBeUndefined();
   });
 
@@ -371,28 +356,26 @@ describe("matrix directory", () => {
           },
         });
 
-        const updated = matrixPlugin.setupContract!.applyAccountConfig({
-          cfg,
-          accountId: "ops",
-          input: { useEnv: true, name: "Ops" },
-        }) as CoreConfig;
+        const updated = applyAccount(cfg, "ops", { useEnv: true, name: "Ops" });
 
         const opsAccount = updated.channels?.["matrix"]?.accounts?.ops;
-        expect(opsAccount?.name).toBe("Ops");
-        expect(opsAccount?.enabled).toBe(true);
-        expect(opsAccount?.encryption).toBe(true);
-        expect(opsAccount?.homeserver).toBeUndefined();
-        expect(opsAccount?.proxy).toBeUndefined();
-        expect(opsAccount?.userId).toBeUndefined();
-        expect(opsAccount?.accessToken).toBeUndefined();
-        expect(opsAccount?.password).toBeUndefined();
-        expect(opsAccount?.deviceId).toBeUndefined();
-        expect(opsAccount?.deviceName).toBeUndefined();
+        expect(opsAccount).toMatchObject({ name: "Ops", enabled: true, encryption: true });
+        expect([
+          opsAccount?.homeserver,
+          opsAccount?.proxy,
+          opsAccount?.userId,
+          opsAccount?.accessToken,
+          opsAccount?.password,
+          opsAccount?.deviceId,
+          opsAccount?.deviceName,
+        ]).toEqual(Array(7).fill(undefined));
         const resolvedOps = resolveMatrixConfigForAccount(updated, "ops", process.env);
-        expect(resolvedOps.homeserver).toBe("https://ops.env.example.org");
-        expect(resolvedOps.accessToken).toBe("ops-env-token");
-        expect(resolvedOps.deviceId).toBe("OPSENVDEVICE");
-        expect(resolvedOps.deviceName).toBe("Ops Env Device");
+        expect(resolvedOps).toMatchObject({
+          homeserver: "https://ops.env.example.org",
+          accessToken: "ops-env-token",
+          deviceId: "OPSENVDEVICE",
+          deviceName: "Ops Env Device",
+        });
       },
     );
   });
@@ -407,15 +390,11 @@ describe("matrix directory", () => {
       },
     });
 
-    const updated = matrixPlugin.setupContract!.applyAccountConfig({
-      cfg,
-      accountId: "default",
-      input: {
-        homeserver: "https://matrix.example.org",
-        userId: "@bot:example.org",
-        password: "new-password", // pragma: allowlist secret
-      } as MatrixSetupInput,
-    }) as CoreConfig;
+    const updated = applyAccount(cfg, "default", {
+      homeserver: "https://matrix.example.org",
+      userId: "@bot:example.org",
+      password: "new-password", // pragma: allowlist secret
+    });
 
     expect(updated.channels?.["matrix"]?.accounts?.default?.password).toBe("new-password");
     expect(updated.channels?.["matrix"]?.accounts?.default?.accessToken).toBeUndefined();

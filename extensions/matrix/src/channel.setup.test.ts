@@ -32,19 +32,15 @@ describe("matrix setup post-write bootstrap", () => {
   } as const;
   const runtime: RuntimeEnv = { log, error, exit };
 
-  function applyAccountConfig(params: {
-    previousCfg: CoreConfig;
-    accountId: string;
-    input: Record<string, unknown>;
-  }) {
-    return {
-      ...params,
-      nextCfg: matrixSetupAdapter.applyAccountConfig({
-        cfg: params.previousCfg,
-        accountId: params.accountId,
-        input: params.input,
-      }) as CoreConfig,
-    };
+  type Setup = { previousCfg: CoreConfig; accountId: string; input: Record<string, unknown> };
+  function applyAccountConfig(params: Setup) {
+    const { previousCfg, accountId, input } = params;
+    const nextCfg = matrixSetupAdapter.applyAccountConfig({
+      cfg: previousCfg,
+      accountId,
+      input,
+    }) as CoreConfig;
+    return { ...params, nextCfg };
   }
 
   function applyDefaultAccountConfig(input: Record<string, unknown> = defaultPasswordInput) {
@@ -66,17 +62,9 @@ describe("matrix setup post-write bootstrap", () => {
     });
   }
 
-  async function runAfterAccountConfigWritten(params: {
-    previousCfg: CoreConfig;
-    nextCfg: CoreConfig;
-    accountId: string;
-  }) {
-    await runMatrixSetupBootstrapAfterConfigWrite({
-      previousCfg: params.previousCfg,
-      cfg: params.nextCfg,
-      accountId: params.accountId,
-      runtime,
-    });
+  async function runAfterAccountConfigWritten(params: ReturnType<typeof applyAccountConfig>) {
+    const { previousCfg, nextCfg: cfg, accountId } = params;
+    await runMatrixSetupBootstrapAfterConfigWrite({ previousCfg, cfg, accountId, runtime });
   }
 
   beforeEach(() => {

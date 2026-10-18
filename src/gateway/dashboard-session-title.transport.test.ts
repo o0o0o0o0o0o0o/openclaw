@@ -42,19 +42,13 @@ async function seedSession(cfg: TitleConfig, storePath: string, name: string) {
   return { scope, entry, sessionId: entry.sessionId, generate };
 }
 function agentModel(min_p: number) {
-  return {
-    models: {
-      [modelRef]: {
-        params: {
-          chatTemplateKwargs: { enable_thinking: true },
-          extraBody: { min_p },
-        },
-      },
-    },
-  };
+  const params = { chatTemplateKwargs: { enable_thinking: true }, extraBody: { min_p } };
+  return { models: { [modelRef]: { params } } };
 }
 const invoice = "Invoice follow-up";
 const literalThink = "Debug `<think>` parsing";
+const disabledThinking = { enable_thinking: false };
+const payloadTitle = "Utility payload verified";
 
 describe("generated titles over the real OpenAI-compatible transport", () => {
   it.each([
@@ -101,9 +95,7 @@ describe("generated titles over the real OpenAI-compatible transport", () => {
       expect(loadSessionEntry(scope)?.displayName).toBe(kind === "controls" ? undefined : title);
     });
   });
-  it("disables configured native Ollama thinking only for the utility request", async ({
-    signal,
-  }) => {
+  it("disables native Ollama thinking only for utility requests", async ({ signal }) => {
     await withTitleProvider(
       "Utility thinking disabled",
       async ({ cfg, agentDir, requests, env }) => {
@@ -116,12 +108,9 @@ describe("generated titles over the real OpenAI-compatible transport", () => {
             const root = lifetime.createTempDir("dashboard-title-native-");
             const bundled = path.join(root, "bundled");
             const pluginRoot = path.join(bundled, "ollama");
-            const isolatedUrl = resolveRuntimeWorkerUrl(dashboardTitleRuntimeEntrypoints.isolated);
-            const dashboardUrl = resolveRuntimeWorkerUrl(
-              dashboardTitleRuntimeEntrypoints.dashboard,
-            );
-            const configUrl = resolveRuntimeWorkerUrl(dashboardTitleRuntimeEntrypoints.config);
-            const ollamaUrl = resolveRuntimeWorkerUrl(dashboardTitleRuntimeEntrypoints.ollama);
+            const runtimeUrl = (key: keyof typeof dashboardTitleRuntimeEntrypoints) =>
+              resolveRuntimeWorkerUrl(dashboardTitleRuntimeEntrypoints[key]);
+            const isolatedUrl = runtimeUrl("isolated");
             await fs.mkdir(pluginRoot, { recursive: true });
             await fs.copyFile(
               new URL("../../extensions/ollama/openclaw.plugin.json", import.meta.url),
@@ -129,15 +118,15 @@ describe("generated titles over the real OpenAI-compatible transport", () => {
             );
             await fs.writeFile(
               path.join(pluginRoot, "index.mjs"),
-              `export { default } from ${JSON.stringify(ollamaUrl.href)};`,
+              `export { default } from ${JSON.stringify(runtimeUrl("ollama").href)};`,
             );
             // A fresh child keeps the real provider and callers in one compiled graph;
             // the normal request still budgets all preparation and execution at five seconds.
             const script = `
               import assert from "node:assert/strict";
               const { runIsolatedCompletion } = await import(${JSON.stringify(isolatedUrl.href)});
-              const { prepareDashboardSessionTitle } = await import(${JSON.stringify(dashboardUrl.href)});
-              const { setRuntimeConfigSnapshot, clearRuntimeConfigSnapshot } = await import(${JSON.stringify(configUrl.href)});
+              const { prepareDashboardSessionTitle } = await import(${JSON.stringify(runtimeUrl("dashboard").href)});
+              const { setRuntimeConfigSnapshot, clearRuntimeConfigSnapshot } = await import(${JSON.stringify(runtimeUrl("config").href)});
               const cfg = ${JSON.stringify(cfg)};
               setRuntimeConfigSnapshot(cfg);
               try {
@@ -233,15 +222,13 @@ describe("generated titles over the real OpenAI-compatible transport", () => {
     "preserves $name through registered utility completion transport",
     async ({ params, defaultParams, expectedTemplate }) => {
       await withTitleProvider(
-        "Utility payload verified",
+        payloadTitle,
         async ({ cfg, requests }) => {
           for (const definition of cfg.models!.providers![provider]!.models) {
             definition.reasoning = true;
             definition.maxTokens = 16_384;
           }
-          await expect(prepareTitle(cfg, "Compare the configured utility payload.")).resolves.toBe(
-            "Utility payload verified",
-          );
+          await expect(prepareTitle(cfg, "Compare utility payload.")).resolves.toBe(payloadTitle);
           expect(requests).toHaveLength(1);
           const body = requests[0]!.body;
           expect(body).toMatchObject({ model, stream: true, min_p: 0.2, enable_thinking: false });
@@ -263,7 +250,7 @@ describe("generated titles over the real OpenAI-compatible transport", () => {
         cfg.agents!.entries = {
           alpha: {
             ...agentModel(0.3),
-            params: { chat_template_kwargs: { enable_thinking: false } },
+            params: { chat_template_kwargs: disabledThinking },
           },
           beta: agentModel(0.7),
         };
@@ -272,18 +259,13 @@ describe("generated titles over the real OpenAI-compatible transport", () => {
             prepareTitle(cfg, "Compare agent-specific utility parameters.", agentId),
           ).resolves.toBe("Agent payload verified");
         }
-        expect(
-          requests.map(({ body }) => ({
-            template: body.chat_template_kwargs,
-            minP: body.min_p,
-          })),
-        ).toEqual([
-          { template: { enable_thinking: false }, minP: 0.3 },
-          { template: { enable_thinking: false }, minP: 0.7 },
-          { template: { enable_thinking: false }, minP: 0.3 },
+        expect(requests.map(({ body }) => [body.chat_template_kwargs, body.min_p])).toEqual([
+          [disabledThinking, 0.3],
+          [disabledThinking, 0.7],
+          [disabledThinking, 0.3],
         ]);
       },
-      { chat_template_kwargs: { enable_thinking: false }, extra_body: { min_p: 0.1 } },
+      { chat_template_kwargs: disabledThinking, extra_body: { min_p: 0.1 } },
     );
   });
 

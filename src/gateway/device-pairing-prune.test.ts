@@ -53,9 +53,7 @@ function createPruneContext(params?: {
     return params?.workerEnvironmentIds?.[deviceId] ?? [];
   });
   const workerPlacementDispatchService = {
-    reconcileActive: async (id: string) => {
-      order.push(`placement:${id}`);
-    },
+    reconcileActive: async (id: string) => void order.push(`placement:${id}`),
   } as NonNullable<PruneContext["workerPlacementDispatchService"]>;
   const invalidate = vi.fn<(id: string) => void>();
   const context = {
@@ -66,9 +64,7 @@ function createPruneContext(params?: {
     },
     hasConnectedClientsForDevice: (id: string) => connectedDeviceIds.includes(id),
     invalidateClientsForDevice: invalidate,
-    disconnectClientsForDevice: vi.fn((id: string) => {
-      order.push(`disconnect:${id}`);
-    }),
+    disconnectClientsForDevice: vi.fn((id: string) => void order.push(`disconnect:${id}`)),
     workerEnvironmentService,
     workerPlacementDispatchService,
     nodeRegistry: { updateSurface: vi.fn((_id: string) => null) },
@@ -77,23 +73,17 @@ function createPruneContext(params?: {
     order.push(`invalidate:${id}`);
     invalidateGatewayDeviceRevocation(context, id);
   });
-  return { context, order, connectedDeviceIds };
+  return Object.assign(context, { order, connectedDeviceIds });
 }
-async function pairSilentDevice(
-  baseDir: string,
-  deviceId: string,
-  roles = ["operator"],
-  clientId = "cli",
-  clientMode = "cli",
-  displayName?: string,
-) {
+async function pairSilentDevice(baseDir: string, deviceId: string, roles = ["operator"]) {
+  const node = roles[0] === "node";
   const request = await requestDevicePairing(
     {
       deviceId,
       publicKey: `pk-${deviceId}`,
-      clientId,
-      clientMode,
-      displayName,
+      clientId: node ? "node-host" : "cli",
+      clientMode: node ? "node" : "cli",
+      displayName: node ? "megaclaw" : undefined,
       role: roles[0],
       roles,
       scopes: [],
@@ -116,8 +106,6 @@ async function makeStateDir() {
   pairingStateDirs.push(baseDir);
   return baseDir;
 }
-const pairNode = (baseDir: string, deviceId: string) =>
-  pairSilentDevice(baseDir, deviceId, ["node"], "node-host", "node", "megaclaw");
 const registerApns = (baseDir: string, nodeId: string) =>
   registerApnsRegistration({
     nodeId,
@@ -128,14 +116,14 @@ const registerApns = (baseDir: string, nodeId: string) =>
     environment: "sandbox",
   });
 const prune = (
-  h: ReturnType<typeof createPruneContext>,
+  context: ReturnType<typeof createPruneContext>,
   baseDir: string,
   deviceId = "cli-anchor",
 ) =>
   pruneSupersededSilentPairingsAfterApproval({
     deviceId,
-    context: h.context,
-    connectedDeviceIds: h.connectedDeviceIds,
+    context,
+    connectedDeviceIds: context.connectedDeviceIds,
     baseDir,
     nowMs: Date.now() + 120_000,
   });
@@ -159,8 +147,7 @@ describe("pruneSupersededSilentPairingsAfterApproval", () => {
     for (const deviceId of ["cli-first", "cli-second", "cli-anchor"]) {
       await pairSilentDevice(baseDir, deviceId);
     }
-    const h = createPruneContext();
-    const { context } = h;
+    const context = createPruneContext();
     let connected = true;
     const request = captureGatewayDeviceRevocation(
       context,
@@ -185,7 +172,7 @@ describe("pruneSupersededSilentPairingsAfterApproval", () => {
         return [];
       },
     );
-    const pruning = prune(h, baseDir, "cli-anchor").catch((error: unknown) => error);
+    const pruning = prune(context, baseDir).catch((error: unknown) => error);
     try {
       try {
         await entered.promise;
@@ -207,13 +194,13 @@ describe("pruneSupersededSilentPairingsAfterApproval", () => {
 
   test("retires stale node siblings across both pairing stores", async () => {
     const baseDir = await makeStateDir();
-    await pairNode(baseDir, "node-stale");
+    await pairSilentDevice(baseDir, "node-stale", ["node"]);
     const nodeRequest = await requestNodePairing(
       { nodeId: "node-stale", displayName: "megaclaw" },
       baseDir,
     );
     await approveNodePairing(nodeRequest.request.requestId, { callerScopes: [] }, baseDir);
-    const anchor = await pairNode(baseDir, "node-anchor");
+    const anchor = await pairSilentDevice(baseDir, "node-anchor", ["node"]);
     await registerApns(baseDir, "node-stale");
     await runNodeWakeAttempt({
       nodeId: "node-stale",
@@ -241,11 +228,10 @@ describe("pruneSupersededSilentPairingsAfterApproval", () => {
     });
     const wakeLifecycle = captureNodeWakeLifecycle("node-stale");
 
-    const h = createPruneContext({
+    const context = createPruneContext({
       workerEnvironmentIds: { "node-stale": ["environment-node-stale"] },
     });
-    const { context } = h;
-    await expect(prune(h, baseDir, anchor.deviceId)).resolves.toMatchObject([
+    await expect(prune(context, baseDir, anchor.deviceId)).resolves.toMatchObject([
       { deviceId: "node-stale" },
     ]);
     await expect(listDevicePairing(baseDir)).resolves.toMatchObject({
@@ -257,7 +243,7 @@ describe("pruneSupersededSilentPairingsAfterApproval", () => {
     expect(drainNodePendingWork("node-stale", { includeDefaultStatus: false }).items).toEqual([]);
     expect(listPendingNodeActions({ nodeId: "node-stale", ttlMs: 60_000 })).toEqual([]);
     await expect(loadApnsRegistration("node-stale", baseDir)).resolves.toBeNull();
-    expect(h.order).toEqual([
+    expect(context.order).toEqual([
       "invalidate:node-stale",
       "worker:node-stale",
       "placement:environment-node-stale",
@@ -286,9 +272,8 @@ describe("pruneSupersededSilentPairingsAfterApproval", () => {
     await pairSilentDevice(baseDir, "cli-live");
     const anchor = await pairSilentDevice(baseDir, "cli-anchor");
 
-    const h = createPruneContext({ connectedDeviceIds: ["cli-live"] });
-    const { context } = h;
-    const pruned = await prune(h, baseDir, anchor.deviceId);
+    const context = createPruneContext({ connectedDeviceIds: ["cli-live"] });
+    const pruned = await prune(context, baseDir, anchor.deviceId);
 
     expect(pruned.map((entry) => entry.deviceId)).toEqual(["cli-stale"]);
     const devices = await listDevicePairing(baseDir);

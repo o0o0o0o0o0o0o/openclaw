@@ -1,4 +1,3 @@
-// Covers manifest contract eligibility decisions.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import "../test-utils/prepare-compiled-subprocesses.js";
 import { normalizePluginsConfig } from "./config-state.js";
@@ -71,6 +70,11 @@ describe("bundled manifest contract availability", () => {
     index,
     plugins: [plugin],
   } as never;
+  const available = (
+    params: Partial<Parameters<typeof isManifestPluginAvailableForControlPlane>[0]>,
+  ) => isManifestPluginAvailableForControlPlane({ snapshot, plugin, ...params });
+  const values = (config: Parameters<typeof listAvailableManifestContractValues>[0]["config"]) =>
+    listAvailableManifestContractValues({ snapshot, contract: "imageGenerationProviders", config });
 
   beforeEach(() => {
     clearPluginMetadataLifecycleCaches();
@@ -80,27 +84,13 @@ describe("bundled manifest contract availability", () => {
 
   it("does not expose a plugin outside a restrictive allowlist", () => {
     const config = { plugins: { allow: ["another-plugin"] } };
-    expect(
-      isManifestPluginAvailableForControlPlane({
-        snapshot,
-        plugin,
-        config,
-        allowBundledProviderCompat: true,
-      }),
-    ).toBe(false);
-    expect(
-      listAvailableManifestContractValues({
-        snapshot,
-        contract: "imageGenerationProviders",
-        config,
-      }),
-    ).toEqual([]);
+    expect(available({ config, allowBundledProviderCompat: true })).toBe(false);
+    expect(values(config)).toEqual([]);
   });
 
   it("preserves explicitly configured custom channel ids distinct from their plugin owner", () => {
     expect(
-      isManifestPluginAvailableForControlPlane({
-        snapshot,
+      available({
         plugin: { ...plugin, id: "custom-owner", channels: ["private-channel"] },
         config: {
           plugins: { allow: ["another-plugin"] },
@@ -113,8 +103,7 @@ describe("bundled manifest contract availability", () => {
 
   it("does not let disabled channel configuration bypass a restrictive allowlist", () => {
     expect(
-      isManifestPluginAvailableForControlPlane({
-        snapshot,
+      available({
         plugin: { ...plugin, id: "discord-owner", channels: ["discord"] },
         config: {
           plugins: { allow: ["another-plugin"] },
@@ -128,8 +117,7 @@ describe("bundled manifest contract availability", () => {
     "does not let channel configuration override explicit plugin prohibition",
     (plugins) => {
       expect(
-        isManifestPluginAvailableForControlPlane({
-          snapshot,
+        available({
           plugin: { ...plugin, id: "discord-owner", channels: ["discord"] },
           config: {
             plugins: { allow: ["another-plugin"], ...plugins },
@@ -143,21 +131,8 @@ describe("bundled manifest contract availability", () => {
   it("preserves globally disabled bundled metadata for the named speech compatibility path", () => {
     const config = { plugins: { enabled: false } };
     const normalizedConfig = normalizePluginsConfig(config.plugins);
-    expect(
-      isManifestPluginAvailableForControlPlane({
-        snapshot,
-        plugin,
-        config,
-        normalizedConfig,
-      }),
-    ).toBe(true);
-    expect(
-      listAvailableManifestContractValues({
-        snapshot,
-        config,
-        contract: "imageGenerationProviders",
-      }),
-    ).toEqual(["google"]);
+    expect(available({ config, normalizedConfig })).toBe(true);
+    expect(values(config)).toEqual(["google"]);
     expect(normalizedConfig.enabled).toBe(false);
   });
 
@@ -165,9 +140,7 @@ describe("bundled manifest contract availability", () => {
     mocks.readBundledDiscoveryMode.mockReturnValue("compat");
 
     expect(
-      isManifestPluginAvailableForControlPlane({
-        snapshot,
-        plugin,
+      available({
         config: { plugins: { allow: ["another-plugin"] } },
         allowBundledProviderCompat: true,
       }),
@@ -180,9 +153,7 @@ describe("bundled manifest contract availability", () => {
       mocks.readBundledDiscoveryMode.mockReturnValue("compat");
 
       expect(
-        isManifestPluginAvailableForControlPlane({
-          snapshot,
-          plugin,
+        available({
           config: { plugins },
           allowBundledProviderCompat: true,
         }),
@@ -232,42 +203,29 @@ describe("prepared installed-plugin eligibility", () => {
     clearPluginMetadataLifecycleCaches();
     mocks.readBundledDiscoveryMode.mockReturnValue("allowlist");
     const index = makePluginMetadataIndex();
+    const records = (id: string, overrides: Partial<(typeof index.plugins)[number]> = {}) =>
+      makePluginMetadataIndex(id).plugins.map((record) => Object.assign({}, record, overrides));
     index.plugins = [
-      ...makePluginMetadataIndex("provider").plugins.map((record) =>
-        Object.assign({}, record, {
-          origin: "bundled" as const,
-          enabledByDefault: true,
-          contributions: {
-            channels: [],
-            channelConfigs: [],
-            providers: ["provider"],
-            modelCatalogProviders: [],
-            modelSupportPrefixes: [],
-            modelSupportPatterns: [],
-            autoEnableProviderIds: [],
-            commandAliases: [],
-            contracts: {},
-          },
-        }),
-      ),
-      ...makePluginMetadataIndex("global").plugins,
-      ...makePluginMetadataIndex("workspace").plugins.map((record) =>
-        Object.assign({}, record, {
-          origin: "workspace" as const,
-        }),
-      ),
-      ...makePluginMetadataIndex("disabled").plugins.map((record) =>
-        Object.assign({}, record, {
-          enabled: false,
-        }),
-      ),
-      ...makePluginMetadataIndex("duplicate").plugins.map((record) =>
-        Object.assign({}, record, {
-          origin: "workspace" as const,
-          enabled: false,
-        }),
-      ),
-      ...makePluginMetadataIndex("duplicate").plugins,
+      ...records("provider", {
+        origin: "bundled" as const,
+        enabledByDefault: true,
+        contributions: {
+          channels: [],
+          channelConfigs: [],
+          providers: ["provider"],
+          modelCatalogProviders: [],
+          modelSupportPrefixes: [],
+          modelSupportPatterns: [],
+          autoEnableProviderIds: [],
+          commandAliases: [],
+          contracts: {},
+        },
+      }),
+      ...records("global"),
+      ...records("workspace", { origin: "workspace" }),
+      ...records("disabled", { enabled: false }),
+      ...records("duplicate", { origin: "workspace", enabled: false }),
+      ...records("duplicate"),
     ];
     const plugins = index.plugins.slice(0, 5).map((record) => ({
       id: record.pluginId,
@@ -327,11 +285,9 @@ describe("loadManifestContractSnapshot", () => {
     };
     mocks.resolvePluginMetadataSnapshot.mockReturnValue(snapshot);
 
-    expect(loadManifestContractSnapshot({ config: {}, workspaceDir: "/workspace", env })).toEqual({
-      index: snapshot.index,
-      plugins: snapshot.plugins,
-      byPluginId: snapshot.byPluginId,
-    });
+    expect(loadManifestContractSnapshot({ config: {}, workspaceDir: "/workspace", env })).toEqual(
+      snapshot,
+    );
 
     expect(mocks.resolvePluginMetadataSnapshot).toHaveBeenCalledWith({
       config: {},
@@ -352,11 +308,7 @@ describe("loadManifestContractSnapshot", () => {
     };
     mocks.loadPluginMetadataSnapshot.mockReturnValue(snapshot);
 
-    expect(loadManifestContractSnapshot({ env })).toEqual({
-      index: snapshot.index,
-      plugins: snapshot.plugins,
-      byPluginId: snapshot.byPluginId,
-    });
+    expect(loadManifestContractSnapshot({ env })).toEqual(snapshot);
 
     expect(mocks.resolvePluginMetadataSnapshot).toHaveBeenCalledWith({
       config: undefined,

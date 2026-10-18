@@ -33,7 +33,7 @@ vi.mock("../config/config.js", () => ({
 }));
 
 vi.mock("./install-persistence.js", () => ({
-  persistPluginInstall: (params: unknown) => mocks.persistInstall(params),
+  persistPluginInstall: mocks.persistInstall,
 }));
 
 vi.mock("./install-config-mutation.js", async (importOriginal) => ({
@@ -46,7 +46,7 @@ vi.mock("./install-config-mutation.js", async (importOriginal) => ({
 }));
 
 vi.mock("./clawhub.js", () => ({
-  installPluginFromClawHub: (params: unknown) => mocks.clawhubInstall(params),
+  installPluginFromClawHub: mocks.clawhubInstall,
 }));
 
 vi.mock("./installed-plugin-index-records.js", async (importOriginal) => ({
@@ -56,18 +56,17 @@ vi.mock("./installed-plugin-index-records.js", async (importOriginal) => ({
 
 vi.mock("./plugin-metadata-snapshot.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./plugin-metadata-snapshot.js")>()),
-  loadPluginMetadataSnapshot: (...args: unknown[]) => mocks.metadata(...args),
-  resolvePluginMetadataSnapshot: (...args: unknown[]) => mocks.metadata(...args),
+  loadPluginMetadataSnapshot: mocks.metadata,
+  resolvePluginMetadataSnapshot: mocks.metadata,
 }));
 
 vi.mock("./official-external-plugin-catalog.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./official-external-plugin-catalog.js")>()),
-  loadConfiguredHostedOfficialExternalPluginCatalogEntries: (...args: unknown[]) =>
-    mocks.officialCatalog(...args),
+  loadConfiguredHostedOfficialExternalPluginCatalogEntries: mocks.officialCatalog,
 }));
 
 vi.mock("./registry-refresh.js", () => ({
-  refreshPluginRegistryAfterConfigMutation: (...args: unknown[]) => mocks.refreshRegistry(...args),
+  refreshPluginRegistryAfterConfigMutation: mocks.refreshRegistry,
 }));
 
 vi.mock("./slot-selection.js", () => ({
@@ -93,13 +92,7 @@ const emptyArtifactAcknowledgment = {
 
 function mockClawHubWorkboardInstall() {
   mocks.clawhubInstall.mockImplementation(
-    async (params: {
-      onBeforePluginArtifactCommit?: (request: {
-        pluginId: string;
-        stagedArtifactDir: string;
-        mode: "install";
-      }) => Promise<void>;
-    }) => {
+    async (params: Parameters<typeof import("./clawhub.js").installPluginFromClawHub>[0]) => {
       const artifactDir = makeTrackedTempDir("managed-registry-consent", trackedArtifactDirs);
       createColdPluginFixture({
         rootDir: artifactDir,
@@ -292,18 +285,12 @@ describe("plugin management registry refresh", () => {
     });
 
     expect(result.ok).toBe(true);
-    expect(mocks.persistInstall).toHaveBeenCalledWith(
-      expect.objectContaining({
-        install: expect.objectContaining({
-          installPath: artifactDir,
-          acceptedSurfaceHash: emptyArtifactAcknowledgment.reviewToken,
-        }),
-        snapshot: expect.objectContaining({
-          config: expect.objectContaining({
-            plugins: expect.objectContaining({ load: { paths: [artifactDir] } }),
-          }),
-        }),
-      }),
-    );
+    expect(mocks.persistInstall.mock.calls[0]?.[0]).toMatchObject({
+      install: {
+        installPath: artifactDir,
+        acceptedSurfaceHash: emptyArtifactAcknowledgment.reviewToken,
+      },
+      snapshot: { config: { plugins: { load: { paths: [artifactDir] } } } },
+    });
   });
 });

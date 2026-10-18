@@ -1,4 +1,3 @@
-// Verifies plugin manifest metadata scanning stays runtime-lazy.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -47,12 +46,18 @@ function writeJson(filePath: string, value: unknown): void {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
 }
 
-function createGlobalPluginFixture(pluginName: string) {
+function createGlobalPluginFixture(pluginName: string, contents?: unknown) {
   const root = createTempRoot();
   const home = path.join(root, "home");
   const pluginDir = path.join(home, ".openclaw", "extensions", pluginName);
   const manifestPath = path.join(pluginDir, "openclaw.plugin.json");
   fs.mkdirSync(pluginDir, { recursive: true });
+  if (contents !== undefined) {
+    fs.writeFileSync(
+      manifestPath,
+      typeof contents === "string" ? contents : JSON.stringify(contents),
+    );
+  }
   return {
     pluginDir,
     manifestPath,
@@ -61,6 +66,10 @@ function createGlobalPluginFixture(pluginName: string) {
       OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(root, "empty-bundled"),
     },
   };
+}
+
+function scanPlugin(env: NodeJS.ProcessEnv, id: string) {
+  return listOpenClawPluginManifestMetadata(env).find((record) => record.manifest.id === id);
 }
 
 function warningMessagesForPath(manifestPath: string): string[] {
@@ -185,30 +194,18 @@ describe("listOpenClawPluginManifestMetadata", () => {
     const statSpy = vi.spyOn(fs, "statSync");
     const readdirSpy = vi.spyOn(fs, "readdirSync");
 
-    expect(
-      listOpenClawPluginManifestMetadata(env).find(
-        (record) => record.manifest.id === "lifecycle-catalog",
-      )?.manifest.generation,
-    ).toBe("first");
+    expect(scanPlugin(env, "lifecycle-catalog")?.manifest.generation).toBe("first");
     const firstStatCalls = statSpy.mock.calls.length;
     const firstReaddirCalls = readdirSpy.mock.calls.length;
     expect(firstReaddirCalls).toBeGreaterThan(0);
 
     writeManifest("second");
-    expect(
-      listOpenClawPluginManifestMetadata(env).find(
-        (record) => record.manifest.id === "lifecycle-catalog",
-      )?.manifest.generation,
-    ).toBe("first");
+    expect(scanPlugin(env, "lifecycle-catalog")?.manifest.generation).toBe("first");
     expect(statSpy).toHaveBeenCalledTimes(firstStatCalls);
     expect(readdirSpy).toHaveBeenCalledTimes(firstReaddirCalls);
 
     clearPluginMetadataLifecycleCaches();
-    expect(
-      listOpenClawPluginManifestMetadata(env).find(
-        (record) => record.manifest.id === "lifecycle-catalog",
-      )?.manifest.generation,
-    ).toBe("second");
+    expect(scanPlugin(env, "lifecycle-catalog")?.manifest.generation).toBe("second");
     expect(statSpy.mock.calls.length).toBeGreaterThan(firstStatCalls);
     expect(readdirSpy.mock.calls.length).toBeGreaterThan(firstReaddirCalls);
   });
@@ -295,30 +292,17 @@ describe("listOpenClawPluginManifestMetadata", () => {
   });
 
   it("skips oversized plugin manifests to prevent OOM during metadata scan", () => {
-    const root = createTempRoot();
-    const home = path.join(root, "home");
-
-    const goodPluginDir = path.join(home, ".openclaw", "extensions", "good-plugin");
+    const {
+      pluginDir: oversizedDir,
+      manifestPath: oversizedPath,
+      env,
+    } = createGlobalPluginFixture("big-plugin", { id: "big-plugin", pad: "x".repeat(256 * 1024) });
+    const goodPluginDir = path.join(path.dirname(oversizedDir), "good-plugin");
     writeJson(path.join(goodPluginDir, "openclaw.plugin.json"), { id: "good-plugin" });
-
-    const oversizedDir = path.join(home, ".openclaw", "extensions", "big-plugin");
-    const oversizedPath = path.join(oversizedDir, "openclaw.plugin.json");
-    fs.mkdirSync(oversizedDir, { recursive: true });
-    fs.writeFileSync(
-      oversizedPath,
-      JSON.stringify({ id: "big-plugin", pad: "x".repeat(256 * 1024) }),
-      "utf8",
-    );
     expect(fs.statSync(oversizedPath).size).toBeGreaterThan(256 * 1024);
-
-    const env = {
-      OPENCLAW_HOME: home,
-      OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(root, "empty-bundled"),
-    };
     const records = listOpenClawPluginManifestMetadata(env);
     const cachedRecords = listOpenClawPluginManifestMetadata(env);
 
-    // "good-plugin" is present; "big-plugin" is skipped due to oversized manifest.
     expect(records.find((record) => record.manifest.id === "good-plugin")).toBeTruthy();
     expect(records.find((record) => record.manifest.id === "big-plugin")).toBeUndefined();
     expect(cachedRecords).toEqual(records);
@@ -339,8 +323,7 @@ describe("listOpenClawPluginManifestMetadata", () => {
       error: "plugin manifest must be an object",
     },
   ])("skips $name and warns once across cache hits", ({ contents, error }) => {
-    const { pluginDir, manifestPath, env } = createGlobalPluginFixture("invalid-plugin");
-    fs.writeFileSync(manifestPath, contents, "utf8");
+    const { pluginDir, manifestPath, env } = createGlobalPluginFixture("invalid-plugin", contents);
 
     const canonicalResult = loadPluginManifest(pluginDir, false);
     assert(!canonicalResult.ok);
@@ -369,9 +352,8 @@ describe("listOpenClawPluginManifestMetadata", () => {
   });
 
   it("accepts JSON5 manifests without warning when strict JSON parsing fails", () => {
-    const { pluginDir, manifestPath, env } = createGlobalPluginFixture("json5-plugin");
     const contents = "{ id: 'json5-plugin', }";
-    fs.writeFileSync(manifestPath, contents, "utf8");
+    const { pluginDir, manifestPath, env } = createGlobalPluginFixture("json5-plugin", contents);
     expect(() => JSON.parse(contents)).toThrow();
 
     const records = listOpenClawPluginManifestMetadata(env);
@@ -385,26 +367,16 @@ describe("listOpenClawPluginManifestMetadata", () => {
   });
 
   it("accepts plugin manifests at the exact byte limit", () => {
-    const root = createTempRoot();
-    const home = path.join(root, "home");
-
-    const exactDir = path.join(home, ".openclaw", "extensions", "exact-plugin");
-    fs.mkdirSync(exactDir, { recursive: true });
-
-    // Write a compact JSON manifest padded to exactly the byte limit.
-    const exactPath = path.join(exactDir, "openclaw.plugin.json");
     const exactManifest = { id: "exact-plugin", pad: "" };
     const compactJson = JSON.stringify(exactManifest);
     const requiredPadding = 256 * 1024 - Buffer.byteLength(compactJson, "utf8");
     exactManifest.pad = "x".repeat(requiredPadding);
-    fs.writeFileSync(exactPath, JSON.stringify(exactManifest), "utf8");
+    const { manifestPath: exactPath, env } = createGlobalPluginFixture(
+      "exact-plugin",
+      exactManifest,
+    );
     expect(Buffer.byteLength(fs.readFileSync(exactPath), "utf8")).toBe(256 * 1024);
 
-    const records = listOpenClawPluginManifestMetadata({
-      OPENCLAW_HOME: home,
-      OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(root, "empty-bundled"),
-    });
-
-    expect(records.find((record) => record.manifest.id === "exact-plugin")).toBeTruthy();
+    expect(scanPlugin(env, "exact-plugin")).toBeTruthy();
   });
 });

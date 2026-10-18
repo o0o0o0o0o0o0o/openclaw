@@ -1,4 +1,3 @@
-// Session target tests cover persisted channel targets for sessions.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { withTempHome } from "openclaw/plugin-sdk/test-env";
@@ -382,11 +381,7 @@ describe("resolveSessionStoreTargets", () => {
   });
 
   it("rejects unknown agent ids", () => {
-    const cfg: OpenClawConfig = {
-      agents: {
-        entries: { main: {}, work: {} },
-      },
-    };
+    const cfg: OpenClawConfig = { agents: { entries: { main: {}, work: {} } } };
 
     expect(() => resolveSessionStoreTargets(cfg, { agent: "ghost" })).toThrow(/Unknown agent id/);
   });

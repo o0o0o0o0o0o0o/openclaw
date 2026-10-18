@@ -1,4 +1,3 @@
-// Session store pruning tests cover pruning decisions and retention ordering.
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -23,6 +22,8 @@ import {
 import type { SessionEntry } from "./types.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const MiB = 1024 * 1024;
+const disabledBudget = { maxDiskBytes: null, highWaterBytes: null };
 
 function makeEntry(updatedAt: number): SessionEntry {
   return { sessionId: crypto.randomUUID(), updatedAt };
@@ -30,14 +31,6 @@ function makeEntry(updatedAt: number): SessionEntry {
 
 function makeStore(entries: Array<[string, SessionEntry]>): Record<string, SessionEntry> {
   return Object.fromEntries(entries);
-}
-
-function resolveSessionEntryMaintenanceHighWater(maxEntries: number): number {
-  let entryCount = 0;
-  while (!shouldRunSessionEntryMaintenance({ entryCount, maxEntries })) {
-    entryCount += 1;
-  }
-  return entryCount;
 }
 
 function createMaintenanceArtifacts() {
@@ -76,57 +69,31 @@ describe("pruneStaleEntries", () => {
   });
 });
 
-describe("resolveQuotaSuspensionEntryMaintenance", () => {
-  function suspension(
-    suspendedAt: number,
-    expectedResumeBy: number,
-    state: "suspended" | "active",
-    reason: "quota_exhausted" | "circuit_open",
-  ) {
-    return {
-      schemaVersion: 1 as const,
-      suspendedAt,
-      expectedResumeBy,
-      state,
-      reason,
-      failedProvider: "anthropic",
-      failedModel: "claude-opus-4-6",
-    };
-  }
-  it("returns an entry-scoped patch when a suspended session should resume", () => {
-    const now = Date.now();
-    const quotaSuspension = suspension(now - 30_000, now - 1, "suspended", "quota_exhausted");
-    const expected = { ...quotaSuspension, state: "resuming" };
-    const result = resolveQuotaSuspensionEntryMaintenance({
+it.each([
+  ["suspended", "quota_exhausted", 30_000, 1, false],
+  ["active", "circuit_open", 61_000, 31_000, true],
+] as const)("transitions a %s quota suspension (%s)", (state, reason, age, resumeAge, cleared) => {
+  const now = Date.now();
+  const quotaSuspension = {
+    schemaVersion: 1 as const,
+    suspendedAt: now - age,
+    expectedResumeBy: now - resumeAge,
+    state,
+    reason,
+    failedProvider: "anthropic",
+    failedModel: "claude-opus-4-6",
+  };
+  const expected = {
+    patch: { quotaSuspension: cleared ? undefined : { ...quotaSuspension, state: "resuming" } },
+    cleared,
+  };
+  expect(
+    resolveQuotaSuspensionEntryMaintenance({
       entry: { ...makeEntry(now), quotaSuspension },
       now,
       ttlMs: 30_000,
-    });
-
-    expect(result).toEqual({
-      patch: {
-        quotaSuspension: expected,
-      },
-      cleared: false,
-    });
-  });
-
-  it("returns an entry-scoped cleanup patch after the resume window expires", () => {
-    const now = Date.now();
-    const result = resolveQuotaSuspensionEntryMaintenance({
-      entry: {
-        ...makeEntry(now),
-        quotaSuspension: suspension(now - 61_000, now - 31_000, "active", "circuit_open"),
-      },
-      now,
-      ttlMs: 30_000,
-    });
-
-    expect(result).toEqual({
-      patch: { quotaSuspension: undefined },
-      cleared: true,
-    });
-  });
+    }),
+  ).toEqual(expected);
 });
 
 describe("applyFileBackedSessionStoreMaintenance", () => {
@@ -140,11 +107,15 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
     highWaterBytes: null,
   };
 
-  function maintain(store: Record<string, SessionEntry>, storePath: string, maxEntries = 1) {
+  function maintain(
+    store: Record<string, SessionEntry>,
+    storePath: string,
+    overrides: Partial<typeof baseMaintenance> = { maxEntries: 1 },
+  ) {
     return applyFileBackedSessionStoreMaintenance({
       store,
       storePath,
-      maintenanceConfig: { ...baseMaintenance, maxEntries },
+      maintenanceConfig: { ...baseMaintenance, ...overrides },
       log: { warn: () => {}, info: () => {} },
       artifacts: createMaintenanceArtifacts(),
     });
@@ -196,17 +167,10 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
         store[`agent:main:explicit:real-${i}`] = makeEntry(now - 3 * DAY_MS);
       }
 
-      await applyFileBackedSessionStoreMaintenance({
-        storePath: "/tmp/openclaw-sessions/sessions.json",
-        store,
-        maintenanceConfig: {
-          ...baseMaintenance,
-          pruneAfterMs: 7 * DAY_MS,
-          maxEntries: 50,
-          modelRunPruneAfterMs,
-        },
-        log: { warn: () => {}, info: () => {} },
-        artifacts: createMaintenanceArtifacts(),
+      await maintain(store, "/tmp/openclaw-sessions/sessions.json", {
+        pruneAfterMs: 7 * DAY_MS,
+        maxEntries: 50,
+        modelRunPruneAfterMs,
       });
 
       expect(
@@ -292,35 +256,27 @@ describe("applyFileBackedSessionStoreMaintenance", () => {
   });
 });
 
-describe("pruneStaleModelRunEntries", () => {
-  it("removes only stale generated gateway model-run sessions", () => {
-    const now = Date.now();
-    const staleModelRun = "agent:main:explicit:model-run-123e4567-e89b-12d3-a456-426614174000";
-    const recentModelRun = "agent:main:explicit:model-run-123e4567-e89b-12d3-a456-426614174001";
-    const store = makeStore([
-      [staleModelRun, makeEntry(now - 25 * 60 * 60 * 1000)],
-      [recentModelRun, makeEntry(now)],
-      ["agent:main:explicit:model-run-not-a-uuid", makeEntry(now - 10 * DAY_MS)],
-      [
-        "agent:main:explicit:model-runner-123e4567-e89b-12d3-a456-426614174002",
-        makeEntry(now - 10 * DAY_MS),
-      ],
-      ["agent:main:telegram:group:-100123:topic:77", makeEntry(now - 10 * DAY_MS)],
-      ["agent:main:cron:job:run:123", makeEntry(now - 10 * DAY_MS)],
-    ]);
-
-    const pruned = pruneStaleModelRunEntries(store, DAY_MS);
-
-    expect(pruned).toBe(1);
-    expect(store[staleModelRun]).toBeUndefined();
-    expect(store).toHaveProperty(recentModelRun);
-    expect(store).toHaveProperty("agent:main:explicit:model-run-not-a-uuid");
-    expect(store).toHaveProperty(
-      "agent:main:explicit:model-runner-123e4567-e89b-12d3-a456-426614174002",
-    );
-    expect(store).toHaveProperty("agent:main:telegram:group:-100123:topic:77");
-    expect(store).toHaveProperty("agent:main:cron:job:run:123");
-  });
+it("removes only stale generated gateway model-run sessions", () => {
+  const now = Date.now();
+  const staleModelRun = "agent:main:explicit:model-run-123e4567-e89b-12d3-a456-426614174000";
+  const recentModelRun = "agent:main:explicit:model-run-123e4567-e89b-12d3-a456-426614174001";
+  const retained = [
+    recentModelRun,
+    "agent:main:explicit:model-run-not-a-uuid",
+    "agent:main:explicit:model-runner-123e4567-e89b-12d3-a456-426614174002",
+    "agent:main:telegram:group:-100123:topic:77",
+    "agent:main:cron:job:run:123",
+  ];
+  const store = makeStore([
+    [staleModelRun, makeEntry(now - 25 * 60 * 60 * 1000)],
+    ...retained.map((key, index): [string, SessionEntry] => [
+      key,
+      makeEntry(index === 0 ? now : now - 10 * DAY_MS),
+    ]),
+  ]);
+  expect(pruneStaleModelRunEntries(store, DAY_MS)).toBe(1);
+  expect(store[staleModelRun]).toBeUndefined();
+  expect(new Set(Object.keys(store))).toEqual(new Set(retained));
 });
 
 describe("capEntryCount", () => {
@@ -331,7 +287,6 @@ describe("capEntryCount", () => {
       ["newest", makeEntry(now)],
       [syntheticKey, makeEntry(now - 1)],
     ]);
-
     expect(capEntryCount(store, 1, { nowMs: now })).toBe(1);
     expect(store[syntheticKey]).toBeUndefined();
     expect(store).toHaveProperty("newest");
@@ -349,9 +304,7 @@ describe("capEntryCount", () => {
       ["agent:main:slack:channel:C2:thread:2", makeEntry(now - 2 * DAY_MS)],
       ["agent:main:slack:channel:C3:thread:3", makeEntry(now - DAY_MS)],
     ]);
-
     expect(capEntryCount(store, 2)).toBe(0);
-
     expect(store).toHaveProperty(mainKey);
     expect(Object.keys(store)).toHaveLength(4);
   });
@@ -381,25 +334,14 @@ it("protects the global primary session", () => {
 });
 
 describe("resolveMaintenanceConfigFromInput", () => {
-  it("honors explicit archive retention and disk budget opt-outs", () => {
-    const maintenance = resolveMaintenanceConfigFromInput({
-      resetArchiveRetention: "7d",
-      maxDiskBytes: false,
-    });
-
-    expect(maintenance).toMatchObject({
-      resetArchiveRetentionMs: 7 * DAY_MS,
-      maxDiskBytes: null,
-      highWaterBytes: null,
-    });
-  });
-
-  it("disables the disk budget when an explicit maxDiskBytes fails to parse", () => {
-    const maintenance = resolveMaintenanceConfigFromInput({ maxDiskBytes: "lots" });
-
-    expect(maintenance.maxDiskBytes).toBeNull();
-    expect(maintenance.highWaterBytes).toBeNull();
-  });
+  it.each([false, "lots"] as const)(
+    "disables the disk budget for %s and preserves archive retention",
+    (maxDiskBytes) => {
+      expect(
+        resolveMaintenanceConfigFromInput({ resetArchiveRetention: "7d", maxDiskBytes }),
+      ).toMatchObject({ ...disabledBudget, resetArchiveRetentionMs: 7 * DAY_MS });
+    },
+  );
 
   it("retains session history when a zero maxDiskBytes disables the budget", async () => {
     await withTestDir({ prefix: "openclaw-zero-disk-budget-" }, async (dir) => {
@@ -423,40 +365,29 @@ describe("resolveMaintenanceConfigFromInput", () => {
         warnOnly: false,
       });
 
-      expect(maintenance.maxDiskBytes).toBeNull();
-      expect(maintenance.highWaterBytes).toBeNull();
+      expect(maintenance).toMatchObject(disabledBudget);
       expect(result).toBeNull();
       await fs.access(transcriptPath);
     });
   });
 
-  it("uses the default high-water mark when highWaterBytes is zero", () => {
-    const maintenance = resolveMaintenanceConfigFromInput({
-      maxDiskBytes: "500mb",
-      highWaterBytes: 0,
-    });
-    expect(maintenance.maxDiskBytes).toBe(500 * 1024 * 1024);
-    expect(maintenance.highWaterBytes).toBe(Math.floor(500 * 1024 * 1024 * 0.8));
-  });
-
-  it("keeps an explicit positive highWaterBytes", () => {
-    const maintenance = resolveMaintenanceConfigFromInput({
-      maxDiskBytes: "500mb",
-      highWaterBytes: "300mb",
-    });
-
-    expect(maintenance.highWaterBytes).toBe(300 * 1024 * 1024);
+  it.each([
+    [0, 400],
+    ["300mb", 300],
+  ] as const)("resolves highWaterBytes %s to %s MiB", (highWaterBytes, expectedMiB) => {
+    expect(
+      resolveMaintenanceConfigFromInput({ maxDiskBytes: "500mb", highWaterBytes }),
+    ).toMatchObject({ maxDiskBytes: 500 * MiB, highWaterBytes: expectedMiB * MiB });
   });
 
   it("force-gates the unset model-run prune default to the cap-eviction threshold", () => {
-    const defaultMaintenance = resolveMaintenanceConfigFromInput({ maxEntries: 50 });
-    expect(resolveSessionEntryMaintenanceHighWater(50)).toBe(75);
-    expect(shouldRunModelRunPrune({ maintenance: defaultMaintenance, entryCount: 60 })).toBe(false);
-    expect(
-      shouldRunModelRunPrune({ maintenance: defaultMaintenance, entryCount: 60, force: true }),
-    ).toBe(true);
-    expect(
-      shouldRunModelRunPrune({ maintenance: defaultMaintenance, entryCount: 50, force: true }),
-    ).toBe(false);
+    const maintenance = resolveMaintenanceConfigFromInput({ maxEntries: 50 });
+    expect(shouldRunSessionEntryMaintenance({ entryCount: 74, maxEntries: 50 })).toBe(false);
+    expect(shouldRunSessionEntryMaintenance({ entryCount: 75, maxEntries: 50 })).toBe(true);
+    expect([
+      shouldRunModelRunPrune({ maintenance, entryCount: 60 }),
+      shouldRunModelRunPrune({ maintenance, entryCount: 60, force: true }),
+      shouldRunModelRunPrune({ maintenance, entryCount: 50, force: true }),
+    ]).toEqual([false, true, false]);
   });
 });

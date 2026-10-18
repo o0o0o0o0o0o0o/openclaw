@@ -1,4 +1,3 @@
-// Session store discovery covers configured, retired, and recovery targets.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { withTempHome } from "openclaw/plugin-sdk/test-env";
@@ -37,7 +36,10 @@ async function writeSession(storePath: string, sessionId: string, agentId?: stri
 }
 
 describe("resolveAgentSessionStoreTargetsSync", () => {
-  it("resolves one requested agent store from the direct path", async () => {
+  it.each([
+    ["candidate", resolveAgentSessionStoreTargetsSync],
+    ["existing", resolveExistingAgentSessionStoreTargetsSync],
+  ] as const)("resolves a configured %s store without broad discovery", async (_kind, resolve) => {
     await withTempHome(async (home) => {
       const customRoot = path.join(home, "custom-state");
       const storePaths = await createAgentSessionStores(customRoot, ["main", "codex"]);
@@ -47,7 +49,7 @@ describe("resolveAgentSessionStoreTargetsSync", () => {
       };
       const enumerateAgentDirs = vi.spyOn(sessionDirs, "resolveAgentSessionDirsFromAgentsDirSync");
       try {
-        expect(resolveAgentSessionStoreTargetsSync(cfg, "codex", { env: process.env })).toEqual([
+        expect(resolve(cfg, "codex", { env: process.env })).toEqual([
           { agentId: "codex", storePath: storePaths.codex },
         ]);
         expect(enumerateAgentDirs).not.toHaveBeenCalled();
@@ -71,26 +73,6 @@ describe("resolveAgentSessionStoreTargetsSync", () => {
 });
 
 describe("resolveExistingAgentSessionStoreTargetsSync", () => {
-  it("resolves configured stores without broad directory discovery", async () => {
-    await withTempHome(async (home) => {
-      const customRoot = path.join(home, "custom-state");
-      const storePaths = await createAgentSessionStores(customRoot, ["main", "codex"]);
-      const cfg: OpenClawConfig = {
-        ...createCustomRootCfg(customRoot, "main"),
-        agents: { entries: { main: {}, codex: {} } },
-      };
-      const enumerateAgentDirs = vi.spyOn(sessionDirs, "resolveAgentSessionDirsFromAgentsDirSync");
-      try {
-        expect(
-          resolveExistingAgentSessionStoreTargetsSync(cfg, "codex", { env: process.env }),
-        ).toEqual([{ agentId: "codex", storePath: storePaths.codex }]);
-        expect(enumerateAgentDirs).not.toHaveBeenCalled();
-      } finally {
-        enumerateAgentDirs.mockRestore();
-      }
-    });
-  });
-
   it("requires agent-specific rows instead of fixed-store file existence", async () => {
     await withTempHome(async (home) => {
       const storePath = path.join(home, "shared", "sessions.json");
@@ -208,12 +190,10 @@ describe("resolveAllAgentSessionStoreTargetsSync", () => {
         "Retired Agent",
       ]);
 
-      expect(
-        targets.some(
-          (target) =>
-            target.agentId === "retired-agent" && target.storePath === storePaths["Retired Agent"],
-        ),
-      ).toBe(true);
+      expect(targets).toContainEqual({
+        agentId: "retired-agent",
+        storePath: storePaths["Retired Agent"],
+      });
       expectTargetsToContainStores(targets, { ops: storePaths.ops });
       expect(countMatching(targets, (target) => target.storePath === storePaths.ops)).toBe(1);
       const scoped = resolveAllAgentSessionStoreTargetsSync(
@@ -241,14 +221,12 @@ describe("resolveAllAgentSessionStoreTargetsSync", () => {
 
       const targets = resolveAllAgentSessionStoreTargetsSync(cfg, { env });
 
-      expect(
-        targets.some((target) => target.agentId === "main" && target.storePath === mainStorePath),
-      ).toBe(true);
-      expect(
-        targets.some(
-          (target) => target.agentId === "retired" && target.storePath === retiredStorePath,
-        ),
-      ).toBe(true);
+      expect(targets).toEqual(
+        expect.arrayContaining([
+          { agentId: "main", storePath: mainStorePath },
+          { agentId: "retired", storePath: retiredStorePath },
+        ]),
+      );
     });
   });
 
@@ -264,11 +242,7 @@ describe("resolveAllAgentSessionStoreTargetsSync", () => {
       const env = { ...process.env, OPENCLAW_STATE_DIR: envStateDir };
 
       const targets = resolveAllAgentSessionStoreTargetsSync(cfg, { env });
-      expect(
-        targets.some(
-          (target) => target.agentId === "retired" && target.storePath === storePaths.retired,
-        ),
-      ).toBe(true);
+      expect(targets).toContainEqual({ agentId: "retired", storePath: storePaths.retired });
     });
   });
 
@@ -355,48 +329,27 @@ describe("resolveAllAgentSessionStoreCandidateTargetsSync", () => {
     });
   });
 
-  it("skips candidate session directories that escape through symlinks", async () => {
-    await withTempHome(async (home) => {
-      if (process.platform === "win32") {
-        return;
-      }
-      const stateDir = path.join(home, ".openclaw");
-      const agentDir = path.join(stateDir, "agents", "retired");
-      const outsideSessionsDir = path.join(home, "outside-sessions");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.mkdir(outsideSessionsDir, { recursive: true });
-      await fs.symlink(outsideSessionsDir, path.join(agentDir, "sessions"));
-      const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
-
-      expect(
-        resolveAllAgentSessionStoreCandidateTargetsSync(EXPLICIT_MAIN_CONFIG, { env }),
-      ).not.toContainEqual({
-        agentId: "retired",
-        storePath: path.join(agentDir, "sessions", "sessions.json"),
+  it.each([false, true])(
+    "rejects escaping candidate session directories (configured: %s)",
+    async (configured) => {
+      await withTempHome(async (home) => {
+        if (process.platform === "win32") {
+          return;
+        }
+        const stateDir = path.join(home, configured ? "custom-state" : ".openclaw");
+        const agentId = configured ? "ops" : "retired";
+        const agentDir = path.join(stateDir, "agents", agentId);
+        const outside = path.join(home, "outside-sessions");
+        await fs.mkdir(agentDir, { recursive: true });
+        await fs.mkdir(outside, { recursive: true });
+        await fs.symlink(outside, path.join(agentDir, "sessions"));
+        const cfg = configured ? createCustomRootCfg(stateDir) : EXPLICIT_MAIN_CONFIG;
+        const env = configured ? process.env : { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+        expect(resolveAllAgentSessionStoreCandidateTargetsSync(cfg, { env })).not.toContainEqual({
+          agentId,
+          storePath: path.join(agentDir, "sessions", "sessions.json"),
+        });
       });
-    });
-  });
-
-  it("skips configured agent session directories that escape through symlinks", async () => {
-    await withTempHome(async (home) => {
-      if (process.platform === "win32") {
-        return;
-      }
-      const customRoot = path.join(home, "custom-state");
-      const agentDir = path.join(customRoot, "agents", "ops");
-      const outsideSessionsDir = path.join(home, "outside-configured-sessions");
-      await fs.mkdir(agentDir, { recursive: true });
-      await fs.mkdir(outsideSessionsDir, { recursive: true });
-      await fs.symlink(outsideSessionsDir, path.join(agentDir, "sessions"));
-
-      expect(
-        resolveAllAgentSessionStoreCandidateTargetsSync(createCustomRootCfg(customRoot), {
-          env: process.env,
-        }),
-      ).not.toContainEqual({
-        agentId: "ops",
-        storePath: path.join(agentDir, "sessions", "sessions.json"),
-      });
-    });
-  });
+    },
+  );
 });

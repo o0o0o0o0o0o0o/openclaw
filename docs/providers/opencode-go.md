@@ -12,6 +12,8 @@ key does not automatically include Go entitlement. Go keeps its own runtime
 provider id (`opencode-go`) so upstream per-model routing stays correct.
 OpenCode Go is bundled in the OpenClaw package, so onboarding
 and configuration are sufficient; no separate plugin install is required.
+OpenClaw uses OpenCode's `https://opencode.ai/inference/go/...` endpoints and
+rewrites legacy `/zen/go` base URLs to the corresponding current route.
 
 | Property         | Value                                              |
 | ---------------- | -------------------------------------------------- |
@@ -83,7 +85,7 @@ cached only when OpenCode Zen or Go is configured or explicitly selected with
 OpenCode credentials; it is never fetched at startup or while using unrelated
 providers.
 
-Example refs include `opencode-go/deepseek-v4-flash`, `opencode-go/kimi-k3`, and
+Example refs include `opencode-go/deepseek-v4.1-flash`, `opencode-go/kimi-k3`, and
 `opencode-go/qwen3.8-max`. Use the CLI for the current lineup rather than treating
 these examples as an inventory. OpenClaw excludes deprecated rows from active
 discovery and applies refreshed lifecycle status to its offline fallback.

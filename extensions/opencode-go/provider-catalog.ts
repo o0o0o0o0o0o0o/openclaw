@@ -15,9 +15,10 @@ import { isOpencodeGoKimiNoReasoningModelId } from "./provider-policy-api.js";
 
 const PROVIDER_ID = "opencode-go";
 
-const OPENCODE_GO_OPENAI_BASE_URL = "https://opencode.ai/zen/go/v1";
-const OPENCODE_GO_ANTHROPIC_BASE_URL = "https://opencode.ai/zen/go";
-const OPENCODE_GO_MODELS_ENDPOINT = "https://opencode.ai/zen/go/v1/models";
+const OPENCODE_GO_OPENAI_BASE_URL = "https://opencode.ai/inference/go/openai/v1";
+const OPENCODE_GO_ANTHROPIC_BASE_URL = "https://opencode.ai/inference/go/anthropic";
+const OPENCODE_GO_GOOGLE_BASE_URL = "https://opencode.ai/inference/go/google/v1beta";
+const OPENCODE_GO_MODELS_ENDPOINT = "https://opencode.ai/inference/go/v1/models";
 const OPENCODE_UPSTREAM_CATALOG_ENDPOINT = "https://models.opencode.ai/api.json";
 const OPENCODE_GO_MODELS_TIMEOUT_MS = 5_000;
 const OPENCODE_GO_MODELS_CACHE_TTL_MS = 60_000;
@@ -136,16 +137,23 @@ export function normalizeOpencodeGoBaseUrl(params: {
   if (!normalized) {
     return undefined;
   }
-  if (normalized === OPENCODE_GO_OPENAI_BASE_URL) {
-    return OPENCODE_GO_OPENAI_BASE_URL;
+  if (
+    normalized === OPENCODE_GO_OPENAI_BASE_URL ||
+    normalized === OPENCODE_GO_ANTHROPIC_BASE_URL ||
+    normalized === OPENCODE_GO_GOOGLE_BASE_URL
+  ) {
+    return normalized;
   }
-  if (normalized === OPENCODE_GO_ANTHROPIC_BASE_URL) {
+  if (normalized === `${OPENCODE_GO_ANTHROPIC_BASE_URL}/v1`) {
     return OPENCODE_GO_ANTHROPIC_BASE_URL;
   }
-  if (normalized === "https://opencode.ai/go") {
-    return OPENCODE_GO_ANTHROPIC_BASE_URL;
-  }
-  if (normalized === "https://opencode.ai/go/v1") {
+  // Preserve existing user configs and persisted model routes.
+  if (
+    normalized === "https://opencode.ai/zen/go" ||
+    normalized === "https://opencode.ai/zen/go/v1" ||
+    normalized === "https://opencode.ai/go" ||
+    normalized === "https://opencode.ai/go/v1"
+  ) {
     return params.api === "anthropic-messages"
       ? OPENCODE_GO_ANTHROPIC_BASE_URL
       : OPENCODE_GO_OPENAI_BASE_URL;

@@ -24,7 +24,14 @@ const providerEndpointPlugins = vi.hoisted(() => [
       },
       {
         endpointClass: "opencode-go-native",
-        baseUrls: ["https://opencode.ai/zen/go", "https://opencode.ai/zen/go/v1"],
+        baseUrls: [
+          "https://opencode.ai/inference/go/openai/v1",
+          "https://opencode.ai/inference/go/anthropic",
+          "https://opencode.ai/inference/go/anthropic/v1",
+          "https://opencode.ai/inference/go/google/v1beta",
+          "https://opencode.ai/zen/go",
+          "https://opencode.ai/zen/go/v1",
+        ],
       },
       { endpointClass: "openrouter", hostSuffixes: ["openrouter.ai"] },
       { endpointClass: "vercel-ai-gateway", hosts: ["ai-gateway.vercel.sh"] },
@@ -254,6 +261,24 @@ describe("provider attribution", () => {
   });
 
   it.each([
+    [
+      "opencode-go",
+      "https://opencode.ai/inference/go/openai/v1",
+      "opencode-go-native",
+      "https://opencode.ai/zen/v1",
+    ],
+    [
+      "opencode-go",
+      "https://opencode.ai/inference/go/anthropic",
+      "opencode-go-native",
+      "https://opencode.ai/zen/v1",
+    ],
+    [
+      "opencode-go",
+      "https://opencode.ai/inference/go/google/v1beta",
+      "opencode-go-native",
+      "https://opencode.ai/zen/v1",
+    ],
     [
       "opencode-go",
       "https://opencode.ai/zen/go/v1",

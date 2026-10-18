@@ -23,7 +23,7 @@ const model: Model = {
   provider: "opencode-go",
   id: "deepseek-v4-flash",
   name: "Synthetic Go model",
-  baseUrl: "https://opencode.ai/zen/go/v1",
+  baseUrl: "https://opencode.ai/inference/go/openai/v1",
   reasoning: true,
   input: ["text"],
   contextWindow: 262_144,

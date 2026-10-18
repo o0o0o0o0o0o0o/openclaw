@@ -302,7 +302,7 @@ describe("Anthropic provider", () => {
     "sends the OpenCode session header with %s cache retention",
     async (cacheRetention) => {
       streamAnthropic(
-        makeAnthropicModel({ baseUrl: "https://opencode.ai/zen/go" }),
+        makeAnthropicModel({ baseUrl: "https://opencode.ai/inference/go/anthropic" }),
         conversation(user("hello", 1)),
         { apiKey: "sk-ant-provider", sessionId: "session-123", cacheRetention },
       );

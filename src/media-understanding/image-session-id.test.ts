@@ -23,7 +23,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const OPENCODE_GO_IMAGE = {
   provider: "opencode-go",
   model: "gemini-3-flash",
-  baseUrl: "https://opencode.ai/zen/go/v1",
+  baseUrl: "https://opencode.ai/inference/go/openai/v1",
 };
 
 function stubProviderStream(text = "vision ok") {

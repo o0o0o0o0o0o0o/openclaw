@@ -4,6 +4,7 @@ import type { ProviderWrapStreamFnContext } from "openclaw/plugin-sdk/plugin-ent
 import { registerSingleProviderPlugin } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { NON_ENV_SECRETREF_MARKER } from "openclaw/plugin-sdk/provider-auth-runtime";
 import { clearLiveCatalogCacheForTests } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
+import { resolveProviderRequestPolicy } from "openclaw/plugin-sdk/provider-http";
 import { buildOpenAICompletionsParams } from "openclaw/plugin-sdk/provider-transport-runtime";
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +13,7 @@ import manifest from "./openclaw.plugin.json" with { type: "json" };
 import {
   buildOpencodeGoLiveProviderConfig,
   buildStaticOpencodeGoProviderConfig,
+  normalizeOpencodeGoBaseUrl,
   resolveOpencodeGoStarterModel,
 } from "./provider-catalog.js";
 import opencodeGoProviderDiscovery from "./provider-discovery.js";
@@ -66,8 +68,8 @@ async function captureGoWirePayload({
     api: standalone ? "openclaw-provider-simple:synthetic" : sourceApi,
     baseUrl:
       sourceApi === "anthropic-messages"
-        ? "https://opencode.ai/zen/go"
-        : "https://opencode.ai/zen/go/v1",
+        ? "https://opencode.ai/inference/go/anthropic"
+        : "https://opencode.ai/inference/go/openai/v1",
     reasoning: true,
     input: ["text"],
     contextWindow: 200_000,
@@ -104,7 +106,7 @@ function createCatalogFetchGuard(params: {
           ? {
               "opencode-go": {
                 id: "opencode-go",
-                api: "https://opencode.ai/zen/go/v1",
+                api: "https://opencode.ai/inference/go/openai/v1",
                 npm: "@ai-sdk/openai-compatible",
                 models: params.upstreamModels,
               },
@@ -127,7 +129,56 @@ describe("opencode-go provider plugin", () => {
     clearLiveCatalogCacheForTests();
   });
 
-  it.each(["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k3"] as const)(
+  it.each([
+    ["openai-completions", "https://opencode.ai/inference/go/openai/v1"],
+    ["anthropic-messages", "https://opencode.ai/inference/go/anthropic"],
+    ["google-generative-ai", "https://opencode.ai/inference/go/google/v1beta"],
+  ])(
+    "identifies %s inference requests and attaches their conversation id",
+    async (api, baseUrl) => {
+      const provider = await registerSingleProviderPlugin(plugin);
+      const policy = resolveProviderRequestPolicy({ provider: "opencode-go", api, baseUrl });
+      expect(policy.endpointClass).toBe("opencode-go-native");
+      expect(policy.attributionHeaders?.["User-Agent"]).toMatch(/^openclaw\//);
+      expect(normalizeOpencodeGoBaseUrl({ api, baseUrl })).toBe(baseUrl);
+      expect(
+        provider.resolveTransportTurnState?.({
+          provider: "opencode-go",
+          modelId: "route-fixture",
+          model: { provider: "opencode-go", id: "route-fixture", api, baseUrl },
+          sessionId: "conversation-123",
+          turnId: "turn-1",
+          attempt: 1,
+          transport: "stream",
+        } as never),
+      ).toEqual({ headers: { "x-opencode-session": "conversation-123" } });
+    },
+  );
+
+  it.each([
+    "https://opencode.ai/zen/go",
+    "https://opencode.ai/zen/go/v1",
+    "https://opencode.ai/go",
+    "https://opencode.ai/go/v1",
+  ])("normalizes persisted %s URLs by transport", (baseUrl) => {
+    expect(normalizeOpencodeGoBaseUrl({ api: "anthropic-messages", baseUrl })).toBe(
+      "https://opencode.ai/inference/go/anthropic",
+    );
+    expect(normalizeOpencodeGoBaseUrl({ api: "openai-completions", baseUrl })).toBe(
+      "https://opencode.ai/inference/go/openai/v1",
+    );
+  });
+
+  it("normalizes the upstream Anthropic v1 base", () => {
+    expect(
+      normalizeOpencodeGoBaseUrl({
+        api: "anthropic-messages",
+        baseUrl: "https://opencode.ai/inference/go/anthropic/v1",
+      }),
+    ).toBe("https://opencode.ai/inference/go/anthropic");
+  });
+
+  it.each(["deepseek-v4-pro", "deepseek-v4.1-flash", "kimi-k3"] as const)(
     "keeps %s thinking per invocation on one standalone completion wrapper",
     async (modelId) => {
       const provider = await registerSingleProviderPlugin(plugin);
@@ -199,14 +250,14 @@ describe("opencode-go provider plugin", () => {
         provider: "opencode-go",
       });
     }
-    expect(requireCatalogEntry(supplemental, "hy3-preview").status).toBe("preview");
+    expect(requireCatalogEntry(supplemental, "deepseek-v4-flash").status).toBe("deprecated");
     expect(provider.resolveDynamicModel?.({ modelId: "kimi-k2.6" } as never)).toMatchObject({
       id: "kimi-k2.6",
       input: ["text", "image"],
     });
     expect(provider.resolveDynamicModel?.({ modelId: "qwen3.8-max" } as never)).toMatchObject({
       api: "anthropic-messages",
-      baseUrl: "https://opencode.ai/zen/go",
+      baseUrl: "https://opencode.ai/inference/go/anthropic",
       compat: { thinkingFormat: "qwen" },
     });
     expect(
@@ -236,19 +287,30 @@ describe("opencode-go provider plugin", () => {
       upstreamModels: {
         "ox-alpha-free": upstreamModel("ox-alpha-free", {
           name: "Ox Alpha Free (Unlimited)",
+          provider: { api: "https://opencode.ai/inference/go/openai/v1" },
           modalities: { input: ["text", "image", "video"] },
           limit: { context: 1_000_000, output: 131_072 },
           reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }],
         }),
         "minimax-future": upstreamModel("minimax-future", {
-          provider: { npm: "@ai-sdk/anthropic" },
+          provider: {
+            npm: "@ai-sdk/anthropic",
+            api: "https://opencode.ai/inference/go/anthropic/v1",
+          },
           cost: { input: 0.3, output: 1.2, cache_read: 0.06 },
+        }),
+        "gemini-future": upstreamModel("gemini-future", {
+          provider: {
+            npm: "@ai-sdk/google",
+            api: "https://opencode.ai/inference/go/google/v1beta",
+          },
         }),
         "legacy-model": upstreamModel("legacy-model", { status: "deprecated" }),
       },
       liveModelIds: [
         "ox-alpha-free",
         "minimax-future",
+        "gemini-future",
         "legacy-model",
         "unknown-live-model",
         "future-embedding",
@@ -263,13 +325,14 @@ describe("opencode-go provider plugin", () => {
     expect(result.models.map((model) => model.id)).toEqual([
       "ox-alpha-free",
       "minimax-future",
+      "gemini-future",
       "unknown-live-model",
     ]);
     expect(result.models[0]).toMatchObject({
       id: "ox-alpha-free",
       name: "Ox Alpha Free (Unlimited)",
       api: "openai-completions",
-      baseUrl: "https://opencode.ai/zen/go/v1",
+      baseUrl: "https://opencode.ai/inference/go/openai/v1",
       input: ["text", "image"],
       contextWindow: 1_000_000,
       maxTokens: 131_072,
@@ -277,17 +340,21 @@ describe("opencode-go provider plugin", () => {
     });
     expect(result.models[1]).toMatchObject({
       api: "anthropic-messages",
-      baseUrl: "https://opencode.ai/zen/go",
+      baseUrl: "https://opencode.ai/inference/go/anthropic",
       cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
     });
     expect(result.models[2]).toMatchObject({
+      api: "google-generative-ai",
+      baseUrl: "https://opencode.ai/inference/go/google/v1beta",
+    });
+    expect(result.models[3]).toMatchObject({
       provider: "opencode-go",
       api: "openai-completions",
-      baseUrl: "https://opencode.ai/zen/go/v1",
+      baseUrl: "https://opencode.ai/inference/go/openai/v1",
       input: ["text"],
     });
     const listingRequest = fetchGuard.mock.calls.find(
-      ([request]) => request.url === "https://opencode.ai/zen/go/v1/models",
+      ([request]) => request.url === "https://opencode.ai/inference/go/v1/models",
     )?.[0];
     expect(new Headers(listingRequest?.init?.headers).get("user-agent")).toMatch(/^openclaw\//);
 
@@ -295,7 +362,7 @@ describe("opencode-go provider plugin", () => {
     expect(provider.resolveDynamicModel?.({ modelId: "legacy-model" } as never)).toBeUndefined();
     const supplemental = await provider.augmentModelCatalog?.({ entries: [] } as never);
     expect(requireCatalogEntry(supplemental, "legacy-model").status).toBe("deprecated");
-    expect(requireCatalogEntry(supplemental, "hy3-preview").status).toBe("preview");
+    expect(requireCatalogEntry(supplemental, "deepseek-v4-flash").status).toBe("deprecated");
   });
 
   it("never resolves another account's upstream-only Go model outside its authenticated catalog", async () => {
@@ -362,7 +429,10 @@ describe("opencode-go provider plugin", () => {
     ).resolves.toMatchObject({
       models: [
         expect.objectContaining({ id: "replacement-model" }),
-        expect.objectContaining({ id: "unsafe-model", baseUrl: "https://opencode.ai/zen/go/v1" }),
+        expect.objectContaining({
+          id: "unsafe-model",
+          baseUrl: "https://opencode.ai/inference/go/openai/v1",
+        }),
       ],
     });
 
@@ -370,7 +440,7 @@ describe("opencode-go provider plugin", () => {
     const entries = await provider.augmentModelCatalog?.({ entries: [] } as never);
     expect(entries?.some((entry) => entry.id === "withdrawn-model")).toBe(false);
     expect(entries?.some((entry) => entry.id === "unsafe-model")).toBe(false);
-    expect(requireCatalogEntry(entries, "hy3-preview").status).toBe("preview");
+    expect(requireCatalogEntry(entries, "kimi-k2.6").status).toBe("deprecated");
   });
 
   it("exposes only trusted offline starter models through provider discovery", async () => {
@@ -381,7 +451,9 @@ describe("opencode-go provider plugin", () => {
       throw new Error("expected OpenCode Go static provider");
     }
     const deepSeekPro = result.provider.models.find((model) => model.id === "deepseek-v4-pro");
-    const deepSeekFlash = result.provider.models.find((model) => model.id === "deepseek-v4-flash");
+    const deepSeekFlash = result.provider.models.find(
+      (model) => model.id === "deepseek-v4.1-flash",
+    );
     const modelIds = result.provider.models.map((model) => model.id);
     expect(new Set(modelIds).size).toBe(modelIds.length);
     expect(modelIds.toSorted()).toEqual(ACTIVE_MODEL_IDS.toSorted());
@@ -398,6 +470,8 @@ describe("opencode-go provider plugin", () => {
       compat: { supportedReasoningEfforts: ["low", "high", "max"] },
     });
     expect(modelIds).not.toContain("hy3-preview");
+    expect(modelIds).not.toContain("deepseek-v4-flash");
+    expect(modelIds).not.toContain("kimi-k2.6");
   });
 
   it("skips unrelated scoped discovery even when OpenCode credentials are configured", async () => {
@@ -463,7 +537,7 @@ describe("opencode-go provider plugin", () => {
       response: new Response(
         JSON.stringify({ data: modelIds.map((id) => ({ id, object: "model" })) }),
       ),
-      finalUrl: "https://opencode.ai/zen/go/v1/models",
+      finalUrl: "https://opencode.ai/inference/go/v1/models",
       release: vi.fn(async () => undefined),
     }));
 
@@ -523,7 +597,7 @@ describe("opencode-go provider plugin", () => {
           provider: "opencode-go",
           id: "glm-5",
           api: "openai-completions",
-          baseUrl: "https://opencode.ai/zen/go/v1",
+          baseUrl: "https://opencode.ai/inference/go/openai/v1",
         },
         sessionId: "conversation-123",
         turnId: "turn-1",
@@ -539,7 +613,7 @@ describe("opencode-go provider plugin", () => {
           provider: "opencode-go",
           id: "glm-5",
           api: "openai-completions",
-          baseUrl: "https://opencode.ai/zen/go/v1",
+          baseUrl: "https://opencode.ai/inference/go/openai/v1",
           headers: { "X-OpenCode-Session": "configured-session" },
         },
         turnId: "turn-1",
@@ -598,7 +672,7 @@ describe("opencode-go provider plugin", () => {
           provider: "opencode-go",
           id: "qwen3.8-max",
           api: testCase.runtimeApi,
-          baseUrl: "https://opencode.ai/zen/go",
+          baseUrl: "https://opencode.ai/inference/go/anthropic",
         } as never,
         {} as never,
         { headers: { "User-Agent": "configured-client/1.0", "X-Custom": "1" } },
@@ -628,6 +702,9 @@ describe("opencode-go provider plugin", () => {
     ["deepseek-v4-flash", "low", "low"],
     ["deepseek-v4-flash", "high", "high"],
     ["deepseek-v4-flash", "max", "max"],
+    ["deepseek-v4.1-flash", "low", "low"],
+    ["deepseek-v4.1-flash", "high", "high"],
+    ["deepseek-v4.1-flash", "max", "max"],
   ] as const)(
     "maps OpenCode Go %s thinking %s to %s reasoning effort",
     async (modelId, thinkingLevel, reasoningEffort) => {
@@ -709,7 +786,7 @@ describe("opencode-go provider plugin", () => {
       } as never),
       "normalized config",
     );
-    expect(normalizedConfig.baseUrl).toBe("https://opencode.ai/zen/go/v1");
+    expect(normalizedConfig.baseUrl).toBe("https://opencode.ai/inference/go/openai/v1");
 
     const normalizedModel = requireRecord(
       provider.normalizeResolvedModel?.({
@@ -729,7 +806,7 @@ describe("opencode-go provider plugin", () => {
       } as never),
       "normalized model",
     );
-    expect(normalizedModel.baseUrl).toBe("https://opencode.ai/zen/go/v1");
+    expect(normalizedModel.baseUrl).toBe("https://opencode.ai/inference/go/openai/v1");
 
     const normalizedKimi = requireRecord(
       provider.normalizeResolvedModel?.({
@@ -739,7 +816,7 @@ describe("opencode-go provider plugin", () => {
           id: "kimi-k2.7-code",
           name: "Kimi K2.7 Code",
           api: "openai-completions",
-          baseUrl: "https://opencode.ai/zen/go/v1",
+          baseUrl: "https://opencode.ai/inference/go/openai/v1",
           reasoning: true,
           input: ["text", "image"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -762,7 +839,7 @@ describe("opencode-go provider plugin", () => {
       } as never),
     ).toEqual({
       api: "openai-completions",
-      baseUrl: "https://opencode.ai/zen/go/v1",
+      baseUrl: "https://opencode.ai/inference/go/openai/v1",
     });
 
     expect(
@@ -773,7 +850,7 @@ describe("opencode-go provider plugin", () => {
       } as never),
     ).toEqual({
       api: "anthropic-messages",
-      baseUrl: "https://opencode.ai/zen/go",
+      baseUrl: "https://opencode.ai/inference/go/anthropic",
     });
   });
 });

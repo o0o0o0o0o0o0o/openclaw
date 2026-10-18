@@ -58,7 +58,11 @@ beforeEach(() => clearLiveCatalogCacheForTests());
 it("lazily shares one anonymous upstream metadata download across provider ids", async () => {
   const { fetchGuard, release } = buildFetchGuard({
     opencode: { id: "opencode", api: "https://opencode.ai/zen/v1", models: {} },
-    "opencode-go": { id: "opencode-go", api: "https://opencode.ai/zen/go/v1", models: {} },
+    "opencode-go": {
+      id: "opencode-go",
+      api: "https://opencode.ai/inference/go/openai/v1",
+      models: {},
+    },
   });
 
   expect(fetchGuard).not.toHaveBeenCalled();
@@ -110,7 +114,11 @@ it("projects pricing, reasoning, tools, and modalities from object tiers JSON", 
       limit: { context: 1_000_000, input: 900_000, output: 128_000 },
       cost: { input: 2, output: 6, cache_read: 0.5, cache_write: 1, tiers: {} },
     },
-    makeProvider("opencode-go", "https://opencode.ai/zen/go/v1", "@ai-sdk/openai-compatible"),
+    makeProvider(
+      "opencode-go",
+      "https://opencode.ai/inference/go/openai/v1",
+      "@ai-sdk/openai-compatible",
+    ),
   );
 
   expect(model).toEqual({
@@ -119,7 +127,7 @@ it("projects pricing, reasoning, tools, and modalities from object tiers JSON", 
     parameterCount: 4_000_000_000,
     provider: "opencode-go",
     api: "openai-responses",
-    baseUrl: "https://opencode.ai/zen/go/v1",
+    baseUrl: "https://opencode.ai/inference/go/openai/v1",
     reasoning: true,
     input: ["text", "image"],
     contextWindow: 1_000_000,

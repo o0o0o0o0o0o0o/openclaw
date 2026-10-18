@@ -143,7 +143,7 @@ it("warns about active OpenCode provider overrides", async () => {
           },
           "opencode-go": {
             api: "openai-completions",
-            baseUrl: "https://opencode.ai/zen/go/v1",
+            baseUrl: "https://opencode.ai/inference/go/openai/v1",
           },
         },
       },

@@ -35,7 +35,7 @@ const baseModel = completionModel({
   baseUrl: "https://api.openai.com/v1",
   reasoning: true,
 });
-const opencode = { provider: "opencode-go", baseUrl: "https://opencode.ai/zen/go/v1" };
+const opencode = { provider: "opencode-go", baseUrl: "https://opencode.ai/inference/go/openai/v1" };
 const custom = { provider: "custom", id: "synthetic-model" };
 const sonnet: Partial<Model> = {
   provider: "anthropic",
@@ -185,7 +185,7 @@ it.each<{
   },
   { name: "model header", patch: { headers: { "X-OpenCode-Session": "caller-owned" } } },
   { name: "proxy endpoint", patch: { baseUrl: "https://proxy.example/v1" } },
-  { name: "insecure endpoint", patch: { baseUrl: "http://opencode.ai/zen/go/v1" } },
+  { name: "insecure endpoint", patch: { baseUrl: "http://opencode.ai/inference/go/openai/v1" } },
 ])("preserves routing options for $name", async ({ patch, options, expectedHeaders }) => {
   const original = structuredClone(options);
   const model: Model = {

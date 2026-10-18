@@ -369,7 +369,7 @@ describe("provider request config", () => {
     const resolved = resolveProviderRequestHeaders({
       provider: "opencode-go",
       api: "openai-completions",
-      baseUrl: "https://opencode.ai/zen/go/v1",
+      baseUrl: "https://opencode.ai/inference/go/openai/v1",
       ...streaming,
       callerHeaders: { "user-agent": "custom-agent/1.0" },
       precedence: "caller-wins",

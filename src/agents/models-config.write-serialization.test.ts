@@ -56,6 +56,22 @@ let actualPrivateFileStore:
   | typeof import("../infra/private-file-store.js").privateFileStore
   | undefined;
 
+type StoreWrite = { filePath: string; rootDir: string; content: string | Uint8Array };
+async function writeActual({ filePath, rootDir, content }: StoreWrite) {
+  if (!actualPrivateFileStore) {
+    throw new Error("private file store mock not initialized");
+  }
+  return actualPrivateFileStore(rootDir).writeText(path.basename(filePath), content);
+}
+
+function catalog(providers: Record<string, unknown>) {
+  return JSON.stringify({ generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY, providers });
+}
+
+function catalogWrites(pluginId: string, contents: string) {
+  return { [encodePluginModelCatalogRelativePath(pluginId)]: contents };
+}
+
 installModelsConfigTestHooks();
 
 let ensureOpenClawModelsJson: typeof import("./models-config.js").ensureOpenClawModelsJson;
@@ -97,19 +113,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   clearPluginMetadataLifecycleCaches();
-  writePrivateStoreTextWriteMock
-    .mockReset()
-    .mockImplementation(
-      async (params: { filePath: string; rootDir: string; content: string | Uint8Array }) => {
-        if (!actualPrivateFileStore) {
-          throw new Error("private file store mock not initialized");
-        }
-        return await actualPrivateFileStore(params.rootDir).writeText(
-          path.basename(params.filePath),
-          params.content,
-        );
-      },
-    );
+  writePrivateStoreTextWriteMock.mockReset().mockImplementation(writeActual);
   planOpenClawModelsJsonMock
     .mockReset()
     .mockImplementation(
@@ -144,14 +148,8 @@ describe("models-config write serialization", () => {
           api: "ollama",
           models: [{ id: "cached-model", name: "Cached model" }],
         };
-        const contents = JSON.stringify({
-          generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-          providers: { ollama: provider, sibling: provider },
-        });
-        const otherCatalog = JSON.stringify({
-          generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-          providers: { other: provider },
-        });
+        const contents = catalog({ ollama: provider, sibling: provider });
+        const otherCatalog = catalog({ other: provider });
         await replacePersistedPluginModelCatalogs({
           agentDir,
           pluginCatalogWrites: {
@@ -171,10 +169,7 @@ describe("models-config write serialization", () => {
             ? [
                 {
                   pluginId: "ollama",
-                  contents: JSON.stringify({
-                    generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-                    providers: { sibling: provider },
-                  }),
+                  contents: catalog({ sibling: provider }),
                 },
                 { pluginId: "other", contents: otherCatalog },
               ]
@@ -193,17 +188,14 @@ describe("models-config write serialization", () => {
   it("prunes after an older discovery plan finishes publishing", async () => {
     await withModelsTempHome(async (home) => {
       const agentDir = path.join(home, "agent");
-      const contents = JSON.stringify({
-        generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-        providers: {
-          ollama: {
-            baseUrl: "https://ollama.com",
-            api: "ollama",
-            models: [{ id: "cached-model", name: "Cached model" }],
-          },
+      const contents = catalog({
+        ollama: {
+          baseUrl: "https://ollama.com",
+          api: "ollama",
+          models: [{ id: "cached-model", name: "Cached model" }],
         },
       });
-      const pluginCatalogWrites = { [encodePluginModelCatalogRelativePath("ollama")]: contents };
+      const pluginCatalogWrites = catalogWrites("ollama", contents);
       await replacePersistedPluginModelCatalogs({ agentDir, pluginCatalogWrites });
       const entered = createDeferredCore();
       const release = createDeferredCore();
@@ -221,10 +213,7 @@ describe("models-config write serialization", () => {
       release.resolve();
       const [published] = await Promise.all([discovery, removal]);
       expect(published.publishedSource?.pluginCatalogs).toEqual([{ pluginId: "ollama", contents }]);
-      const pruned = JSON.stringify({
-        generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-        providers: {},
-      });
+      const pruned = catalog({});
       expect(loadPersistedPluginModelCatalogsReadOnly(agentDir)).toEqual([
         { pluginId: "ollama", contents: pruned },
       ]);
@@ -232,7 +221,7 @@ describe("models-config write serialization", () => {
         expect(pluginCatalogs).toEqual([{ pluginId: "ollama", contents: pruned }]);
         return {
           action: "noop",
-          pluginCatalogWrites: { [encodePluginModelCatalogRelativePath("ollama")]: pruned },
+          pluginCatalogWrites: catalogWrites("ollama", pruned),
         };
       });
       const next = await ensureOpenClawModelsJson({}, agentDir);
@@ -297,20 +286,12 @@ describe("models-config write serialization", () => {
   it("writes implicit models.json privately into the configured default agent dir", async () => {
     await withModelsTempHome(async (home) => {
       let modeAfterWrite: number | undefined;
-      writePrivateStoreTextWriteMock.mockImplementationOnce(
-        async (params: { filePath: string; rootDir: string; content: string | Uint8Array }) => {
-          if (!actualPrivateFileStore) {
-            throw new Error("private file store mock not initialized");
-          }
-          await actualPrivateFileStore(params.rootDir).writeText(
-            path.basename(params.filePath),
-            params.content,
-          );
-          if (process.platform !== "win32") {
-            modeAfterWrite = (await fs.stat(params.filePath)).mode & 0o777;
-          }
-        },
-      );
+      writePrivateStoreTextWriteMock.mockImplementationOnce(async (params: StoreWrite) => {
+        await writeActual(params);
+        if (process.platform !== "win32") {
+          modeAfterWrite = (await fs.stat(params.filePath)).mode & 0o777;
+        }
+      });
       const cfg = {
         agents: {
           defaults: { systemAgent: { agentId: "ops" } },
@@ -338,26 +319,18 @@ describe("models-config write serialization", () => {
   it("writes plugin-owned model catalogs into the agent SQLite cache", async () => {
     await withModelsTempHome(async (home) => {
       const agentDir = path.join(home, "agent");
+      const contents = catalog({
+        zai: {
+          baseUrl: "https://api.z.ai/api/paas/v4",
+          api: "openai-completions",
+          apiKey: "ZAI_API_KEY",
+          models: [{ id: "glm-5.1", name: "GLM 5.1" }],
+        },
+      });
       planOpenClawModelsJsonMock.mockImplementation(async () => ({
         action: "write",
         contents: `${JSON.stringify({ providers: {} }, null, 2)}\n`,
-        pluginCatalogWrites: {
-          [encodePluginModelCatalogRelativePath("zai")]: `${JSON.stringify(
-            {
-              generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-              providers: {
-                zai: {
-                  baseUrl: "https://api.z.ai/api/paas/v4",
-                  api: "openai-completions",
-                  apiKey: "ZAI_API_KEY",
-                  models: [{ id: "glm-5.1", name: "GLM 5.1" }],
-                },
-              },
-            },
-            null,
-            2,
-          )}\n`,
-        },
+        pluginCatalogWrites: catalogWrites("zai", contents),
       }));
 
       await ensureOpenClawModelsJson({}, agentDir);
@@ -368,12 +341,12 @@ describe("models-config write serialization", () => {
       const stored = loadPersistedPluginModelCatalogsReadOnly(agentDir);
       expect(stored).toHaveLength(1);
       expect(stored[0]?.pluginId).toBe("zai");
-      const catalog = JSON.parse(stored[0]?.contents ?? "{}") as {
+      const storedCatalog = JSON.parse(stored[0]?.contents ?? "{}") as {
         providers?: Record<string, unknown>;
       };
       expect(root.providers).toEqual({});
       expect(root).not.toHaveProperty("pluginCatalogs");
-      expect(Object.keys(catalog.providers ?? {})).toEqual(["zai"]);
+      expect(Object.keys(storedCatalog.providers ?? {})).toEqual(["zai"]);
       await expect(fs.access(path.join(agentDir, "plugins"))).rejects.toMatchObject({
         code: "ENOENT",
       });
@@ -385,12 +358,7 @@ describe("models-config write serialization", () => {
       const agentDir = path.join(home, "agent");
       await replacePersistedPluginModelCatalogs({
         agentDir,
-        pluginCatalogWrites: {
-          [encodePluginModelCatalogRelativePath("old-provider")]: `${JSON.stringify({
-            generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-            providers: {},
-          })}\n`,
-        },
+        pluginCatalogWrites: catalogWrites("old-provider", `${catalog({})}\n`),
       });
       planOpenClawModelsJsonMock.mockImplementation(async () => ({
         action: "noop",
@@ -413,32 +381,19 @@ describe("models-config write serialization", () => {
   it("passes persisted catalog bytes to planning without repair or repeated fingerprint changes", async () => {
     await withModelsTempHome(async (home) => {
       const agentDir = path.join(home, "agent");
+      const nvidia = {
+        baseUrl: "https://integrate.api.nvidia.com/v1",
+        apiKey: "NVIDIA_API_KEY",
+        models: [{ id: "meta-llama/llama-3.3-70b-instruct" }],
+      };
       await replacePersistedPluginModelCatalogs({
         agentDir,
-        pluginCatalogWrites: {
-          [encodePluginModelCatalogRelativePath("nvidia")]: JSON.stringify({
-            generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-            providers: {
-              nvidia: {
-                baseUrl: "https://integrate.api.nvidia.com/v1",
-                api: "openai-completions",
-                apiKey: "NVIDIA_API_KEY",
-                models: [{ id: "meta-llama/llama-3.3-70b-instruct" }],
-              },
-            },
-          }),
-        },
+        pluginCatalogWrites: catalogWrites(
+          "nvidia",
+          catalog({ nvidia: { ...nvidia, api: "openai-completions" } }),
+        ),
       });
-      const malformed = JSON.stringify({
-        generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-        providers: {
-          nvidia: {
-            baseUrl: "https://integrate.api.nvidia.com/v1",
-            apiKey: "NVIDIA_API_KEY",
-            models: [{ id: "meta-llama/llama-3.3-70b-instruct" }],
-          },
-        },
-      });
+      const malformed = catalog({ nvidia });
       const database = new DatabaseSync(path.join(agentDir, "openclaw-agent.sqlite"));
       try {
         database
@@ -466,24 +421,19 @@ describe("models-config write serialization", () => {
 
   it("keeps the ready cache warm while repairing models.json permissions", async () => {
     await withModelsTempHome(async () => {
-      const catalog = JSON.stringify({
-        generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-        providers: {},
-      });
+      const contents = catalog({});
       planOpenClawModelsJsonMock.mockResolvedValue({
         action: "write",
         contents: '{"providers":{}}\n',
-        pluginCatalogWrites: {
-          [encodePluginModelCatalogRelativePath("fixture")]: catalog,
-        },
+        pluginCatalogWrites: catalogWrites("fixture", contents),
       });
       const first = await ensureOpenClawModelsJson(CUSTOM_PROXY_MODELS_CONFIG);
       expect(first.publishedSource).toEqual({
         modelsJsonContents: '{"providers":{}}\n',
-        pluginCatalogs: [{ pluginId: "fixture", contents: catalog }],
+        pluginCatalogs: [{ pluginId: "fixture", contents }],
       });
       const modelsPath = path.join(first.agentDir, "models.json");
-      const contents = await fs.readFile(modelsPath, "utf8");
+      const rootContents = await fs.readFile(modelsPath, "utf8");
       if (process.platform !== "win32") {
         await fs.chmod(modelsPath, 0o644);
       }
@@ -492,7 +442,7 @@ describe("models-config write serialization", () => {
       expect(cached).toEqual({ agentDir: first.agentDir, wrote: true });
       expect(planOpenClawModelsJsonMock).toHaveBeenCalledTimes(1);
       expect(writePrivateStoreTextWriteMock).toHaveBeenCalledOnce();
-      expect(await fs.readFile(modelsPath, "utf8")).toBe(contents);
+      expect(await fs.readFile(modelsPath, "utf8")).toBe(rootContents);
       if (process.platform !== "win32") {
         expect((await fs.stat(modelsPath)).mode & 0o777).toBe(0o600);
       }
@@ -557,53 +507,39 @@ describe("models-config write serialization", () => {
 
       let inFlightWrites = 0;
       let maxInFlightWrites = 0;
-      let markFirstModelsWriteStarted: () => void = () => {};
-      const firstModelsWriteStarted = new Promise<void>((resolve) => {
-        markFirstModelsWriteStarted = resolve;
-      });
-      let releaseModelsWrites: () => void = () => {};
-      const modelsWritesCanContinue = new Promise<void>((resolve) => {
-        releaseModelsWrites = resolve;
-      });
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
       let modelsWriteCount = 0;
-      writePrivateStoreTextWriteMock.mockImplementation(
-        async (params: { filePath: string; rootDir: string; content: string | Uint8Array }) => {
-          // Hold both writes at the store boundary to prove the outer serializer works.
-          const isModelsWrite = path.basename(params.filePath) === "models.json";
+      writePrivateStoreTextWriteMock.mockImplementation(async (params: StoreWrite) => {
+        // Hold both writes at the store boundary to prove the outer serializer works.
+        const isModelsWrite = path.basename(params.filePath) === "models.json";
+        if (isModelsWrite) {
+          modelsWriteCount += 1;
+          inFlightWrites += 1;
+          if (inFlightWrites > maxInFlightWrites) {
+            maxInFlightWrites = inFlightWrites;
+          }
+          if (modelsWriteCount === 1) {
+            entered.resolve();
+          }
+          await release.promise;
+        }
+        try {
+          return await writeActual(params);
+        } finally {
           if (isModelsWrite) {
-            modelsWriteCount += 1;
-            inFlightWrites += 1;
-            if (inFlightWrites > maxInFlightWrites) {
-              maxInFlightWrites = inFlightWrites;
-            }
-            if (modelsWriteCount === 1) {
-              markFirstModelsWriteStarted();
-            }
-            await modelsWritesCanContinue;
+            inFlightWrites -= 1;
           }
-          try {
-            if (!actualPrivateFileStore) {
-              throw new Error("private file store mock not initialized");
-            }
-            return await actualPrivateFileStore(params.rootDir).writeText(
-              path.basename(params.filePath),
-              params.content,
-            );
-          } finally {
-            if (isModelsWrite) {
-              inFlightWrites -= 1;
-            }
-          }
-        },
-      );
+        }
+      });
 
       const writes = Promise.all([
         ensureOpenClawModelsJson(first),
         ensureOpenClawModelsJson(second),
       ]);
-      await firstModelsWriteStarted;
+      await entered.promise;
       await Promise.resolve();
-      releaseModelsWrites();
+      release.resolve();
       await writes;
 
       expect(maxInFlightWrites).toBe(1);

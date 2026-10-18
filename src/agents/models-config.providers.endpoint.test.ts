@@ -1,5 +1,5 @@
 import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ModelProviderConfig } from "../config/types.models.js";
+import type { ModelDefinitionConfig, ModelProviderConfig } from "../config/types.models.js";
 import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
 import type { ProviderPlugin } from "../plugins/types.js";
 import {
@@ -25,20 +25,19 @@ import {
   PLUGIN_MODEL_CATALOG_GENERATED_BY,
 } from "./plugin-model-catalog.js";
 
+const nativeModel: ModelDefinitionConfig = {
+  id: "native-model",
+  name: "Native model",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 128000,
+  maxTokens: 8192,
+};
 const nativeCatalog: ModelProviderConfig = {
   baseUrl: "https://native.example/v1",
   api: "openai-completions",
-  models: [
-    {
-      id: "native-model",
-      name: "Native model",
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128000,
-      maxTokens: 8192,
-    },
-  ],
+  models: [nativeModel],
 };
 const provider: ProviderPlugin = {
   id: "fixture",
@@ -47,12 +46,12 @@ const provider: ProviderPlugin = {
   auth: [],
   staticCatalog: { order: "simple", run: async () => ({ provider: nativeCatalog }) },
 };
-function createMetadata() {
+function createMetadata(providers = ["fixture"]) {
   return createPluginMetadataSnapshotFixture({
     plugins: [
       {
         id: "catalog-owner",
-        providers: ["fixture"],
+        providers,
         providerEndpoints: [{ endpointClass: "openai-public", hosts: ["native.example"] }],
       },
     ],
@@ -62,6 +61,16 @@ function createMetadata() {
 describe("provider endpoint source eligibility", () => {
   let state: OpenClawTestState;
   let pluginMetadataSnapshot: ReturnType<typeof createMetadata>;
+  const customProvider = { baseUrl: "https://proxy.example/v1", models: [] };
+  function discoveryParams(providers = ["fixture"], ids = providers) {
+    return {
+      env: state.env,
+      agentDir: state.agentDir(),
+      pluginMetadataSnapshot: createMetadata(providers),
+      providerDiscoveryProviderIds: ids,
+      providerDiscoveryEntriesOnly: true,
+    };
+  }
   beforeEach(async () => {
     state = await createOpenClawTestState({ label: "endpoint-eligibility" });
     pluginMetadataSnapshot = createMetadata();
@@ -87,10 +96,7 @@ describe("provider endpoint source eligibility", () => {
       baseUrl: "https://proxy.example/v1",
       models: [
         {
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          maxTokens: 8192,
+          ...nativeModel,
           id: "manual-model",
           name: "Authored model",
           contextWindow: 16384,
@@ -100,12 +106,7 @@ describe("provider endpoint source eligibility", () => {
     const planned = await planOpenClawModelsJsonSource(
       { models: { providers: { fixture: explicit } } },
       state.agentDir(),
-      {
-        env: state.env,
-        pluginMetadataSnapshot,
-        providerDiscoveryProviderIds: ["fixture"],
-        providerDiscoveryEntriesOnly: true,
-      },
+      discoveryParams(),
     );
     const catalog = planned.pluginCatalogs.find((entry) => entry.pluginId === "catalog-owner");
     assert(catalog, "The source plan must contain the authored provider");
@@ -117,28 +118,17 @@ describe("provider endpoint source eligibility", () => {
   it("preserves a selected native alias when its sibling has a custom endpoint", async () => {
     const aliasedProvider = { ...provider, aliases: ["alternate"] };
     resolveRuntimePluginDiscoveryProviders.mockResolvedValue([aliasedProvider]);
-    const metadata = createPluginMetadataSnapshotFixture({
-      plugins: [
-        {
-          id: "catalog-owner",
-          providers: ["fixture", "alternate"],
-          providerEndpoints: [{ endpointClass: "openai-public", hosts: ["native.example"] }],
-        },
-      ],
-    });
     const config = {
       models: {
         providers: {
-          fixture: { baseUrl: "https://proxy.example/v1", models: [] },
+          fixture: customProvider,
           alternate: { baseUrl: "https://native.example/v1", models: [] },
         },
       },
     };
     const params = {
       config,
-      env: state.env,
-      pluginMetadataSnapshot: metadata,
-      providerDiscoveryProviderIds: ["alternate"],
+      ...discoveryParams(["fixture", "alternate"], ["alternate"]),
     };
     const preparedStaticProviderCatalog = await prepareImplicitProviderStaticCatalog(params);
     expect(preparedStaticProviderCatalog.entries).toEqual([
@@ -149,8 +139,6 @@ describe("provider endpoint source eligibility", () => {
     ]);
     const discovered = await resolveImplicitProviders({
       ...params,
-      agentDir: state.agentDir(),
-      providerDiscoveryEntriesOnly: true,
       preparedStaticProviderCatalog,
       explicitProviders: {
         alternate: {
@@ -162,14 +150,11 @@ describe("provider endpoint source eligibility", () => {
     expect(discovered?.alternate?.models.map((model) => model.id)).toEqual(["native-model"]);
     expect(discovered?.alternate?.models[0]?.name).toBe("Authored model");
     expect(discovered?.fixture).toBeUndefined();
-    const next = await resolveImplicitProviders({
-      ...params,
-      agentDir: state.agentDir(),
-      providerDiscoveryEntriesOnly: true,
-      preparedStaticProviderCatalog,
+    const next = await resolveImplicitProviders({ ...params, preparedStaticProviderCatalog });
+    expect(next?.alternate).toMatchObject({
+      baseUrl: "https://native.example/v1",
+      models: [{ name: "Native model" }],
     });
-    expect(next?.alternate?.baseUrl).toBe("https://native.example/v1");
-    expect(next?.alternate?.models[0]?.name).toBe("Native model");
     expect(
       preparedStaticProviderCatalog.entries[0]?.providerConfigs.alternate?.models[0]?.name,
     ).toBe("Native model");
@@ -183,53 +168,33 @@ describe("provider endpoint source eligibility", () => {
       env: state.env,
       pluginMetadataSnapshot,
       providerDiscoveryProviderIds: ["fixture"],
-      config: {
-        models: { providers: { fixture: { baseUrl: "https://proxy.example/v1", models: [] } } },
-      },
+      config: { models: { providers: { fixture: customProvider } } },
     });
     expect(prepared.providers).toEqual([excludedProvider]);
     expect(prepared.entries).toEqual([{ provider: excludedProvider, providerConfigs: {} }]);
     expect(run).not.toHaveBeenCalled();
   });
 
-  it.each([false])(
-    "preserves an eligible shared-hook output without aliases (scoped: %s)",
-    async (scoped) => {
-      const sharedProvider: ProviderPlugin = {
-        ...provider,
-        staticCatalog: {
-          order: "simple",
-          run: async () => ({ providers: { fixture: nativeCatalog, alternate: nativeCatalog } }),
-        },
-      };
-      resolveRuntimePluginDiscoveryProviders.mockResolvedValue([sharedProvider]);
-      const metadata = createPluginMetadataSnapshotFixture({
-        plugins: [
-          {
-            id: "catalog-owner",
-            providers: ["fixture", "alternate"],
-            providerEndpoints: [{ endpointClass: "openai-public", hosts: ["native.example"] }],
-          },
-        ],
-      });
-      const config = {
-        models: { providers: { fixture: { baseUrl: "https://proxy.example/v1", models: [] } } },
-      };
-      const params = {
-        config,
-        env: state.env,
-        pluginMetadataSnapshot: metadata,
-        ...(scoped ? { providerDiscoveryProviderIds: ["alternate"] } : {}),
-      };
-      const preparedStaticProviderCatalog = await prepareImplicitProviderStaticCatalog(params);
-      const discovered = await resolveImplicitProviders({
-        ...params,
-        agentDir: state.agentDir(),
-        providerDiscoveryEntriesOnly: true,
-        preparedStaticProviderCatalog,
-      });
-      expect(discovered?.alternate?.models.map((model) => model.id)).toEqual(["native-model"]);
-      expect(discovered?.fixture).toBeUndefined();
-    },
-  );
+  it("preserves an eligible shared-hook output without aliases", async () => {
+    const sharedProvider: ProviderPlugin = {
+      ...provider,
+      staticCatalog: {
+        order: "simple",
+        run: async () => ({ providers: { fixture: nativeCatalog, alternate: nativeCatalog } }),
+      },
+    };
+    resolveRuntimePluginDiscoveryProviders.mockResolvedValue([sharedProvider]);
+    const params = {
+      ...discoveryParams(["fixture", "alternate"]),
+      providerDiscoveryProviderIds: undefined,
+      config: { models: { providers: { fixture: customProvider } } },
+    };
+    const preparedStaticProviderCatalog = await prepareImplicitProviderStaticCatalog(params);
+    const discovered = await resolveImplicitProviders({
+      ...params,
+      preparedStaticProviderCatalog,
+    });
+    expect(discovered?.alternate?.models.map((model) => model.id)).toEqual(["native-model"]);
+    expect(discovered?.fixture).toBeUndefined();
+  });
 });

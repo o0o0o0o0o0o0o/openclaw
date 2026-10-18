@@ -31,6 +31,10 @@ function model(id: string, input: Array<"text" | "image"> = ["text"]) {
   };
 }
 
+function configFor<T>(providerId: string, provider: T, mode?: "merge" | "replace") {
+  return { models: { ...(mode ? { mode } : {}), providers: { [providerId]: provider } } };
+}
+
 function discoveryOptions(providerId: string, discovered: ProviderConfig) {
   const provider: ProviderPlugin = {
     id: providerId,
@@ -78,28 +82,25 @@ describe("models config input presence", () => {
         const { input: _input, cost: _cost, ...row } = model(id);
         return { ...row, ...fields };
       };
-      const cfg = {
-        models: {
-          mode,
-          providers: {
-            [providerId]: {
-              baseUrl: "https://catalog-fields.example/v1",
-              api: "openai-completions",
-              apiKey: "CATALOG_FIXTURE_KEY",
-              models: [
-                sourceModel("latest", { cost: { input: 7 } }),
-                sourceModel("bare", { input: ["text"], cost: { input: 2 } }),
-                sourceModel("custom/bare", { cost: { output: 8 } }),
-                sourceModel("alias-exact", {
-                  input: ["text"],
-                  cost: { input: 99, output: 99, cacheRead: 99, cacheWrite: 99 },
-                }),
-                sourceModel("exact"),
-              ],
-            },
-          },
+      const cfg = configFor(
+        providerId,
+        {
+          baseUrl: "https://catalog-fields.example/v1",
+          api: "openai-completions",
+          apiKey: "CATALOG_FIXTURE_KEY",
+          models: [
+            sourceModel("latest", { cost: { input: 7 } }),
+            sourceModel("bare", { input: ["text"], cost: { input: 2 } }),
+            sourceModel("custom/bare", { cost: { output: 8 } }),
+            sourceModel("alias-exact", {
+              input: ["text"],
+              cost: { input: 99, output: 99, cacheRead: 99, cacheWrite: 99 },
+            }),
+            sourceModel("exact"),
+          ],
         },
-      } as unknown as OpenClawConfig;
+        mode,
+      ) as unknown as OpenClawConfig;
       const original = structuredClone(cfg);
       const discovered = {
         baseUrl: "https://catalog-fields.example/v1",
@@ -235,24 +236,18 @@ describe("models config input presence", () => {
         apiKey: "CATALOG_FIXTURE_KEY",
         models: [configuredModel],
       };
-      const cfg: OpenClawConfig = { models: { providers: { [providerId]: configuredProvider } } };
+      const cfg: OpenClawConfig = configFor(providerId, configuredProvider);
       const { cost: _materializedCost, ...sourceModel } = configuredModel;
-      const sourceConfigForSecrets = {
-        models: {
-          providers: {
-            " Catalog-Price-Fixture ": {
-              ...configuredProvider,
-              models: [
-                {
-                  ...sourceModel,
-                  ...(cost === undefined ? {} : { cost }),
-                },
-                ...(duplicateCost ? [{ ...configuredModel, cost: duplicateCost }] : []),
-              ],
-            },
+      const sourceConfigForSecrets = configFor(" Catalog-Price-Fixture ", {
+        ...configuredProvider,
+        models: [
+          {
+            ...sourceModel,
+            ...(cost === undefined ? {} : { cost }),
           },
-        },
-      } as unknown as OpenClawConfig;
+          ...(duplicateCost ? [{ ...configuredModel, cost: duplicateCost }] : []),
+        ],
+      }) as unknown as OpenClawConfig;
       const discovered = {
         ...configuredProvider,
         models: [
@@ -266,6 +261,7 @@ describe("models config input presence", () => {
         pluginMetadataSnapshot,
         ...discoveryOptions(providerId, discovered),
       };
+      const expectedModels = [{ ...configuredModel, cost: expected }, model("discovered-only")];
       if (independent) {
         // Missing top-level runtime state makes this an independent supplied config.
         setRuntimeConfigSnapshot({ ...cfg, gateway: { mode: "local" } }, sourceConfigForSecrets);
@@ -274,10 +270,9 @@ describe("models config input presence", () => {
             ...options,
             env: state.env,
           });
-          expect(JSON.parse(plan.modelsJsonContents!).providers[providerId].models).toEqual([
-            { ...configuredModel, cost: expected },
-            model("discovered-only"),
-          ]);
+          expect(JSON.parse(plan.modelsJsonContents!).providers[providerId].models).toEqual(
+            expectedModels,
+          );
         });
         return;
       }
@@ -314,10 +309,7 @@ describe("models config input presence", () => {
         }),
       );
       const generated = JSON.parse(plan.contents);
-      expect(generated.providers[providerId].models).toEqual([
-        { ...configuredModel, cost: expected },
-        model("discovered-only"),
-      ]);
+      expect(generated.providers[providerId].models).toEqual(expectedModels);
     },
   );
 });

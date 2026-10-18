@@ -2,6 +2,7 @@ import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import type { ModelDefinitionConfig, ModelProviderConfig } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createTestPluginApi } from "../plugin-sdk/plugin-test-api.js";
 import { clearLiveCatalogCacheForTests } from "../plugin-sdk/provider-catalog-shared.js";
@@ -24,6 +25,49 @@ const discovery = vi.hoisted(() => ({ providers: new Array<ProviderPlugin>() }))
 vi.mock("../plugins/provider-discovery.runtime.js", () => ({
   resolvePluginDiscoveryProvidersRuntime: () => discovery.providers,
 }));
+
+const configFor = (ollama: ModelProviderConfig): OpenClawConfig => ({
+  models: { providers: { ollama } },
+});
+const modelFor = (id: string, name = id): ModelDefinitionConfig => ({
+  id,
+  name,
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 8192,
+  maxTokens: 2048,
+});
+async function catalogPlan(
+  cfg: OpenClawConfig,
+  agentDir: string,
+  authStore: AuthProfileStore = { version: 1, profiles: {} },
+  discoveryAuthConfig = cfg,
+) {
+  const plan = await planOpenClawModelsJson({
+    context: {
+      cfg,
+      discoveryAuthConfig,
+      sourceConfigForSecrets: cfg,
+      agentDir,
+      env: {},
+      envFingerprint: {},
+      pluginMetadataSnapshot: createPluginMetadataSnapshotFixture({
+        plugins: [{ id: "ollama", providers: discovery.providers.map(({ id }) => id) }],
+      }),
+    },
+    authStore,
+    existingRaw: "",
+    existingParsed: null,
+  });
+  const catalog = JSON.parse(
+    expectDefined(
+      plan.pluginCatalogWrites?.[encodePluginModelCatalogRelativePath("ollama")],
+      "Ollama writable plugin catalog",
+    ),
+  ) as { providers: { ollama: ModelProviderConfig } };
+  return { plan, catalog: catalog.providers.ollama };
+}
 
 describe("registered Ollama catalog", () => {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -68,11 +112,7 @@ describe("registered Ollama catalog", () => {
       await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir, OLLAMA_API_KEY: undefined }, async () => {
         const agentDir = path.join(stateDir, "agent");
         const ref = { source: "store", provider: "default", id: "OLLAMA_DISCOVERY_KEY" } as const;
-        const profile = {
-          type: "api_key",
-          provider: "ollama",
-          keyRef: ref,
-        } as const;
+        const profile = { type: "api_key", provider: "ollama", keyRef: ref } as const;
         const authStore: AuthProfileStore = {
           version: 1,
           profiles: owner === "profile" ? { "ollama:fixture": profile } : {},
@@ -87,27 +127,11 @@ describe("registered Ollama catalog", () => {
             agentDir,
           );
         }
-        const model = {
-          id: "fixture-model",
-          name: "Fixture model",
-          reasoning: false,
-          input: ["text"] as ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 8192,
-          maxTokens: 2048,
-        };
+        const model = modelFor("fixture-model", "Fixture model");
         const provider = { baseUrl, models: explicitModels ? [model] : [] };
-        const cfg: OpenClawConfig = {
-          models: {
-            providers: {
-              ollama: { ...provider, ...(owner === "config" ? { apiKey: ref } : {}) },
-            },
-          },
-        };
+        const cfg = configFor({ ...provider, ...(owner === "config" ? { apiKey: ref } : {}) });
         const discoveryAuthConfig: OpenClawConfig =
-          owner === "config"
-            ? { models: { providers: { ollama: { ...provider, apiKey: runtimeKey } } } }
-            : cfg;
+          owner === "config" ? configFor({ ...provider, apiKey: runtimeKey }) : cfg;
         const authorization: Array<string | null> = [];
         const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
           authorization.push(new Headers(init?.headers).get("authorization"));
@@ -123,41 +147,24 @@ describe("registered Ollama catalog", () => {
         });
         vi.stubGlobal("fetch", withFetchPreconnect(fetchMock));
         try {
-          const plan = await planOpenClawModelsJson({
-            context: {
-              cfg,
-              discoveryAuthConfig,
-              sourceConfigForSecrets: cfg,
-              agentDir,
-              env: {},
-              envFingerprint: {},
-              pluginMetadataSnapshot: createPluginMetadataSnapshotFixture({
-                plugins: [{ id: "ollama", providers: discovery.providers.map(({ id }) => id) }],
-              }),
-            },
+          const { plan, catalog } = await catalogPlan(
+            cfg,
+            agentDir,
             authStore,
-            existingRaw: "",
-            existingParsed: null,
-          });
-          const contents = expectDefined(
-            plan.pluginCatalogWrites?.[encodePluginModelCatalogRelativePath("ollama")],
-            "Ollama writable plugin catalog",
+            discoveryAuthConfig,
           );
           // Equal bytes do not make the source-derived marker secret material.
           if (runtimeKey !== NON_ENV_SECRETREF_MARKER) {
             expect(JSON.stringify(plan)).not.toContain(runtimeKey);
           }
           expect(JSON.stringify(plan)).not.toContain("discoveryApiKey");
-          const catalog = JSON.parse(contents) as {
-            providers: { ollama: { api: string; apiKey: string; models: Array<{ id: string }> } };
-          };
-          expect(catalog.providers.ollama.models.map(({ id }) => id)).toEqual([model.id]);
-          expect(catalog.providers.ollama.api).toBe("ollama");
+          expect(catalog.models.map(({ id }) => id)).toEqual([model.id]);
+          expect(catalog.api).toBe("ollama");
           // Explicit local catalogs intentionally select synthetic auth before profiles,
           // and that synthetic marker never reaches the local discovery request.
           const syntheticLocalAuth =
             owner === "profile" && explicitModels && baseUrl.startsWith("http://127.0.0.1");
-          expect(catalog.providers.ollama.apiKey).toBe(
+          expect(catalog.apiKey).toBe(
             syntheticLocalAuth ? "ollama-local" : NON_ENV_SECRETREF_MARKER,
           );
           expect(authorization).toEqual(
@@ -175,24 +182,17 @@ describe("registered Ollama catalog", () => {
     const stateDir = tempDirs.make("ollama-catalog-pull-");
     await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir, OLLAMA_API_KEY: undefined }, async () => {
       const setupModel = {
-        id: "qwen2.5:0.5b",
-        name: "qwen2.5:0.5b",
-        reasoning: false,
-        input: ["text"] as ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 8192,
-        maxTokens: 2048,
+        ...modelFor("qwen2.5:0.5b"),
         // Documented workaround for local models that fail on tool schemas.
         compat: { supportsTools: false },
       };
       // Setup saves the models it found; later pulls must not need a config edit.
-      const cfg: OpenClawConfig = {
-        models: {
-          providers: {
-            ollama: { baseUrl: local, api: "ollama", apiKey: "ollama-local", models: [setupModel] },
-          },
-        },
-      };
+      const cfg = configFor({
+        baseUrl: local,
+        api: "ollama",
+        apiKey: "ollama-local",
+        models: [setupModel],
+      });
       let installed: string[] | undefined = [setupModel.id, "qwen3:0.6b", "nomic-embed-text"];
       let tagsRequests = 0;
       const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -212,31 +212,8 @@ describe("registered Ollama catalog", () => {
       });
       vi.stubGlobal("fetch", withFetchPreconnect(fetchMock));
       const listedModels = async () => {
-        const plan = await planOpenClawModelsJson({
-          context: {
-            cfg,
-            discoveryAuthConfig: cfg,
-            sourceConfigForSecrets: cfg,
-            agentDir: path.join(stateDir, "agent"),
-            env: {},
-            envFingerprint: {},
-            pluginMetadataSnapshot: createPluginMetadataSnapshotFixture({
-              plugins: [{ id: "ollama", providers: discovery.providers.map(({ id }) => id) }],
-            }),
-          },
-          authStore: { version: 1, profiles: {} },
-          existingRaw: "",
-          existingParsed: null,
-        });
-        const catalog: {
-          providers: { ollama: { models: Array<{ id: string; compat?: unknown }> } };
-        } = JSON.parse(
-          expectDefined(
-            plan.pluginCatalogWrites?.[encodePluginModelCatalogRelativePath("ollama")],
-            "Ollama writable plugin catalog",
-          ),
-        );
-        return catalog.providers.ollama.models.map(({ id, compat }) => ({ id, compat }));
+        const { catalog } = await catalogPlan(cfg, path.join(stateDir, "agent"));
+        return catalog.models.map(({ id, compat }) => ({ id, compat }));
       };
 
       // `/api/show` advertises tools for the setup model, but its configured compat still wins.

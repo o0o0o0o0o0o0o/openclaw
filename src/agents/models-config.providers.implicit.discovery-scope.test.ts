@@ -83,38 +83,21 @@ function metadataWithOwners(owners: Partial<PluginMetadataSnapshotOwnerMaps>) {
   return { ...snapshot, owners: { ...snapshot.owners, ...owners } };
 }
 
+const emptyCatalog = { order: "simple" as const, run: async () => null };
 function createProvider(id: string): ProviderPlugin {
-  return {
-    id,
-    label: id,
-    auth: [],
-    catalog: {
-      order: "simple",
-      run: async () => null,
-    },
-  };
-}
-
-function createProviderWithStaticCatalog(id: string): ProviderPlugin {
-  return {
-    ...createProvider(id),
-    staticCatalog: {
-      order: "simple",
-      run: async () => null,
-    },
-  };
+  return { id, label: id, auth: [], catalog: emptyCatalog };
 }
 
 function createStaticOnlyProvider(id: string): ProviderPlugin {
-  return {
-    id,
-    label: id,
-    auth: [],
-    staticCatalog: {
-      order: "simple",
-      run: async () => null,
-    },
-  };
+  return { id, label: id, auth: [], staticCatalog: emptyCatalog };
+}
+
+function catalogConfig(
+  baseUrl: string,
+  models: ModelProviderConfig["models"] = [],
+  api?: ModelProviderConfig["api"],
+): ModelProviderConfig {
+  return { baseUrl, models, ...(api ? { api } : {}) };
 }
 
 function createTextModel(id: string, name: string) {
@@ -159,24 +142,11 @@ describe("resolveImplicitProviders startup discovery scope", () => {
     // The sentinel keeps a failing isolation regression inside this disposable fixture.
     ambientHome = vi.spyOn(os, "homedir").mockReturnValue(state.path("ambient-home-sentinel"));
     mocks.resolveRuntimePluginDiscoveryProviders.mockResolvedValue([createProvider("openai")]);
-    mocks.runProviderCatalog.mockResolvedValue({
-      providers: {
-        openai: {
-          baseUrl: "https://api.openai.com/v1",
-          api: "openai-responses",
-          models: [],
-        },
-      },
-    });
-    mocks.runProviderStaticCatalog.mockResolvedValue({
-      providers: {
-        openai: {
-          baseUrl: "https://api.openai.com/v1",
-          api: "openai-responses",
-          models: [],
-        },
-      },
-    });
+    const result = {
+      providers: { openai: catalogConfig("https://api.openai.com/v1", [], "openai-responses") },
+    };
+    mocks.runProviderCatalog.mockResolvedValue(result);
+    mocks.runProviderStaticCatalog.mockResolvedValue(result);
     mocks.prepareProviderStaticCatalog.mockResolvedValue({
       providers: [],
       entries: [],
@@ -269,11 +239,11 @@ describe("resolveImplicitProviders startup discovery scope", () => {
     mocks.runProviderCatalog.mockImplementation(
       async ({ provider }: { provider: ProviderPlugin }) => ({
         providers: {
-          [provider.id]: {
-            baseUrl: `https://${provider.id}.example.test`,
-            api: "openai-completions",
-            models: [],
-          },
+          [provider.id]: catalogConfig(
+            `https://${provider.id}.example.test`,
+            [],
+            "openai-completions",
+          ),
         },
       }),
     );
@@ -392,54 +362,46 @@ describe("resolveImplicitProviders startup discovery scope", () => {
     expect(mocks.runProviderStaticCatalog).not.toHaveBeenCalled();
   });
 
-  it.each([true])(
-    "falls back to static provider catalogs when runtime discovery has no rows (prepared: %s)",
-    async (prepared) => {
-      const provider = { ...createProviderWithStaticCatalog("minimax"), pluginId: "minimax" };
-      const staticConfig: ModelProviderConfig = {
-        baseUrl: "https://api.minimax.io/anthropic",
-        api: "anthropic-messages",
-        models: [createTextModel("MiniMax-M2.7", "MiniMax M2.7")],
-      };
-      mocks.resolveRuntimePluginDiscoveryProviders.mockResolvedValue([provider]);
-      mocks.runProviderCatalog.mockResolvedValue(null);
-      mocks.runProviderStaticCatalog.mockResolvedValue({ providers: { minimax: staticConfig } });
+  it("falls back to prepared static catalogs when runtime discovery has no rows", async () => {
+    const provider = {
+      ...createProvider("minimax"),
+      staticCatalog: emptyCatalog,
+      pluginId: "minimax",
+    };
+    const staticConfig = catalogConfig(
+      "https://api.minimax.io/anthropic",
+      [createTextModel("MiniMax-M2.7", "MiniMax M2.7")],
+      "anthropic-messages",
+    );
+    mocks.resolveRuntimePluginDiscoveryProviders.mockResolvedValue([provider]);
+    mocks.runProviderCatalog.mockResolvedValue(null);
+    mocks.runProviderStaticCatalog.mockResolvedValue({ providers: { minimax: staticConfig } });
 
-      const providers = await discover({
-        providerDiscoveryProviderIds: ["minimax"],
-        ...(prepared
-          ? {
-              preparedStaticProviderCatalog: {
-                providers: [provider],
-                entries: [
-                  {
-                    provider,
-                    providerConfigs: {
-                      minimax: {
-                        ...staticConfig,
-                        models: [createTextModel("prepared-minimax", "Prepared MiniMax")],
-                      },
-                    },
-                  },
-                ],
+    const providers = await discover({
+      providerDiscoveryProviderIds: ["minimax"],
+      preparedStaticProviderCatalog: {
+        providers: [provider],
+        entries: [
+          {
+            provider,
+            providerConfigs: {
+              minimax: {
+                ...staticConfig,
+                models: [createTextModel("prepared-minimax", "Prepared MiniMax")],
               },
-            }
-          : {}),
-      });
+            },
+          },
+        ],
+      },
+    });
 
-      expect(mocks.runProviderCatalog).toHaveBeenCalledTimes(1);
-      expect(mocks.runProviderStaticCatalog).toHaveBeenCalledTimes(prepared ? 0 : 1);
-      expect(providers?.minimax?.models.map((model) => model.id)).toEqual([
-        prepared ? "prepared-minimax" : "MiniMax-M2.7",
-      ]);
-    },
-  );
-  it.each([
-    { scoped: false, api: "openai-responses" as const },
-    { scoped: true, api: "openai-responses" as const },
-  ])(
-    "prepares configured native auth within the discovery scope (scoped: $scoped, api: $api)",
-    async ({ scoped, api }) => {
+    expect(mocks.runProviderCatalog).toHaveBeenCalledTimes(1);
+    expect(mocks.runProviderStaticCatalog).not.toHaveBeenCalled();
+    expect(providers?.minimax?.models.map((model) => model.id)).toEqual(["prepared-minimax"]);
+  });
+  it.each([false, true])(
+    "prepares configured native auth within the discovery scope (scoped: %s)",
+    async (scoped) => {
       const prepareNative = vi.fn<NonNullable<ProviderPlugin["prepareSyntheticAuth"]>>(
         async () => ({ apiKey: "native-auth-ready", source: "native fixture", mode: "oauth" }),
       );
@@ -464,15 +426,8 @@ describe("resolveImplicitProviders startup discovery scope", () => {
       const config = {
         models: {
           providers: {
-            "custom-native": {
-              api,
-              baseUrl: "https://native.example.test",
-              models: [],
-            },
-            "unrelated-provider": {
-              baseUrl: "https://unrelated.example.test",
-              models: [],
-            },
+            "custom-native": catalogConfig("https://native.example.test", [], "openai-responses"),
+            "unrelated-provider": catalogConfig("https://unrelated.example.test"),
           },
         },
       };
@@ -497,20 +452,16 @@ describe("resolveImplicitProviders startup discovery scope", () => {
           return {
             providers: {
               [provider.id]: {
+                ...catalogConfig("https://native.example.test"),
                 apiKey: auth.apiKey,
-                baseUrl: "https://native.example.test",
-                models: [],
               },
             },
           };
         },
       );
       try {
-        await resolveImplicitProviders({
-          agentDir: state.agentDir(),
-          authStore: { version: 1, profiles: {} },
+        await discover({
           config,
-          env: state.env,
           pluginMetadataSnapshot,
           ...(scoped ? { providerDiscoveryProviderIds: [provider.id] } : {}),
         });
@@ -552,10 +503,7 @@ describe("resolveImplicitProviders startup discovery scope", () => {
         OPENCLAW_DISABLE_BUNDLED_PLUGINS: undefined,
       },
       async () =>
-        await resolveImplicitProviders({
-          agentDir: state.agentDir(),
-          config: {},
-          authStore: { version: 1, profiles: {} },
+        await discover({
           env: {
             ...state.env,
             OPENCLAW_BUNDLED_PLUGINS_DIR: BUNDLED_PLUGINS_DIR,
@@ -591,9 +539,7 @@ describe("resolveImplicitProviders startup discovery scope", () => {
       },
     });
 
-    const providers = await resolveImplicitProviders({
-      agentDir: state.agentDir(),
-      authStore: { version: 1, profiles: {} },
+    const providers = await discover({
       config: { models: { providers: { "amazon-bedrock": explicitProvider } } },
       env: { ...state.env, AWS_PROFILE: "default" },
       explicitProviders: { "amazon-bedrock": explicitProvider },
@@ -626,27 +572,12 @@ describe("resolveImplicitProviders startup discovery scope", () => {
       },
     });
 
-    const providers = await resolveImplicitProviders({
-      agentDir: state.agentDir(),
-      authStore: { version: 1, profiles: {} },
+    const providers = await discover({
       config: {
-        agents: {
-          defaults: {
-            models: {
-              "vllm/manual-model": {},
-            },
-          },
-        },
-        models: {
-          providers: {
-            vllm: explicitProvider,
-          },
-        },
+        agents: { defaults: { models: { "vllm/manual-model": {} } } },
+        models: { providers: { vllm: explicitProvider } },
       },
-      env: state.env,
-      explicitProviders: {
-        vllm: explicitProvider,
-      },
+      explicitProviders: { vllm: explicitProvider },
     });
 
     expect(providers?.vllm?.models.map((model) => model.id)).toEqual([
@@ -658,19 +589,11 @@ describe("resolveImplicitProviders startup discovery scope", () => {
     const openai = { ...createStaticOnlyProvider("openai"), pluginId: "openai" };
     const anthropic = { ...createStaticOnlyProvider("anthropic"), pluginId: "anthropic" };
     const openaiConfigs: Record<string, ModelProviderConfig> = {
-      openai: { baseUrl: "https://api.openai.com/v1", api: "openai-responses", models: [] },
-      unrelated: {
-        baseUrl: "https://unrelated.example.test",
-        api: "openai-completions",
-        models: [],
-      },
+      openai: catalogConfig("https://api.openai.com/v1", [], "openai-responses"),
+      unrelated: catalogConfig("https://unrelated.example.test", [], "openai-completions"),
     };
     const anthropicConfigs: Record<string, ModelProviderConfig> = {
-      anthropic: {
-        baseUrl: "https://api.anthropic.com",
-        api: "anthropic-messages",
-        models: [],
-      },
+      anthropic: catalogConfig("https://api.anthropic.com", [], "anthropic-messages"),
     };
     const providers = await discover({
       explicitProviders: {},

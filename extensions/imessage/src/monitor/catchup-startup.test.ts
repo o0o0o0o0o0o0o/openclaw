@@ -70,17 +70,56 @@ describe("registered iMessage account startup", () => {
     }
   }
 
-  function startAccount(catchupEnabled = false) {
-    const cfg: OpenClawConfig = {
-      channels: {
-        imessage: {
-          cliPath: path.join(stateDir, "synthetic-imsg"),
-          dbPath,
-          dmPolicy: "disabled",
-          ...(catchupEnabled ? { catchup: { enabled: true } } : {}),
-        },
+  const catchupStore = () =>
+    getIMessageRuntime().state.openSyncKeyedStore<IMessageCatchupCursor>({
+      namespace: IMESSAGE_CATCHUP_CURSOR_NAMESPACE,
+      maxEntries: IMESSAGE_CATCHUP_CURSOR_MAX_ENTRIES,
+    });
+
+  const makeConfig = (
+    overrides: NonNullable<NonNullable<OpenClawConfig["channels"]>["imessage"]>,
+  ): OpenClawConfig => ({
+    channels: {
+      imessage: {
+        cliPath: path.join(stateDir, "synthetic-imsg"),
+        dmPolicy: "disabled",
+        ...overrides,
       },
-    };
+    },
+  });
+
+  function launch(
+    cfg: OpenClawConfig,
+    client: IMessageRpcClient,
+    runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn<(code: number) => void>() },
+  ) {
+    const account = resolveIMessageAccount({ cfg, accountId: "default" });
+    vi.spyOn(client, "waitForClose").mockResolvedValue(undefined);
+    createClient.mockResolvedValue(client);
+    return imessagePlugin.gateway!.startAccount!({
+      scheduler: createTestPluginServiceScheduler(),
+      cfg,
+      accountId: account.accountId,
+      account,
+      runtime,
+      abortSignal: new AbortController().signal,
+      getStatus: () => ({ accountId: account.accountId }),
+      setStatus: vi.fn(),
+    });
+  }
+
+  function expectSubscription(request: ReturnType<typeof startAccount>["request"], rowid?: number) {
+    expect(request).toHaveBeenCalledWith(
+      "watch.subscribe",
+      rowid === undefined
+        ? { attachments: false, include_reactions: true }
+        : expect.objectContaining({ since_rowid: rowid }),
+      expect.any(Object),
+    );
+  }
+
+  function startAccount(catchupEnabled = false) {
+    const cfg = makeConfig({ dbPath, ...(catchupEnabled ? { catchup: { enabled: true } } : {}) });
     const account = resolveIMessageAccount({ cfg, accountId: "default" });
     const client = new IMessageRpcClient({ cliPath: account.config.cliPath, dbPath });
     const request = vi.spyOn(client, "request").mockImplementation(async (method) => {
@@ -92,19 +131,7 @@ describe("registered iMessage account startup", () => {
       }
       throw new Error(`unexpected bridge method ${method}`);
     });
-    vi.spyOn(client, "waitForClose").mockResolvedValue(undefined);
-    createClient.mockResolvedValue(client);
-    const starting = imessagePlugin.gateway!.startAccount!({
-      scheduler: createTestPluginServiceScheduler(),
-      cfg,
-      accountId: account.accountId,
-      account,
-      runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-      abortSignal: new AbortController().signal,
-      getStatus: () => ({ accountId: account.accountId }),
-      setStatus: vi.fn(),
-    });
-    return { request, starting };
+    return { request, starting: launch(cfg, client) };
   }
 
   it("reads the startup watermark off the caller thread before subscribing", async () => {
@@ -128,11 +155,7 @@ describe("registered iMessage account startup", () => {
     const { request, starting } = startAccount();
     await starting;
 
-    expect(request).toHaveBeenCalledWith(
-      "watch.subscribe",
-      expect.objectContaining({ since_rowid: 5000 }),
-      expect.any(Object),
-    );
+    expectSubscription(request, 5000);
     expect(watermarkQueries()).toHaveLength(0);
   });
 
@@ -151,16 +174,11 @@ describe("registered iMessage account startup", () => {
             lastRowid: 4990,
           });
       } else {
-        state
-          .openSyncKeyedStore<IMessageCatchupCursor>({
-            namespace: IMESSAGE_CATCHUP_CURSOR_NAMESPACE,
-            maxEntries: IMESSAGE_CATCHUP_CURSOR_MAX_ENTRIES,
-          })
-          .register(resolveIMessageCatchupCursorKey("default"), {
-            lastSeenMs: Date.now(),
-            lastSeenRowid: 4990,
-            updatedAt: Date.now(),
-          });
+        catchupStore().register(resolveIMessageCatchupCursorKey("default"), {
+          lastSeenMs: Date.now(),
+          lastSeenRowid: 4990,
+          updatedAt: Date.now(),
+        });
       }
       const failure = new Error("synthetic cursor read unavailable");
       let failReads = true;
@@ -191,11 +209,7 @@ describe("registered iMessage account startup", () => {
       failReads = false;
       const recovered = startAccount();
       await recovered.starting;
-      expect(recovered.request).toHaveBeenCalledWith(
-        "watch.subscribe",
-        expect.objectContaining({ since_rowid: 4990 }),
-        expect.any(Object),
-      );
+      expectSubscription(recovered.request, 4990);
     },
   );
 
@@ -215,11 +229,7 @@ describe("registered iMessage account startup", () => {
     const { request, starting } = startAccount(true);
     await starting;
 
-    expect(request).toHaveBeenCalledWith(
-      "watch.subscribe",
-      { attachments: false, include_reactions: true },
-      expect.any(Object),
-    );
+    expectSubscription(request);
     expect(request).toHaveBeenCalledWith("chats.list", expect.any(Object), expect.any(Object));
   });
 
@@ -249,11 +259,7 @@ describe("registered iMessage account startup", () => {
       releaseClose.resolve();
       await starting;
     }
-    expect(request).toHaveBeenCalledWith(
-      "watch.subscribe",
-      expect.objectContaining({ since_rowid: 5000 }),
-      expect.any(Object),
-    );
+    expectSubscription(request, 5000);
   });
 
   it.each(["missing", "invalid"])(
@@ -266,11 +272,7 @@ describe("registered iMessage account startup", () => {
       const { request, starting } = startAccount();
       await starting;
 
-      expect(request).toHaveBeenCalledWith(
-        "watch.subscribe",
-        { attachments: false, include_reactions: true },
-        expect.any(Object),
-      );
+      expectSubscription(request);
       expect(diagnostic).toHaveBeenCalledWith(
         expect.stringContaining(`imessage: startup rowid watermark unavailable for db=${dbPath}:`),
       );
@@ -297,23 +299,10 @@ describe("registered iMessage account startup", () => {
         text: "missed during downtime",
         created_at: new Date(backlogStartMs + (index + 1) * 1_000).toISOString(),
       }));
-      const cfg: OpenClawConfig = {
-        channels: {
-          imessage: {
-            cliPath: path.join(stateDir, "synthetic-imsg"),
-            // Admission is the boundary under test; ordinary policy completes the rows
-            // without starting unrelated agent turns.
-            dmPolicy: "disabled",
-            catchup: { enabled: true, perRunLimit: 50, maxAgeMinutes: 60 },
-          },
-        },
-      };
-      const account = resolveIMessageAccount({ cfg, accountId: "default" });
-      const cursorStore = getIMessageRuntime().state.openSyncKeyedStore<IMessageCatchupCursor>({
-        namespace: IMESSAGE_CATCHUP_CURSOR_NAMESPACE,
-        maxEntries: IMESSAGE_CATCHUP_CURSOR_MAX_ENTRIES,
-      });
-      const cursorKey = resolveIMessageCatchupCursorKey(account.accountId);
+      // Disabled DMs complete ingress admission without unrelated agent turns.
+      const cfg = makeConfig({ catchup: { enabled: true, perRunLimit: 50, maxAgeMinutes: 60 } });
+      const cursorStore = catchupStore();
+      const cursorKey = resolveIMessageCatchupCursorKey("default");
       cursorStore.register(cursorKey, {
         lastSeenMs: backlogStartMs,
         lastSeenRowid: 0,
@@ -357,10 +346,6 @@ describe("registered iMessage account startup", () => {
             }
             throw new Error(`unexpected bridge method ${method}`);
           });
-          // The monitor calls this after catchup finishes, then drains real ingress
-          // during shutdown before the next registered account start.
-          vi.spyOn(client, "waitForClose").mockResolvedValue(undefined);
-          createClient.mockResolvedValue(client);
           const runtime = {
             log: vi.fn(),
             error: vi.fn(),
@@ -368,16 +353,7 @@ describe("registered iMessage account startup", () => {
               throw new Error(`unexpected exit ${code}`);
             }),
           };
-          await imessagePlugin.gateway!.startAccount!({
-            scheduler: createTestPluginServiceScheduler(),
-            cfg,
-            accountId: account.accountId,
-            account,
-            runtime,
-            abortSignal: new AbortController().signal,
-            getStatus: () => ({ accountId: account.accountId }),
-            setStatus: vi.fn(),
-          });
+          await launch(cfg, client, runtime);
 
           const admitted = database
             .prepare(

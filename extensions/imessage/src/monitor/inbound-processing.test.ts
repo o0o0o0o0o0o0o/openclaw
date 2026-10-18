@@ -20,26 +20,21 @@ beforeAll(async () => {
     await import("./inbound-processing.js"));
 });
 
-function createInboundDecisionParams(
+function resolveDecision(
   overrides: Omit<Partial<InboundDecisionParams>, "message"> & {
     message?: Partial<InboundDecisionParams["message"]>;
   } = {},
-): InboundDecisionParams {
+) {
   const { message: messageOverrides, ...restOverrides } = overrides;
   const message = {
-    id: 42,
-    sender: "+15555550123",
-    text: "ok",
-    is_from_me: false,
-    is_group: false,
+    ...directMessage(42, "ok"),
     ...messageOverrides,
   };
   const messageText = restOverrides.messageText ?? message.text ?? "";
   const bodyText = restOverrides.bodyText ?? messageText;
-  return {
+  return resolveIMessageInboundDecision({
     cfg,
     accountId: "default",
-    opts: undefined,
     allowFrom: ["*"],
     groupAllowFrom: [],
     groupPolicy: "open",
@@ -47,20 +42,42 @@ function createInboundDecisionParams(
     storeAllowFrom: [],
     historyLimit: 0,
     groupHistories: new Map(),
-    echoCache: undefined,
-    selfChatCache: undefined,
     isKnownFromMeMessageId: () => false,
-    logVerbose: undefined,
     ...restOverrides,
     message,
     messageText,
     bodyText,
-  };
+  });
 }
 
-function resolveDecision(overrides: Parameters<typeof createInboundDecisionParams>[0] = {}) {
-  return resolveIMessageInboundDecision(createInboundDecisionParams(overrides));
+async function buildContext(
+  message: InboundDecisionParams["message"],
+  overrides: Partial<Parameters<typeof buildIMessageInboundContext>[0]> = {},
+) {
+  const decision = overrides.decision ?? (await resolveDecision({ message }));
+  expect(decision.kind).toBe("dispatch");
+  if (decision.kind !== "dispatch") {
+    throw new Error("expected dispatch decision");
+  }
+  return buildIMessageInboundContext({
+    cfg,
+    accountService: undefined,
+    decision,
+    message,
+    historyLimit: 0,
+    groupHistories: new Map(),
+    ...overrides,
+  });
 }
+
+const directMessage = (id: number, text: string, guid?: string) => ({
+  id,
+  text,
+  guid,
+  sender: "+15555550123",
+  is_from_me: false,
+  is_group: false,
+});
 
 describe("resolveIMessageInboundDecision echo detection", () => {
   it("drops inbound messages when outbound message id matches echo cache", async () => {
@@ -74,8 +91,6 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         id: 42,
         text: "Reasoning:\n_step_",
       },
-      messageText: "Reasoning:\n_step_",
-      bodyText: "Reasoning:\n_step_",
       echoCache: { has: echoHas },
       logVerbose,
     });
@@ -104,8 +119,6 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         id: 42,
         text: "",
       },
-      messageText: "",
-      bodyText: "",
       mediaFacts: [{ contentType: "image/png", kind: "image" }],
       echoCache: { has: echoHas },
     });
@@ -132,14 +145,7 @@ describe("resolveIMessageInboundDecision echo detection", () => {
   it("keeps self-chat cache scoped to configured group threads", async () => {
     const selfChatCache = createSelfChatCache();
     const groupedCfg = {
-      channels: {
-        imessage: {
-          groups: {
-            "123": {},
-            "456": {},
-          },
-        },
-      },
+      channels: { imessage: { groups: { "123": {}, "456": {} } } },
     } as OpenClawConfig;
     const createdAt = "2026-03-02T20:58:10.649Z";
 
@@ -187,8 +193,6 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         text: "fresh inbound",
         is_group: true,
       },
-      messageText: "fresh inbound",
-      bodyText: "fresh inbound",
       echoCache: { has: echoHas },
     });
 
@@ -211,8 +215,6 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         created_at: createdAt,
         is_from_me: true,
       },
-      messageText: bodyText,
-      bodyText,
       selfChatCache,
       logVerbose,
     });
@@ -225,8 +227,6 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         text: bodyText,
         created_at: createdAt,
       },
-      messageText: bodyText,
-      bodyText,
       selfChatCache,
       logVerbose,
     });
@@ -250,18 +250,15 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         reacted_to_guid: "target-guid",
         text: "",
       },
-      messageText: "",
-      bodyText: "",
       echoCache: { has: echoHas },
     });
 
-    expect(decision.kind).toBe("reaction");
-    if (decision.kind !== "reaction") {
-      throw new Error("expected reaction decision");
-    }
-    expect(decision.text).toBe("iMessage reaction added: 👍 by +15555550123 on msg target-guid");
-    expect(decision.route.sessionKey).toBe("agent:main:main");
-    expect(decision.contextKey).toContain("imessage:reaction:added");
+    expect(decision).toMatchObject({
+      kind: "reaction",
+      text: "iMessage reaction added: 👍 by +15555550123 on msg target-guid",
+      route: { sessionKey: "agent:main:main" },
+      contextKey: expect.stringContaining("imessage:reaction:added"),
+    });
   });
 
   it("dispatches ordinary quoted prose instead of dropping it as a tapback", async () => {
@@ -294,19 +291,14 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         chat_guid: "any;-;+15555550123",
         chat_identifier: "+15555550123",
       },
-      messageText: "Loved “tapback target”",
-      bodyText: "Loved “tapback target”",
       echoCache: { has: () => false },
       isKnownFromMeMessageId: undefined,
     });
 
-    expect(decision.kind).toBe("reaction");
-    if (decision.kind !== "reaction") {
-      throw new Error("expected reaction decision");
-    }
-    expect(decision.text).toBe(
-      "iMessage reaction added: ❤️ by +15555550123 on msg imsg-production",
-    );
+    expect(decision).toMatchObject({
+      kind: "reaction",
+      text: "iMessage reaction added: ❤️ by +15555550123 on msg imsg-production",
+    });
   });
 
   it("drops tapbacks on non-bot messages in own notification mode", async () => {
@@ -317,8 +309,6 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         reacted_to_guid: "someone-else",
         text: "",
       },
-      messageText: "",
-      bodyText: "",
       echoCache: { has: () => false },
     });
 
@@ -334,8 +324,6 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         reacted_to_guid: "target-guid",
         text: "",
       },
-      messageText: "",
-      bodyText: "",
     });
 
     expect(decision).toEqual({ kind: "drop", reason: "reaction notifications disabled" });
@@ -353,6 +341,7 @@ describe("resolveIMessageReactionContext", () => {
   });
 
   it("detects imsg tapback flags and associated message types", async () => {
+    const guid = "321D6826-1013-4DF0-B53C-6F6241EF2EF6";
     expect(
       resolveIMessageReactionContext(
         { is_tapback: true, reaction_emoji: "👍", reacted_to_guid: "target" },
@@ -367,7 +356,7 @@ describe("resolveIMessageReactionContext", () => {
     expect(
       resolveIMessageReactionContext(
         {
-          associated_message_guid: "p:0/321D6826-1013-4DF0-B53C-6F6241EF2EF6",
+          associated_message_guid: `p:0/${guid}`,
           associated_message_type: 2000,
           reaction_emoji: "❤️",
         },
@@ -376,11 +365,8 @@ describe("resolveIMessageReactionContext", () => {
     ).toStrictEqual({
       action: "added",
       emoji: "❤️",
-      targetGuid: "321D6826-1013-4DF0-B53C-6F6241EF2EF6",
-      targetGuids: [
-        "321D6826-1013-4DF0-B53C-6F6241EF2EF6",
-        "p:0/321D6826-1013-4DF0-B53C-6F6241EF2EF6",
-      ],
+      targetGuid: guid,
+      targetGuids: [guid, `p:0/${guid}`],
     });
     expect(resolveIMessageReactionContext({ associated_message_type: 2001 }, "")).toStrictEqual({
       action: "added",
@@ -394,65 +380,35 @@ describe("resolveIMessageReactionContext", () => {
 
 describe("buildIMessageInboundContext", () => {
   it("keeps generated media notices out of command input", async () => {
-    const message = {
-      id: 12347,
-      guid: "p:0/GUID-media-failure",
-      sender: "+15555550123",
-      text: "/reset",
-      is_from_me: false,
-      is_group: false,
-    };
+    const message = directMessage(12347, "/reset", "p:0/GUID-media-failure");
     const decision = await resolveDecision({ message });
-    expect(decision.kind).toBe("dispatch");
     if (decision.kind !== "dispatch") {
-      return;
+      throw new Error("expected dispatch decision");
     }
-
-    const { ctxPayload } = await buildIMessageInboundContext({
-      cfg: {} as OpenClawConfig,
-      accountService: undefined,
+    const { ctxPayload } = await buildContext(message, {
       decision: {
         ...decision,
         agentBodyText: "/reset\n\n[imessage attachment unavailable]",
       },
-      message,
-      historyLimit: 0,
-      groupHistories: new Map(),
     });
-
-    expect(ctxPayload.RawBody).toBe("/reset");
-    expect(ctxPayload.CommandBody).toBe("/reset");
-    expect(ctxPayload.BodyForAgent).toBe("/reset\n\n[imessage attachment unavailable]");
+    expect(ctxPayload).toMatchObject({
+      RawBody: "/reset",
+      CommandBody: "/reset",
+      BodyForAgent: "/reset\n\n[imessage attachment unavailable]",
+    });
     expect(ctxPayload.Body).toContain("/reset\n\n[imessage attachment unavailable]");
   });
 
   it("prepends direct-message history when supplied", async () => {
-    const message = {
-      id: 12346,
-      guid: "p:0/GUID-current-history",
-      sender: "+15555550123",
-      text: "current",
-      is_from_me: false,
-      is_group: false,
-    };
-    const decision = await resolveDecision({ message });
-    expect(decision.kind).toBe("dispatch");
-    if (decision.kind !== "dispatch") {
-      return;
-    }
-
-    const { ctxPayload, inboundHistory } = await buildIMessageInboundContext({
-      cfg: {} as OpenClawConfig,
-      accountService: undefined,
-      decision,
-      message,
-      historyLimit: 0,
-      groupHistories: new Map(),
-      dmHistory: {
-        body: "[iMessage from +15555550123]\nprevious\n[/iMessage]",
-        inboundHistory: [{ sender: "+15555550123", body: "previous" }],
+    const { ctxPayload, inboundHistory } = await buildContext(
+      directMessage(12346, "current", "p:0/GUID-current-history"),
+      {
+        dmHistory: {
+          body: "[iMessage from +15555550123]\nprevious\n[/iMessage]",
+          inboundHistory: [{ sender: "+15555550123", body: "previous" }],
+        },
       },
-    });
+    );
 
     expect(ctxPayload.Body).toContain("previous");
     expect(ctxPayload.Body).toContain("current");
@@ -461,19 +417,6 @@ describe("buildIMessageInboundContext", () => {
   });
 
   it("uses the monitor's prepared account service without re-reading channel config", async () => {
-    const message = {
-      id: 12348,
-      sender: "+15555550123",
-      text: "current",
-      is_from_me: false,
-      is_group: false,
-    };
-    const decision = await resolveDecision({ message });
-    expect(decision.kind).toBe("dispatch");
-    if (decision.kind !== "dispatch") {
-      return;
-    }
-
     let channelConfigReads = 0;
     const projectionCfg = Object.defineProperty({}, "channels", {
       enumerable: true,
@@ -482,13 +425,9 @@ describe("buildIMessageInboundContext", () => {
         return { imessage: { service: "imessage" } };
       },
     }) as OpenClawConfig;
-    const { ctxPayload, imessageTo } = await buildIMessageInboundContext({
+    const { ctxPayload, imessageTo } = await buildContext(directMessage(12348, "current"), {
       cfg: projectionCfg,
       accountService: "sms",
-      decision,
-      message,
-      historyLimit: 0,
-      groupHistories: new Map(),
     });
 
     expect(ctxPayload.MessageSid).toBeUndefined();

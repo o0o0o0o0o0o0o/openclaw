@@ -39,11 +39,7 @@ let state: OpenClawTestState;
 const withState = (run: () => Promise<void>) =>
   withOpenClawTestState({ scenario: "minimal" }, async (fixture) => {
     state = fixture;
-    try {
-      await run();
-    } finally {
-      vi.useRealTimers();
-    }
+    await run().finally(() => vi.useRealTimers());
   });
 
 function seedSession(

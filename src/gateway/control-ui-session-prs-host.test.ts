@@ -11,10 +11,6 @@ import { loadControlUiSessionPullRequests } from "./control-ui-session-prs.js";
 import { githubJson, pullListItem, requestUrl } from "./control-ui-session-prs.test-support.js";
 import { getSessionRowProjection } from "./session-row-projection-access.js";
 
-function sentText(socket: { send: { mock: { calls: ReadonlyArray<readonly unknown[]> } } }) {
-  return socket.send.mock.calls.map(([data]) => String(data)).join("\n");
-}
-
 type Fixture = Awaited<ReturnType<typeof createFixture>>;
 async function withReader(run: (fixture: Fixture) => Promise<void>) {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
@@ -35,17 +31,6 @@ function publicationPull(host = "github.com", title = "Public change") {
     title,
     html_url: `https://${host}/synthetic/publication/pull/103469`,
     base: { repo: { name: "publication", owner: { login: "synthetic" } } },
-  });
-}
-
-function configureEnterprise(f: Fixture) {
-  setRuntimeConfigSnapshot({
-    ...f.cfg,
-    gateway: {
-      ...f.cfg.gateway,
-      github: { host: "ghe.example.test", apiBaseUrl: "https://ghe.example.test/api/v3" },
-      controlUi: { github: { host: "ghe.example.test", token: "synthetic-enterprise-token" } },
-    },
   });
 }
 
@@ -136,56 +121,61 @@ it.each([false, true])(
   },
 );
 
-it("keeps a public session reader outside a same-named private Enterprise repository", async () => {
-  await withReader(async (f) => {
-    const provider = vi.fn<typeof fetch>(async (input) => {
-      const url = new URL(requestUrl(input));
-      const isPublic = url.hostname === "api.github.com";
-      return githubJson([
-        {
-          ...publicationPull(
-            isPublic ? "github.com" : "ghe.example.test",
-            isPublic ? "Public change" : "Private Enterprise secret",
-          ),
-          head: {},
+it.each([false, true])(
+  "isolates same-named GitHub repositories (Enterprise reader=%s)",
+  async (enterprise) => {
+    await withReader(async (f) => {
+      const provider = vi.fn<typeof fetch>(async (input) => {
+        const url = new URL(requestUrl(input));
+        if (enterprise) {
+          return url.pathname.endsWith("/pulls") ? githubJson([]) : githubJson({ fork: false });
+        }
+        const isPublic = url.hostname === "api.github.com";
+        return githubJson([
+          {
+            ...publicationPull(
+              isPublic ? "github.com" : "ghe.example.test",
+              isPublic ? "Public change" : "Private Enterprise secret",
+            ),
+            head: {},
+          },
+        ]);
+      });
+      vi.stubGlobal("fetch", provider);
+      setRuntimeConfigSnapshot({
+        ...f.cfg,
+        gateway: {
+          ...f.cfg.gateway,
+          github: { host: "ghe.example.test", apiBaseUrl: "https://ghe.example.test/api/v3" },
+          controlUi: { github: { host: "ghe.example.test", token: "synthetic-enterprise-token" } },
         },
-      ]);
-    });
-    vi.stubGlobal("fetch", provider);
-    configureEnterprise(f);
-    const privateKey = "agent:main:private-enterprise";
-    await seedRepository(f, sessionKey, "github.com");
-    await seedRepository(f, privateKey, "ghe.example.test", f.other.id);
-    await f.subscribe([sessionKey, privateKey]);
-    await f.subscriptions.pollNow();
-    const delivered = sentText(f.socket);
-    expect(delivered).toContain("Public change");
-    expect(delivered).not.toContain("Private Enterprise secret");
-    expect(provider).toHaveBeenCalledOnce();
-    const [input, options] = provider.mock.calls[0]!;
-    expect(new URL(requestUrl(input)).origin).toBe("https://api.github.com");
-    expect(new Headers(options?.headers).has("Authorization")).toBe(false);
-  });
-});
-
-it("reads an admitted Enterprise session and builds its branch link on that host", async () => {
-  await withReader(async (f) => {
-    const provider = vi.fn<typeof fetch>(async (input, options) => {
-      const url = new URL(requestUrl(input));
-      expect(url.origin).toBe("https://ghe.example.test");
-      expect(new Headers(options?.headers).get("Authorization")).toBe(
-        "Bearer synthetic-enterprise-token",
+      });
+      await seedRepository(f, sessionKey, enterprise ? "ghe.example.test" : "github.com");
+      const privateKey = "agent:main:private-enterprise";
+      if (!enterprise) {
+        await seedRepository(f, privateKey, "ghe.example.test", f.other.id);
+      }
+      await f.subscribe(enterprise ? undefined : [sessionKey, privateKey]);
+      await f.subscriptions.pollNow();
+      const delivered = f.socket.send.mock.calls.map(([data]) => String(data)).join("\n");
+      expect(delivered).toContain(
+        enterprise
+          ? "https://ghe.example.test/synthetic/publication/pull/new/guest-change"
+          : "Public change",
       );
-      return url.pathname.endsWith("/pulls") ? githubJson([]) : githubJson({ fork: false });
+      if (!enterprise) {
+        expect(delivered).not.toContain("Private Enterprise secret");
+      }
+      expect(provider).toHaveBeenCalledTimes(enterprise ? 2 : 1);
+      for (const [input, options] of provider.mock.calls) {
+        expect({
+          origin: new URL(requestUrl(input)).origin,
+          authorization: new Headers(options?.headers).get("Authorization"),
+        }).toEqual({
+          origin: enterprise ? "https://ghe.example.test" : "https://api.github.com",
+          authorization: enterprise ? "Bearer synthetic-enterprise-token" : null,
+        });
+      }
     });
-    vi.stubGlobal("fetch", provider);
-    configureEnterprise(f);
-    await seedRepository(f);
-    await f.subscribe();
-    await f.subscriptions.pollNow();
-    expect(sentText(f.socket)).toContain(
-      "https://ghe.example.test/synthetic/publication/pull/new/guest-change",
-    );
-    expect(provider).toHaveBeenCalledTimes(2);
-  });
-});
+  },
+);

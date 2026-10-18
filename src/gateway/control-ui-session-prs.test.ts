@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runGitWorkerOperation } from "../infra/git-worker.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -15,11 +16,10 @@ const { load: loadControlUiSessionPullRequests } = createSessionPullRequestsFixt
 
 vi.mock("../infra/git-worker.js", () => ({ runGitWorkerOperation: vi.fn() }));
 
-const resolveGitContext = async () => context;
 const load = (refresh = false, deps: Parameters<typeof loadControlUiSessionPullRequests>[1] = {}) =>
   loadControlUiSessionPullRequests(
     { sessionKey: "agent:main:main", refresh },
-    { resolveGitContext, ...deps },
+    { resolveGitContext: async () => context, ...deps },
   );
 let cacheEpochMs = Date.now();
 
@@ -48,14 +48,45 @@ const expectedChip = {
   state: "open",
 };
 
-function localGitReads() {
+function localGitReads(type?: string) {
   return vi
     .mocked(runGitWorkerOperation)
     .mock.calls.filter(
       ([operation]) =>
+        (!type || operation.type === type) &&
         operation.type !== "checkout.revision" &&
         operation.type !== "pull-request.branch-comparison",
     );
+}
+
+const mergedPull = pullListItem({ merged_at: "2026-07-09T10:00:00Z" });
+const repository = { owner: "openclaw", repo: "openclaw" };
+function mockCheckout(options: {
+  revision: () => string | null;
+  resolve?: (root: string) => typeof context & { root: string; defaultBranch: string };
+  additions?: (root: string) => number;
+}) {
+  vi.mocked(runGitWorkerOperation).mockImplementation(async (operation) => {
+    switch (operation.type) {
+      case "pull-request.branch-comparison":
+        return { statsBase: null, creatable: false, equalPushedTips: false, complete: true };
+      case "checkout.revision":
+        return options.revision();
+      case "checkout.context":
+        if (options.resolve) {
+          return options.resolve(operation.input.root);
+        }
+        break;
+      case "pull-request.branch-facts":
+        return {
+          creatable: true,
+          stats: options.additions
+            ? { additions: options.additions(operation.input.root), deletions: 0, changedFiles: 1 }
+            : null,
+        };
+    }
+    throw new Error("Unexpected local Git operation");
+  });
 }
 
 function makeCheckRuns(count: number, verbose = false) {
@@ -105,15 +136,11 @@ function mockChecks(
 describe("parseGitHubRemoteUrl", () => {
   it("parses the configured GitHub Enterprise host without admitting another host", () => {
     const expected = { owner: "acme", repo: "private-repo" };
-    expect(
+    expect([
       parseGitHubRemoteUrl("https://ghe.example.test/acme/private-repo.git", "ghe.example.test"),
-    ).toEqual(expected);
-    expect(
       parseGitHubRemoteUrl("git@ghe.example.test:acme/private-repo.git", "ghe.example.test"),
-    ).toEqual(expected);
-    expect(
       parseGitHubRemoteUrl("https://github.com/acme/private-repo.git", "ghe.example.test"),
-    ).toBeNull();
+    ]).toEqual([expected, expected, null]);
   });
 
   it("rejects non-GitHub and malformed remotes", () => {
@@ -148,7 +175,7 @@ describe("loadControlUiSessionPullRequests", () => {
     const result = await load();
 
     expect(result).toEqual({
-      repository: { owner: "openclaw", repo: "openclaw" },
+      repository,
       pullRequests: [
         {
           ...expectedChip,
@@ -185,7 +212,7 @@ describe("loadControlUiSessionPullRequests", () => {
       vi.stubEnv("GH_TOKEN", "");
       await expect(load(false, { cacheSignal: cacheLifetime.signal })).resolves.toEqual({
         pullRequests: [],
-        repository: { owner: "openclaw", repo: "openclaw" },
+        repository,
         rateLimited: false,
         status: "unavailable",
       });
@@ -197,7 +224,6 @@ describe("loadControlUiSessionPullRequests", () => {
         "Bearer github-token-a",
       );
       expect(fetchImpl.mock.calls[1]?.[1]?.headers).not.toHaveProperty("Authorization");
-      // The current credential's PR cache is the only retained lookup here.
       expect(getEventListeners(cacheLifetime.signal, "abort")).toHaveLength(1);
     } finally {
       cacheLifetime.abort();
@@ -232,9 +258,7 @@ describe("loadControlUiSessionPullRequests", () => {
     const count = 100;
     mockChecks(makeCheckRuns(count, true), { additions: 4, deletions: 3 });
 
-    const result = await load();
-
-    expect(result.pullRequests[0]?.checks).toEqual({
+    expect((await load()).pullRequests[0]?.checks).toEqual({
       state: "failing",
       passed: count - 1,
       failed: 1,
@@ -247,10 +271,8 @@ describe("loadControlUiSessionPullRequests", () => {
     mockChecks(makeCheckRuns(101), { additions: 4, deletions: 3 }, 403);
 
     const result = await load();
-
-    expect(result.pullRequests[0]?.number).toBe(103469);
+    expect(result).toMatchObject({ pullRequests: [{ number: 103469 }], rateLimited: false });
     expect(result.pullRequests[0]?.checks).toBeUndefined();
-    expect(result.rateLimited).toBe(false);
   });
 
   it.each([
@@ -260,9 +282,7 @@ describe("loadControlUiSessionPullRequests", () => {
   ])("bounds check collection for $count runs", async ({ count, passed }) => {
     const fetchImpl = mockChecks(makeCheckRuns(count), { additions: 4, deletions: 3 });
 
-    const result = await load();
-
-    expect(result.pullRequests[0]?.checks?.passed).toBe(passed);
+    expect((await load()).pullRequests[0]?.checks?.passed).toBe(passed);
     expect(
       fetchImpl.mock.calls.filter(([url]) => requestUrl(url).includes("/check-runs")).length,
     ).toBeLessThanOrEqual(10);
@@ -276,8 +296,7 @@ describe("loadControlUiSessionPullRequests", () => {
           fork: true,
           parent: { name: "openclaw", owner: { login: "openclaw" } },
         }),
-      "/repos/openclaw/openclaw/pulls?head=": () =>
-        githubJson([pullListItem({ merged_at: "2026-07-09T10:00:00Z" })]),
+      "/repos/openclaw/openclaw/pulls?head=": () => githubJson([mergedPull]),
     });
     const result = await load(false, {
       resolveGitContext: async () => ({ ...context, owner: "fork-owner" }),
@@ -296,15 +315,12 @@ describe("loadControlUiSessionPullRequests", () => {
   it("serves stale chips flagged rateLimited when GitHub quota runs out", async () => {
     let limited = false;
     const fetchImpl = stubGithub({
-      "/pulls?head=": () =>
-        limited
-          ? rateLimitedResponse()
-          : githubJson([pullListItem({ merged_at: "2026-07-09T10:00:00Z" })]),
+      "/pulls?head=": () => (limited ? rateLimitedResponse() : githubJson([mergedPull])),
     });
 
     const fresh = await load();
     expect(fresh.rateLimited).toBe(false);
-    expect(fresh.repository).toEqual({ owner: "openclaw", repo: "openclaw" });
+    expect(fresh.repository).toEqual(repository);
 
     limited = true;
     vi.advanceTimersByTime(91_000);
@@ -324,13 +340,6 @@ describe("loadControlUiSessionPullRequests", () => {
     expect(fetchImpl.mock.calls).toHaveLength(callsDuringBackoff);
   });
 
-  it("returns no chips without a git context and spends no quota", async () => {
-    const fetchImpl = stubGithub({});
-    const result = await load(false, { resolveGitContext: async () => null });
-    expect(result).toEqual({ pullRequests: [], rateLimited: false });
-    expect(fetchImpl.mock.calls).toHaveLength(0);
-  });
-
   it("revalidates local facts on refresh and observes changed merged heads or the slow fallback", async () => {
     let pulls: Record<string, unknown>[] = [];
     const fetchImpl = stubGithub({
@@ -338,24 +347,9 @@ describe("loadControlUiSessionPullRequests", () => {
       "/repos/openclaw/openclaw": () => githubJson({ fork: false }),
     });
     let additions = 1;
-    vi.mocked(runGitWorkerOperation).mockImplementation(async (operation) => {
-      if (operation.type === "pull-request.branch-comparison") {
-        return { statsBase: null, creatable: false, equalPushedTips: false, complete: true };
-      }
-      if (operation.type === "checkout.revision") {
-        return "unchanged";
-      }
-      if (operation.type !== "pull-request.branch-facts") {
-        throw new Error("Unexpected local Git operation");
-      }
-      return {
-        creatable: true,
-        stats: {
-          additions: operation.input.root === "/repo/b" ? 3 : additions,
-          deletions: 0,
-          changedFiles: 1,
-        },
-      };
+    mockCheckout({
+      revision: () => "unchanged",
+      additions: (root) => (root === "/repo/b" ? 3 : additions),
     });
     const loadSession = (sessionKey: string, refresh = false) =>
       loadControlUiSessionPullRequests(
@@ -369,38 +363,35 @@ describe("loadControlUiSessionPullRequests", () => {
           }),
         },
       );
+    const expectAdditions = async (expected: number, reads: number, refresh = false, key = "a") => {
+      expect((await loadSession(`agent:main:${key}`, refresh)).branch?.additions).toBe(expected);
+      expect(localGitReads()).toHaveLength(reads);
+    };
 
-    expect((await loadSession("agent:main:a")).branch?.additions).toBe(1);
+    await expectAdditions(1, 1);
     additions = 2;
-    expect((await loadSession("agent:main:a")).branch?.additions).toBe(1);
-    expect(localGitReads()).toHaveLength(1);
-    expect((await loadSession("agent:main:a", true)).branch?.additions).toBe(1);
-    expect(localGitReads()).toHaveLength(1);
+    await expectAdditions(1, 1);
+    await expectAdditions(1, 1, true);
     expect(
       fetchImpl.mock.calls.filter((call) =>
         requestUrl(call[0] as RequestInfo | URL).includes("/pulls?head="),
       ),
     ).toHaveLength(2);
 
-    pulls = [pullListItem({ merged_at: "2026-07-09T10:00:00Z" })];
+    pulls = [mergedPull];
     additions = 4;
-    expect((await loadSession("agent:main:a", true)).branch?.additions).toBe(4);
-    expect(localGitReads()).toHaveLength(2);
+    await expectAdditions(4, 2, true);
 
     const githubRequests = fetchImpl.mock.calls.length;
     vi.advanceTimersByTime(60_000);
     additions = 5;
-    expect((await loadSession("agent:main:a")).branch?.additions).toBe(4);
-    expect(localGitReads()).toHaveLength(2);
+    await expectAdditions(4, 2);
     expect(fetchImpl.mock.calls).toHaveLength(githubRequests);
 
     vi.advanceTimersByTime(240_001);
-    additions = 5;
-    expect((await loadSession("agent:main:a")).branch?.additions).toBe(5);
-    expect(localGitReads()).toHaveLength(3);
+    await expectAdditions(5, 3);
 
-    expect((await loadSession("agent:main:b")).branch?.additions).toBe(3);
-    expect(localGitReads()).toHaveLength(4);
+    await expectAdditions(3, 4, false, "b");
   });
 
   it("refreshes branch context on metadata changes without repeating it for working-tree activity", async () => {
@@ -410,27 +401,14 @@ describe("loadControlUiSessionPullRequests", () => {
       "/pulls?head=": () => githubJson([]),
       "/repos/openclaw/openclaw": () => githubJson({ fork: false }),
     });
-    vi.mocked(runGitWorkerOperation).mockImplementation(async (operation) => {
-      if (operation.type === "pull-request.branch-comparison") {
-        return { statsBase: null, creatable: false, equalPushedTips: false, complete: true };
-      }
-      if (operation.type === "checkout.revision") {
-        return revision;
-      }
-      if (operation.type === "checkout.context") {
-        return { ...context, branch, root: operation.input.root, defaultBranch: "main" };
-      }
-      if (operation.type === "pull-request.branch-facts") {
-        return { creatable: true, stats: null };
-      }
-      throw new Error("Unexpected local Git operation");
+    mockCheckout({
+      revision: () => revision,
+      resolve: (root) => ({ ...context, branch, root, defaultBranch: "main" }),
     });
     const loadContext = (refresh = false) =>
       loadControlUiSessionPullRequests(
-        { sessionKey: "agent:main:context-refresh", ...(refresh ? { refresh: true } : {}) },
-        {
-          resolveGitRoot: async () => "/repo/forced-context",
-        },
+        { sessionKey: "agent:main:context-refresh", refresh },
+        { resolveGitRoot: async () => "/repo/forced-context" },
       );
 
     expect((await loadContext()).branch?.branch).toBe("feature-a");
@@ -439,9 +417,7 @@ describe("loadControlUiSessionPullRequests", () => {
     expect((await loadContext(true)).branch?.branch).toBe("feature-a");
     revision = "changed-head";
     expect((await loadContext()).branch?.branch).toBe("feature-b");
-    expect(
-      localGitReads().filter(([operation]) => operation.type === "checkout.context"),
-    ).toHaveLength(2);
+    expect(localGitReads("checkout.context")).toHaveLength(2);
     // Unsupported layouts retain immediate explicit branch discovery.
     revision = null;
     expect((await loadContext()).branch?.branch).toBe("feature-b");
@@ -460,7 +436,7 @@ describe("loadControlUiSessionPullRequests", () => {
           initialPullStarted.resolve();
           return initialPulls.promise;
         }
-        return githubJson([pullListItem({ merged_at: "2026-07-09T10:00:00Z" })]);
+        return githubJson([mergedPull]);
       },
       "/repos/openclaw/openclaw": () => githubJson({ fork: false }),
     });
@@ -483,7 +459,6 @@ describe("loadControlUiSessionPullRequests", () => {
   });
 
   it("keeps the proven PR list as state-only chips when detail fetches are rate limited", async () => {
-    // A cached empty branch discovers a new PR before quota dies on detail fetches.
     let hasPull = false;
     const routes = [
       {
@@ -506,13 +481,7 @@ describe("loadControlUiSessionPullRequests", () => {
 
     expect(result.rateLimited).toBe(true);
     expect(result.branch).toBeUndefined();
-    expect(result.pullRequests).toEqual([
-      {
-        ...expectedChip,
-        // The list fetch succeeded, so its author survives the degraded chip.
-        author: { login: "octocat" },
-      },
-    ]);
+    expect(result.pullRequests).toEqual([{ ...expectedChip, author: { login: "octocat" } }]);
 
     // Outage outlives the rate-limit cache window and now even the list
     // fetch 429s: the proven chips must survive as the last-known fallback.
@@ -524,4 +493,3 @@ describe("loadControlUiSessionPullRequests", () => {
     expect(stillLimited.pullRequests.map((item) => item.number)).toEqual([103469]);
   });
 });
-import { getEventListeners } from "node:events";

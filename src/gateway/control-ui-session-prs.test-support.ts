@@ -21,9 +21,16 @@ import { prepareSessionMutationFacts } from "./session-sharing-preparation.js";
 import { resolveSessionStoreKey } from "./session-store-key.js";
 import { loadGatewaySessionEntryReadOnlyAsync as loadEntry } from "./session-utils-store.js";
 
-type GitContext = { owner: string; repo: string; branch: string };
 type PrRequest = Parameters<typeof loadPrs>[0];
 type PrDeps = Omit<Parameters<typeof loadPrs>[1], "read">;
+
+function requestAgent(params: PrRequest, cfg = getRuntimeConfig()) {
+  const requested = resolveRequestedSessionAgentId(cfg, params.sessionKey, params.agentId);
+  if (!requested.ok) {
+    throw new Error(requested.error.message);
+  }
+  return requested.agentId;
+}
 
 export function githubJson(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -39,14 +46,14 @@ export function requestUrl(input: RequestInfo | URL | undefined): string {
 export function routedFetch(
   routes: Array<{ match: string; response: () => Response | Promise<Response> }>,
 ) {
-  return vi.fn(async (input: RequestInfo | URL) => {
+  return vi.fn<typeof fetch>(async (input) => {
     const url = requestUrl(input);
     const route = routes.find((candidate) => url.includes(candidate.match));
     if (!route) {
       throw new Error(`unexpected GitHub request: ${url}`);
     }
     return route.response();
-  }) as unknown as typeof fetch & { mock: { calls: unknown[][] } };
+  });
 }
 
 export function pullListItem(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -63,7 +70,7 @@ export function pullListItem(overrides: Record<string, unknown> = {}): Record<st
   };
 }
 
-export const testGitContext: GitContext = {
+export const testGitContext = {
   owner: "openclaw",
   repo: "openclaw",
   branch: "claude/browser-tabs-tighter-header",
@@ -74,22 +81,15 @@ export async function loadTestSessionPullRequests(
   params: PrRequest,
   deps: PrDeps = {},
 ): ReturnType<typeof loadPrs> {
-  const requested = resolveRequestedSessionAgentId(
-    getRuntimeConfig(),
-    params.sessionKey,
-    params.agentId,
-  );
-  if (!requested.ok) {
-    throw new Error(requested.error.message);
-  }
-  const target = await prepareTestSessionPrTarget({ ...params, agentId: requested.agentId });
+  const agentId = requestAgent(params);
+  const target = await prepareTestSessionPrTarget({ ...params, agentId });
   if (!target) {
     return { pullRequests: [], rateLimited: false };
   }
   const facts = await prepareSessionMutationFacts({
     cfg: getRuntimeConfig(),
     sessionKey: params.sessionKey,
-    agentId: requested.agentId,
+    agentId,
   });
   try {
     const original = facts.readCurrent(getRuntimeConfig()).target.entry;
@@ -164,30 +164,23 @@ export function createSessionPullRequestsFixture() {
     if (!state) {
       throw new Error("Session PR fixture is not active");
     }
-    const requested = resolveRequestedSessionAgentId(cfg, params.sessionKey, params.agentId);
-    if (!requested.ok) {
-      throw new Error(requested.error.message);
-    }
+    const agentId = requestAgent(params, cfg);
     const sessionKey = resolveSessionStoreKey({
       cfg,
       sessionKey: params.sessionKey,
-      storeAgentId: requested.agentId,
+      storeAgentId: agentId,
     });
     if (!seeded.has(sessionKey)) {
-      replaceSessionEntrySync(
-        { agentId: requested.agentId, sessionKey },
-        { sessionId: randomUUID(), updatedAt: 1 },
-      );
+      replaceSessionEntrySync({ agentId, sessionKey }, { sessionId: randomUUID(), updatedAt: 1 });
       seeded.add(sessionKey);
     }
-    return { sessionKey, agentId: requested.agentId };
-  };
-  const load: typeof loadTestSessionPullRequests = (params, deps) => {
-    seed(params);
-    return loadTestSessionPullRequests(params, deps);
+    return { sessionKey, agentId };
   };
   return {
-    load,
+    load: (params: PrRequest, deps?: PrDeps) => {
+      seed(params);
+      return loadTestSessionPullRequests(params, deps);
+    },
     prepareRead: async (_connId: string, session: PrRequest) => {
       const params = seed(session);
       return () => prepareTestSessionPrTarget(params);

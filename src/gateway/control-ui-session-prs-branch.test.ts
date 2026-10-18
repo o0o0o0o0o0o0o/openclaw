@@ -16,6 +16,7 @@ import {
 } from "./control-ui-session-prs.test-support.js";
 
 const { load: loadControlUiSessionPullRequests } = createSessionPullRequestsFixture();
+const branchIdentity = { ...context, branch: "feature" };
 
 describe("session branch diff stats", () => {
   const execFileAsync = promisify(execFile);
@@ -46,20 +47,14 @@ describe("session branch diff stats", () => {
   const resolveRevision = async (revision: string) =>
     (await git("rev-parse", revision)).stdout.trim();
 
-  const initializeRepoAt = async (repo: string, initialContents: string) => {
+  const initializeRepo = async (initialContents = "one\n", repo = root) => {
+    if (repo === root && initialContents === "one\n") {
+      return fs.cp(templateRepo, root, { recursive: true });
+    }
     await gitIn(repo, "init", "--initial-branch=main", ".");
     await fs.writeFile(path.join(repo, "a.txt"), initialContents);
     await gitIn(repo, "add", "a.txt");
     await gitIn(repo, "commit", "-m", "base");
-  };
-
-  const initializeRepo = async (initialContents = "one\n") => {
-    if (initialContents !== "one\n") {
-      await initializeRepoAt(root, initialContents);
-      return;
-    }
-    // Each case owns its .git directory; only the unchanged base history is copied.
-    await fs.cp(templateRepo, root, { recursive: true });
   };
 
   const initializeFeatureWork = async ({
@@ -89,7 +84,7 @@ describe("session branch diff stats", () => {
       ...overrides,
     });
 
-  const loadBranchState = async (pullRequests?: Array<Record<string, unknown>>) => {
+  const stubGithub = (pullRequests?: Array<Record<string, unknown>>) => {
     const routes = [{ match: "/pulls?head=", response: () => githubJson(pullRequests ?? []) }];
     if (pullRequests === undefined) {
       routes.push({
@@ -97,17 +92,14 @@ describe("session branch diff stats", () => {
         response: () => githubJson({ fork: false }),
       });
     }
-    const fetchImpl = routedFetch(routes);
-    vi.stubGlobal("fetch", fetchImpl);
+    vi.stubGlobal("fetch", routedFetch(routes));
+  };
+  const loadBranchState = (pullRequests?: Array<Record<string, unknown>>) => {
+    stubGithub(pullRequests);
     return loadControlUiSessionPullRequests(
       { sessionKey: "agent:main:main" },
       {
-        resolveGitContext: async () => ({
-          ...context,
-          branch: "feature",
-          root,
-          defaultBranch: "main",
-        }),
+        resolveGitContext: async () => ({ ...branchIdentity, root, defaultBranch: "main" }),
       },
     );
   };
@@ -124,9 +116,7 @@ describe("session branch diff stats", () => {
     await git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main");
   };
   const expectedBranch = (additions: number, deletions: number, changedFiles: number) => ({
-    owner: "openclaw",
-    repo: "openclaw",
-    branch: "feature",
+    ...branchIdentity,
     additions,
     deletions,
     changedFiles,
@@ -135,7 +125,7 @@ describe("session branch diff stats", () => {
 
   beforeAll(async () => {
     templateRepo = templateDirs.make("openclaw-session-prs-template-");
-    await initializeRepoAt(templateRepo, "one\n");
+    await initializeRepo("one\n", templateRepo);
   });
 
   beforeEach(async () => {
@@ -213,11 +203,7 @@ describe("session branch diff stats", () => {
   it("keeps PR facts when unrelated snapshot refs change or refs are packed", async () => {
     await initializeFeatureWork({ trackFeature: true });
     await connectGithub();
-    const fetchImpl = routedFetch([
-      { match: "/pulls?head=", response: () => githubJson([]) },
-      { match: "/repos/openclaw/openclaw", response: () => githubJson({ fork: false }) },
-    ]);
-    vi.stubGlobal("fetch", fetchImpl);
+    stubGithub();
     const load = () => loadCheckout("snapshot-refs");
     const initial = await load();
     expect(initial.branch).toMatchObject({ additions: 1, changedFiles: 1 });
@@ -289,7 +275,7 @@ describe("session branch diff stats", () => {
       return run(cwd, args, options);
     });
     const result = await loadMergedBranchState("1".repeat(40));
-    expect(result.branch).toEqual({ owner: "openclaw", repo: "openclaw", branch: "feature" });
+    expect(result.branch).toEqual(branchIdentity);
     expect(ancestryCalls).toBe(2);
   });
 
@@ -310,27 +296,17 @@ describe("session branch diff stats", () => {
     );
     const result = await loadMergedBranchState("1".repeat(40));
     expect(result.branch).toMatchObject({ additions: 1, changedFiles: 1 });
-    const trace = await fs.readFile(tracePath, "utf8");
-    expect(
-      trace
-        .split("\n")
-        .filter(
-          (line) =>
-            line.includes('"event":"child_start"') && line.includes('"child_class":"transport/'),
-        ),
-    ).toEqual([]);
+    const childStarts = (await fs.readFile(tracePath, "utf8"))
+      .split("\n")
+      .filter((line) => line.includes('"event":"child_start"'));
+    expect(childStarts.join("\n")).not.toContain('"child_class":"transport/');
   });
 
   it("suppresses the Create PR row when the merged PR falls outside the display cap", async () => {
     await initializeFeatureWork({ trackFeature: true });
     const mergedHead = await resolveRevision("HEAD");
-    const closedPull = (n: number) =>
-      pullListItem({ number: n, title: `closed ${n}`, state: "closed" });
-
     const result = await loadBranchState([
-      closedPull(5),
-      closedPull(4),
-      closedPull(3),
+      ...[5, 4, 3].map((number) => pullListItem({ number, state: "closed" })),
       mergedPull(mergedHead),
     ]);
     expect(result.branch).toBeUndefined();

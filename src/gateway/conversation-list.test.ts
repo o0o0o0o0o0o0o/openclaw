@@ -127,6 +127,12 @@ const reefDelivery = {
   context: { channel: "reef", accountId: "default", to: "reef:room" },
   origin: { provider: "reef", accountId: "default" },
 };
+const conversationEntry = (sessionId: string) => ({
+  sessionId,
+  updatedAt: 100,
+  chatType: "channel" as const,
+  delivery: reefDelivery,
+});
 
 describe("runGatewayConversationList", () => {
   it("filters persisted routes before applying the result limit", async () => {
@@ -322,12 +328,7 @@ describe("worker conversation reads", () => {
     state = await createOpenClawTestState({ scenario: "minimal" });
     storePath = state.statePath("shared-conversations.sqlite");
     openOpenClawAgentDatabase({ agentId: "physical-owner", path: storePath });
-    replaceSessionEntrySync(scope(), {
-      sessionId,
-      updatedAt: 100,
-      chatType: "channel",
-      delivery: reefDelivery,
-    });
+    replaceSessionEntrySync(scope(), conversationEntry(sessionId));
   });
   afterEach(() => vi.restoreAllMocks());
   afterAll(async () => state.cleanup());
@@ -453,12 +454,7 @@ describe("worker conversation reads", () => {
       sessionKey: "agent:main:dashboard:incognito-conversation-read",
       sessionId: "incognito-conversation-read",
     };
-    await replaceSessionEntry(memory, {
-      sessionId: memory.sessionId,
-      updatedAt: 100,
-      chatType: "channel",
-      delivery: reefDelivery,
-    });
+    await replaceSessionEntry(memory, conversationEntry(memory.sessionId));
     const worker = vi.spyOn(historyLane.pool, "run");
     const prepared = await prepareConversationRegistryScope({
       agentId: "main",

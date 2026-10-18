@@ -14,8 +14,10 @@ const {
   resolveGraphTokenMock: vi.fn(),
 }));
 
+// mock-isolation: Directory results use fixed users without calling Microsoft Graph.
 vi.mock("./graph-users.js", () => ({ searchGraphUsers: searchGraphUsersMock }));
 
+// mock-isolation: Directory queries use fixed teams and tokens without network authentication.
 vi.mock("./graph.js", () => ({
   listTeamsByName: listTeamsByNameMock,
   listChannelsForTeam: listChannelsForTeamMock,

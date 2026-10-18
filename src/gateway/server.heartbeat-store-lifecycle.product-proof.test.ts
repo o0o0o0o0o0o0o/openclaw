@@ -1,9 +1,13 @@
+// Exercise notification ownership through real Gateway reload/replacement and provider HTTP.
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import path from "node:path";
 import { json } from "node:stream/consumers";
-import { expect, it, vi } from "vitest";
-import { createOpenAiResponsesModelConfig } from "../../test/helpers/openai-responses-model-fixture.js";
-import { writeOpenAiResponsesText } from "../../test/helpers/openai-responses-sse.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  writeOpenAiResponsesSse,
+  writeOpenAiResponsesText,
+} from "../../test/helpers/openai-responses-sse.js";
 import { withinTest } from "../../test/helpers/promise.js";
 import { runQaGatewayFixture } from "../../test/helpers/qa-gateway-cleanup.js";
 import { resetSubagentRegistryForTests } from "../agents/subagents/registry/subagent-registry.test-helpers.js";
@@ -22,7 +26,6 @@ import {
   resetGatewayTestState,
   setupGatewayTempHome,
 } from "./gateway.test-support.js";
-import { startProofProvider, writeProofToolCall } from "./server.provider-proof.test-support.js";
 import type { SessionsListResult } from "./session-utils.types.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "./test-helpers.e2e.js";
 
@@ -39,8 +42,8 @@ async function startProvider() {
   let notice = createDeferredCore<ProviderRequest>();
   let spawn: Receipt | undefined;
   let spawnRequested = false;
-  const server = await startProofProvider(async (request, response) => {
-    try {
+  const server = createServer((request, response) => {
+    void (async () => {
       const body = (await json(request)) as ProviderRequest;
       requests.push(body);
       const input = JSON.stringify(body.input);
@@ -70,7 +73,25 @@ async function startProvider() {
             expectsCompletionMessage: false,
           }),
         };
-        writeProofToolCall(response, item, "resp_spawn", "delta");
+        writeOpenAiResponsesSse(response, [
+          { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
+          {
+            type: "response.function_call_arguments.delta",
+            item_id: item.id,
+            output_index: 0,
+            delta: item.arguments,
+          },
+          { type: "response.output_item.done", output_index: 0, item },
+          {
+            type: "response.completed",
+            response: {
+              id: "resp_spawn",
+              status: "completed",
+              output: [item],
+              usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+            },
+          },
+        ]);
       } else {
         writeOpenAiResponsesText(response, {
           text: title ? "Store lifecycle proof" : isNotice ? "NOTICE-RECEIVED" : "CHILD-DONE",
@@ -81,16 +102,24 @@ async function startProvider() {
       if (isNotice) {
         notice.resolve(body);
       }
-    } catch (error) {
+    })().catch((error: unknown) => {
       errors.push(error);
       if (!response.headersSent) {
         response.writeHead(500);
       }
       response.end();
-    }
+    });
   });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Provider did not bind");
+  }
   return {
-    baseUrl: server.baseUrl,
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
     requests,
     errors,
     armNoticeObservation() {
@@ -100,189 +129,236 @@ async function startProvider() {
     get spawn() {
       return spawn;
     },
-    stop: server.close,
+    async stop() {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    },
   };
 }
 
-it.for(["different store", "same-store replacement"] as const)(
-  "Gateway handles a queued child notice after %s",
-  { timeout: 180_000 },
-  async (transition, { signal }) => {
-    resetGatewayTestState();
-    resetHeartbeatEventsForTest();
-    const home = await setupGatewayTempHome({ prefix: "openclaw-heartbeat-store-" });
-    let provider: Awaited<ReturnType<typeof startProvider>> | undefined;
-    let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
-    let sweepSettled = createDeferredCore();
-    const originalSweep = stateEventSweep.sweepSessionStateWatchNotices;
-    const sweepSpy = vi
-      .spyOn(stateEventSweep, "sweepSessionStateWatchNotices")
-      .mockImplementation(async (options) => {
-        const observedSweep = sweepSettled;
-        await originalSweep(options);
-        observedSweep.resolve();
-      });
-    await runQaGatewayFixture(
-      async () => {
-        provider = await startProvider();
-        const token = randomUUID();
-        setTestEnvValue("OPENCLAW_GATEWAY_TOKEN", token);
-        const oldStore = path.join(home.tempHome, "old-store", "sessions.json");
-        const newStore = path.join(home.tempHome, "new-store", "sessions.json");
-        const { models } = createOpenAiResponsesModelConfig({
-          baseUrl: provider.baseUrl,
-          providerId: "proof",
-          modelId: "primary",
-          reasoning: false,
-          toolProfile: "coding",
+describe("session notification store ownership through the Gateway", () => {
+  it.for(["different store", "same-store replacement"] as const)(
+    "handles a queued child notice after %s",
+    { timeout: 180_000 },
+    async (transition, { signal }) => {
+      resetGatewayTestState();
+      resetHeartbeatEventsForTest();
+      const home = await setupGatewayTempHome({ prefix: "openclaw-heartbeat-store-" });
+      let provider: Awaited<ReturnType<typeof startProvider>> | undefined;
+      let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
+      let sweepSettled = createDeferredCore();
+      const originalSweep = stateEventSweep.sweepSessionStateWatchNotices;
+      const sweepSpy = vi
+        .spyOn(stateEventSweep, "sweepSessionStateWatchNotices")
+        .mockImplementation(async (options) => {
+          const observedSweep = sweepSettled;
+          await originalSweep(options);
+          observedSweep.resolve();
         });
-        const modelProvider = models!.providers!.proof;
-        modelProvider.apiKey = "synthetic-key";
-        const catalog = modelProvider.models!;
-        catalog.push(
-          ...catalog.map((model) => Object.assign({}, model, { id: "backup", name: "backup" })),
-        );
-        const cfg: OpenClawConfig = {
-          agents: {
-            entries: { main: {} },
-            defaults: {
-              workspace: home.workspaceDir,
-              skipBootstrap: true,
-              model: "proof/primary",
-              heartbeat: { every: "30m" },
-              subagents: { allowAgents: ["*"], maxConcurrent: 2 },
-              models: Object.fromEntries(
-                ["primary", "backup"].map((model) => [
-                  `proof/${model}`,
-                  { params: { transport: "sse", openaiWsWarmup: false } },
-                ]),
-              ),
+      await runQaGatewayFixture(
+        async () => {
+          provider = await startProvider();
+          const token = randomUUID();
+          setTestEnvValue("OPENCLAW_GATEWAY_TOKEN", token);
+          const oldStore = path.join(home.tempHome, "old-store", "sessions.json");
+          const newStore = path.join(home.tempHome, "new-store", "sessions.json");
+          const cfg: OpenClawConfig = {
+            agents: {
+              entries: { main: {} },
+              defaults: {
+                workspace: home.workspaceDir,
+                skipBootstrap: true,
+                model: "proof/primary",
+                heartbeat: { every: "30m" },
+                subagents: { allowAgents: ["*"], maxConcurrent: 2 },
+                models: Object.fromEntries(
+                  ["primary", "backup"].map((model) => [
+                    `proof/${model}`,
+                    { params: { transport: "sse", openaiWsWarmup: false } },
+                  ]),
+                ),
+              },
             },
-          },
-          models,
-          session: { store: oldStore },
-          // The provider scripts a direct spawn to isolate notification-store ownership.
-          tools: { profile: "coding", toolSearch: false },
-          gateway: { auth: { mode: "token", token } },
-          hooks: { enabled: false },
-        };
-        const configPath = await createGatewayConfigPath(home.tempHome);
-        const start = async () => {
-          const active = await startGatewayWithClient({
-            cfg,
-            configPath,
-            token,
-            clientName: GATEWAY_CLIENT_NAMES.CLI,
-            mode: GATEWAY_CLIENT_MODES.CLI,
-            scopes: ["operator.admin"],
-          });
-          gateway = active;
-          await active.server.startupSettled;
+            models: {
+              mode: "replace",
+              providers: {
+                proof: {
+                  baseUrl: provider.baseUrl,
+                  apiKey: "synthetic-key",
+                  api: "openai-responses",
+                  request: { allowPrivateNetwork: true },
+                  models: ["primary", "backup"].map((id) => ({
+                    id,
+                    name: id,
+                    api: "openai-responses",
+                    reasoning: false,
+                    input: ["text"],
+                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                    contextWindow: 128_000,
+                    maxTokens: 4096,
+                  })),
+                },
+              },
+            },
+            session: { store: oldStore },
+            // The provider scripts a direct spawn to isolate notification-store ownership.
+            tools: { profile: "coding", toolSearch: false },
+            gateway: { auth: { mode: "token", token } },
+            hooks: { enabled: false },
+          };
+          const start = () =>
+            startGatewayWithClient({
+              cfg,
+              configPath,
+              token,
+              clientName: GATEWAY_CLIENT_NAMES.CLI,
+              mode: GATEWAY_CLIENT_MODES.CLI,
+              scopes: ["operator.admin"],
+            });
+          const configPath = await createGatewayConfigPath(home.tempHome);
+          gateway = await start();
+          await gateway.server.startupSettled;
           // Startup observers settle separately from startupSettled.
           await withinTest(sweepSettled.promise, signal);
-          return active;
-        };
-        gateway = await start();
-        const parentKey = `agent:main:store-proof-${randomUUID()}`;
-        const wait = (runId: string) =>
-          gateway!.client.request<{ status: string }>(
-            "agent.wait",
-            { runId, timeoutMs: 120_000 },
-            { timeoutMs: 125_000 },
-          );
-        const turn = async (method: "agent" | "chat.send", sessionKey: string, message: string) => {
-          const accepted = await gateway!.client.request<{ runId: string }>(
-            method,
-            { sessionKey, message, deliver: false, idempotencyKey: randomUUID() },
+          const parentKey = `agent:main:store-proof-${randomUUID()}`;
+          const wait = (runId: string) =>
+            gateway!.client.request<{ status: string }>(
+              "agent.wait",
+              { runId, timeoutMs: 120_000 },
+              { timeoutMs: 125_000 },
+            );
+          const accepted = await gateway.client.request<{ runId: string }>(
+            "chat.send",
+            {
+              sessionKey: parentKey,
+              message: "Spawn one worker now.",
+              deliver: false,
+              idempotencyKey: randomUUID(),
+            },
             { expectFinal: false },
           );
-          const result = await wait(accepted.runId);
-          expect(result.status, JSON.stringify(result)).toBe("ok");
-        };
-        const list = () =>
-          gateway!.client.request<SessionsListResult>("sessions.list", {
+          const parentResult = await wait(accepted.runId);
+          expect(parentResult.status, JSON.stringify(parentResult)).toBe("ok");
+          expect(provider.spawn?.status).toBe("accepted");
+          const child = provider.spawn;
+          if (!child) {
+            throw new Error("Parent did not receive sessions_spawn receipt");
+          }
+          expect((await wait(child.runId)).status).toBe("ok");
+          const before = await gateway.client.request<SessionsListResult>("sessions.list", {
             agentId: "main",
             limit: 100,
           });
-        await turn("chat.send", parentKey, "Spawn one worker now.");
-        expect(provider.spawn?.status).toBe("accepted");
-        const child = provider.spawn;
-        if (!child) {
-          throw new Error("Parent did not receive sessions_spawn receipt");
-        }
-        expect((await wait(child.runId)).status).toBe("ok");
-        const before = await list();
-        const parentId = before.sessions.find((entry) => entry.key === parentKey)?.sessionId;
-        expect(parentId).toBeTypeOf("string");
-        await turn("agent", child.childSessionKey, `Human followup ${WORKER}`);
+          const parentSessionId = before.sessions.find(
+            (entry) => entry.key === parentKey,
+          )?.sessionId;
+          expect(parentSessionId).toBeTypeOf("string");
+          const followup = await gateway.client.request<{ runId: string }>(
+            "agent",
+            {
+              sessionKey: child.childSessionKey,
+              message: `Human followup ${WORKER}`,
+              deliver: false,
+              idempotencyKey: randomUUID(),
+            },
+            { expectFinal: false },
+          );
+          const followupResult = await wait(followup.runId);
+          expect(followupResult.status, JSON.stringify(followupResult)).toBe("ok");
 
-        if (transition === "different store") {
-          const { hash } = await gateway.client.request<{ hash: string }>("config.get", {});
-          await gateway.client.request("config.patch", {
-            baseHash: hash,
-            raw: JSON.stringify({
-              session: { store: newStore },
-              agents: { defaults: { model: "proof/backup" } },
-            }),
+          if (transition === "different store") {
+            const { hash } = await gateway.client.request<{ hash: string }>("config.get", {});
+            await gateway.client.request("config.patch", {
+              baseHash: hash,
+              raw: JSON.stringify({
+                session: { store: newStore },
+                agents: { defaults: { model: "proof/backup" } },
+              }),
+            });
+            expect(await gateway.client.request("last-heartbeat", {})).toMatchObject({
+              status: "skipped",
+              reason: "store-replaced",
+            });
+            const after = await gateway.client.request<SessionsListResult>("sessions.list", {
+              agentId: "main",
+              limit: 100,
+            });
+            expect(after.sessions.map((entry) => entry.key)).not.toContain(parentKey);
+            expect(after.sessions.map((entry) => entry.key)).not.toContain(child.childSessionKey);
+            expect(provider.requests.map((request) => request.model)).not.toContain("backup");
+          } else {
+            expect(
+              peekSystemEventEntries(parentKey).some(
+                (event) =>
+                  decodeSessionStateNoticeContextKey(event.contextKey ?? "") ===
+                    child.childSessionKey && !isSystemEventTurnOwned(parentKey, event),
+              ),
+              "Child notice must still be passive before Gateway replacement",
+            ).toBe(true);
+            await disconnectGatewayClient(gateway.client);
+            await gateway.server.close({ reason: "same-store replacement" });
+            gateway = undefined;
+            const replacementRequestOffset = provider.requests.length;
+            const replacementNotice = provider.armNoticeObservation();
+            sweepSettled = createDeferredCore();
+            gateway = await start();
+            await gateway.server.startupSettled;
+            await withinTest(sweepSettled.promise, signal);
+            // Restart restores unread notices as context for the next ordinary turn.
+            const resumed = await gateway.client.request<{ runId: string }>(
+              "chat.send",
+              {
+                sessionKey: parentKey,
+                message: "Continue after the Gateway restart.",
+                deliver: false,
+                idempotencyKey: randomUUID(),
+              },
+              { expectFinal: false },
+            );
+            const resumedResult = await wait(resumed.runId);
+            expect(resumedResult.status, JSON.stringify(resumedResult)).toBe("ok");
+            const notice = await withinTest(replacementNotice, signal);
+            expect(provider.requests.indexOf(notice)).toBeGreaterThanOrEqual(
+              replacementRequestOffset,
+            );
+            expect(notice.model).toBe("primary");
+            expect(JSON.stringify(notice.input)).toContain(child.childSessionKey);
+            expect(JSON.stringify(notice.input)).toContain(WORKER);
+            const after = await gateway.client.request<SessionsListResult>("sessions.list", {
+              agentId: "main",
+              limit: 100,
+            });
+            expect(after.sessions.find((entry) => entry.key === parentKey)?.sessionId).toBe(
+              parentSessionId,
+            );
+          }
+          expect(provider.errors).toEqual([]);
+        },
+        async () => {
+          if (!gateway) {
+            return;
+          }
+          setHeartbeatsEnabled(false);
+          await requestHeartbeatAndWait({
+            source: "manual",
+            intent: "immediate",
+            reason: "wake",
+            coalesceMs: 0,
           });
-          expect(await gateway.client.request("last-heartbeat", {})).toMatchObject({
-            status: "skipped",
-            reason: "store-replaced",
-          });
-          const after = await list();
-          expect(after.sessions.map((entry) => entry.key)).not.toContain(parentKey);
-          expect(after.sessions.map((entry) => entry.key)).not.toContain(child.childSessionKey);
-          expect(provider.requests.map((request) => request.model)).not.toContain("backup");
-        } else {
-          expect(
-            peekSystemEventEntries(parentKey).some(
-              (event) =>
-                decodeSessionStateNoticeContextKey(event.contextKey ?? "") ===
-                  child.childSessionKey && !isSystemEventTurnOwned(parentKey, event),
-            ),
-            "Child notice must still be passive before Gateway replacement",
-          ).toBe(true);
-          await disconnectGatewayClient(gateway.client);
-          await gateway.server.close({ reason: "same-store replacement" });
-          gateway = undefined;
-          const requestOffset = provider.requests.length;
-          const noticePending = provider.armNoticeObservation();
-          sweepSettled = createDeferredCore();
-          gateway = await start();
-          // Restart restores unread notices as context for the next ordinary turn.
-          await turn("chat.send", parentKey, "Continue after the Gateway restart.");
-          const notice = await withinTest(noticePending, signal);
-          expect(provider.requests.indexOf(notice)).toBeGreaterThanOrEqual(requestOffset);
-          expect(notice.model).toBe("primary");
-          expect(JSON.stringify(notice.input)).toContain(child.childSessionKey);
-          expect(JSON.stringify(notice.input)).toContain(WORKER);
-          const after = await list();
-          expect(after.sessions.find((entry) => entry.key === parentKey)?.sessionId).toBe(parentId);
-        }
-        expect(provider.errors).toEqual([]);
-      },
-      async () => {
-        if (!gateway) {
-          return;
-        }
-        setHeartbeatsEnabled(false);
-        await requestHeartbeatAndWait({
-          source: "manual",
-          intent: "immediate",
-          reason: "wake",
-          coalesceMs: 0,
-        });
-      },
-      () => gateway && disconnectGatewayClient(gateway.client),
-      () => gateway?.server.close({ reason: "heartbeat store proof complete" }),
-      () => sweepSpy.mockRestore(),
-      () => provider?.stop(),
-      () => resetSubagentRegistryForTests({ persist: false }),
-      () => removeGatewayTempHome(home.tempHome),
-      () => home.envSnapshot.restore(),
-      () => setHeartbeatsEnabled(true),
-      resetHeartbeatEventsForTest,
-      resetGatewayTestState,
-    );
-  },
-);
+        },
+        () => gateway && disconnectGatewayClient(gateway.client),
+        () => gateway?.server.close({ reason: "heartbeat store proof complete" }),
+        () => sweepSpy.mockRestore(),
+        () => provider?.stop(),
+        () => resetSubagentRegistryForTests({ persist: false }),
+        () => removeGatewayTempHome(home.tempHome),
+        () => home.envSnapshot.restore(),
+        () => setHeartbeatsEnabled(true),
+        resetHeartbeatEventsForTest,
+        resetGatewayTestState,
+      );
+    },
+  );
+});

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { defaultRuntime, ExitError } from "../runtime.js";
@@ -17,22 +17,6 @@ import {
 const successfulRun = async () => {};
 const ignoreError = () => {};
 const proxyChildTempDir = useAutoCleanupTempDirTracker(afterAll).make("openclaw-proxy-child-tmp-");
-const moduleUrl = (relative: string) => JSON.stringify(new URL(relative, import.meta.url).href);
-const reject = (error: unknown) => () => Promise.reject(error);
-type Completion = Parameters<typeof runCliWithExitFinalization>[0];
-function complete(
-  run: Completion["run"] = successfulRun,
-  finalize?: Completion["finalize"],
-  onError: Completion["onError"] = ignoreError,
-  runtime?: Completion["runtime"],
-) {
-  return runCliWithExitFinalization({ run, finalize, onError, runtime });
-}
-
-function expectChildExit(result: ReturnType<typeof runCliChild>, status: number) {
-  expect(result.error).toBeUndefined();
-  expect(result).toMatchObject({ status, signal: null });
-}
 
 function runCliChild(script: string, envOverrides: NodeJS.ProcessEnv = {}, maxBuffer?: number) {
   const env = { ...process.env, ...envOverrides };
@@ -47,168 +31,203 @@ function runCliChild(script: string, envOverrides: NodeJS.ProcessEnv = {}, maxBu
   });
 }
 
-let previousExitCode: typeof process.exitCode;
-beforeEach(() => {
-  previousExitCode = process.exitCode;
-  process.exitCode = undefined;
-});
-afterEach(() => {
-  process.exitCode = previousExitCode;
-  vi.restoreAllMocks();
-});
-
-it("unwinds the injected runtime with its requested code", () => {
-  const exit = vi.fn();
-  const runtime = { ...defaultRuntime, exit };
-  const defaultExit = vi.spyOn(defaultRuntime, "exit").mockImplementation(() => {});
-  expect(() => exitCliAfterOutput(runtime, 7)).toThrow(
-    expect.objectContaining({ constructor: ExitError, code: 7 }),
-  );
-  expect(defaultExit).not.toHaveBeenCalled();
-  expect(exit).toHaveBeenCalledExactlyOnceWith(7);
-});
-
-it.each([
-  { outcome: "cleanup failure after success", commandExit: undefined },
-  {
-    outcome: "deferred exit with failed reporter",
-    commandExit: 7,
-    reporterRethrows: true,
-  },
-])("leaves $outcome owned by the injected runtime", async ({ commandExit, reporterRethrows }) => {
-  const commandFailure = commandExit === undefined ? undefined : new ExitError(commandExit);
-  const cleanupFailure = new Error("state cleanup failed");
-  const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
-  const onError = vi.fn((error: unknown) => {
-    if (reporterRethrows) {
-      throw error;
-    }
+describe("one-shot CLI completion", () => {
+  let previousExitCode: typeof process.exitCode;
+  beforeEach(() => {
+    previousExitCode = process.exitCode;
+    process.exitCode = undefined;
   });
-  await expect(
-    complete(
-      async () => {
-        if (commandFailure) {
-          throw commandFailure;
-        }
-      },
-      reject(cleanupFailure),
-      onError,
-      runtime,
-    ),
-  ).rejects.toBe(commandFailure ?? cleanupFailure);
-  expect(onError).toHaveBeenCalledExactlyOnceWith(cleanupFailure);
-  expect(runtime.exit).not.toHaveBeenCalled();
-  expect(process.exitCode).toBeUndefined();
-});
+  afterEach(() => {
+    process.exitCode = previousExitCode;
+    vi.restoreAllMocks();
+  });
 
-it.each(["run", "finalize"] as const)(
-  "waits for %s before publishing completion",
-  async (phase) => {
-    const entered = createDeferred();
-    const finish = createDeferred();
-    const wait = async () => {
-      entered.resolve();
-      await finish.promise;
-    };
-    const finalize = vi.fn(phase === "finalize" ? wait : successfulRun);
-    const running = complete(phase === "run" ? wait : reject(new ExitError(7)), finalize);
-    if (phase === "run") {
-      requestExitAfterOneShotOutput(defaultRuntime, 7);
+  it("unwinds the injected runtime with its requested code", () => {
+    const exit = vi.fn();
+    const runtime = { ...defaultRuntime, exit };
+    const defaultExit = vi.spyOn(defaultRuntime, "exit").mockImplementation(() => {});
+    let thrown: unknown;
+    try {
+      exitCliAfterOutput(runtime, 7);
+    } catch (error) {
+      thrown = error;
     }
+    expect(thrown).toBeInstanceOf(ExitError);
+    expect(thrown).toMatchObject({ code: 7 });
+    expect(defaultExit).not.toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledExactlyOnceWith(7);
+  });
+
+  it.each([
+    { outcome: "cleanup failure after success", commandExit: undefined },
+    {
+      outcome: "deferred exit with failed reporter",
+      commandExit: 7,
+      reporterRethrows: true,
+    },
+  ])("leaves $outcome owned by the injected runtime", async ({ commandExit, reporterRethrows }) => {
+    const commandFailure = commandExit === undefined ? undefined : new ExitError(commandExit);
+    const cleanupFailure = new Error("state cleanup failed");
+    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const onError = vi.fn((error: unknown) => {
+      if (reporterRethrows) {
+        throw error;
+      }
+    });
+    await expect(
+      runCliWithExitFinalization({
+        run: async () => {
+          if (commandFailure) {
+            throw commandFailure;
+          }
+        },
+        finalize: async () => {
+          throw cleanupFailure;
+        },
+        onError,
+        runtime,
+      }),
+    ).rejects.toBe(commandFailure ?? cleanupFailure);
+    expect(onError).toHaveBeenCalledExactlyOnceWith(cleanupFailure);
+    expect(runtime.exit).not.toHaveBeenCalled();
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("does not finalize a long-lived command until its run settles", async () => {
+    const finish = createDeferred();
+    const finalize = vi.fn(async () => {});
+    const running = runCliWithExitFinalization({
+      run: () => finish.promise,
+      finalize,
+      onError: ignoreError,
+    });
+    requestExitAfterOneShotOutput(defaultRuntime, 7);
+    await Promise.resolve();
+    expect(finalize).not.toHaveBeenCalled();
+    expect(process.exitCode).toBeUndefined();
+    finish.resolve();
+    await running;
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(7);
+  });
+
+  it.each([
+    { requested: 0, signal: "SIGTERM" as const, expected: 143 },
+    { requested: "0", signal: "SIGINT" as const, expected: 130 },
+    { requested: 7, signal: "SIGTERM" as const, expected: 7 },
+  ])(
+    "retains an accepted signal over pending success ($requested, $signal)",
+    async ({ requested, signal, expected }) => {
+      const cleanup = createDeferred();
+      const unregister = registerSignalExitGate(cleanup.promise);
+      const finalize = vi.fn(async () => {});
+      exitAfterSignalExitBarriers(requested);
+      const signalDrain = waitForSignalExitBarriers(signal);
+      const completing = runCliWithExitFinalization({
+        run: successfulRun,
+        onError: ignoreError,
+        finalize,
+      });
+      try {
+        await Promise.resolve();
+        expect(finalize).not.toHaveBeenCalled();
+        cleanup.resolve();
+        await Promise.all([signalDrain, completing]);
+        expect(process.exitCode).toBe(expected);
+        expect(finalize).toHaveBeenCalledOnce();
+      } finally {
+        cleanup.resolve();
+        await Promise.all([signalDrain, completing]);
+        unregister();
+      }
+    },
+  );
+
+  it("joins caller-owned cleanup before publishing completion", async () => {
+    const closed = createDeferred();
+    const entered = createDeferred();
+    const running = runCliWithExitFinalization({
+      run: async () => {
+        throw new ExitError(7);
+      },
+      finalize: async () => {
+        entered.resolve();
+        await closed.promise;
+      },
+      onError: ignoreError,
+    });
     try {
       await entered.promise;
       expect(process.exitCode).toBeUndefined();
-      if (phase === "run") {
-        expect(finalize).not.toHaveBeenCalled();
-      }
     } finally {
-      finish.resolve();
+      closed.resolve();
       await running;
     }
-    expect(finalize).toHaveBeenCalledOnce();
     expect(process.exitCode).toBe(7);
-  },
-);
+  });
 
-it.each<[number | string, "SIGINT" | "SIGTERM", number]>([
-  [0, "SIGTERM", 143],
-  ["0", "SIGINT", 130],
-  [7, "SIGTERM", 7],
-])(
-  "retains an accepted signal over pending success (%s, %s)",
-  async (requested, signal, expected) => {
-    const cleanup = createDeferred();
-    const unregister = registerSignalExitGate(cleanup.promise);
-    const finalize = vi.fn(async () => {});
-    exitAfterSignalExitBarriers(requested);
-    const signalDrain = waitForSignalExitBarriers(signal);
-    const completing = complete(successfulRun, finalize);
-    try {
-      await Promise.resolve();
-      expect(finalize).not.toHaveBeenCalled();
-      cleanup.resolve();
-      await Promise.all([signalDrain, completing]);
+  it("reports failure before replacing a queued successful outcome", async () => {
+    const order: string[] = [];
+    requestExitAfterOneShotOutput(defaultRuntime, 0);
+    await runCliWithExitFinalization({
+      run: async () => {
+        throw new Error("command failed");
+      },
+      onError: async () => {
+        await Promise.resolve();
+        order.push("reported");
+        process.exitCode = 6;
+      },
+      finalize: async () => {
+        order.push("closed");
+      },
+    });
+    expect(order).toEqual(["reported", "closed"]);
+    expect(process.exitCode).toBe(6);
+  });
+
+  it.each([{ recorded: undefined, expected: 0 }])(
+    "preserves recorded outcome $recorded",
+    async ({ recorded, expected }) => {
+      await runCliWithExitFinalization({
+        run: async () => {
+          requestExitAfterOneShotOutput();
+          process.exitCode = recorded;
+        },
+        onError: ignoreError,
+      });
       expect(process.exitCode).toBe(expected);
-      expect(finalize).toHaveBeenCalledOnce();
-    } finally {
-      cleanup.resolve();
-      await Promise.all([signalDrain, completing]);
-      unregister();
-    }
-  },
-);
-
-it("reports failure before replacing a queued successful outcome", async () => {
-  const order: string[] = [];
-  requestExitAfterOneShotOutput(defaultRuntime, 0);
-  await complete(
-    reject(new Error("command failed")),
-    async () => {
-      order.push("closed");
-    },
-    async () => {
-      await Promise.resolve();
-      order.push("reported");
-      process.exitCode = 6;
     },
   );
-  expect(order).toEqual(["reported", "closed"]);
-  expect(process.exitCode).toBe(6);
-});
 
-it("defaults an unrecorded outcome to success", async () => {
-  await complete(async () => {
-    requestExitAfterOneShotOutput();
-    process.exitCode = undefined;
-  });
-  expect(process.exitCode).toBe(0);
-});
+  it.each(["before cleanup", "during cleanup"])(
+    "retains terminal signal outcome %s",
+    async (phase) => {
+      await runCliWithExitFinalization({
+        run: async () => {
+          requestExitAfterOneShotOutput(defaultRuntime, 0);
+          if (phase === "before cleanup") {
+            exitAfterSignalExitBarriers(143);
+          }
+        },
+        finalize: async () => {
+          if (phase === "during cleanup") {
+            exitAfterSignalExitBarriers(143);
+          }
+        },
+        onError: ignoreError,
+      });
+      expect(process.exitCode).toBe(143);
+    },
+  );
 
-it.each(["before cleanup", "during cleanup"])(
-  "retains terminal signal outcome %s",
-  async (phase) => {
-    await complete(
-      async () => {
-        requestExitAfterOneShotOutput(defaultRuntime, 0);
-        if (phase === "before cleanup") {
-          exitAfterSignalExitBarriers(143);
-        }
-      },
-      async () => {
-        if (phase === "during cleanup") {
-          exitAfterSignalExitBarriers(143);
-        }
-      },
-    );
-    expect(process.exitCode).toBe(143);
-  },
-);
-
-it("drains large piped JSON before a deferred ExitError without reporting another error", () => {
-  const payloadBytes = 1024 * 1024;
-  const script = `
-      import { runCliWithExitFinalization } from ${moduleUrl("./one-shot-exit.ts")};
-      import { defaultRuntime, ExitError } from ${moduleUrl("../runtime.ts")};
+  it("drains large piped JSON before a deferred ExitError without reporting another error", () => {
+    const oneShotExitUrl = new URL("./one-shot-exit.ts", import.meta.url).href;
+    const runtimeUrl = new URL("../runtime.ts", import.meta.url).href;
+    const payloadBytes = 1024 * 1024;
+    const script = `
+      import { runCliWithExitFinalization } from ${JSON.stringify(oneShotExitUrl)};
+      import { defaultRuntime, ExitError } from ${JSON.stringify(runtimeUrl)};
       await runCliWithExitFinalization({
         run: async () => {
           defaultRuntime.writeJson({ ok: false, payload: "x".repeat(${payloadBytes}) });
@@ -221,22 +240,28 @@ it("drains large piped JSON before a deferred ExitError without reporting anothe
       });
     `;
 
-  const result = runCliChild(script, {}, 2 * payloadBytes);
+    const result = runCliChild(script, {}, 2 * payloadBytes);
 
-  expectChildExit(result, 7);
-  expect(result.stderr).toBe("");
-  expect(result.stdout).toBe(
-    `${JSON.stringify({ ok: false, payload: "x".repeat(payloadBytes) }, null, 2)}\n`,
-  );
-});
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(7);
+    expect(result.signal).toBeNull();
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toBe(
+      `${JSON.stringify({ ok: false, payload: "x".repeat(payloadBytes) }, null, 2)}\n`,
+    );
+  });
 
-it("keeps the real proxy command exit truthful when --help is consumed as a proxy URL", () => {
-  const script = `
+  it("keeps the real proxy command exit truthful when --help is consumed as a proxy URL", () => {
+    const oneShotExitUrl = new URL("./one-shot-exit.ts", import.meta.url).href;
+    const runtimeSnapshotUrl = new URL("../config/runtime-snapshot.ts", import.meta.url).href;
+    const argvInvocationUrl = new URL("./argv-invocation.ts", import.meta.url).href;
+    const proxyCliUrl = new URL("./proxy-cli.ts", import.meta.url).href;
+    const script = `
       import { Command, CommanderError } from "commander";
-      import { setRuntimeConfigSnapshot } from ${moduleUrl("../config/runtime-snapshot.ts")};
-      import { resolveCliArgvInvocation } from ${moduleUrl("./argv-invocation.ts")};
-      import { registerProxyCli } from ${moduleUrl("./proxy-cli.ts")};
-      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${moduleUrl("./one-shot-exit.ts")};
+      import { setRuntimeConfigSnapshot } from ${JSON.stringify(runtimeSnapshotUrl)};
+      import { resolveCliArgvInvocation } from ${JSON.stringify(argvInvocationUrl)};
+      import { registerProxyCli } from ${JSON.stringify(proxyCliUrl)};
+      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${JSON.stringify(oneShotExitUrl)};
 
       setRuntimeConfigSnapshot({});
       const argv = ["node", "openclaw", "proxy", "validate", ...${JSON.stringify(["--proxy-url", "--help", "--json"])}];
@@ -260,49 +285,46 @@ it("keeps the real proxy command exit truthful when --help is consumed as a prox
       });
     `;
 
-  const result = runCliChild(script, {
-    OPENCLAW_STATE_DIR: "/dev/null",
-    OPENCLAW_CONFIG_PATH: "/dev/null",
-    TMPDIR: proxyChildTempDir,
-    TEMP: proxyChildTempDir,
-    TMP: proxyChildTempDir,
-    NODE_DISABLE_COMPILE_CACHE: "1",
+    const result = runCliChild(script, {
+      OPENCLAW_STATE_DIR: "/dev/null",
+      OPENCLAW_CONFIG_PATH: "/dev/null",
+      TMPDIR: proxyChildTempDir,
+      TEMP: proxyChildTempDir,
+      TMP: proxyChildTempDir,
+      NODE_DISABLE_COMPILE_CACHE: "1",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toEqual(
+      expect.objectContaining({
+        ok: false,
+        config: expect.objectContaining({
+          errors: ["proxyUrl must use http:// or https://"],
+        }),
+      }),
+    );
   });
 
-  expectChildExit(result, 1);
-  expect(JSON.parse(result.stdout)).toMatchObject({
-    ok: false,
-    config: {
-      errors: ["proxyUrl must use http:// or https://"],
+  it.each([
+    { name: "deferred hooks failure", exitCode: 1, explicitRequest: true },
+    {
+      name: "natural successful completion",
+      exitCode: 0,
+      explicitRequest: false,
     },
-  });
-});
-
-it.each(["deferred hooks failure", "natural successful completion", "fatal rejection"] as const)(
-  "keeps real dual-TTY JSON clean for %s",
-  (mode) => {
-    const fatal = mode === "fatal rejection";
-    const explicitRequest = mode === "deferred hooks failure";
-    const exitCode = mode === "natural successful completion" ? 0 : 1;
+  ])("keeps real dual-TTY JSON clean for $name", ({ exitCode, explicitRequest }) => {
+    const oneShotExitUrl = new URL("./one-shot-exit.ts", import.meta.url).href;
+    const runtimeUrl = new URL("../runtime.ts", import.meta.url).href;
+    const loggingStateUrl = new URL("../logging/state.ts", import.meta.url).href;
     const script = `
-      import { defaultRuntime } from ${moduleUrl("../runtime.ts")};
-      import { loggingState } from ${moduleUrl("../logging/state.ts")};
+      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${JSON.stringify(oneShotExitUrl)};
+      import { defaultRuntime } from ${JSON.stringify(runtimeUrl)};
+      import { loggingState } from ${JSON.stringify(loggingStateUrl)};
       Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
       Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });
       loggingState.forceConsoleToStderr = true;
-      ${
-        fatal
-          ? `
-      import { installUnhandledRejectionHandler } from ${moduleUrl("../infra/unhandled-rejections.ts")};
-      installUnhandledRejectionHandler();
-      defaultRuntime.writeJson({ ok: false });
-      const error = Object.assign(new Error("expected fatal test"), {
-        code: "ERR_OUT_OF_MEMORY",
-      });
-      process.emit("unhandledRejection", error, Promise.resolve());
-      `
-          : `
-      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${moduleUrl("./one-shot-exit.ts")};
       await runCliWithExitFinalization({
         run: async () => {
           defaultRuntime.writeStdout(JSON.stringify({ ok: ${exitCode === 0} }));
@@ -314,19 +336,48 @@ it.each(["deferred hooks failure", "natural successful completion", "fatal rejec
         },
         onError: (error) => { throw error; },
       });
-      `
-      }
     `;
+
     const result = runCliChild(script);
-    expectChildExit(result, exitCode);
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(exitCode);
+    expect(result.signal).toBeNull();
     expect(JSON.parse(result.stdout)).toEqual({ ok: exitCode === 0 });
-    if (!fatal) {
-      expect(result.stderr.startsWith("finalized\n")).toBe(true);
-    }
-    if (explicitRequest || fatal) {
+    expect(result.stderr.startsWith("finalized\n")).toBe(true);
+    if (explicitRequest) {
       expect(result.stderr).toContain("\x1b[?25h");
     } else {
       expect(result.stderr).toBe("finalized\n");
     }
-  },
-);
+  });
+
+  it("keeps real dual-TTY JSON clean after a fatal unhandled rejection", () => {
+    const runtimeUrl = new URL("../runtime.ts", import.meta.url).href;
+    const loggingStateUrl = new URL("../logging/state.ts", import.meta.url).href;
+    const unhandledRejectionsUrl = new URL("../infra/unhandled-rejections.ts", import.meta.url)
+      .href;
+    const script = `
+      import { defaultRuntime } from ${JSON.stringify(runtimeUrl)};
+      import { loggingState } from ${JSON.stringify(loggingStateUrl)};
+      import { installUnhandledRejectionHandler } from ${JSON.stringify(unhandledRejectionsUrl)};
+      Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+      Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });
+      loggingState.forceConsoleToStderr = true;
+      installUnhandledRejectionHandler();
+      defaultRuntime.writeJson({ ok: false });
+      const error = Object.assign(new Error("expected fatal test"), {
+        code: "ERR_OUT_OF_MEMORY",
+      });
+      process.emit("unhandledRejection", error, Promise.resolve());
+    `;
+
+    const result = runCliChild(script);
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.signal).toBeNull();
+    expect(JSON.parse(result.stdout)).toEqual({ ok: false });
+    expect(result.stderr).toContain("\x1b[?25h");
+  });
+});

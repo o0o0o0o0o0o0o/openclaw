@@ -348,23 +348,21 @@ describe("msteams graph helpers", () => {
       return new Response("denied", { status: 403 });
     });
 
-    await expectRejectsToThrow(
+    await expect(
       mutateGraphJson({
         token: graphToken,
         path: "/teams/team-1/channels",
         method: "POST",
         body: { displayName: "Deployments" },
       }),
-      "Graph POST /teams/team-1/channels failed (403): denied",
-    );
+    ).rejects.toThrow("Graph POST /teams/team-1/channels failed (403): denied");
 
-    await expectRejectsToThrow(
+    await expect(
       deleteGraphRequest({
         token: graphToken,
         path: "/teams/team-1/channels/channel-1",
       }),
-      "Graph DELETE /teams/team-1/channels/channel-1 failed (404): not found",
-    );
+    ).rejects.toThrow("Graph DELETE /teams/team-1/channels/channel-1 failed (404): not found");
   });
 
   it("releases a successful bodyful DELETE response", async () => {

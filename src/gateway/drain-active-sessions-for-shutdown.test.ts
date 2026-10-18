@@ -16,6 +16,7 @@ type TestHookRunner =
 const hookRunner = vi.fn<() => TestHookRunner>(() => createMockHookRunner());
 const readTranscript = vi.fn();
 
+// mock-isolation: Shutdown uses a fixture hook runner without the global plugin registry.
 vi.mock("../plugins/hook-runner-global.js", () => ({
   getGlobalHookRunner: hookRunner,
 }));

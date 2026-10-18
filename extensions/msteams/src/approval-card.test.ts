@@ -76,7 +76,7 @@ it("preserves complete OpenClaw Change cards across phases", () => {
   for (const [resolvedBy, text] of [
     ["  reviewer  ", "Resolved by reviewer"],
     [" \t ", "Resolved"],
-  ]) {
+  ] as const) {
     expect(
       buildMSTeamsResolvedApprovalCard({
         ...common,

@@ -1,32 +1,38 @@
 import fs from "node:fs/promises";
+import { createServer } from "node:http";
 import path from "node:path";
-import { json } from "node:stream/consumers";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, it } from "vitest";
 import type {
   ArtifactsDownloadResult,
   ArtifactsListResult,
 } from "../../packages/gateway-protocol/src/schema/artifacts.js";
-import { createOpenAiResponsesModelConfig } from "../../test/helpers/openai-responses-model-fixture.js";
-import { writeOpenAiResponsesText } from "../../test/helpers/openai-responses-sse.js";
+import {
+  writeOpenAiResponsesSse,
+  writeOpenAiResponsesText,
+} from "../../test/helpers/openai-responses-sse.js";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { clearConfigCache, clearRuntimeConfigSnapshot } from "../config/config.js";
 import { clearSessionStoreCacheForTest } from "../config/sessions/store-writer-state.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
-import { startProofProvider, writeProofToolCall } from "./server.provider-proof.test-support.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "./test-helpers.e2e.js";
-import {
-  configureManualGatewayBackgroundEnv,
-  MANUAL_GATEWAY_ENV_KEYS,
-} from "./test-helpers.manual-gateway-env.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const attachment = Buffer.from("current-source attachment");
-const ordinaryCaption = "Attached proof.";
-const internalCaption =
-  "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nBOOT.md:\nWake up and report.\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
-const deliveryCaption =
-  "Delivery: Final assistant text is not automatically delivered in this run. Use the `message` tool to send user-visible output.";
+const captionCases = [
+  { name: "ordinary", caption: "Attached proof." },
+  {
+    name: "internal-context",
+    caption:
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nBOOT.md:\nWake up and report.\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
+  },
+  {
+    name: "delivery-metadata",
+    caption:
+      "Delivery: Final assistant text is not automatically delivered in this run. Use the `message` tool to send user-visible output.",
+  },
+] as const;
 
 it(
   "chat.send publishes sanitized message buffers through history and authorized artifacts.download",
@@ -51,78 +57,105 @@ it(
       bytes?: Buffer;
       finalText?: string;
     };
-    const makeScenario = (
-      name: string,
-      expected: Scenario["expected"],
-      fields: Partial<Scenario> = {},
-    ): Scenario => ({ name, expected, caption: internalCaption, ...fields });
-    const data = { buffer: attachment.toString("base64"), bytes: attachment };
-    const buffered = (name: string, caption: string) =>
-      makeScenario(name, "attachment", { caption, ...data });
     const cases: [Scenario, ...Scenario[]] = [
-      buffered("ordinary", ordinaryCaption),
-      buffered("internal-context", internalCaption),
-      buffered("delivery-metadata", deliveryCaption),
-      ...[undefined, "", "  "].map((buffer, index) =>
-        makeScenario(`empty-${index}`, "suppressed", {
-          buffer,
-          finalText: "No attachment was provided, so nothing was sent.",
-        }),
-      ),
-      makeScenario("text-only", "text", { caption: ordinaryCaption }),
-      makeScenario("invalid", "error", {
+      {
+        ...captionCases[0],
+        buffer: attachment.toString("base64"),
+        expected: "attachment",
+        bytes: attachment,
+      },
+      ...captionCases.slice(1).map((scenario) => ({
+        name: scenario.name,
+        caption: scenario.caption,
+        buffer: attachment.toString("base64"),
+        expected: "attachment" as const,
+        bytes: attachment,
+      })),
+      ...[undefined, "", "  "].map((buffer, index) => ({
+        name: `empty-${index}`,
+        caption: captionCases[1].caption,
+        buffer,
+        expected: "suppressed" as const,
+        finalText: "No attachment was provided, so nothing was sent.",
+      })),
+      { name: "text-only", caption: "Attached proof.", expected: "text" },
+      {
+        name: "invalid",
+        caption: captionCases[1].caption,
         buffer: "%%%",
+        expected: "error",
         error: /invalid base64 data/,
         finalText: "The attachment data is invalid, so it was not sent.",
-      }),
-      makeScenario("oversized", "error", {
-        caption: deliveryCaption,
+      },
+      {
+        name: "oversized",
+        caption: captionCases[2].caption,
         buffer: Buffer.alloc(2048).toString("base64"),
+        expected: "error",
         error: /Media too large/,
         finalText: "The attachment exceeds the size limit, so it was not sent.",
-      }),
-      makeScenario("explicit", "attachment", {
+      },
+      {
+        name: "explicit",
+        caption: captionCases[1].caption,
         buffer: "%%%",
         media: explicitMedia,
+        expected: "attachment",
         bytes: explicitBytes,
-      }),
-      makeScenario("denied", "error", {
+      },
+      {
+        name: "denied",
+        caption: captionCases[1].caption,
         media: deniedMedia,
+        expected: "error",
         error: /allowed directory|could not be staged/,
         finalText: "The attachment could not be accessed, so it was not sent.",
-      }),
+      },
     ];
     const configPath = path.join(state, "openclaw.json");
     const environment = {
       OPENCLAW_HOME: root,
       OPENCLAW_STATE_DIR: state,
       OPENCLAW_CONFIG_PATH: configPath,
+      OPENCLAW_SKIP_CHANNELS: "1",
+      OPENCLAW_SKIP_GMAIL_WATCHER: "1",
+      OPENCLAW_SKIP_CRON: "1",
+      OPENCLAW_SKIP_CANVAS_HOST: "1",
+      OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
+      OPENCLAW_SKIP_PROVIDERS: "1",
+      OPENCLAW_DISABLE_BUNDLED_PLUGINS: "0",
+      OPENCLAW_BUNDLED_PLUGINS_DIR: path.resolve("dist/extensions"),
     };
-    const snapshot = captureEnv([...MANUAL_GATEWAY_ENV_KEYS, ...Object.keys(environment)]);
-    configureManualGatewayBackgroundEnv(root);
+    const snapshot = captureEnv(Object.keys(environment));
     for (const [key, value] of Object.entries(environment)) {
       setTestEnvValue(key, value);
     }
-    setTestEnvValue("OPENCLAW_DISABLE_BUNDLED_PLUGINS", "0");
-    setTestEnvValue("OPENCLAW_BUNDLED_PLUGINS_DIR", path.resolve("dist/extensions"));
     let selected = cases[0];
     let requests: Array<Record<string, unknown>> = [];
-    const primaryRequests = () => requests.filter((request) => request.model === "buffer-proof");
-    let provider: Awaited<ReturnType<typeof startProofProvider>> | undefined;
-    let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
-    try {
-      provider = await startProofProvider(async (request, response) => {
+    const provider = createServer((request, response) => {
+      void (async () => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
         if (request.method !== "POST" || request.url !== "/v1/responses") {
           response.writeHead(404).end();
           return;
         }
-        const body: unknown = await json(request);
+        const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         if (!isRecord(body)) {
           throw new Error("Invalid completion request");
         }
         requests.push(body);
-        const summary = body.model !== "buffer-proof";
-        if (!summary && primaryRequests().length === 1) {
+        if (body.model !== "buffer-proof") {
+          writeOpenAiResponsesText(response, {
+            text: "Attachment requested.",
+            messageId: `summary_${selected.name}`,
+            responseId: `summary_response_${selected.name}`,
+          });
+          return;
+        }
+        if (requests.filter((candidate) => candidate.model === "buffer-proof").length === 1) {
           const item = {
             type: "function_call",
             id: `fc_${selected.name}`,
@@ -138,41 +171,85 @@ it(
             }),
             status: "completed",
           };
-          writeProofToolCall(response, item, `response_${selected.name}`, "done", 10);
-          return;
+          writeOpenAiResponsesSse(response, [
+            {
+              type: "response.output_item.added",
+              output_index: 0,
+              item: { ...item, status: "in_progress", arguments: "" },
+            },
+            {
+              type: "response.function_call_arguments.done",
+              item_id: item.id,
+              output_index: 0,
+              arguments: item.arguments,
+            },
+            { type: "response.output_item.done", output_index: 0, item },
+            {
+              type: "response.completed",
+              response: {
+                id: `response_${selected.name}`,
+                status: "completed",
+                output: [item],
+                usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 },
+              },
+            },
+          ]);
+        } else {
+          writeOpenAiResponsesText(response, {
+            text: selected.finalText ?? "NO_REPLY",
+            messageId: `msg_${selected.name}`,
+            responseId: `final_${selected.name}`,
+          });
         }
-        writeOpenAiResponsesText(response, {
-          text: summary ? "Attachment requested." : (selected.finalText ?? "NO_REPLY"),
-          messageId: `${summary ? "summary" : "msg"}_${selected.name}`,
-          responseId: `${summary ? "summary_response" : "final"}_${selected.name}`,
-        });
-      });
-      const fixture = createOpenAiResponsesModelConfig({
-        baseUrl: provider.baseUrl,
-        providerId: "openai",
-        modelId: "buffer-proof",
-        reasoning: false,
-        toolProfile: "messaging",
-      });
-      const modelProvider = fixture.models!.providers!.openai;
-      modelProvider.apiKey = "test";
-      for (const model of modelProvider.models!) {
-        model.contextWindow = 16000;
-        model.maxTokens = 256;
+      })().catch((error: unknown) => response.destroy(error instanceof Error ? error : undefined));
+    });
+    let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
+    try {
+      const listening = createDeferred();
+      provider.once("error", listening.reject);
+      provider.listen(0, "127.0.0.1", listening.resolve);
+      await listening.promise;
+      const address = provider.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Missing completion endpoint address");
       }
       gateway = await startGatewayWithClient({
         cfg: {
-          ...fixture,
           agents: {
             defaults: {
-              ...fixture.agents!.defaults,
-              heartbeat: undefined,
               workspace,
               mediaMaxMb: 1 / 1024,
+              skipBootstrap: true,
+              skills: [],
               model: { primary: "openai/buffer-proof", fallbacks: [] },
+              models: { "openai/buffer-proof": { agentRuntime: { id: "openclaw" } } },
             },
             entries: { main: {} },
           },
+          models: {
+            mode: "replace",
+            providers: {
+              openai: {
+                baseUrl: `http://127.0.0.1:${address.port}/v1`,
+                apiKey: "test",
+                api: "openai-responses",
+                request: { allowPrivateNetwork: true },
+                models: [
+                  {
+                    id: "buffer-proof",
+                    name: "buffer-proof",
+                    api: "openai-responses",
+                    reasoning: false,
+                    input: ["text"],
+                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                    contextWindow: 16000,
+                    maxTokens: 256,
+                  },
+                ],
+              },
+            },
+          },
+          // This provider scripts direct message calls to prove buffer handling, not discovery.
           tools: { profile: "messaging", toolSearch: false },
           plugins: {
             allow: ["openai"],
@@ -184,36 +261,28 @@ it(
         configPath,
         token: "buffer-proof-token",
       });
-      const client = gateway.client;
-      const wait = (runId: string) =>
-        client.request<{ status: string }>(
-          "agent.wait",
-          { runId, timeoutMs: 60_000 },
-          { timeoutMs: 65_000 },
-        );
-      const artifacts = (sessionKey: string) =>
-        client.request<ArtifactsListResult>("artifacts.list", {
-          sessionKey,
-          messageRole: "assistant",
-        });
-      const send = (sessionKey: string, name: string) =>
-        client.request<{ runId: string }>("chat.send", {
-          sessionKey,
-          message: "Send the attachment in this conversation.",
-          idempotencyKey: `buffer-${name}`,
-        });
       for (const scenario of cases) {
-        const check = (value: unknown) => expect.soft(value, scenario.name);
         selected = scenario;
         requests = [];
         const sessionKey = `agent:main:buffer-${scenario.name}`;
-        const started = await send(sessionKey, scenario.name);
-        const completed = await wait(started.runId);
+        const started = await gateway.client.request<{ runId: string }>("chat.send", {
+          sessionKey,
+          message: "Send the attachment in this conversation.",
+          idempotencyKey: `buffer-${scenario.name}`,
+        });
+        const completed = await gateway.client.request<{ status: string }>(
+          "agent.wait",
+          { runId: started.runId, timeoutMs: 60_000 },
+          { timeoutMs: 65_000 },
+        );
         const history = await gateway.client.request<{ messages: Array<Record<string, unknown>> }>(
           "chat.history",
           { sessionKey, limit: 20 },
         );
-        const listed = await artifacts(sessionKey);
+        const listed = await gateway.client.request<ArtifactsListResult>("artifacts.list", {
+          sessionKey,
+          messageRole: "assistant",
+        });
         const visibleText = history.messages
           .filter((message) => message.role === "assistant")
           .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
@@ -225,40 +294,56 @@ it(
         if (scenario.finalText) {
           expectedText.push(scenario.finalText);
         }
-        check(visibleText).toEqual(expectedText);
+        expect.soft(visibleText, scenario.name).toEqual(expectedText);
         const toolResults = history.messages.filter((message) => message.role === "toolResult");
-        check(toolResults).toHaveLength(1);
+        expect.soft(toolResults, scenario.name).toHaveLength(1);
         if (scenario.error) {
-          check(toolResults[0]).toMatchObject({ isError: true });
-          check(JSON.stringify(toolResults)).toMatch(scenario.error);
+          expect.soft(toolResults[0], scenario.name).toMatchObject({ isError: true });
+          expect.soft(JSON.stringify(toolResults), scenario.name).toMatch(scenario.error);
         }
         if (scenario.expected === "suppressed") {
-          check(JSON.stringify(toolResults)).toContain("internal_runtime_context_echo");
+          expect
+            .soft(JSON.stringify(toolResults), scenario.name)
+            .toContain("internal_runtime_context_echo");
         }
-        check(completed.status).toBe("ok");
-        check(listed.artifacts).toHaveLength(scenario.expected === "attachment" ? 1 : 0);
+        expect.soft(completed.status, scenario.name).toBe("ok");
+        expect
+          .soft(listed.artifacts, scenario.name)
+          .toHaveLength(scenario.expected === "attachment" ? 1 : 0);
         for (const artifact of listed.artifacts) {
           const downloaded = await gateway.client.request<ArtifactsDownloadResult>(
             "artifacts.download",
             { sessionKey, artifactId: artifact.id },
           );
-          check(downloaded.artifact).toMatchObject({
-            mimeType: "text/plain",
-            title: "proof.txt",
-          });
+          expect.soft(downloaded.artifact.mimeType, scenario.name).toBe("text/plain");
+          expect.soft(downloaded.artifact.title, scenario.name).toBe("proof.txt");
           if (!downloaded.url) {
             throw new Error("Managed artifact URL missing");
           }
           const response = await fetch(new URL(downloaded.url, `http://127.0.0.1:${gateway.port}`));
           expect(response.ok).toBe(true);
-          check(Buffer.from(await response.arrayBuffer())).toEqual(scenario.bytes);
+          expect
+            .soft(Buffer.from(await response.arrayBuffer()), scenario.name)
+            .toEqual(scenario.bytes);
         }
-        const primaryCount = primaryRequests().length;
-        const replay = await send(sessionKey, scenario.name);
+        const primaryCount = requests.filter((request) => request.model === "buffer-proof").length;
+        const replay = await gateway.client.request<{ runId: string }>("chat.send", {
+          sessionKey,
+          message: "Send the attachment in this conversation.",
+          idempotencyKey: `buffer-${scenario.name}`,
+        });
         expect(replay.runId).toBe(started.runId);
-        await wait(replay.runId);
-        expect(await artifacts(sessionKey)).toEqual(listed);
-        expect(primaryRequests()).toHaveLength(primaryCount);
+        await gateway.client.request(
+          "agent.wait",
+          { runId: replay.runId, timeoutMs: 60_000 },
+          { timeoutMs: 65_000 },
+        );
+        expect(
+          await gateway.client.request("artifacts.list", { sessionKey, messageRole: "assistant" }),
+        ).toEqual(listed);
+        expect(requests.filter((request) => request.model === "buffer-proof")).toHaveLength(
+          primaryCount,
+        );
       }
     } finally {
       try {
@@ -267,14 +352,14 @@ it(
           await gateway.server.close();
         }
       } finally {
-        try {
-          await provider?.close();
-        } finally {
-          snapshot.restore();
-          clearRuntimeConfigSnapshot();
-          clearConfigCache();
-          clearSessionStoreCacheForTest();
-        }
+        provider.closeAllConnections();
+        const closed = createDeferred();
+        provider.close(() => closed.resolve());
+        await closed.promise;
+        snapshot.restore();
+        clearRuntimeConfigSnapshot();
+        clearConfigCache();
+        clearSessionStoreCacheForTest();
       }
     }
   },

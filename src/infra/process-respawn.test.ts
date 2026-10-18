@@ -87,6 +87,10 @@ function setupWindowsGateway() {
   });
 }
 
+function mockDetachedChild(pid: number) {
+  return { pid, kill: vi.fn(), on: vi.fn(), unref: vi.fn() };
+}
+
 function setupUpdate(platform: NodeJS.Platform, pid: number, entry = "/repo/dist/index.js") {
   setupSupervisor(platform);
   process.execArgv = [];
@@ -96,7 +100,7 @@ function setupUpdate(platform: NodeJS.Platform, pid: number, entry = "/repo/dist
     "gateway",
     "run",
   ];
-  const child = { pid, kill: vi.fn(), on: vi.fn(), unref: vi.fn() };
+  const child = mockDetachedChild(pid);
   spawnMock.mockReturnValue(child);
   return child;
 }

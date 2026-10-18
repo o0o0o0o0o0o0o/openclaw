@@ -1,3 +1,4 @@
+// Covers provider usage summary loading across auth and plugin paths.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProviderResolveUsageAuthContext } from "../plugins/types.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
@@ -13,48 +14,33 @@ import { ignoredErrors } from "./provider-usage.shared.js";
 import { loadUsageWithAuth, usageNow } from "./provider-usage.test-support.js";
 import type { ProviderUsageSnapshot, UsageSummary } from "./provider-usage.types.js";
 
-const authHook = getProviderUsageAuthWithPluginMock();
-const snapshotHook = getProviderUsageSnapshotWithPluginMock();
-const loadSummary = (options: Parameters<typeof loadProviderUsageSummary>[0]) =>
-  loadProviderUsageSummary({ config: {}, env: {}, now: usageNow, ...options });
-const trackSummary = (scope: AsyncWorkScope, options: Parameters<typeof loadSummary>[0]) =>
-  scope.track(() => loadSummary({ timeoutMs: 1, ...options }));
-const auth = (...providers: string[]) =>
-  providers.map((provider) => ({ provider, token: "token" }));
-const failure = (error: string) => ({
-  provider: "anthropic",
-  displayName: "Claude",
-  windows: [],
-  error,
-});
-const snapshot = (provider: string, displayName: string, label: string, usedPercent: number) => ({
-  provider,
-  displayName,
-  windows: [{ label, usedPercent }],
-});
+const resolveProviderUsageAuthWithPluginMock = getProviderUsageAuthWithPluginMock();
+const resolveProviderUsageSnapshotWithPluginMock = getProviderUsageSnapshotWithPluginMock();
 
 describe("provider-usage.load", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     resetProviderUsageSnapshotWithPluginMock();
   });
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.unstubAllGlobals();
-  });
+  afterEach(() => vi.useRealTimers());
 
   it("does not dispatch auth or fetch for an exhausted budget", async () => {
     const fetch = vi.fn(async () => new Response("{}"));
-    authHook.mockResolvedValue({ token: "fixture-token" });
-    const result = await loadSummary({
+    resolveProviderUsageAuthWithPluginMock.mockResolvedValue({ token: "fixture-token" });
+    const result = await loadProviderUsageSummary({
       providers: ["anthropic"],
+      config: {},
       env: { ANTHROPIC_API_KEY: "fixture-token" },
+      now: usageNow,
       timeoutMs: 0,
       fetch,
     });
-    expect(result).toEqual({ updatedAt: usageNow, providers: [failure("Timeout")] });
-    expect(authHook).not.toHaveBeenCalled();
-    expect(snapshotHook).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      updatedAt: usageNow,
+      providers: [{ provider: "anthropic", displayName: "Claude", windows: [], error: "Timeout" }],
+    });
+    expect(resolveProviderUsageAuthWithPluginMock).not.toHaveBeenCalled();
+    expect(resolveProviderUsageSnapshotWithPluginMock).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -84,13 +70,21 @@ describe("provider-usage.load", () => {
         started.resolve();
         return response.promise;
       });
-      snapshotHook.mockImplementation(async ({ context }) => {
+      resolveProviderUsageSnapshotWithPluginMock.mockImplementation(async ({ context }) => {
         await (signalSource === "init"
           ? context.fetchFn("https://usage.example.test", { signal: caller.signal })
           : context.fetchFn(new Request("https://usage.example.test", { signal: caller.signal })));
         return { provider: "anthropic", displayName: "Claude", windows: [] };
       });
-      const pending = trackSummary(scope, { auth: auth("anthropic"), fetch });
+      const pending = scope.track(() =>
+        loadProviderUsageSummary({
+          auth: [{ provider: "anthropic", token: "fixture-token" }],
+          config: {},
+          env: {},
+          timeoutMs: 1,
+          fetch,
+        }),
+      );
       try {
         await started.promise;
         if (callerAbort) {
@@ -98,10 +92,15 @@ describe("provider-usage.load", () => {
         }
         await vi.advanceTimersByTimeAsync(callerAbort ? 0 : 1);
         expect(fetchSignal?.aborted).toBe(true);
-        expect(caller.signal.aborted).toBe(callerAbort);
         expect(aborted).toHaveBeenCalledOnce();
+        expect(caller.signal.aborted).toBe(callerAbort);
         expect((await pending).providers).toEqual([
-          failure(callerAbort ? "Caller cancelled" : "Timeout"),
+          {
+            provider: "anthropic",
+            displayName: "Claude",
+            windows: [],
+            error: callerAbort ? "Caller cancelled" : "Timeout",
+          },
         ]);
         await scope.drain();
         expect(scope.hasPendingWork).toBe(false);
@@ -120,28 +119,34 @@ describe("provider-usage.load", () => {
       const scope = new AsyncWorkScope();
       const captured = createDeferredCore<ProviderResolveUsageAuthContext>();
       const release = createDeferredCore();
-      authHook.mockImplementation(async ({ context }) => {
+      resolveProviderUsageAuthWithPluginMock.mockImplementation(async ({ context }) => {
         captured.resolve(context);
         await release.promise;
         return { handled: true };
       });
-      const pending = trackSummary(scope, {
-        providers: ["anthropic"],
-        env: { ANTHROPIC_API_KEY: "fixture-token" },
-      });
+      const pending = scope.track(() =>
+        loadProviderUsageSummary({
+          providers: ["anthropic"],
+          config: {},
+          env: { ANTHROPIC_API_KEY: "fixture-token" },
+          timeoutMs: 1,
+        }),
+      );
       try {
         const context = await captured.promise;
         await vi.advanceTimersByTimeAsync(1);
         expect((await pending).providers[0]?.error).toBe("Timeout");
         expect(context.signal?.aborted).toBe(true);
         await expect(
-          Promise.resolve().then(() =>
-            helper === "candidates"
-              ? context.resolveApiKeyCandidatesFromConfigAndStore?.()
-              : context.resolveOAuthToken(),
-          ),
+          Promise.resolve().then(async () => {
+            if (helper === "candidates") {
+              await context.resolveApiKeyCandidatesFromConfigAndStore?.();
+            } else {
+              await context.resolveOAuthToken();
+            }
+          }),
         ).rejects.toBe(context.signal?.reason);
-        expect(snapshotHook).not.toHaveBeenCalled();
+        expect(resolveProviderUsageSnapshotWithPluginMock).not.toHaveBeenCalled();
       } finally {
         release.resolve();
         await pending;
@@ -152,12 +157,17 @@ describe("provider-usage.load", () => {
 
   it("returns unsupported provider snapshots for unknown provider ids", async () => {
     const mockFetch = createProviderUsageFetch(async () => makeResponse(404, "not found"));
-    const summary = await loadSummary({ auth: auth("unsupported-provider"), fetch: mockFetch });
-    expect(summary.providers).toMatchObject([{ error: "Unsupported provider" }]);
+    const summary = await loadUsageWithAuth(
+      loadProviderUsageSummary,
+      [{ provider: "unsupported-provider", token: "token-u" }],
+      mockFetch,
+    );
+    expect(summary.providers).toHaveLength(1);
+    expect(summary.providers[0]?.error).toBe("Unsupported provider");
   });
 
   it("filters errors that are marked as ignored", async () => {
-    snapshotHook.mockResolvedValueOnce({
+    resolveProviderUsageSnapshotWithPluginMock.mockResolvedValueOnce({
       provider: "anthropic",
       displayName: "Claude",
       windows: [],
@@ -181,20 +191,38 @@ describe("provider-usage.load", () => {
 
   it("keeps window and balance-only snapshots with injected auth", async () => {
     const snapshots: ProviderUsageSnapshot[] = [
-      snapshot("anthropic", "Claude", "5h", 20),
+      { provider: "anthropic", displayName: "Claude", windows: [{ label: "5h", usedPercent: 20 }] },
       { provider: "deepseek", displayName: "DeepSeek", windows: [], summary: "Balance ¥42.50" },
     ];
-    const expected = structuredClone(snapshots);
-    snapshotHook.mockImplementation(
-      async ({ provider }) => snapshots.find((entry) => entry.provider === provider) ?? null,
+    resolveProviderUsageSnapshotWithPluginMock.mockImplementation(
+      async ({ provider }) => snapshots.find((snapshot) => snapshot.provider === provider) ?? null,
     );
     const mockFetch = createProviderUsageFetch(async () => {
       throw new Error("legacy fetch should not run");
     });
 
-    const summary = await loadSummary({ auth: auth("anthropic", "deepseek"), fetch: mockFetch });
+    const summary = await loadUsageWithAuth(
+      loadProviderUsageSummary,
+      [
+        { provider: "anthropic", token: "token-a" },
+        { provider: "deepseek", token: "token-d" },
+      ],
+      mockFetch,
+    );
 
-    expect(summary.providers).toEqual(expected);
+    expect(summary.providers).toEqual([
+      {
+        provider: "anthropic",
+        displayName: "Claude",
+        windows: [{ label: "5h", usedPercent: 20 }],
+      },
+      {
+        provider: "deepseek",
+        displayName: "DeepSeek",
+        windows: [],
+        summary: "Balance ¥42.50",
+      },
+    ]);
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
@@ -202,68 +230,122 @@ describe("provider-usage.load", () => {
     vi.useFakeTimers();
     const scope = new AsyncWorkScope();
     const heldSnapshot = createDeferredCore<ProviderUsageSnapshot>();
-    const lateSnapshot = snapshot("anthropic", "Claude", "5h", 20);
+    const lateSnapshot: ProviderUsageSnapshot = {
+      provider: "anthropic",
+      displayName: "Claude",
+      windows: [{ label: "5h", usedPercent: 20 }],
+    };
     let summaryPromise: Promise<UsageSummary> | undefined;
     let draining: Promise<void> | undefined;
     try {
-      snapshotHook.mockImplementation(async ({ provider }) =>
-        provider === "anthropic" ? heldSnapshot.promise : snapshot(provider, "Codex", "3h", 12),
+      resolveProviderUsageSnapshotWithPluginMock.mockImplementation(async ({ provider }) => {
+        if (provider === "anthropic") {
+          return await heldSnapshot.promise;
+        }
+        return {
+          provider,
+          displayName: "Codex",
+          windows: [{ label: "3h", usedPercent: 12 }],
+        };
+      });
+      summaryPromise = scope.track(() =>
+        loadProviderUsageSummary({
+          auth: [
+            { provider: "anthropic", token: "token-a" },
+            { provider: "openai", token: "token-codex" },
+          ],
+          config: {},
+          env: {},
+          timeoutMs: 5_000,
+        }),
       );
-      summaryPromise = trackSummary(scope, { auth: auth("anthropic", "openai"), timeoutMs: 5_000 });
-      const settled = vi.fn();
-      void summaryPromise.then(settled);
+      let settled = false;
+      void summaryPromise.then(() => {
+        settled = true;
+      });
 
       await vi.advanceTimersByTimeAsync(5_000);
-      expect(settled).toHaveBeenCalledOnce();
+      const settledAtDeadline = settled;
+      if (!settledAtDeadline) {
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
       const summary = await summaryPromise;
 
+      expect(settledAtDeadline).toBe(true);
       expect(summary.providers).toEqual([
-        failure("Timeout"),
-        snapshot("openai", "Codex", "3h", 12),
+        { provider: "anthropic", displayName: "Claude", windows: [], error: "Timeout" },
+        {
+          provider: "openai",
+          displayName: "Codex",
+          windows: [{ label: "3h", usedPercent: 12 }],
+        },
       ]);
-      const drained = vi.fn();
-      draining = scope.drain().then(drained);
+      let drained = false;
+      draining = scope.drain().then(() => {
+        drained = true;
+      });
       await vi.advanceTimersByTimeAsync(0);
-      expect(drained).not.toHaveBeenCalled();
+      expect(drained).toBe(false);
       heldSnapshot.resolve(lateSnapshot);
       await draining;
-      expect(drained).toHaveBeenCalledOnce();
+      expect(drained).toBe(true);
       expect(summary.providers[0]?.error).toBe("Timeout");
     } finally {
       heldSnapshot.resolve(lateSnapshot);
       await Promise.allSettled([
         summaryPromise,
-        ...snapshotHook.mock.results.map((result) => result.value),
+        ...resolveProviderUsageSnapshotWithPluginMock.mock.results.map((result) => result.value),
       ]);
       await (draining ?? scope.drain());
+      vi.useRealTimers();
     }
   });
 
   it("keeps successful provider usage when a sibling auth hook rejects", async () => {
-    authHook.mockImplementation(async ({ provider }) => {
+    resolveProviderUsageAuthWithPluginMock.mockImplementation(async ({ provider }) => {
       if (provider === "anthropic") {
         throw new Error("auth failed");
       }
       return { token: `${provider}-token` };
     });
-    snapshotHook.mockImplementation(async ({ provider }) => snapshot(provider, provider, "5h", 12));
+    resolveProviderUsageSnapshotWithPluginMock.mockImplementation(async ({ provider }) => ({
+      provider,
+      displayName: provider,
+      windows: [{ label: "5h", usedPercent: 12 }],
+    }));
 
-    const summary = await loadSummary({
+    const summary = await loadProviderUsageSummary({
       providers: ["anthropic", "openai"],
-      // Both credential sources must pass the plugin-auth gate.
+      config: {},
+      // Credential sources keep both providers past the plugin-auth gate so the
+      // sibling-isolation behavior under test is actually exercised.
       env: { ANTHROPIC_API_KEY: "sk-ant-test", OPENAI_API_KEY: "sk-openai-test" },
     });
 
     expect(summary.providers).toEqual([
-      failure("auth failed"),
-      snapshot("openai", "openai", "5h", 12),
+      { provider: "anthropic", displayName: "Claude", windows: [], error: "auth failed" },
+      {
+        provider: "openai",
+        displayName: "openai",
+        windows: [{ label: "5h", usedPercent: 12 }],
+      },
     ]);
   });
 
   it("throws when fetch is unavailable", async () => {
+    const previousFetch = globalThis.fetch;
     vi.stubGlobal("fetch", undefined);
-    await expect(loadSummary({ auth: auth("xiaomi"), fetch: undefined })).rejects.toThrow(
-      "fetch is not available",
-    );
+    try {
+      await expect(
+        loadProviderUsageSummary({
+          now: usageNow,
+          auth: [{ provider: "xiaomi", token: "token-x" }],
+          env: {},
+          fetch: undefined,
+        }),
+      ).rejects.toThrow("fetch is not available");
+    } finally {
+      vi.stubGlobal("fetch", previousFetch);
+    }
   });
 });

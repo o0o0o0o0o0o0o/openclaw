@@ -16,7 +16,7 @@ import type { AuthProfileStore } from "./types.js";
 export const TEST_PRIMARY_PROFILE_ID = "openai:primary@example.test";
 export const TEST_SECONDARY_PROFILE_ID = "openai:secondary@example.test";
 
-export const authStoreMocks = vi.hoisted(() => {
+const authStoreMocks = vi.hoisted(() => {
   const emptyStore = (): AuthProfileStore => ({ version: 1, profiles: {} });
   const state = {
     hasSource: false,
@@ -45,6 +45,8 @@ export const authStoreMocks = vi.hoisted(() => {
   };
 });
 
+export { authStoreMocks };
+
 vi.mock("./store.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./store.js")>()),
   getRuntimeAuthProfileStoreSnapshot: () => authStoreMocks.state.store,
@@ -61,6 +63,7 @@ vi.mock("./store-runtime.js", () => ({
   loadAuthProfileStoreForRuntimeAsync: async () => authStoreMocks.state.store,
 }));
 
+// mock-isolation: Session selection uses controlled cooldown state without runtime usage writes.
 vi.mock("./usage.js", () => ({ isProfileInCooldown: authStoreMocks.isProfileInCooldown }));
 
 vi.mock("../../plugins/provider-model-routes.js", () => ({
@@ -72,7 +75,7 @@ vi.mock("../../plugins/provider-model-routes.js", () => ({
 }));
 
 export const { resolveSessionAuthSelection } = await import("./session-override.js");
-afterEach(authStoreMocks.reset);
+afterEach(() => authStoreMocks.reset());
 
 export async function withAuthState<T>(run: (state: OpenClawTestState) => Promise<T>): Promise<T> {
   return await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-auth-" }, run);

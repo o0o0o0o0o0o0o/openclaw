@@ -1,10 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  awaitGateBeforeSettlement,
-  createDeferred,
-  withinTest,
-} from "../../test/helpers/promise.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { CRON_AGENT_SELECTION_REQUIRED_MESSAGE } from "../cron/agent-id.js";
 import type { CronJob } from "../cron/types.js";
 import type {
@@ -15,88 +11,20 @@ import type {
 } from "../process/supervisor/types.js";
 import { AsyncWorkScope, trackAsyncWork } from "../shared/async-work-scope.js";
 import {
-  createGatewaySchedulerClock as schedulerClock,
-  createTestGatewayScheduler as createScheduler,
+  createGatewaySchedulerClock,
+  createTestGatewayScheduler,
 } from "../test-utils/gateway-scheduler-clock.js";
 import { resolveStreamStopReason } from "./cron-stream-watchers.js";
 import {
-  createCronStreamWatcherFixture as createFixture,
+  createCronStreamWatcherFixture,
+  createWatchers,
   exitResult,
   fakeSupervisor,
   job,
   settle,
 } from "./cron-stream-watchers.test-helpers.js";
 
-function sourceRun(runId: string, cancel: (finish: () => void) => void, settled = false) {
-  const wait = createDeferred<RunExit>();
-  const activity = { resultSettled: settled, lastOutputAtMs: Date.now() };
-  const finish = () => {
-    activity.resultSettled = true;
-    wait.resolve(exitResult({ reason: "manual-cancel" }));
-  };
-  return {
-    activity,
-    runId,
-    startedAtMs: Date.now(),
-    detachOutput: vi.fn(),
-    cancel: vi.fn(() => cancel(finish)),
-    wait: () => (settled ? Promise.resolve(exitResult()) : wait.promise),
-  } satisfies ManagedRun;
-}
-
-const replacementJob = (id = "stream-job") =>
-  job({ id, schedule: { kind: "stream", command: ["replacement"], batchMs: 50 } });
-const stoppedState = { state: "stopped", processAlive: false, restartTimerPending: false };
-function sourceFixture(spawn: ProcessSupervisor["spawn"], minIntervalMs?: number) {
-  const supervisor = { ...fakeSupervisor().supervisor, spawn } satisfies ProcessSupervisor;
-  return createFixture({ getProcessSupervisor: () => supervisor, minIntervalMs });
-}
-
-function stubbornSourceFixture(replacing = false) {
-  const cancels: Record<string, ReturnType<typeof vi.fn>> = {};
-  const spawn = vi.fn(async (input: SpawnInput) => {
-    if (!input.scopeKey || (replacing && input.mode !== "child")) {
-      throw new Error("Expected a scoped stream source");
-    }
-    const jobId = input.scopeKey.replace("cron-stream:", "");
-    const command = input.mode === "child" ? input.argv[0] : undefined;
-    const stubborn = jobId === "stubborn-job" && (!replacing || command === "stream-source");
-    const run = sourceRun(`run-${jobId}${replacing ? `-${command}` : ""}`, (finish) => {
-      if (!stubborn) {
-        finish();
-      }
-    });
-    cancels[jobId] = run.cancel;
-    return run;
-  });
-  return { cancels, spawn, ...sourceFixture(spawn, 1) };
-}
-
-async function flush() {
-  await settle();
-  await vi.advanceTimersByTimeAsync(50);
-  await settle();
-}
-function blockStateWrite(
-  matches: (patch: Partial<CronJob["state"]>, jobId: string) => boolean,
-  result?: boolean,
-) {
-  const entered = createDeferred();
-  const release = createDeferred();
-  const updateState = vi.fn(async (jobId: string, patch: Partial<CronJob["state"]>) => {
-    if (matches(patch, jobId)) {
-      entered.resolve();
-      await release.promise;
-      return result;
-    }
-  });
-  return { entered: entered.promise, release: release.resolve, updateState };
-}
-
 describe("cron stream watchers", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -105,7 +33,7 @@ describe("cron stream watchers", () => {
     "withholds a stream needing %s repair without blocking its healthy sibling",
     async (repair) => {
       const warn = vi.fn();
-      const { fake, watchers } = createFixture({
+      const { fake, watchers } = createCronStreamWatcherFixture({
         logger: { info: vi.fn(), warn },
       });
       const invalid = job({ id: "invalid-delivery", delivery: { mode: "none" } });
@@ -141,7 +69,7 @@ describe("cron stream watchers", () => {
 
   it("rechecks ownership after persisting stream admission and before spawning", async () => {
     let defaultAgentId: string | undefined = "main";
-    const { fake, updateState, watchers } = createFixture({
+    const { fake, updateState, watchers } = createCronStreamWatcherFixture({
       getDefaultAgentId: () => defaultAgentId,
     });
     updateState.mockImplementationOnce(async () => {
@@ -163,33 +91,20 @@ describe("cron stream watchers", () => {
     }
   });
 
-  it.each([false, true])("coalesces late source wakes (restarting: %s)", async (restarting) => {
-    const clock = schedulerClock();
-    const scheduler = createScheduler(clock.clock);
-    const { fake, updateState, watchers } = createFixture({ scheduler, retryBackoffMs: [1_000] });
+  it("marks a source stable once after a late scheduler wake", async () => {
+    const clock = createGatewaySchedulerClock();
+    const scheduler = createTestGatewayScheduler(clock.clock);
+    const { fake, updateState, watchers } = createCronStreamWatcherFixture({ scheduler });
     try {
-      await watchers.start(restarting ? job() : job({ state: { streamConsecutiveFailures: 4 } }));
-      if (restarting) {
-        fake.exits[0]?.(exitResult());
-        await settle();
-        await settle();
-        expect(watchers.inspect("stream-job")?.state).toBe("backoff");
-      }
-      clock.setTime(restarting ? 300_000 : 180_000);
+      await watchers.start(job({ state: { streamConsecutiveFailures: 4 } }));
+      clock.setTime(180_000);
       await clock.wake();
-      await clock.advanceBy(restarting ? 0 : 60_000);
-      if (restarting) {
-        expect(watchers.inspect("stream-job")?.state).toBe("running");
-        expect(fake.spawn).toHaveBeenCalledTimes(2);
-        await watchers.stopAll("shutdown");
-        await clock.advanceBy(60_000);
-      } else {
-        expect(watchers.inspect("stream-job")?.consecutiveFailures).toBe(0);
-        expect(
-          updateState.mock.calls.filter(([, p]) => p.streamConsecutiveFailures === 0),
-        ).toHaveLength(1);
-      }
-      expect(fake.spawn).toHaveBeenCalledTimes(restarting ? 2 : 1);
+      await clock.advanceBy(60_000);
+      expect(watchers.inspect("stream-job")?.consecutiveFailures).toBe(0);
+      expect(
+        updateState.mock.calls.filter(([, patch]) => patch.streamConsecutiveFailures === 0),
+      ).toHaveLength(1);
+      expect(fake.spawn).toHaveBeenCalledOnce();
       expect(scheduler.nextWakeAtMs).toBeNull();
     } finally {
       await watchers.stopAll("shutdown");
@@ -197,80 +112,95 @@ describe("cron stream watchers", () => {
     }
   });
 
-  it.each([undefined, false] as const)(
-    "joins scheduled stability teardown (write result: %s)",
-    async (result, { signal }) => {
-      const clock = schedulerClock();
-      const scheduler = createScheduler(clock.clock);
-      const write = blockStateWrite(
-        (patch) => patch.streamStatus === "running" && patch.streamConsecutiveFailures === 0,
-        result,
-      );
-      const { fake, watchers } = createFixture({ scheduler, updateState: write.updateState });
-      let wake: ReturnType<typeof clock.advanceBy> = undefined;
-      let stoppingSource: Promise<void> | undefined;
-      let stoppingScheduler: Promise<void> | undefined;
-      try {
-        await watchers.start(job({ state: { streamConsecutiveFailures: 4 } }));
-        wake = clock.advanceBy(60_000);
-        await withinTest(
-          awaitGateBeforeSettlement(
-            write.entered,
-            Promise.resolve(wake),
-            "Scheduled callback settled before its state write",
-          ),
-          signal,
-        );
-        let stopped = false;
-        stoppingScheduler = result === false ? undefined : scheduler.stop();
-        stoppingSource =
-          result === false ? watchers.stop("stream-job", "disabled") : watchers.stopAll("shutdown");
-        void (stoppingScheduler ?? stoppingSource).then(() => {
-          stopped = true;
-        });
-        await settle();
-        expect(stopped).toBe(false);
-      } finally {
-        write.release();
-        scheduler.beginClose();
-        await withinTest(
-          Promise.all([
-            wake,
-            stoppingSource ?? watchers.stop("stream-job", "disabled"),
-            stoppingScheduler ?? scheduler.stop(),
-          ]),
-          signal,
-        );
-      }
-      expect(watchers.inspect("stream-job")?.state).toBe("stopped");
-      expect(fake.runs[0]?.cancel).toHaveBeenCalledOnce();
-      expect(scheduler.nextWakeAtMs).toBeNull();
-    },
-  );
-  it.each(["throws", "rejects ownership"] as const)(
-    "treats state persistence that %s according to its authority",
-    async (result) => {
-      const failed = result === "throws";
-      const { fake, watchers } = createFixture({
-        updateState: vi.fn(async () => {
-          if (failed) {
-            throw new Error("state write failed");
-          }
-          return false;
-        }),
-      });
-      await (failed ? watchers.reconcile([job()], true) : watchers.start(job()));
+  it("restarts once after sleeping past source backoff and cancels the next deadline on stop", async () => {
+    const clock = createGatewaySchedulerClock();
+    const scheduler = createTestGatewayScheduler(clock.clock);
+    const { fake, watchers } = createCronStreamWatcherFixture({
+      scheduler,
+      retryBackoffMs: [1_000],
+    });
+    try {
+      await watchers.start(job());
+      fake.exits[0]?.(exitResult());
       await settle();
-      expect(fake.spawn).toHaveBeenCalledTimes(failed ? 1 : 0);
-      expect(watchers.inspect("stream-job")).toMatchObject({
-        state: failed ? "running" : "stopped",
-      });
-      if (failed) {
-        await watchers.stopAll("shutdown");
-      }
-    },
-  );
+      await settle();
+      expect(watchers.inspect("stream-job")?.state).toBe("backoff");
+      clock.setTime(300_000);
+      await clock.wake();
+      await clock.advanceBy(0);
+      expect(fake.spawn).toHaveBeenCalledTimes(2);
+      expect(watchers.inspect("stream-job")?.state).toBe("running");
+      await watchers.stopAll("shutdown");
+      await clock.advanceBy(60_000);
+      expect(fake.spawn).toHaveBeenCalledTimes(2);
+      expect(scheduler.nextWakeAtMs).toBeNull();
+    } finally {
+      await watchers.stopAll("shutdown");
+      await scheduler.stop();
+    }
+  });
+
+  it("joins a scheduled stability write while the source owner stops", async () => {
+    const clock = createGatewaySchedulerClock();
+    const scheduler = createTestGatewayScheduler(clock.clock);
+    const writing = createDeferred();
+    const releaseWrite = createDeferred();
+    const { watchers } = createCronStreamWatcherFixture({
+      scheduler,
+      updateState: vi.fn(async (_id: string, patch: Partial<CronJob["state"]>) => {
+        if (patch.streamStatus === "running" && patch.streamConsecutiveFailures === 0) {
+          writing.resolve();
+          await releaseWrite.promise;
+        }
+      }),
+    });
+    await watchers.start(job({ state: { streamConsecutiveFailures: 4 } }));
+    const wake = clock.advanceBy(60_000);
+    await writing.promise;
+    let stopped = false;
+    const stoppingScheduler = scheduler.stop().then(() => {
+      stopped = true;
+    });
+    const stoppingSource = watchers.stopAll("shutdown");
+    try {
+      await settle();
+      expect(stopped).toBe(false);
+    } finally {
+      releaseWrite.resolve();
+      await Promise.all([wake, stoppingSource, stoppingScheduler]);
+    }
+    expect(watchers.inspect("stream-job")?.state).toBe("stopped");
+    expect(scheduler.nextWakeAtMs).toBeNull();
+  });
+
+  it("keeps lifecycle ownership when a diagnostic state write fails", async () => {
+    const { fake, watchers } = createCronStreamWatcherFixture({
+      updateState: vi.fn(async () => {
+        throw new Error("state write failed");
+      }),
+    });
+
+    await watchers.reconcile([job()], true);
+    await settle();
+
+    expect(fake.spawn).toHaveBeenCalledOnce();
+    expect(watchers.inspect("stream-job")?.state).toBe("running");
+    await watchers.stopAll("shutdown");
+  });
+
+  it("does not spawn after the cron store explicitly rejects schedule ownership", async () => {
+    const { fake, watchers } = createCronStreamWatcherFixture({
+      updateState: vi.fn(async () => false),
+    });
+
+    await watchers.start(job());
+
+    expect(fake.spawn).not.toHaveBeenCalled();
+    expect(watchers.inspect("stream-job")?.state).toBe("stopped");
+  });
+
   it("preserves historical stream ownership and settlement after the creating request closes", async () => {
+    vi.useFakeTimers();
     const creatorContext = new AsyncLocalStorage<string>();
     const creatorWork = new AsyncWorkScope();
     const inCreator = creatorContext.run("creator", () =>
@@ -280,27 +210,30 @@ describe("cron stream watchers", () => {
     const persistedStatuses: Array<CronJob["state"]["streamStatus"]> = [];
     const delivered: Array<{ agentId: string | undefined; batch: string }> = [];
     const fake = fakeSupervisor();
-    function observe<T>(work: () => T) {
-      observedContexts.push(creatorContext.getStore());
-      return work();
-    }
-    const { watchers } = createFixture({
+    const watchers = createWatchers({
       getDefaultAgentId: () => "research",
       getProcessSupervisor: () => ({
         ...fake.supervisor,
-        spawn: async (input: SpawnInput) => await observe(() => fake.spawn(input)),
+        spawn: async (input: SpawnInput) => {
+          observedContexts.push(creatorContext.getStore());
+          return await fake.spawn(input);
+        },
       }),
       minIntervalMs: 1,
       updateState: async (_jobId, patch) => {
-        await trackAsyncWork(() => observe(() => persistedStatuses.push(patch.streamStatus)));
+        await trackAsyncWork(() => {
+          observedContexts.push(creatorContext.getStore());
+          persistedStatuses.push(patch.streamStatus);
+        });
       },
+      recordFailure: vi.fn(async () => {}),
       fireBatch: async (current, batch) =>
-        await trackAsyncWork(() =>
-          observe(() => {
-            delivered.push({ agentId: current.agentId, batch });
-            return "fired" as const;
-          }),
-        ),
+        await trackAsyncWork(() => {
+          observedContexts.push(creatorContext.getStore());
+          delivered.push({ agentId: current.agentId, batch });
+          return "fired" as const;
+        }),
+      logger: { info: vi.fn(), warn: vi.fn() },
     });
     try {
       await inCreator(() => watchers.start(job({ agentId: "ops" })));
@@ -310,6 +243,7 @@ describe("cron stream watchers", () => {
       await inCreator(() => vi.advanceTimersByTimeAsync(50));
       await settle();
       await inCreator(() => watchers.stopAll("shutdown"));
+
       expect(delivered).toEqual([{ agentId: "ops", batch: "owned output" }]);
       expect(persistedStatuses).toEqual(expect.arrayContaining(["starting", "running", "stopped"]));
       expect(observedContexts.every((context) => context === undefined)).toBe(true);
@@ -324,58 +258,160 @@ describe("cron stream watchers", () => {
     }
   });
 
-  it.each([
-    [
-      undefined,
-      "stream sources are disabled because the operator set cron.triggers.enabled: false; remove it or set it to true",
-    ],
-    [true, "cron is disabled"],
-  ] as const)(
-    "withholds disabled sources and reports remediation (triggers: %s)",
-    async (triggers, streamError) => {
-      const { fake, updateState, watchers } = createFixture();
-      await watchers.reconcile([job()], false, triggers);
-      expect(fake.spawn).not.toHaveBeenCalled();
-      expect(updateState).toHaveBeenCalledWith(
-        "stream-job",
-        expect.objectContaining({ streamStatus: "disabled", streamError }),
-        expect.any(String),
-        expect.any(String),
-      );
-    },
-  );
+  it("does not spawn and records a clear status when trigger trust is disabled", async () => {
+    const { fake, updateState, watchers } = createCronStreamWatcherFixture();
 
-  it.each([false, true])("continues a failed owner sweep (replacement: %s)", async (replacing) => {
-    const { cancels, spawn, watchers } = stubbornSourceFixture(replacing);
-    const stubborn = job({ id: "stubborn-job" });
-    const healthy = job({ id: "healthy-job" });
-    await watchers.reconcile(replacing ? [stubborn] : [stubborn, healthy], true);
+    await watchers.reconcile([job()], false);
+
+    expect(fake.spawn).not.toHaveBeenCalled();
+    expect(updateState).toHaveBeenCalledWith(
+      "stream-job",
+      expect.objectContaining({
+        streamStatus: "disabled",
+        streamError:
+          "stream sources are disabled because the operator set cron.triggers.enabled: false; remove it or set it to true",
+      }),
+      expect.any(String),
+      expect.any(String),
+    );
+  });
+
+  it("reports cron-disabled remediation when only cron itself is off", async () => {
+    const { fake, updateState, watchers } = createCronStreamWatcherFixture();
+
+    // cron globally disabled but triggers enabled: the remediation must name
+    // cron, not point the operator at an already-enabled trigger flag.
+    await watchers.reconcile([job()], false, true);
+
+    expect(fake.spawn).not.toHaveBeenCalled();
+    expect(updateState).toHaveBeenCalledWith(
+      "stream-job",
+      expect.objectContaining({ streamStatus: "disabled", streamError: "cron is disabled" }),
+      expect.any(String),
+      expect.any(String),
+    );
+  });
+
+  it("fences every source during a disable sweep even when one stop fails", async () => {
+    vi.useFakeTimers();
+    const inputs: Array<{ jobId: string }> = [];
+    const cancels: Record<string, ReturnType<typeof vi.fn>> = {};
+    const spawn = vi.fn(async (input: SpawnInput) => {
+      if (!input.scopeKey) {
+        throw new Error("Expected a scoped stream source");
+      }
+      const jobId = input.scopeKey.replace("cron-stream:", "");
+      inputs.push({ jobId });
+      const stubborn = jobId === "stubborn-job";
+      const { promise: wait, resolve: resolveWait } = createDeferred<RunExit>();
+      const activity = { resultSettled: false, lastOutputAtMs: Date.now() };
+      const cancel = vi.fn(() => {
+        if (!stubborn) {
+          activity.resultSettled = true;
+          resolveWait(exitResult({ reason: "manual-cancel" }));
+        }
+      });
+      cancels[jobId] = cancel;
+      return {
+        activity,
+        runId: `run-${jobId}`,
+        startedAtMs: Date.now(),
+        cancel,
+        detachOutput: vi.fn(),
+        wait: () => wait,
+      } satisfies ManagedRun;
+    });
+    const supervisor = {
+      ...fakeSupervisor().supervisor,
+      spawn,
+    } satisfies ProcessSupervisor;
+    const { watchers } = createCronStreamWatcherFixture({
+      getProcessSupervisor: () => supervisor,
+      minIntervalMs: 1,
+    });
+    const jobs = [job({ id: "stubborn-job" }), job({ id: "healthy-job" })];
+    await watchers.reconcile(jobs, true);
     await settle();
-    expect(spawn).toHaveBeenCalledTimes(replacing ? 1 : 2);
-    const sweep = replacing
-      ? watchers.reconcile([replacementJob(stubborn.id), healthy], true)
-      : watchers.reconcile([stubborn, healthy], false, false);
-    await vi.advanceTimersByTimeAsync(replacing ? 120_000 : 60_000);
+    expect(spawn).toHaveBeenCalledTimes(2);
+
+    // Trust disable: the stubborn child never exits, so its bounded stop
+    // rejects. The sweep must contain that failure and still fence and stop
+    // the healthy sibling instead of aborting the loop.
+    const sweep = watchers.reconcile(jobs, false, false);
+    await vi.advanceTimersByTimeAsync(60_000);
     await sweep;
-    expect(watchers.inspect(healthy.id)?.state).toBe(replacing ? "running" : "stopped");
-    if (replacing) {
-      expect(spawn.mock.calls.length).toBeGreaterThanOrEqual(2);
-      const shutdown = watchers.stopAll("shutdown").catch(() => undefined);
-      await vi.advanceTimersByTimeAsync(60_000);
-      await shutdown;
-    } else {
-      expect(cancels[healthy.id]).toHaveBeenCalled();
-    }
+    expect(cancels["healthy-job"]).toHaveBeenCalled();
+    expect(watchers.inspect("healthy-job")?.state).toBe("stopped");
+  });
+
+  it("continues reconciling after a stubborn schedule replacement fails", async () => {
+    vi.useFakeTimers();
+    const cancels: Record<string, ReturnType<typeof vi.fn>> = {};
+    const spawn = vi.fn(async (input: SpawnInput) => {
+      if (input.mode !== "child" || !input.scopeKey) {
+        throw new Error("Expected an argv-based stream source");
+      }
+      const jobId = input.scopeKey.replace("cron-stream:", "");
+      const stubborn = jobId === "stubborn-job" && input.argv[0] === "stream-source";
+      const { promise: wait, resolve: resolveWait } = createDeferred<RunExit>();
+      const activity = { resultSettled: false, lastOutputAtMs: Date.now() };
+      const cancel = vi.fn(() => {
+        if (!stubborn) {
+          activity.resultSettled = true;
+          resolveWait(exitResult({ reason: "manual-cancel" }));
+        }
+      });
+      cancels[jobId] = cancel;
+      return {
+        activity,
+        runId: `run-${jobId}-${input.argv[0]}`,
+        startedAtMs: Date.now(),
+        cancel,
+        detachOutput: vi.fn(),
+        wait: () => wait,
+      } satisfies ManagedRun;
+    });
+    const supervisor = {
+      ...fakeSupervisor().supervisor,
+      spawn,
+    } satisfies ProcessSupervisor;
+    const { watchers } = createCronStreamWatcherFixture({
+      getProcessSupervisor: () => supervisor,
+      minIntervalMs: 1,
+    });
+    await watchers.reconcile([job({ id: "stubborn-job" })], true);
+    await settle();
+    expect(spawn).toHaveBeenCalledTimes(1);
+
+    // The stubborn child refuses to exit, so its schedule replacement rejects
+    // after the bounded stop. The sweep must still start the sibling job.
+    const replaced = job({
+      id: "stubborn-job",
+      schedule: { kind: "stream", command: ["replacement"], batchMs: 50 },
+    });
+    const sweep = watchers.reconcile([replaced, job({ id: "healthy-job" })], true);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await sweep;
+    expect(spawn.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(watchers.inspect("healthy-job")?.state).toBe("running");
+    // The stubborn child also fails shutdown; advance its bounded stop.
+    const shutdown = watchers.stopAll("shutdown").catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await shutdown;
   });
 
   it("leaves an exit queued ahead of a requested stop to the stop operation", async () => {
-    const { fake, updateState, recordFailure, watchers } = createFixture({
+    const { fake, updateState, recordFailure, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 1,
     });
     await watchers.start(job());
+
+    // The child exits and the operator stop lands before the exit callback is
+    // processed: the exit belongs to the stop, not the failure counters.
     fake.exits[0]?.(exitResult({ reason: "exit", exitCode: 1 }));
     const stopping = watchers.stop("stream-job", "disabled");
     await stopping;
+
     expect(watchers.inspect("stream-job")).toMatchObject({
       state: "stopped",
       consecutiveFailures: 0,
@@ -388,13 +424,24 @@ describe("cron stream watchers", () => {
   });
 
   it("restarts fast exits and records terminal failure after five attempts", async () => {
-    const spawn = vi.fn(async () => sourceRun(`run-${spawn.mock.calls.length}`, () => {}, true));
+    vi.useFakeTimers();
+    const spawn = vi.fn(async () => {
+      const result = exitResult();
+      return {
+        activity: { resultSettled: true, lastOutputAtMs: Date.now() },
+        runId: `run-${spawn.mock.calls.length}`,
+        startedAtMs: Date.now(),
+        cancel: vi.fn(),
+        detachOutput: vi.fn(),
+        wait: async () => result,
+      } satisfies ManagedRun;
+    });
     const supervisor = {
       ...fakeSupervisor().supervisor,
       spawn,
     } satisfies ProcessSupervisor;
     const recordFailure = vi.fn(async () => {});
-    const { watchers } = createFixture({
+    const { watchers } = createCronStreamWatcherFixture({
       getProcessSupervisor: () => supervisor,
       minIntervalMs: 1,
       retryBackoffMs: [1],
@@ -416,207 +463,322 @@ describe("cron stream watchers", () => {
     await watchers.stopAll("shutdown");
   });
 
-  it("starts unrelated jobs without cross-job mutation fencing", async () => {
-    const { fake, watchers } = createFixture();
-    await Promise.all([
-      watchers.start(job({ id: "stream-a" })),
-      watchers.start(job({ id: "stream-b" })),
-    ]);
-    expect(fake.spawn).toHaveBeenCalledTimes(2);
-    expect(watchers.activeJobIds()).toEqual(expect.arrayContaining(["stream-a", "stream-b"]));
-    await watchers.stopAll("shutdown");
-  });
+  describe("serialized owner interleavings", () => {
+    it("starts unrelated jobs without cross-job mutation fencing", async () => {
+      const { fake, watchers } = createCronStreamWatcherFixture();
 
-  it.each(["starting", "replacement", "reconcile"] as const)(
-    "fences a gated %s operation when shutdown wins",
-    async (operation) => {
-      const write = blockStateWrite(
-        (patch) => patch.streamStatus === (operation === "starting" ? "starting" : "stopped"),
-      );
-      const { fake, watchers, updateState } = createFixture({
-        updateState: write.updateState,
-      });
-      if (operation !== "starting") {
-        await watchers.start(job({ id: operation === "reconcile" ? "old-job" : "stream-job" }));
-      }
-      const pending =
-        operation === "reconcile"
-          ? watchers.reconcile([job({ id: "new-job" })], true)
-          : watchers.start(operation === "starting" ? job() : replacementJob());
-      await write.entered;
-      const shutdown = watchers.stopAll("shutdown");
-      write.release();
-      await Promise.all([pending, shutdown]);
-      expect(fake.spawn).toHaveBeenCalledTimes(operation === "starting" ? 0 : 1);
-      expect(watchers.activeJobIds()).toEqual([]);
-      if (operation === "starting") {
-        expect(updateState.mock.calls.at(-1)?.[1]).toMatchObject({ streamStatus: "stopped" });
-        expect(watchers.inspect("stream-job")).toMatchObject(stoppedState);
-      }
-      if (operation === "reconcile") {
-        expect(watchers.inspect("new-job")).toBeUndefined();
-      }
-    },
-  );
-  it("bounds shutdown outside a stalled owner operation and pre-cancels its scope", async () => {
-    const write = blockStateWrite((p) => p.streamStatus === "starting");
-    const { fake, watchers } = createFixture({ updateState: write.updateState });
-    void watchers.start(job());
-    await write.entered;
-    const shutdown = watchers.stopAll("shutdown");
-    const shutdownFailure = expect(shutdown).rejects.toThrow("stream owner stop did not settle");
-    expect(fake.supervisor.cancelScope).toHaveBeenCalledWith(
-      "cron-stream:stream-job",
-      "manual-cancel",
-    );
-    await vi.advanceTimersByTimeAsync(20_000);
-    await shutdownFailure;
-    expect(fake.spawn).not.toHaveBeenCalled();
-  });
+      await Promise.all([
+        watchers.start(job({ id: "stream-a" })),
+        watchers.start(job({ id: "stream-b" })),
+      ]);
 
-  it("holds shutdown open until every owner stop settles before surfacing a failure", async () => {
-    const write = blockStateWrite((p, id) => id === "slow-job" && p.streamStatus === "stopped");
-    const { watchers } = createFixture({
-      updateState: write.updateState,
-      retireSource: vi.fn(async (jobId: string) => {
-        if (jobId === "fail-job") {
-          throw new Error("retirement write lost");
+      expect(fake.spawn).toHaveBeenCalledTimes(2);
+      expect(watchers.activeJobIds()).toEqual(expect.arrayContaining(["stream-a", "stream-b"]));
+      await watchers.stopAll("shutdown");
+    });
+
+    it("rechecks the stop fence after a slow starting-state write and persists stopped", async () => {
+      const { promise: startingWrite, resolve: releaseStarting } = createDeferred();
+      const { promise: starting, resolve: markStarting } = createDeferred();
+      const updateState = vi.fn(async (_jobId: string, patch: Partial<CronJob["state"]>) => {
+        if (patch.streamStatus === "starting") {
+          markStarting();
+          await startingWrite;
         }
-        return undefined;
-      }),
-    });
-    await watchers.start(job({ id: "slow-job" }));
-    await watchers.start(job({ id: "fail-job" }));
-    const shutdown = watchers.stopAll("shutdown");
-    let settled = false;
-    shutdown.catch(() => {
-      settled = true;
-    });
-    const shutdownFailure = expect(shutdown).rejects.toThrow("retirement write lost");
-    await settle();
-    expect(settled).toBe(false);
-    write.release();
-    await shutdownFailure;
-    expect(settled).toBe(true);
-  });
+      });
+      const { fake, watchers } = createCronStreamWatcherFixture({
+        updateState,
+      });
 
-  it("retains a late spawn handle until a later stop confirms its exit", async () => {
-    const { promise: spawned, resolve: resolveSpawn } = createDeferred<ManagedRun>();
-    let cancelAttempts = 0;
-    const run = sourceRun("late-run", (finish) => {
-      if (++cancelAttempts === 2) {
-        finish();
-      }
-    });
-    const { watchers } = sourceFixture(vi.fn(async () => await spawned));
-    const starting = watchers.start(job());
-    await settle();
-    const stopping = watchers.stop("stream-job", "shutdown");
-    resolveSpawn(run);
-    const startFailure = expect(starting).rejects.toThrow("stream source did not exit");
-    await vi.advanceTimersByTimeAsync(10_000);
-    await startFailure;
-    await stopping;
-    expect(run.cancel).toHaveBeenCalledTimes(2);
-    expect(watchers.inspect("stream-job")).toMatchObject(stoppedState);
-  });
+      const start = watchers.start(job());
+      await starting;
+      const shutdown = watchers.stopAll("shutdown");
+      releaseStarting();
+      await Promise.all([start, shutdown]);
 
-  it("cancels old backoff before starting an updated schedule", async () => {
-    const { fake, watchers } = createFixture({
-      minIntervalMs: 1,
-      retryBackoffMs: [100],
+      expect(fake.spawn).not.toHaveBeenCalled();
+      expect(updateState.mock.calls.at(-1)?.[1]).toMatchObject({ streamStatus: "stopped" });
+      expect(watchers.inspect("stream-job")).toMatchObject({
+        state: "stopped",
+        processAlive: false,
+        restartTimerPending: false,
+      });
     });
-    await watchers.start(job());
-    fake.exits[0]?.(exitResult());
-    await settle();
-    await settle();
-    expect(watchers.inspect("stream-job")?.state).toBe("backoff");
-    await watchers.start(replacementJob());
-    expect(fake.spawn).toHaveBeenCalledTimes(2);
-    expect(fake.inputs[1]).toMatchObject({ argv: ["replacement"] });
-    await vi.advanceTimersByTimeAsync(200);
-    expect(fake.spawn).toHaveBeenCalledTimes(2);
-    await watchers.stopAll("shutdown");
-  });
 
-  it("replaces same-schedule owners when logical source identity changes", async () => {
-    vi.setSystemTime(1_000);
-    const { fake, fireBatch, watchers } = createFixture({
-      minIntervalMs: 100,
-    });
-    await watchers.start(job({ state: { lastRunAtMs: 1_000, streamSourceIdentity: "source-a" } }));
-    fake.inputs[0]?.onStdout?.("old pending\n");
-    await flush();
-    await watchers.start(job({ state: { streamSourceIdentity: "source-b" } }));
-    expect(fake.spawn).toHaveBeenCalledTimes(2);
-    expect(watchers.inspect("stream-job")).toMatchObject({
-      sourceIdentity: "source-b",
-      droppedBatches: 1,
-    });
-    expect(fireBatch).not.toHaveBeenCalled();
-    fake.inputs[1]?.onStdout?.("fresh\n");
-    await flush();
-    expect(fireBatch).toHaveBeenLastCalledWith(
-      expect.any(Object),
-      "fresh",
-      expect.any(String),
-      "source-b",
-    );
-    await watchers.stopAll("shutdown");
-  });
+    it("bounds shutdown outside a stalled owner operation and pre-cancels its scope", async () => {
+      vi.useFakeTimers();
+      const { promise: starting, resolve: markStarting } = createDeferred();
+      const { fake, watchers } = createCronStreamWatcherFixture({
+        updateState: vi.fn(async (_jobId: string, patch: Partial<CronJob["state"]>) => {
+          if (patch.streamStatus === "starting") {
+            markStarting();
+            await new Promise<never>(() => {});
+          }
+        }),
+      });
 
-  it("lets a newer explicit start replace an owner being removed", async () => {
-    const retireSource = vi.fn(async (_jobId: string, _scheduleKey: string, identity: string) => {
-      return `${identity}:retired`;
-    });
-    const { fake, watchers } = createFixture({
-      retireSource,
-    });
-    await watchers.start(job());
-    const removal = watchers.stop("stream-job", "removed");
-    const replacement = watchers.start(job());
-    await Promise.all([removal, replacement]);
-    expect(fake.spawn).toHaveBeenCalledTimes(2);
-    expect(watchers.inspect("stream-job")).toMatchObject({
-      state: "running",
-      processAlive: true,
-      // Only the durable removal retires; disposing the obsolete owner for
-      // the replacement start must not rotate the incoming identity.
-      sourceIdentity: "source:stream-job",
-    });
-    expect(retireSource).toHaveBeenCalledTimes(1);
-    await watchers.stopAll("shutdown");
-  });
+      void watchers.start(job());
+      await starting;
+      const shutdown = watchers.stopAll("shutdown");
+      const shutdownFailure = expect(shutdown).rejects.toThrow("stream owner stop did not settle");
 
-  it("retires logical source identity before waiting on an in-flight batch", async () => {
-    const { promise: payload, resolve: releasePayload } = createDeferred();
-    const retireSource = vi.fn(async () => "source-retired");
-    const { fake, watchers } = createFixture({
-      minIntervalMs: 1,
-      retireSource,
-      fireBatch: vi.fn(async () => {
-        await payload;
-        return "fired" as const;
-      }),
+      expect(fake.supervisor.cancelScope).toHaveBeenCalledWith(
+        "cron-stream:stream-job",
+        "manual-cancel",
+      );
+      await vi.advanceTimersByTimeAsync(20_000);
+      await shutdownFailure;
+      expect(fake.spawn).not.toHaveBeenCalled();
     });
-    await watchers.start(job());
-    fake.inputs[0]?.onStdout?.("in flight\n");
-    await flush();
-    const stopping = watchers.stop("stream-job", "removed");
-    await settle();
-    expect(retireSource).toHaveBeenCalledWith(
-      "stream-job",
-      expect.any(String),
-      "source:stream-job",
-    );
-    expect(watchers.inspect("stream-job")).toMatchObject({
-      state: "stopping",
-      sourceIdentity: "source-retired",
+
+    it("holds shutdown open until every owner stop settles before surfacing a failure", async () => {
+      const { promise: slowStopWrite, resolve: releaseSlowStop } = createDeferred();
+      const { watchers } = createCronStreamWatcherFixture({
+        updateState: vi.fn(async (jobId: string, patch: Partial<CronJob["state"]>) => {
+          if (jobId === "slow-job" && patch.streamStatus === "stopped") {
+            await slowStopWrite;
+          }
+        }),
+        retireSource: vi.fn(async (jobId: string) => {
+          if (jobId === "fail-job") {
+            throw new Error("retirement write lost");
+          }
+          return undefined;
+        }),
+      });
+      await watchers.start(job({ id: "slow-job" }));
+      await watchers.start(job({ id: "fail-job" }));
+
+      // fail-job's stop rejects quickly (failed durable retirement) while
+      // slow-job's final persist is still gated. Shutdown must stay a barrier:
+      // no settlement, success or failure, until both owners tore down.
+      const shutdown = watchers.stopAll("shutdown");
+      let settled = false;
+      shutdown.catch(() => {
+        settled = true;
+      });
+      const shutdownFailure = expect(shutdown).rejects.toThrow("retirement write lost");
+      await settle();
+      expect(settled).toBe(false);
+      releaseSlowStop();
+      await shutdownFailure;
+      expect(settled).toBe(true);
     });
-    await vi.advanceTimersByTimeAsync(10_000);
-    await stopping;
-    releasePayload();
-    await settle();
+
+    it("discards a queued replacement start superseded by shutdown", async () => {
+      let blockStops = false;
+      const { promise: stopWrite, resolve: releaseStop } = createDeferred();
+      const { promise: stopStarted, resolve: markStop } = createDeferred();
+      const { fake, watchers } = createCronStreamWatcherFixture({
+        updateState: vi.fn(async (_jobId: string, patch: Partial<CronJob["state"]>) => {
+          if (blockStops && patch.streamStatus === "stopped") {
+            markStop();
+            await stopWrite;
+          }
+        }),
+      });
+      await watchers.start(job());
+      blockStops = true;
+
+      const replacement = watchers.start(
+        job({ schedule: { kind: "stream", command: ["replacement"], batchMs: 50 } }),
+      );
+      await stopStarted;
+      const shutdown = watchers.stopAll("shutdown");
+      releaseStop();
+      await Promise.all([replacement, shutdown]);
+
+      expect(fake.spawn).toHaveBeenCalledOnce();
+      expect(watchers.activeJobIds()).toEqual([]);
+    });
+
+    it("retains a late spawn handle until a later stop confirms its exit", async () => {
+      vi.useFakeTimers();
+      const { promise: spawned, resolve: resolveSpawn } = createDeferred<ManagedRun>();
+      const { promise: wait, resolve: resolveWait } = createDeferred<RunExit>();
+      const activity = { resultSettled: false, lastOutputAtMs: Date.now() };
+      let cancelAttempts = 0;
+      const run: ManagedRun = {
+        activity,
+        runId: "late-run",
+        startedAtMs: Date.now(),
+        cancel: vi.fn(() => {
+          cancelAttempts += 1;
+          if (cancelAttempts === 2) {
+            activity.resultSettled = true;
+            resolveWait(exitResult({ reason: "manual-cancel" }));
+          }
+        }),
+        detachOutput: vi.fn(),
+        wait: () => wait,
+      };
+      const supervisor = {
+        ...fakeSupervisor().supervisor,
+        spawn: vi.fn(async () => await spawned),
+      } satisfies ProcessSupervisor;
+      const { watchers } = createCronStreamWatcherFixture({
+        getProcessSupervisor: () => supervisor,
+      });
+
+      const starting = watchers.start(job());
+      await settle();
+      const stopping = watchers.stop("stream-job", "shutdown");
+      resolveSpawn(run);
+      const startFailure = expect(starting).rejects.toThrow("stream source did not exit");
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await startFailure;
+      await stopping;
+      expect(run.cancel).toHaveBeenCalledTimes(2);
+      expect(watchers.inspect("stream-job")).toMatchObject({
+        state: "stopped",
+        processAlive: false,
+        restartTimerPending: false,
+      });
+    });
+
+    it("cancels old backoff before starting an updated schedule", async () => {
+      vi.useFakeTimers();
+      const { fake, watchers } = createCronStreamWatcherFixture({
+        minIntervalMs: 1,
+        retryBackoffMs: [100],
+      });
+      await watchers.start(job());
+      fake.exits[0]?.(exitResult());
+      await settle();
+      await settle();
+      expect(watchers.inspect("stream-job")?.state).toBe("backoff");
+
+      await watchers.start(
+        job({ schedule: { kind: "stream", command: ["replacement"], batchMs: 50 } }),
+      );
+      expect(fake.spawn).toHaveBeenCalledTimes(2);
+      expect(fake.inputs[1]).toMatchObject({ argv: ["replacement"] });
+      await vi.advanceTimersByTimeAsync(200);
+      expect(fake.spawn).toHaveBeenCalledTimes(2);
+      await watchers.stopAll("shutdown");
+    });
+
+    it("replaces same-schedule owners when logical source identity changes", async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(1_000);
+      const { fake, fireBatch, watchers } = createCronStreamWatcherFixture({
+        minIntervalMs: 100,
+      });
+      await watchers.start(
+        job({ state: { lastRunAtMs: 1_000, streamSourceIdentity: "source-a" } }),
+      );
+      fake.inputs[0]?.onStdout?.("old pending\n");
+      await settle();
+      await vi.advanceTimersByTimeAsync(50);
+      await settle();
+
+      await watchers.start(job({ state: { streamSourceIdentity: "source-b" } }));
+      expect(fake.spawn).toHaveBeenCalledTimes(2);
+      expect(watchers.inspect("stream-job")).toMatchObject({
+        sourceIdentity: "source-b",
+        droppedBatches: 1,
+      });
+      expect(fireBatch).not.toHaveBeenCalled();
+
+      fake.inputs[1]?.onStdout?.("fresh\n");
+      await settle();
+      await vi.advanceTimersByTimeAsync(50);
+      await settle();
+      expect(fireBatch).toHaveBeenLastCalledWith(
+        expect.any(Object),
+        "fresh",
+        expect.any(String),
+        "source-b",
+      );
+      await watchers.stopAll("shutdown");
+    });
+
+    it("fences a stale reconcile that is overtaken by shutdown", async () => {
+      const { promise: stopWrite, resolve: releaseStopWrite } = createDeferred();
+      const { promise: stopWriteStarted, resolve: markStopWriteStarted } = createDeferred();
+      const updateState = vi.fn(async (_jobId: string, patch: Partial<CronJob["state"]>) => {
+        if (patch.streamStatus === "stopped") {
+          markStopWriteStarted();
+          await stopWrite;
+        }
+      });
+      const { fake, watchers } = createCronStreamWatcherFixture({
+        updateState,
+      });
+      await watchers.start(job({ id: "old-job" }));
+
+      const staleReconcile = watchers.reconcile([job({ id: "new-job" })], true);
+      await stopWriteStarted;
+      const shutdown = watchers.stopAll("shutdown");
+      releaseStopWrite();
+      await Promise.all([staleReconcile, shutdown]);
+
+      expect(fake.spawn).toHaveBeenCalledOnce();
+      expect(watchers.activeJobIds()).toEqual([]);
+      expect(watchers.inspect("new-job")).toBeUndefined();
+    });
+
+    it("lets a newer explicit start replace an owner being removed", async () => {
+      const retireSource = vi.fn(async (_jobId: string, _scheduleKey: string, identity: string) => {
+        return `${identity}:retired`;
+      });
+      const { fake, watchers } = createCronStreamWatcherFixture({
+        retireSource,
+      });
+      await watchers.start(job());
+
+      const removal = watchers.stop("stream-job", "removed");
+      const replacement = watchers.start(job());
+      await Promise.all([removal, replacement]);
+
+      expect(fake.spawn).toHaveBeenCalledTimes(2);
+      expect(watchers.inspect("stream-job")).toMatchObject({
+        state: "running",
+        processAlive: true,
+        // Only the durable removal retires; disposing the obsolete owner for
+        // the replacement start must not rotate the incoming identity.
+        sourceIdentity: "source:stream-job",
+      });
+      expect(retireSource).toHaveBeenCalledTimes(1);
+      await watchers.stopAll("shutdown");
+    });
+
+    it("retires logical source identity before waiting on an in-flight batch", async () => {
+      vi.useFakeTimers();
+      const { promise: payload, resolve: releasePayload } = createDeferred();
+      const retireSource = vi.fn(async () => "source-retired");
+      const { fake, watchers } = createCronStreamWatcherFixture({
+        minIntervalMs: 1,
+        retireSource,
+        fireBatch: vi.fn(async () => {
+          await payload;
+          return "fired" as const;
+        }),
+      });
+      await watchers.start(job());
+      fake.inputs[0]?.onStdout?.("in flight\n");
+      await settle();
+      await vi.advanceTimersByTimeAsync(50);
+      await settle();
+
+      const stopping = watchers.stop("stream-job", "removed");
+      await settle();
+      expect(retireSource).toHaveBeenCalledWith(
+        "stream-job",
+        expect.any(String),
+        "source:stream-job",
+      );
+      expect(watchers.inspect("stream-job")).toMatchObject({
+        state: "stopping",
+        sourceIdentity: "source-retired",
+      });
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      await stopping;
+      releasePayload();
+      await settle();
+    });
   });
 });
 

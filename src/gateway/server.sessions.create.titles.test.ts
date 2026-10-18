@@ -34,41 +34,6 @@ vi.mock("../plugins/session-discussion-registry.js", () => ({
 }));
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
-const adminClient = { client: { connect: { scopes: ["operator.admin"] } } as never };
-const sessionTitle = (storePath: string, sessionKey: string) =>
-  loadSessionEntry({ agentId: "main", sessionKey, storePath })?.displayName;
-const dispatched = { queuedFinal: false, counts: { block: 0, final: 0, tool: 0 } };
-type CreatedSession = Record<"key" | "runId" | "sessionId", string> & { runStarted: boolean };
-async function create(
-  params: Record<string, unknown>,
-  options: Parameters<typeof directSessionReq>[2] = adminClient,
-) {
-  const result = await directSessionReq<CreatedSession>(
-    "sessions.create",
-    { agentId: "main", ...params },
-    options,
-  );
-  expect(result.ok, JSON.stringify(result.error)).toBe(true);
-  return result.payload!;
-}
-
-async function prepareWorkspace() {
-  const workspace = await initializeRepository(tempDirs.make("session-title-"), "workspace");
-  testState.agentConfig = { workspace };
-  return { workspace, ...(await createSessionStoreDir()) };
-}
-
-async function removeWorktree(key: string | undefined) {
-  const owned = key ? await managedWorktrees.findLiveByOwner("session", key) : undefined;
-  if (owned) {
-    await managedWorktrees.remove({
-      id: owned.id,
-      reason: "test-cleanup",
-      allowSnapshotLoss: true,
-    });
-  }
-}
-
 afterEach(async () => {
   await disposeSessionReadContexts();
   titleMocks.generate.mockReset();
@@ -79,7 +44,7 @@ afterEach(async () => {
 });
 
 test.for(["keep", "delete"] as const)(
-  "remote naming does not block placement or %s",
+  "names a remote session without blocking placement or deletion (%s)",
   async (outcome, { signal }) => {
     const naming = createDeferredCore<string>();
     const namingStarted = createDeferredCore();
@@ -94,18 +59,23 @@ test.for(["keep", "delete"] as const)(
     };
     let key: string | undefined;
     try {
-      const created = await create(
+      const created = await directSessionReq<{ key: string; runStarted: boolean }>(
+        "sessions.create",
         {
+          agentId: "main",
           repository: { url: "https://github.com/openclaw/openclaw.git" },
-          titleSource: "Explain safe rollback",
+          titleSource: "Explain how the updater safely rolls back a failed release",
         },
         { ...controlUiClient, context },
       );
-      expect(created.runStarted).toBe(false);
-      key = created.key;
+      expect(created.ok, JSON.stringify(created.error)).toBe(true);
+      expect(created.payload?.runStarted).toBe(false);
+      key = created.payload!.key;
       await racePromiseWithAbortSignal(namingStarted.promise, signal);
       expect(titleMocks.generate).toHaveBeenCalledOnce();
-      expect(sessionTitle(storePath, key)).toBeUndefined();
+      expect(
+        loadSessionEntry({ agentId: "main", sessionKey: key, storePath })?.displayName,
+      ).toBeUndefined();
       expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
       // Cloud dispatch uses this drain before provisioning; optional naming cannot hold it.
       expect(
@@ -117,15 +87,20 @@ test.for(["keep", "delete"] as const)(
       ).toBe(true);
       if (outcome === "delete") {
         const deleted = await directSessionReq<{ deleted: boolean }>("sessions.delete", { key });
-        expect(deleted).toMatchObject({ ok: true, payload: { deleted: true } });
+        expect(deleted.ok, JSON.stringify(deleted.error)).toBe(true);
+        expect(deleted.payload?.deleted).toBe(true);
       }
-      naming.resolve("Safe rollback");
+      naming.resolve("Explain safe updater rollback");
       await vi.waitFor(() => expect(getActiveGatewayRootWorkCount()).toBe(0));
       if (outcome === "delete") {
         expect(loadSessionEntry({ agentId: "main", sessionKey: key, storePath })).toBeUndefined();
         return;
       }
-      await vi.waitFor(() => expect(sessionTitle(storePath, key!)).toBe("Safe rollback"));
+      await vi.waitFor(() =>
+        expect(
+          loadSessionEntry({ agentId: "main", sessionKey: key!, storePath })?.displayName,
+        ).toBe("Explain safe updater rollback"),
+      );
       await vi.waitFor(() =>
         expect(context.broadcastToConnIds).toHaveBeenCalledWith(
           "sessions.changed",
@@ -136,7 +111,7 @@ test.for(["keep", "delete"] as const)(
       );
       expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
     } finally {
-      naming.resolve("Safe rollback");
+      naming.resolve("Explain safe updater rollback");
       await vi.waitFor(() => expect(getActiveGatewayRootWorkCount()).toBe(0));
       await settleWorkspaceRuns(context, storePath, key);
     }
@@ -144,29 +119,38 @@ test.for(["keep", "delete"] as const)(
 );
 
 test.each(["adopted", "incognito"] as const)(
-  "%s sessions ignore creation title input",
+  "creation title input leaves an %s session unnamed",
   async (kind) => {
     const { storePath } = await createSessionStoreDir();
     const key = "agent:main:dashboard:adopted-title";
-    const params = kind === "incognito" ? { incognito: true } : { key };
+    const params = { agentId: "main", ...(kind === "incognito" ? { incognito: true } : { key }) };
+    const client = { client: { connect: { scopes: ["operator.admin"] } } as never };
     if (kind === "adopted") {
-      await create(params);
+      expect((await directSessionReq("sessions.create", params, client)).ok).toBe(true);
     }
-    const result = await create({
-      ...params,
-      titleSource: "A different task",
-    });
+    const result = await directSessionReq<{ key: string }>(
+      "sessions.create",
+      { ...params, titleSource: "A different task must not name this existing conversation" },
+      client,
+    );
+    expect(result.ok, JSON.stringify(result.error)).toBe(true);
     await settleWorkspaceRuns({}, storePath, key);
     expect(titleMocks.generate).not.toHaveBeenCalled();
-    expect(sessionTitle(storePath, result.key)).toBeUndefined();
+    expect(
+      loadSessionEntry({ agentId: "main", sessionKey: result.payload!.key, storePath })
+        ?.displayName,
+    ).toBeUndefined();
   },
 );
 
-test("naming survives setup failure and is shared with discussion and retry", async () => {
+test("successful naming survives setup failure and is shared with discussion open and retry", async () => {
   const naming = createDeferredCore<string>();
   titleMocks.generate.mockReturnValue(naming.promise);
   titleMocks.open.mockResolvedValue({ state: "available" });
-  const { workspace, storePath } = await prepareWorkspace();
+  const root = tempDirs.make("openclaw-session-worktree-retry-scope-");
+  const workspace = await initializeRepository(root, "workspace");
+  testState.agentConfig = { workspace };
+  const { storePath } = await createSessionStoreDir();
   const setup = path.join(workspace, ".openclaw");
   await fs.mkdir(setup);
   const starts = path.join(setup, "starts");
@@ -179,15 +163,29 @@ test("naming survives setup failure and is shared with discussion and retry", as
     broadcast: vi.fn(),
     dedupe: new Map(),
   };
-  dispatchInboundMessageMock.mockResolvedValue(dispatched);
+  dispatchInboundMessageMock.mockResolvedValue({
+    queuedFinal: false,
+    counts: { block: 0, final: 0, tool: 0 },
+  });
   let key: string | undefined;
   try {
-    const created = await create(
-      { message: "Start work in the checkout", worktree: true },
-      { ...adminClient, context },
+    const created = await directSessionReq<{
+      key: string;
+      runId: string;
+      sessionId: string;
+      runStarted: boolean;
+    }>(
+      "sessions.create",
+      {
+        agentId: "main",
+        message: "Start work in the checkout",
+        worktree: true,
+      },
+      { client: { connect: { scopes: ["operator.admin"] } } as never, context },
     );
-    expect(created.runStarted).toBe(true);
-    key = created.key;
+    expect(created.ok, JSON.stringify(created.error)).toBe(true);
+    expect(created.payload?.runStarted).toBe(true);
+    key = created.payload!.key;
     await settleWorkspaceRuns(context, storePath, key);
     await vi.waitFor(() => expect(titleMocks.generate).toHaveBeenCalledOnce());
     const discussion = directSessionReq(
@@ -204,7 +202,7 @@ test("naming survives setup failure and is shared with discussion and retry", as
     expect(context.broadcast).toHaveBeenCalledWith(
       "chat",
       expect.objectContaining({
-        runId: created.runId,
+        runId: created.payload!.runId,
         state: "error",
         errorMessage: expect.stringContaining("worktree setup failed"),
       }),
@@ -212,7 +210,9 @@ test("naming survives setup failure and is shared with discussion and retry", as
     );
     expect(await fs.readFile(starts, "utf8")).toBe("started\n");
     expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
-    expect(sessionTitle(storePath, key)).toBe("Workspace repair plan");
+    expect(loadSessionEntry({ agentId: "main", sessionKey: key, storePath })?.displayName).toBe(
+      "Workspace repair plan",
+    );
     expect(titleMocks.generate).toHaveBeenCalledOnce();
 
     const retried = await directSessionReq(
@@ -220,8 +220,8 @@ test("naming survives setup failure and is shared with discussion and retry", as
       {
         agentId: "main",
         sessionKey: key,
-        message: "Continue",
-        idempotencyKey: "setup-retry",
+        message: "Continue without repository setup",
+        idempotencyKey: "write-only-setup-retry",
       },
       { ...controlUiClient, context },
     );
@@ -235,23 +235,32 @@ test("naming survives setup failure and is shared with discussion and retry", as
     expect(dispatchInboundMessageMock).toHaveBeenCalledOnce();
     const entry = loadSessionEntry({ agentId: "main", sessionKey: key, storePath });
     expect(entry).toMatchObject({
-      sessionId: created.sessionId,
+      sessionId: created.payload!.sessionId,
       worktree: { canonicalWorkspaceDir: workspace },
     });
     expect(entry).not.toHaveProperty("pendingWorktree");
   } finally {
     naming.resolve("Workspace repair plan");
     await settleWorkspaceRuns(context, storePath, key, true);
-    await removeWorktree(key);
+    const owned = key ? await managedWorktrees.findLiveByOwner("session", key) : undefined;
+    if (owned) {
+      await managedWorktrees.remove({
+        id: owned.id,
+        reason: "test-cleanup",
+        allowSnapshotLoss: true,
+      });
+    }
   }
 });
 
 test.each(["generator error", "delayed title"])(
-  "background title recovery after %s",
+  "sessions.create preserves background title recovery after %s",
   async (failure) => {
-    const { storePath } = await prepareWorkspace();
+    const root = tempDirs.make("openclaw-session-worktree-recovery-");
+    testState.agentConfig = { workspace: await initializeRepository(root, "workspace") };
+    const { storePath } = await createSessionStoreDir();
     const key = "agent:main:dashboard:worktree-title-fallback";
-    const read = () => loadSessionEntry({ sessionKey: key, storePath });
+    const target = { sessionKey: key, storePath };
     const title = createDeferredCore<string>();
     const titleStarted = createDeferredCore();
     const dispatchStarted = createDeferredCore();
@@ -284,37 +293,56 @@ test.each(["generator error", "delayed title"])(
     dispatchInboundMessageMock.mockImplementationOnce(async () => {
       dispatchStarted.resolve();
       await dispatchFinished.promise;
-      return dispatched;
+      return { queuedFinal: false, counts: { block: 0, final: 0, tool: 0 } };
     });
     try {
-      const created = await create(
-        { key, worktree: true, message: "Investigate fallback" },
-        { ...adminClient, context },
+      const created = await directSessionReq<{ runStarted: boolean }>(
+        "sessions.create",
+        {
+          agentId: "main",
+          key,
+          worktree: true,
+          message: "Investigate the raw fallback title",
+        },
+        { client: { connect: { scopes: ["operator.admin"] } } as never, context },
       );
-      expect(created.runStarted).toBe(true);
+
+      expect(created.ok, JSON.stringify(created.error)).toBe(true);
+      expect(created.payload?.runStarted).toBe(true);
       await waitForPreparation(dispatchStarted.promise);
       await waitForPreparation(titleStarted.promise);
-      const branch = read()?.worktree?.branch;
+      const branch = loadSessionEntry(target)?.worktree?.branch;
       expect(branch).toMatch(/^openclaw\/[a-z]+-[a-z]+$/);
       expect(titleMocks.generate).toHaveBeenCalledOnce();
       dispatchFinished.resolve();
       await settleWorkspaceRuns(context, storePath, key);
       if (delayed) {
-        expect(read()?.displayName).toBeUndefined();
+        expect(loadSessionEntry(target)?.displayName).toBeUndefined();
         title.resolve("Late investigation title");
-        await vi.waitFor(() => expect(read()?.displayName).toBe("Late investigation title"), {
-          interval: 1,
-        });
+        await vi.waitFor(
+          () => expect(loadSessionEntry(target)?.displayName).toBe("Late investigation title"),
+          { interval: 1 },
+        );
+        expect(loadSessionEntry(target)?.worktree?.branch).toBe(branch);
       } else {
-        await vi.waitFor(() => expect(read()?.displayName).toMatch(/^[a-z]+-[a-z]+$/));
+        await vi.waitFor(() =>
+          expect(loadSessionEntry(target)?.displayName).toMatch(/^[a-z]+-[a-z]+$/),
+        );
       }
-      expect(read()?.worktree?.branch).toBe(branch);
+      expect(loadSessionEntry(target)?.worktree?.branch).toBe(branch);
       expect(titleMocks.generate).toHaveBeenCalledTimes(delayed ? 1 : 2);
     } finally {
       title.resolve("Fixture cleanup");
       dispatchFinished.resolve();
       await settleWorkspaceRuns(context, storePath, key, true);
-      await removeWorktree(key);
+      const owned = await managedWorktrees.findLiveByOwner("session", key);
+      if (owned) {
+        await managedWorktrees.remove({
+          id: owned.id,
+          reason: "test-cleanup",
+          allowSnapshotLoss: true,
+        });
+      }
       testState.agentConfig = undefined;
     }
   },
@@ -361,14 +389,22 @@ test("creates a two-word worktree name before an initial turn can generate its t
 });
 
 test("sessions.create rejects another plugin's session before naming or worktree preparation", async () => {
-  const { storePath } = await prepareWorkspace();
+  const root = tempDirs.make("openclaw-session-protected-title-");
+  const workspace = await initializeRepository(root, "workspace");
+  testState.agentConfig = { workspace };
+  const { storePath } = await createSessionStoreDir();
   const sessionKey = "agent:main:dashboard:protected-title";
   const scope = { agentId: "main", sessionKey, storePath };
   const client = {
     connect: { scopes: ["operator.admin"] },
     internal: { pluginRuntimeOwnerId: "synthetic-owner" },
   };
-  await create({ key: sessionKey }, { client: client as never });
+  const created = await directSessionReq(
+    "sessions.create",
+    { agentId: "main", key: sessionKey },
+    { client: client as never },
+  );
+  expect(created.ok, JSON.stringify(created.error)).toBe(true);
   const entry = loadSessionEntry(scope);
   expect(entry?.pluginOwnerId).toBe("synthetic-owner");
   titleMocks.generate.mockResolvedValue("Protected title");
@@ -379,10 +415,8 @@ test("sessions.create rejects another plugin's session before naming or worktree
       client: { ...client, internal: { pluginRuntimeOwnerId: "synthetic-requester" } } as never,
     },
   );
-  expect(result).toMatchObject({
-    ok: false,
-    error: { message: expect.stringContaining("did not create it") },
-  });
+  expect(result.ok).toBe(false);
+  expect(result.error?.message).toContain("did not create it");
   expect(titleMocks.generate).not.toHaveBeenCalled();
   expect(loadSessionEntry(scope)).toEqual(entry);
   expect(await managedWorktrees.findLiveByOwner("session", sessionKey)).toBeUndefined();

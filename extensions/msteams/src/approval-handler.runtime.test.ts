@@ -80,19 +80,22 @@ function createPluginPendingView(): PluginApprovalPendingView {
 }
 
 function createRequest(view: PendingApprovalView): ExecApprovalRequest | PluginApprovalRequest {
-  return {
+  const common = {
     id: view.approvalId,
     createdAtMs: Date.now(),
     expiresAtMs: view.expiresAtMs,
-    request:
-      view.approvalKind === "plugin"
-        ? {
-            title: view.title,
-            description: view.description ?? "",
-            severity: view.severity,
-          }
-        : { command: view.commandText },
   };
+  if (view.approvalKind === "plugin") {
+    return {
+      ...common,
+      request: {
+        title: view.title,
+        description: view.description ?? "",
+        severity: view.severity,
+      },
+    };
+  }
+  return { ...common, request: { command: view.commandText } };
 }
 
 async function createPendingScenario(view: PendingApprovalView = createExecPendingView()) {

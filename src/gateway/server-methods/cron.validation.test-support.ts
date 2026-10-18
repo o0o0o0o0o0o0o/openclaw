@@ -283,7 +283,7 @@ export function createCronTestInvoker(
     await handler({
       req: {} as never,
       params,
-      respond,
+      respond: (...args) => respond(...args),
       context: context as never,
       client: options.client ?? null,
       sessionMutationCommitGuard: options.sessionMutationCommitGuard,

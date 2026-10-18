@@ -32,6 +32,7 @@ vi.mock("./action-runtime.js", async () => {
   return { ...actual, handleSlackAction: mocks.handleAction };
 });
 
+// mock-isolation: Channel routing captures outbound sends without contacting Slack.
 vi.mock("./send.js", () => ({
   resolveSlackDmChannelId: mocks.resolveDm,
   sendMessageSlack: mocks.sendMessage,

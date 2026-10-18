@@ -6,10 +6,8 @@ import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers
 import { registerDevicesCli } from "../../cli/devices-cli.js";
 import * as gatewayRpc from "../../cli/gateway-rpc.js";
 import * as devicePairingJoinCode from "../../infra/device-pairing-join-code.js";
-import type * as updateCheckLifecycle from "../../infra/update-check-lifecycle.js";
 import { defaultRuntime } from "../../runtime.js";
 import { useMockHttp } from "../../test-utils/mock-http.js";
-import type * as versionModule from "../../version.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
 const mocks = vi.hoisted(() => ({
@@ -27,21 +25,17 @@ vi.mock("../../pairing/setup-code.js", async (importOriginal) => ({
   resolvePairingSetupFromConfig: mocks.resolvePairingSetupFromConfig,
   encodePairingSetupCode: mocks.encodePairingSetupCode,
 }));
-vi.mock("../../media/qr-image.js", () => ({
-  renderQrPngDataUrl: mocks.renderQrPngDataUrl,
-}));
-vi.mock("../../process/exec.js", () => ({
-  runCommandWithTimeout: mocks.runCommandWithTimeout,
-}));
+vi.mock("../../media/qr-image.js", () => ({ renderQrPngDataUrl: mocks.renderQrPngDataUrl }));
+vi.mock("../../process/exec.js", () => ({ runCommandWithTimeout: mocks.runCommandWithTimeout }));
 vi.mock("../../infra/device-bootstrap.js", () => ({
   readDevicePairSetupCompletion: mocks.readDevicePairSetupCompletion,
 }));
 vi.mock("../../infra/update-check-lifecycle.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof updateCheckLifecycle>()),
+  ...(await importOriginal<typeof import("../../infra/update-check-lifecycle.js")>()),
   currentUpdateCheckLifecycle: () => ({ installStatus: mocks.readInstallStatus() }),
 }));
 vi.mock("../../version.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof versionModule>()),
+  ...(await importOriginal<typeof import("../../version.js")>()),
   get VERSION() {
     return mocks.version;
   },
@@ -51,13 +45,7 @@ const mockHttp = useMockHttp();
 
 import { devicePairSetupHandlers } from "./device-pair-setup.js";
 
-function createOptions(
-  params: Record<string, unknown>,
-  config: Record<string, unknown> = {},
-): {
-  options: GatewayRequestHandlerOptions;
-  respond: ReturnType<typeof vi.fn>;
-} {
+function createOptions(params: Record<string, unknown>, config: Record<string, unknown> = {}) {
   const respond = vi.fn();
   const options = {
     req: { type: "req", id: "req-1", method: "device.pair.setupCode", params },
@@ -73,12 +61,13 @@ function createOptions(
   return { options, respond };
 }
 
+function setupHandler(method: "setupCode" | "setupStatus") {
+  return expectDefined(devicePairSetupHandlers[`device.pair.${method}`], `${method} handler`);
+}
+
 async function runSetupCode(params: Record<string, unknown>, config: Record<string, unknown> = {}) {
   const { options, respond } = createOptions(params, config);
-  await expectDefined(
-    devicePairSetupHandlers["device.pair.setupCode"],
-    "device.pair.setupCode handler",
-  )(options);
+  await setupHandler("setupCode")(options);
   return respond;
 }
 
@@ -90,6 +79,30 @@ function mockJoinCode() {
 
 function expectSetupResponse(respond: ReturnType<typeof vi.fn>, payload: unknown) {
   expect(respond).toHaveBeenCalledWith(true, payload, undefined);
+}
+
+function expectResolutionOptions(options: Record<string, unknown>) {
+  expect(mocks.resolvePairingSetupFromConfig).toHaveBeenCalledWith(
+    expect.any(Object),
+    expect.objectContaining(options),
+  );
+}
+
+function expectSetupError(respond: ReturnType<typeof vi.fn>, message: string) {
+  expect(respond).toHaveBeenCalledWith(
+    false,
+    undefined,
+    expect.objectContaining({ message: expect.stringContaining(message) }),
+  );
+}
+
+function joinCommands(joinUrl: string, spec = "openclaw") {
+  return {
+    command: `npx -y ${spec} connect ${joinUrl} --service --session-host`,
+    serviceCommand: `npx -y ${spec} connect ${joinUrl} --service`,
+    installedCommand: `openclaw connect ${joinUrl} --service --session-host`,
+    versionNote: expect.stringContaining("matching Gateway build"),
+  };
 }
 
 const okResolution = {
@@ -109,23 +122,18 @@ const okResolution = {
 
 describe("device.pair.setupCode", () => {
   beforeEach(() => {
-    mocks.resolvePairingSetupFromConfig.mockReset();
-    mocks.encodePairingSetupCode.mockReset();
-    mocks.renderQrPngDataUrl.mockReset();
     mocks.runCommandWithTimeout.mockReset();
     mocks.readDevicePairSetupCompletion.mockReset();
-    mocks.resolvePairingSetupFromConfig.mockResolvedValue(okResolution);
-    mocks.encodePairingSetupCode.mockReturnValue("SETUP-CODE-XYZ");
-    mocks.renderQrPngDataUrl.mockResolvedValue("data:image/png;base64,qr");
+    mocks.resolvePairingSetupFromConfig.mockReset().mockResolvedValue(okResolution);
+    mocks.encodePairingSetupCode.mockReset().mockReturnValue("SETUP-CODE-XYZ");
+    mocks.renderQrPngDataUrl.mockReset().mockResolvedValue("data:image/png;base64,qr");
     mocks.version = "2026.9.9";
     mocks.readInstallStatus.mockReturnValue({
       status: { installKind: "package", packageManager: "npm" },
     });
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
+  afterEach(() => vi.restoreAllMocks());
 
   it("returns the setup code, QR data URL, and only an auth label", async () => {
     const respond = await runSetupCode({});
@@ -142,12 +150,8 @@ describe("device.pair.setupCode", () => {
       urlSource: "remote",
       access: "full",
     });
-    // The setup id is an independent correlator; the bearer remains only in the opaque code.
     expect(JSON.stringify(respond.mock.calls[0]?.[1])).not.toContain("boot-123");
-    expect(mocks.resolvePairingSetupFromConfig).toHaveBeenCalledWith(
-      expect.any(Object),
-      expect.objectContaining({ localTlsFingerprint: "sha256:gateway-leaf" }),
-    );
+    expectResolutionOptions({ localTlsFingerprint: "sha256:gateway-leaf" });
   });
 
   it("reports when plaintext transport limits a requested full-access code", async () => {
@@ -167,10 +171,7 @@ describe("device.pair.setupCode", () => {
   it("labels an explicit request URL separately from configured fallback", async () => {
     const respond = await runSetupCode({ publicUrl: "wss://request.example.com" });
 
-    expect(mocks.resolvePairingSetupFromConfig).toHaveBeenCalledWith(
-      expect.any(Object),
-      expect.objectContaining({ publicUrl: "wss://request.example.com" }),
-    );
+    expectResolutionOptions({ publicUrl: "wss://request.example.com" });
     expect(respond.mock.calls[0]?.[1]?.urlSource).toBe("request.publicUrl");
   });
 
@@ -181,73 +182,60 @@ describe("device.pair.setupCode", () => {
         { preferRemoteUrl, includeQr: false },
         { gateway: { mode: "remote", remote: { url: "wss://primary.example" } } },
       );
-      expect(mocks.resolvePairingSetupFromConfig).toHaveBeenCalledWith(
-        expect.any(Object),
-        expect.objectContaining({ useLocalGateway: !preferRemoteUrl, preferRemoteUrl }),
-      );
+      expectResolutionOptions({ useLocalGateway: !preferRemoteUrl, preferRemoteUrl });
     },
   );
 
   it.each([
-    { bootstrapProfile: "node", profile: { roles: ["node"], scopes: [] } },
+    { bootstrapProfile: "node", scopes: [] },
     {
       bootstrapProfile: "limited",
-      profile: {
-        roles: ["node", "operator"],
-        scopes: [
-          "operator.approvals",
-          "operator.questions",
-          "operator.read",
-          "operator.talk.secrets",
-          "operator.write",
-        ],
-      },
+      scopes: [
+        "operator.approvals",
+        "operator.questions",
+        "operator.read",
+        "operator.talk.secrets",
+        "operator.write",
+      ],
     },
     {
       bootstrapProfile: "voice-node",
-      profile: {
-        roles: ["node", "operator"],
-        scopes: ["operator.read", "operator.talk"],
-        purpose: "voice-node",
-      },
+      scopes: ["operator.read", "operator.talk"],
     },
-  ])("requests the exact $bootstrapProfile setup grant", async ({ bootstrapProfile, profile }) => {
+  ])("requests the exact $bootstrapProfile setup grant", async ({ bootstrapProfile, scopes }) => {
     const respond = await runSetupCode({ includeQr: false, bootstrapProfile });
 
     expect(respond.mock.calls[0]?.[0]).toBe(true);
-    expect(mocks.resolvePairingSetupFromConfig).toHaveBeenCalledWith(
-      expect.any(Object),
-      expect.objectContaining({ bootstrapProfile: profile }),
-    );
+    expectResolutionOptions({
+      bootstrapProfile: {
+        roles: bootstrapProfile === "node" ? ["node"] : ["node", "operator"],
+        scopes,
+        ...(bootstrapProfile === "voice-node" ? { purpose: "voice-node" } : {}),
+      },
+    });
   });
 
   it("mints from a secure fallback and preserves its public context path", async () => {
-    const resolution = {
-      ...okResolution,
-      payload: {
-        url: "ws://192.168.1.20:18789/openclaw-gw",
-        urls: [
-          "ws://192.168.1.20:18789/openclaw-gw",
-          "wss://gateway.tailnet.example/public-gateway",
-        ],
-        bootstrapToken: "boot-123",
-        expiresAtMs: 123_456,
-      },
+    const payload = {
+      ...okResolution.payload,
+      url: "ws://192.168.1.20:18789/openclaw-gw",
+      urls: ["ws://192.168.1.20:18789/openclaw-gw", "wss://gateway.tailnet.example/public-gateway"],
+      expiresAtMs: 123_456,
     };
-    mocks.resolvePairingSetupFromConfig.mockResolvedValue(resolution);
+    mocks.resolvePairingSetupFromConfig.mockResolvedValue({
+      ...okResolution,
+      payload,
+    });
     // Keep storage substitution test-local: this shard shares a non-isolated worker
     // with the real mint/redeem test, where a leaked module mock creates unbacked codes.
     const registerDevicePairingJoinCode = mockJoinCode();
 
     const respond = await runSetupCode({ includeQr: false, joinUrl: true });
 
-    expect(mocks.resolvePairingSetupFromConfig).toHaveBeenCalledWith(
-      expect.any(Object),
-      expect.objectContaining({ bootstrapProfile: { roles: ["node"], scopes: [] } }),
-    );
+    expectResolutionOptions({ bootstrapProfile: { roles: ["node"], scopes: [] } });
     expect(registerDevicePairingJoinCode).toHaveBeenCalledWith({
-      payload: resolution.payload,
-      expiresAtMs: resolution.expiresAtMs,
+      payload,
+      expiresAtMs: okResolution.expiresAtMs,
       context: expect.objectContaining({ admission: expect.any(Object) }),
       assertCurrent: expect.any(Function),
     });
@@ -268,12 +256,7 @@ describe("device.pair.setupCode", () => {
       return okResolution;
     });
     const register = mockJoinCode();
-    const pending = Promise.resolve(
-      expectDefined(
-        devicePairSetupHandlers["device.pair.setupCode"],
-        "device pairing handler is registered",
-      )(options),
-    );
+    const pending = Promise.resolve(setupHandler("setupCode")(options));
     try {
       await awaitGateBeforeSettlement(entered.promise, pending, "setup resolution was not reached");
       current = false;
@@ -284,11 +267,7 @@ describe("device.pair.setupCode", () => {
     }
 
     expect(register).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ message: expect.stringContaining("requester authority changed") }),
-    );
+    expectSetupError(respond, "requester authority changed");
   });
 
   it.each([
@@ -335,10 +314,7 @@ describe("device.pair.setupCode", () => {
     const joinUrl = `https://pair.example${basePath}/j/${"a".repeat(22)}`;
     expect(writeJson).toHaveBeenCalledWith({
       joinUrl,
-      command: `npx -y openclaw connect ${joinUrl} --service --session-host`,
-      serviceCommand: `npx -y openclaw connect ${joinUrl} --service`,
-      installedCommand: `openclaw connect ${joinUrl} --service --session-host`,
-      versionNote: expect.stringContaining("matching Gateway build"),
+      ...joinCommands(joinUrl),
     });
   });
 
@@ -369,11 +345,10 @@ describe("device.pair.setupCode", () => {
       }
       const respond = await runSetupCode({ joinUrl: true, includeQr: false });
       const joinUrl = `https://gw.example:8443/j/${"a".repeat(22)}`;
+      const { versionNote, ...commands } = joinCommands(joinUrl, spec);
       expect(respond.mock.calls[0]?.[1]).toMatchObject({
-        command: `npx -y ${spec} connect ${joinUrl} --service --session-host`,
-        serviceCommand: `npx -y ${spec} connect ${joinUrl} --service`,
-        installedCommand: `openclaw connect ${joinUrl} --service --session-host`,
-        ...(exact ? {} : { versionNote: expect.stringContaining("matching Gateway build") }),
+        ...commands,
+        ...(exact ? {} : { versionNote }),
       });
       if (exact) {
         expect(respond.mock.calls[0]?.[1]).not.toHaveProperty("versionNote");
@@ -381,19 +356,22 @@ describe("device.pair.setupCode", () => {
     },
   );
 
-  it.each(["voice-node"])("does not put a %s grant in a join URL", async (bootstrapProfile) => {
-    const respond = await runSetupCode({ joinUrl: true, bootstrapProfile });
+  it.each([{ joinUrl: true, bootstrapProfile: "voice-node" }, { bogus: true }])(
+    "rejects invalid setup params %j before touching pairing helpers",
+    async (params) => {
+      const respond = await runSetupCode(params);
+      expect(respond.mock.calls[0]?.[0]).toBe(false);
+      expect(mocks.resolvePairingSetupFromConfig).not.toHaveBeenCalled();
+    },
+  );
 
-    expect(respond.mock.calls[0]?.[0]).toBe(false);
-    expect(mocks.resolvePairingSetupFromConfig).not.toHaveBeenCalled();
-  });
-
-  it("omits an oversized QR but still returns the setup code", async () => {
-    // Exceed the result schema's qrDataUrl bound (16_384) so the response stays valid.
-    mocks.renderQrPngDataUrl.mockResolvedValue(`data:image/png;base64,${"a".repeat(20_000)}`);
-
+  it.each(["oversized", "failed"])("keeps the setup code when QR rendering is %s", async (mode) => {
+    if (mode === "failed") {
+      mocks.renderQrPngDataUrl.mockRejectedValue(new Error("qr boom"));
+    } else {
+      mocks.renderQrPngDataUrl.mockResolvedValue(`data:image/png;base64,${"a".repeat(20_000)}`);
+    }
     const respond = await runSetupCode({});
-
     expectSetupResponse(respond, expect.objectContaining({ setupCode: "SETUP-CODE-XYZ" }));
     expect(respond.mock.calls[0]?.[1].qrDataUrl).toBeUndefined();
   });
@@ -406,55 +384,19 @@ describe("device.pair.setupCode", () => {
 
     const respond = await runSetupCode({});
 
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({
-        message: expect.stringContaining("Gateway auth is not configured"),
-      }),
-    );
+    expectSetupError(respond, "Gateway auth is not configured");
     expect(mocks.encodePairingSetupCode).not.toHaveBeenCalled();
-  });
-
-  it("rejects unknown params before touching pairing helpers", async () => {
-    const respond = await runSetupCode({ bogus: true });
-
-    const [ok] = expectDefined(respond.mock.calls[0], "respond.mock.calls[0] test invariant");
-    expect(ok).toBe(false);
-    expect(mocks.resolvePairingSetupFromConfig).not.toHaveBeenCalled();
-  });
-
-  it("keeps the setup code when optional QR rendering throws", async () => {
-    mocks.renderQrPngDataUrl.mockRejectedValue(new Error("qr boom"));
-
-    const respond = await runSetupCode({});
-
-    expectSetupResponse(respond, expect.objectContaining({ setupCode: "SETUP-CODE-XYZ" }));
-    expect(respond.mock.calls[0]?.[1].qrDataUrl).toBeUndefined();
   });
 });
 
 describe("device.pair.setupStatus", () => {
-  const completion = {
-    setupId: "setup-123",
-    deviceId: "device-123",
-    access: "full",
-    completedAtMs: 1_800_000_000_000,
-    deliveryState: "confirmed",
-    retainUntilMs: 1_800_000_600_000,
-  };
   async function runSetupStatus(params: Record<string, unknown>) {
     const { options, respond } = createOptions(params);
-    await expectDefined(
-      devicePairSetupHandlers["device.pair.setupStatus"],
-      'devicePairSetupHandlers["device.pair.setupStatus"] test invariant',
-    )(options);
+    await setupHandler("setupStatus")(options);
     return expectDefined(respond.mock.calls[0], "respond.mock.calls[0] test invariant");
   }
 
-  beforeEach(() => {
-    mocks.readDevicePairSetupCompletion.mockReset();
-  });
+  beforeEach(() => mocks.readDevicePairSetupCompletion.mockReset());
 
   it.each([
     ["setup-123", "confirmed", "full", "Pixel 9", "completion"],
@@ -462,26 +404,23 @@ describe("device.pair.setupStatus", () => {
   ] as const)(
     "returns the recorded %s delivery outcome without retention bookkeeping",
     async (setupId, deliveryState, access, deviceName, field) => {
-      mocks.readDevicePairSetupCompletion.mockResolvedValue({
-        ...completion,
+      const identity = {
         setupId,
-        deliveryState,
+        deviceId: "device-123",
         access,
         ...(deviceName ? { deviceName } : {}),
+      };
+      mocks.readDevicePairSetupCompletion.mockResolvedValue({
+        ...identity,
+        deliveryState,
+        completedAtMs: 1_800_000_000_000,
+        retainUntilMs: 1_800_000_600_000,
       });
       const response = await runSetupStatus({ setupId });
       expect(mocks.readDevicePairSetupCompletion).toHaveBeenCalledWith({ setupId });
       expect(response).toEqual([
         true,
-        {
-          [field]: {
-            setupId,
-            deviceId: "device-123",
-            access,
-            ts: 1_800_000_000_000,
-            ...(deviceName ? { deviceName } : {}),
-          },
-        },
+        { [field]: { ...identity, ts: 1_800_000_000_000 } },
         undefined,
       ]);
     },
@@ -490,10 +429,7 @@ describe("device.pair.setupStatus", () => {
   it("returns an empty result when no completion is recorded", async () => {
     mocks.readDevicePairSetupCompletion.mockResolvedValue(null);
 
-    const [ok, payload] = await runSetupStatus({ setupId: "setup-unknown" });
-
-    expect(ok).toBe(true);
-    expect(payload).toEqual({});
+    expect(await runSetupStatus({ setupId: "setup-unknown" })).toEqual([true, {}, undefined]);
   });
 
   it("rejects unknown params before reading pairing state", async () => {
@@ -506,10 +442,10 @@ describe("device.pair.setupStatus", () => {
   it("reports an unavailable error when the completion store throws", async () => {
     mocks.readDevicePairSetupCompletion.mockRejectedValue(new Error("state db locked"));
 
-    const [ok, payload, error] = await runSetupStatus({ setupId: "setup-123" });
-
-    expect(ok).toBe(false);
-    expect(payload).toBeUndefined();
-    expect(error?.message).toContain("state db locked");
+    expect(await runSetupStatus({ setupId: "setup-123" })).toEqual([
+      false,
+      undefined,
+      expect.objectContaining({ message: expect.stringContaining("state db locked") }),
+    ]);
   });
 });

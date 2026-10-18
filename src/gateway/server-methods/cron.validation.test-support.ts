@@ -2,7 +2,6 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { expect, vi } from "vitest";
 import { createOperationalRunInstanceRef } from "../../agents/admitted-run-context.js";
-import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveCronListSnapshotRevision } from "../../cron/list-snapshot-revision.js";
 import type { CronRuntimeAuthority } from "../../cron/runtime-authority.js";
@@ -22,43 +21,34 @@ type MutationOptions = {
   captureRuntimeAuthority?: () => CronRuntimeAuthority | undefined;
 };
 
-function createPrefixOnlyChannelPlugin(
-  id: string,
-  targetPrefixes: readonly string[],
-  aliases?: readonly string[],
-): ChannelPlugin {
-  const base = createChannelTestPluginBase({
-    id,
-    config: {
-      isConfigured: (_account, cfg) => {
-        const configured = cfg.channels?.[id];
-        return Boolean(configured && configured.enabled !== false);
-      },
-    },
-  });
-  return {
-    ...base,
-    meta: { ...base.meta, ...(aliases ? { aliases } : {}) },
-    messaging: { targetPrefixes },
-  };
-}
-
 export function setCronValidationTestRegistry(): void {
+  const channels: [id: string, targetPrefixes: string[], aliases?: string[]][] = [
+    ["discord", ["discord"]],
+    ["telegram", ["telegram", "tg"]],
+    ["slack", ["slack"]],
+    ["msteams", ["msteams", "teams"], ["teams"]],
+    ["synology-chat", ["synology-chat", "synology_chat", "synology"]],
+  ];
   setActivePluginRegistry(
     createTestRegistry(
-      (
-        [
-          ["discord", ["discord"]],
-          ["telegram", ["telegram", "tg"]],
-          ["slack", ["slack"]],
-          ["msteams", ["msteams", "teams"], ["teams"]],
-          ["synology-chat", ["synology-chat", "synology_chat", "synology"]],
-        ] satisfies [id: string, prefixes: string[], aliases?: string[]][]
-      ).map(([id, prefixes, aliases]) => ({
-        pluginId: id,
-        plugin: createPrefixOnlyChannelPlugin(id, prefixes, aliases),
-        source: `test:${id}`,
-      })),
+      channels.map(([id, targetPrefixes, aliases]) => {
+        const base = createChannelTestPluginBase({
+          id,
+          config: {
+            isConfigured: (_account, cfg) =>
+              Boolean(cfg.channels?.[id] && cfg.channels[id].enabled !== false),
+          },
+        });
+        return {
+          pluginId: id,
+          plugin: {
+            ...base,
+            meta: { ...base.meta, ...(aliases ? { aliases } : {}) },
+            messaging: { targetPrefixes },
+          },
+          source: `test:${id}`,
+        };
+      }),
     ),
   );
 }
@@ -79,11 +69,7 @@ export function createCronTestContext(
   };
   const update = vi.fn(async (id: string, patch: Partial<CronJob>) => {
     committedUpdates.push({ id, patch });
-    return createCronJob({
-      ...jobs.find((job) => job.id === id),
-      ...patch,
-      id,
-    });
+    return createCronJob({ ...jobs.find((job) => job.id === id), ...patch, id });
   });
   return {
     committedAdds,
@@ -144,47 +130,32 @@ export function createCronTestContext(
         },
       ),
       list: vi.fn(async () => jobs),
-      listPage: vi.fn(
-        async (
-          opts?: {
-            agentId?: string;
-            limit?: number;
-            offset?: number;
-            trigger?: "all" | "conditional" | "unconditional";
-          },
-          matchesJob?: (job: CronJob) => boolean,
-        ) => {
-          const requestedAgentId = opts?.agentId?.trim().toLowerCase();
-          const agentJobs = requestedAgentId
-            ? jobs.filter(
-                (job) => (job.agentId ?? "main").trim().toLowerCase() === requestedAgentId,
-              )
-            : jobs;
-          const filteredJobs = matchesJob ? agentJobs.filter(matchesJob) : agentJobs;
-          const total = filteredJobs.length;
-          const offset = Math.max(0, Math.min(total, Math.floor(opts?.offset ?? 0)));
-          const defaultLimit = total === 0 ? 50 : total;
-          const limit = Math.max(1, Math.min(200, Math.floor(opts?.limit ?? defaultLimit)));
-          const pageJobs = filteredJobs.slice(offset, offset + limit);
-          const nextOffset = offset + pageJobs.length;
-          return {
-            jobs: freezeJsonSnapshot(structuredClone(pageJobs)),
-            snapshotRevision: resolveCronListSnapshotRevision(filteredJobs),
-            total,
-            offset,
-            limit,
-            hasMore: nextOffset < total,
-            nextOffset: nextOffset < total ? nextOffset : null,
-          };
-        },
-      ),
+      listPage: vi.fn(async (...[opts, matchesJob]: Parameters<CronService["listPage"]>) => {
+        const requestedAgentId = opts?.agentId?.trim().toLowerCase();
+        const agentJobs = requestedAgentId
+          ? jobs.filter((job) => (job.agentId ?? "main").trim().toLowerCase() === requestedAgentId)
+          : jobs;
+        const filteredJobs = matchesJob ? agentJobs.filter(matchesJob) : agentJobs;
+        const total = filteredJobs.length;
+        const offset = Math.max(0, Math.min(total, Math.floor(opts?.offset ?? 0)));
+        const defaultLimit = total === 0 ? 50 : total;
+        const limit = Math.max(1, Math.min(200, Math.floor(opts?.limit ?? defaultLimit)));
+        const pageJobs = filteredJobs.slice(offset, offset + limit);
+        const nextOffset = offset + pageJobs.length;
+        return {
+          jobs: freezeJsonSnapshot(structuredClone(pageJobs)),
+          snapshotRevision: resolveCronListSnapshotRevision(filteredJobs),
+          total,
+          offset,
+          limit,
+          hasMore: nextOffset < total,
+          nextOffset: nextOffset < total ? nextOffset : null,
+        };
+      }),
     },
-    logGateway: {
-      info: vi.fn(),
-      warn: vi.fn(),
-    },
+    logGateway: { info: vi.fn(), warn: vi.fn() },
     cronStorePath: "cron-validation-test.json",
-    getRuntimeConfig: () => getRuntimeConfig(),
+    getRuntimeConfig,
     validateAgentRuntimeApprovalAuthority: undefined as
       | GatewayRequestContext["validateAgentRuntimeApprovalAuthority"]
       | undefined,
@@ -192,15 +163,8 @@ export function createCronTestContext(
 }
 
 export function agentTurnCronParams(overrides: Record<string, unknown> = {}) {
-  return {
-    name: "cron job",
-    enabled: true,
-    schedule: { kind: "every", everyMs: 60_000 },
-    sessionTarget: "isolated",
-    wakeMode: "next-heartbeat",
-    payload: { kind: "agentTurn", message: "hello", toolsAllow: ["*"] },
-    ...overrides,
-  };
+  const { name, enabled, schedule, sessionTarget, wakeMode, payload } = createCronJob();
+  return { name, enabled, schedule, sessionTarget, wakeMode, payload, ...overrides };
 }
 
 export function createCronJob(overrides: Partial<CronJob> = {}): CronJob {
@@ -221,9 +185,7 @@ export function createCronJob(overrides: Partial<CronJob> = {}): CronJob {
 }
 
 export function pluginEntries(...ids: string[]): OpenClawConfig["plugins"] {
-  return {
-    entries: Object.fromEntries(ids.map((id) => [id, { enabled: true }])),
-  };
+  return { entries: Object.fromEntries(ids.map((id) => [id, { enabled: true }])) };
 }
 
 export function telegramConfig(): OpenClawConfig {
@@ -314,10 +276,8 @@ export function createCronTestInvoker(
   handlers: typeof import("./cron.js").cronHandlers,
   getRuntimeConfig: () => OpenClawConfig,
 ) {
-  type CronMethod = keyof typeof handlers;
-
   return async function invokeCron(
-    method: CronMethod,
+    method: keyof typeof handlers,
     params: Record<string, unknown>,
     options: {
       currentJob?: CronJob;
@@ -330,13 +290,11 @@ export function createCronTestInvoker(
   ) {
     const context = options.context ?? createCronTestContext(options.currentJob, getRuntimeConfig);
     const respond = options.respond ?? vi.fn();
-    await expectDefined(
-      handlers[method],
-      "cronHandlers[method] test invariant",
-    )({
+    const handler = expectDefined(handlers[method], "cron handler");
+    await handler({
       req: {} as never,
-      params: params as never,
-      respond: respond as never,
+      params,
+      respond,
       context: context as never,
       client: options.client ?? null,
       sessionMutationCommitGuard: options.sessionMutationCommitGuard,
@@ -363,13 +321,9 @@ export function expectResponseError(
   respond: ReturnType<typeof vi.fn>,
   expected: { code?: string; messageIncludes?: string; details?: Record<string, unknown> },
 ) {
-  const call = respond.mock.calls.at(0);
-  if (!call) {
-    throw new Error("expected response call");
-  }
-  expect(call[0]).toBe(false);
-  expect(call[1]).toBeUndefined();
-  const error = requireRecord(call[2], "response error");
+  const [ok, payload, responseError] = expectDefined(respond.mock.calls[0], "response call");
+  expect([ok, payload]).toEqual([false, undefined]);
+  const error = requireRecord(responseError, "response error");
   if (expected.code) {
     expect(error.code).toBe(expected.code);
   }

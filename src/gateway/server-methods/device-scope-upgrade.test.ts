@@ -23,12 +23,6 @@ vi.mock("../operator-role-policy.js", () => ({
 
 import { scopeUpgradeHandlers } from "./device-scope-upgrade.js";
 
-const GUEST_ROLE = {
-  sessions: { others: "view" },
-  agents: "*",
-  scopes: ["operator.read", "operator.write"],
-} satisfies GatewayOperatorRoleDefinition;
-
 const FULL_SCOPES = [
   "operator.admin",
   "operator.read",
@@ -42,62 +36,65 @@ const ROLE_SCOPE_CASES: [string, string[] | undefined, string[], boolean][] = [
   ["admin implies full Control UI scopes", ["operator.admin"], FULL_SCOPES, true],
   ["write implies read and talk", ["operator.write"], ["operator.read", "operator.talk"], true],
   ["no operator role policy", undefined, FULL_SCOPES, true],
-  ["guest cannot request admin", GUEST_ROLE.scopes, FULL_SCOPES, false],
+  ["guest cannot request admin", ["operator.read", "operator.write"], FULL_SCOPES, false],
   ["empty ceiling denies read", [], ["operator.read"], false],
 ];
 
-function createUpgradeContext() {
-  return {
-    broadcast: vi.fn(),
-    getRuntimeConfig: () => ({}),
-    logGateway: { warn: vi.fn() },
-    scopeUpgradeCoordinator: { register: vi.fn(() => true), notify: vi.fn(), wait: vi.fn() },
-  };
-}
+const createUpgradeContext = () => ({
+  getRuntimeConfig: () => ({}),
+  logGateway: { warn: vi.fn() },
+  scopeUpgradeCoordinator: { register: vi.fn(() => true), notify: vi.fn(), wait: vi.fn() },
+});
 
-function createUpgradeClient() {
-  return {
-    connId: "connection-1",
-    authenticatedUserProfile: { profileId: "profile-1" },
-    connect: {
-      role: "operator",
-      scopes: ["operator.read"],
-      device: { id: "device-1", publicKey: "public-key-1" },
-      client: { id: "control-ui", platform: "test", mode: "webchat" },
-    },
-  };
-}
+const owner = { deviceId: "device-1", publicKey: "public-key-1" };
+const upgradeRequest = { requestId: "request-1" };
+const rolePolicy = (scopes: string[] | undefined) =>
+  scopes
+    ? ({
+        sessions: { others: "view" },
+        agents: "*",
+        scopes,
+      } satisfies GatewayOperatorRoleDefinition)
+    : undefined;
+const denial = (message: string) =>
+  expect.objectContaining({ code: "INVALID_REQUEST", message: expect.stringContaining(message) });
 
 async function runUpgradeHandler(
-  method: "device.scopes.requestUpgrade" | "device.scopes.waitUpgrade",
+  method: "requestUpgrade" | "waitUpgrade",
   params: Record<string, unknown>,
   context = createUpgradeContext(),
 ) {
   const respond = vi.fn();
-  const client = createUpgradeClient();
   await expectDefined(
-    scopeUpgradeHandlers[method],
+    scopeUpgradeHandlers[`device.scopes.${method}`],
     `${method} handler`,
   )({
     params,
     respond,
     context,
-    client,
+    client: {
+      connId: "connection-1",
+      connect: {
+        role: "operator",
+        scopes: ["operator.read"],
+        device: { id: owner.deviceId, publicKey: owner.publicKey },
+        client: { id: "control-ui", platform: "test", mode: "webchat" },
+      },
+    },
   } as never);
-  return { respond, context, client };
+  return { respond, context };
 }
 
 describe("device scope upgrade role ceiling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getPairedDeviceMock.mockResolvedValue({
-      deviceId: "device-1",
-      publicKey: "public-key-1",
+      ...owner,
       approvedAtMs: 1,
       tokens: { operator: { token: "old-token", scopes: ["operator.read"] } },
     });
     requestDevicePairingMock.mockResolvedValue({
-      request: { requestId: "request-1" },
+      request: upgradeRequest,
       expiresAtMs: Date.now() + 60_000,
       created: false,
     });
@@ -105,18 +102,12 @@ describe("device scope upgrade role ceiling", () => {
   });
 
   describe.each(ROLE_SCOPE_CASES)("%s", (_name, allowedScopes, scopes, allowed) => {
-    const rolePolicy = allowedScopes ? { ...GUEST_ROLE, scopes: allowedScopes } : undefined;
-    const roleDenial = expect.objectContaining({
-      code: "INVALID_REQUEST",
-      message: expect.stringContaining("assigned operator role"),
-    });
+    const policy = rolePolicy(allowedScopes);
+    const roleDenial = denial("assigned operator role");
 
     it("enforces the ceiling when requesting approval", async () => {
-      resolveOperatorRolePolicyMock.mockReturnValue(rolePolicy);
-
-      const { respond, context } = await runUpgradeHandler("device.scopes.requestUpgrade", {
-        scopes,
-      });
+      resolveOperatorRolePolicyMock.mockReturnValue(policy);
+      const { respond, context } = await runUpgradeHandler("requestUpgrade", { scopes });
 
       expect(respond).toHaveBeenCalledOnce();
       if (!allowed) {
@@ -125,14 +116,14 @@ describe("device scope upgrade role ceiling", () => {
         expect(context.scopeUpgradeCoordinator.register).not.toHaveBeenCalled();
         return;
       }
-      expect(respond).toHaveBeenCalledWith(true, { requestId: "request-1" }, undefined);
+      expect(respond).toHaveBeenCalledWith(true, upgradeRequest, undefined);
       expect(requestDevicePairingMock).toHaveBeenCalledWith(
         expect.objectContaining({ scopes: scopes.toSorted(), silent: false }),
       );
       expect(context.scopeUpgradeCoordinator.register).toHaveBeenCalledWith(
         expect.objectContaining({
-          requestId: "request-1",
-          owner: { deviceId: "device-1", publicKey: "public-key-1" },
+          ...upgradeRequest,
+          owner,
           requestedScopes: scopes.toSorted(),
           initialToken: "old-token",
           initialApprovedAtMs: 1,
@@ -144,23 +135,13 @@ describe("device scope upgrade role ceiling", () => {
       const context = createUpgradeContext();
       const approval = createDeferred<ScopeUpgradeResult>();
       context.scopeUpgradeCoordinator.wait.mockReturnValue(approval.promise);
-      resolveOperatorRolePolicyMock.mockReturnValue({
-        ...GUEST_ROLE,
-        scopes: allowed ? [] : ["operator.admin"],
-      });
-      const pending = runUpgradeHandler(
-        "device.scopes.waitUpgrade",
-        { requestId: "request-1" },
-        context,
-      );
-      expect(context.scopeUpgradeCoordinator.wait).toHaveBeenCalledWith("request-1", {
-        deviceId: "device-1",
-        publicKey: "public-key-1",
-      });
-      resolveOperatorRolePolicyMock.mockReturnValue(rolePolicy);
+      resolveOperatorRolePolicyMock.mockReturnValue(rolePolicy(allowed ? [] : ["operator.admin"]));
+      const pending = runUpgradeHandler("waitUpgrade", upgradeRequest, context);
+      expect(context.scopeUpgradeCoordinator.wait).toHaveBeenCalledWith("request-1", owner);
+      resolveOperatorRolePolicyMock.mockReturnValue(policy);
       const result: ScopeUpgradeResult = {
         status: "approved",
-        requestId: "request-1",
+        ...upgradeRequest,
         deviceToken: "upgraded-token",
         scopes,
       };
@@ -177,16 +158,12 @@ describe("device scope upgrade role ceiling", () => {
   });
 
   it("returns an unchanged rejected result", async () => {
-    resolveOperatorRolePolicyMock.mockReturnValue({ ...GUEST_ROLE, scopes: [] });
+    resolveOperatorRolePolicyMock.mockReturnValue(rolePolicy([]));
     const context = createUpgradeContext();
-    const result: ScopeUpgradeResult = { status: "rejected", requestId: "request-1" };
+    const result: ScopeUpgradeResult = { status: "rejected", ...upgradeRequest };
     context.scopeUpgradeCoordinator.wait.mockResolvedValue(result);
 
-    const { respond } = await runUpgradeHandler(
-      "device.scopes.waitUpgrade",
-      { requestId: "request-1" },
-      context,
-    );
+    const { respond } = await runUpgradeHandler("waitUpgrade", upgradeRequest, context);
 
     expect(respond).toHaveBeenCalledWith(true, result, undefined);
   });
@@ -195,18 +172,9 @@ describe("device scope upgrade role ceiling", () => {
     { scopes: ["operator.read", "operator.unknown"], message: "unknown operator scope" },
     { scopes: ["operator.approvals"], message: "current scopes" },
   ])("rejects $message even with an admin ceiling", async ({ scopes, message }) => {
-    resolveOperatorRolePolicyMock.mockReturnValue({ ...GUEST_ROLE, scopes: FULL_SCOPES });
-
-    const { respond } = await runUpgradeHandler("device.scopes.requestUpgrade", { scopes });
-
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({
-        code: "INVALID_REQUEST",
-        message: expect.stringContaining(message),
-      }),
-    );
+    resolveOperatorRolePolicyMock.mockReturnValue(rolePolicy(FULL_SCOPES));
+    const { respond } = await runUpgradeHandler("requestUpgrade", { scopes });
+    expect(respond).toHaveBeenCalledWith(false, undefined, denial(message));
     expect(requestDevicePairingMock).not.toHaveBeenCalled();
   });
 });

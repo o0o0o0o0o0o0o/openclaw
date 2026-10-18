@@ -4,6 +4,7 @@ import { createConfigRuntimeEnv } from "../config/env-vars.js";
 import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import * as authProfileStoreRuntime from "./auth-profiles/store-runtime.js";
+import { modelDefinition, providerConfig } from "./model-auth.fixtures.test-support.js";
 import { planModelsJsonForTest } from "./models-config.plan.test-support.js";
 import * as modelsConfigProviders from "./models-config.providers.js";
 import type { ProviderConfig } from "./models-config.providers.secrets.js";
@@ -61,15 +62,11 @@ afterEach(() => {
 const discover = (providers: Record<string, ProviderConfig>) =>
   vi.spyOn(modelsConfigProviders, "resolveImplicitProviders").mockResolvedValue(providers);
 
-const defaultModel: ProviderConfig["models"][number] = {
-  id: "gpt-5.5",
+const defaultModel = modelDefinition("gpt-5.5", {
   name: "GPT-5.5",
-  reasoning: true,
-  input: ["text"],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   contextWindow: 400000,
   maxTokens: 128000,
-};
+});
 const provider = (overrides: Partial<ProviderConfig> = {}): ProviderConfig => ({
   baseUrl: "https://api.openai.com/v1",
   api: "openai-responses",
@@ -118,9 +115,7 @@ describe("models-config planning", () => {
   it("keeps the implicit catalog when the explicit baseUrl is blank", async () => {
     discover({ openai: provider() });
     const plan = await generate({
-      cfg: {
-        models: { providers: { openai: { baseUrl: "   ", apiKey: "OPENAI_API_KEY", models: [] } } },
-      },
+      cfg: providerConfig("openai", { baseUrl: "   ", apiKey: "OPENAI_API_KEY", models: [] }),
       pluginMetadataSnapshot: createPluginMetadataSnapshotFixture(),
     });
     expect(plan.providers.openai).toMatchObject({
@@ -195,14 +190,7 @@ describe("models-config planning", () => {
     const vertex = provider({
       baseUrl: "https://{location}-aiplatform.googleapis.com",
       api: "google-vertex",
-      models: [
-        {
-          ...structuredClone(defaultModel),
-          id: "gemini-2.5-pro",
-          name: "Gemini 2.5 Pro",
-          input: ["text", "image"],
-        },
-      ],
+      models: [modelDefinition("gemini-2.5-pro")],
     });
     discover({ "google-vertex": vertex });
     const plan = await generate({

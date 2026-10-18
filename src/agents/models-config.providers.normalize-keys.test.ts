@@ -6,6 +6,7 @@ import { readConfigFileSnapshotFromContext } from "../config/io.snapshot.js";
 import { ModelsConfigSchema } from "../config/zod-schema.core.js";
 import { NON_ENV_SECRETREF_MARKER } from "../secrets/provider-credential-values.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { configForProviders, modelDefinition } from "./model-auth.fixtures.test-support.js";
 import { normalizeProviderCatalogModelsForConfig } from "./models-config.providers.catalog.js";
 import { normalizeProviders } from "./models-config.providers.normalize.js";
 import { enforceSourceManagedProviderSecrets } from "./models-config.providers.source-managed.js";
@@ -20,16 +21,6 @@ describe("normalizeProviders", () => {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   type Providers = NonNullable<NonNullable<OpenClawConfig["models"]>["providers"]>;
   type ConfigModel = Providers[string]["models"][number];
-  const createModel = (overrides: Partial<ConfigModel> = {}) => ({
-    id: "config-model",
-    name: "Config model",
-    input: ["text"] as Array<"text" | "image">,
-    reasoning: false,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 8192,
-    maxTokens: 2048,
-    ...overrides,
-  });
   const provider = (overrides: Partial<Providers[string]> = {}): Providers[string] => ({
     baseUrl: "https://api.openai.com/v1",
     api: "openai-completions",
@@ -52,7 +43,7 @@ describe("normalizeProviders", () => {
       " openai ": provider({
         baseUrl: "https://example.com/v1",
         apiKey: "CUSTOM_OPENAI_API_KEY", // pragma: allowlist secret
-        models: [createModel({ id: "gpt-4.1-mini" })],
+        models: [modelDefinition("gpt-4.1-mini")],
       }),
     };
     const normalized = await normalize(providers);
@@ -66,10 +57,11 @@ describe("normalizeProviders", () => {
 
   it("deduplicates model rows and keeps repeated publication stable with secret ownership", async () => {
     const agentDir = tempDirs.make("provider-normalize-");
-    const pinned = createModel({
-      id: "gemini-3-pro-preview",
+    const pinned = modelDefinition("gemini-3-pro-preview", {
       name: "Pinned Gemini",
       contextWindow: 12345,
+      maxTokens: 2048,
+      reasoning: false,
       cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
     });
     const expected = { ...structuredClone(pinned), id: "gemini-3.1-pro-preview" };
@@ -80,8 +72,7 @@ describe("normalizeProviders", () => {
         apiKey: "GOOGLE_API_KEY", // pragma: allowlist secret
         models: [
           pinned,
-          createModel({
-            id: "gemini-3.1-pro-preview",
+          modelDefinition("gemini-3.1-pro-preview", {
             name: "Discovered Gemini",
             contextWindow: 1_048_576,
             maxTokens: 65536,
@@ -126,7 +117,7 @@ describe("normalizeProviders", () => {
     const providers = {
       openai: provider({
         apiKey: "sk-test-secret-value-12345", // pragma: allowlist secret; simulates resolved ${OPENAI_API_KEY}
-        models: [createModel({ id: "gpt-4.1" })],
+        models: [modelDefinition("gpt-4.1")],
       }),
     };
     const normalized = await normalize(providers, { env, secretRefManagedProviders });
@@ -168,15 +159,13 @@ describe("normalizeProviders", () => {
         async (state) => {
           await state.writeConfig({
             plugins: { enabled: false },
-            models: {
-              providers: {
-                custom: provider({
-                  baseUrl: "https://provider.example/v1",
-                  apiKey: "plain-fixture-key",
-                  headers: { "X.Trace": authored },
-                }),
-              },
-            },
+            ...configForProviders({
+              custom: provider({
+                baseUrl: "https://provider.example/v1",
+                apiKey: "plain-fixture-key",
+                headers: { "X.Trace": authored },
+              }),
+            }),
           });
           const snapshot = await readConfigFileSnapshotFromContext(
             createConfigIoContext({
@@ -208,7 +197,7 @@ describe("normalizeProviders", () => {
 
   it("publishes schema-complete costs after duplicate model rows merge", () => {
     const modelWithPartialCost = (id: string, cost: Partial<NonNullable<ConfigModel["cost"]>>) =>
-      ({ ...createModel({ id }), cost }) as ConfigModel;
+      ({ ...modelDefinition(id), cost }) as ConfigModel;
     const tieredPricing = [
       {
         input: 8,
@@ -223,7 +212,7 @@ describe("normalizeProviders", () => {
         baseUrl: "https://models.example/v1",
         models: [
           modelWithPartialCost("partial", { input: 10, output: 50, tieredPricing }),
-          createModel({ id: "unknown", cost: undefined }),
+          modelDefinition("unknown", { cost: undefined }),
           modelWithPartialCost("duplicate", { input: 3, output: 15 }),
           modelWithPartialCost("duplicate", { cacheRead: 0.3, cacheWrite: 3.75 }),
         ],
@@ -232,13 +221,11 @@ describe("normalizeProviders", () => {
 
     expect(ModelsConfigSchema.safeParse({ providers }).success).toBe(true);
     expect(normalizeProviderCatalogModelsForConfig(providers)?.custom?.models).toEqual([
-      createModel({
-        id: "partial",
+      modelDefinition("partial", {
         cost: { input: 10, output: 50, cacheRead: 0, cacheWrite: 0, tieredPricing },
       }),
-      createModel({ id: "unknown", cost: undefined }),
-      createModel({
-        id: "duplicate",
+      modelDefinition("unknown", { cost: undefined }),
+      modelDefinition("duplicate", {
         cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
       }),
     ]);

@@ -92,22 +92,15 @@ describe("runtime tool input schema projection", () => {
     expect(
       projectRuntimeToolInputSchema({
         type: "object",
-        $defs: {
-          $dynamicAnchor: { type: "string" },
-        },
-        properties: {
-          $dynamicRef: { type: "string" },
-        },
+        $defs: { $dynamicAnchor: { type: "string" } },
+        properties: { $dynamicRef: { type: "string" } },
       }).violations,
     ).toEqual([]);
   });
 
   it("keeps tools whose examples contain literal schema documents", () => {
     const instance = {
-      document: {
-        $dynamicAnchor: "node",
-        properties: { child: { $dynamicRef: "#node" } },
-      },
+      document: { $dynamicAnchor: "node", properties: { child: { $dynamicRef: "#node" } } },
     };
     const parameters = Type.Object(
       { document: Type.Record(Type.String(), Type.Unknown()) },
@@ -116,10 +109,7 @@ describe("runtime tool input schema projection", () => {
     const original = structuredClone(parameters);
     const tool = { name: "store_schema", parameters };
 
-    expect(projectRuntimeToolInputSchema(parameters)).toEqual({
-      schema: original,
-      violations: [],
-    });
+    expect(projectRuntimeToolInputSchema(parameters)).toEqual({ schema: original, violations: [] });
     expect(filterRuntimeCompatibleTools([tool])).toEqual({ tools: [tool], diagnostics: [] });
     expect(parameters).toEqual(original);
   });

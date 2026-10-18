@@ -68,9 +68,7 @@ function createDeferredCall(target: AnyAgentTool) {
 }
 
 async function createDeferredMcpCall(result: CallToolResult) {
-  const materialized = await materializeBundleMcpToolsForRun({
-    runtime: makeMcpRuntime(result),
-  });
+  const materialized = await materializeBundleMcpToolsForRun({ runtime: makeMcpRuntime(result) });
   const target = expectDefined(materialized.tools[0], "materialized MCP tool");
   return { callTool: createDeferredCall(target), target };
 }

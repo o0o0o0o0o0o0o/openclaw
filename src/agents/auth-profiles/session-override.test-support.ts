@@ -18,36 +18,29 @@ export const TEST_PRIMARY_PROFILE_ID = "openai:primary@example.test";
 export const TEST_SECONDARY_PROFILE_ID = "openai:secondary@example.test";
 
 const authStoreMocks = vi.hoisted(() => {
-  const state: {
-    hasSource: boolean;
-    routeResolutions: Map<string, ProviderModelRouteResolution>;
-    store: AuthProfileStore;
-  } = {
+  const emptyStore = (): AuthProfileStore => ({ version: 1, profiles: {} });
+  const state = {
     hasSource: false,
-    routeResolutions: new Map(),
-    store: { version: 1, profiles: {} },
+    routeResolutions: new Map<string, ProviderModelRouteResolution>(),
+    store: emptyStore(),
   };
-  const ensureAuthProfileStoreAsync = vi.fn(async () => state.store);
-  const hasAnyAuthProfileStoreSourceAsync = vi.fn(() => state.hasSource);
-  const available = (_store: AuthProfileStore, _profileId: string) => false;
-  const routes = ({ provider, modelId }: { provider: string; modelId?: string }) =>
-    state.routeResolutions.get(`${provider}\0${modelId ?? ""}`) ?? null;
-  const isProfileInCooldown = vi.fn(available);
-  const resolveProviderModelRoutes = vi.fn(routes);
+  const calls = {
+    ensureAuthProfileStoreAsync: vi.fn(async () => state.store),
+    hasAnyAuthProfileStoreSourceAsync: vi.fn(() => state.hasSource),
+    isProfileInCooldown: vi.fn((_store: AuthProfileStore, _profileId: string) => false),
+    resolveProviderModelRoutes: vi.fn(
+      ({ provider, modelId }: { provider: string; modelId?: string }) =>
+        state.routeResolutions.get(`${provider}\0${modelId ?? ""}`) ?? null,
+    ),
+  };
   return {
     state,
-    ensureAuthProfileStoreAsync,
-    hasAnyAuthProfileStoreSourceAsync,
-    isProfileInCooldown,
-    resolveProviderModelRoutes,
+    ...calls,
     reset() {
       state.hasSource = false;
       state.routeResolutions.clear();
-      state.store = { version: 1, profiles: {} };
-      ensureAuthProfileStoreAsync.mockReset().mockImplementation(async () => state.store);
-      hasAnyAuthProfileStoreSourceAsync.mockReset().mockImplementation(() => state.hasSource);
-      isProfileInCooldown.mockReset().mockImplementation(available);
-      resolveProviderModelRoutes.mockReset().mockImplementation(routes);
+      state.store = emptyStore();
+      Object.values(calls).forEach((mock) => mock.mockReset());
     },
   };
 });
@@ -92,19 +85,11 @@ export async function withAuthState<T>(run: (state: OpenClawTestState) => Promis
   return await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-auth-" }, run);
 }
 
-export function createAuthStoreWithProfiles(params: {
-  profiles: AuthProfileStore["profiles"];
-  order?: Record<string, string[]>;
-}): AuthProfileStore {
-  return { version: 1, ...params };
-}
-
-export function configureProviderRoutes(params: {
-  provider: string;
-  modelId: string;
-  requirements: ProviderModelRouteAuthRequirement[];
-}): void {
-  const routes = params.requirements.map<ProviderModelRouteCandidate>((authRequirement, index) => ({
+export function configureProviderRoutes(
+  requirements: ProviderModelRouteAuthRequirement[],
+  modelId = "gpt-5.6-sol",
+): void {
+  const routes = requirements.map<ProviderModelRouteCandidate>((authRequirement, index) => ({
     api: authRequirement === "api-key" ? "openai-responses" : "openai-chatgpt-responses",
     baseUrl: `https://route-${index}.example.test`,
     authRequirement,
@@ -114,7 +99,7 @@ export function configureProviderRoutes(params: {
   if (!first) {
     return;
   }
-  authStoreMocks.state.routeResolutions.set(`${params.provider}\0${params.modelId}`, {
+  authStoreMocks.state.routeResolutions.set(`openai\0${modelId}`, {
     kind: "routes",
     routes: [first, ...routes.slice(1)],
   });
@@ -132,12 +117,11 @@ export async function prepareCooldownAuthState(
   authStoreMocks.state.hasSource = true;
   const profileIds = options.profileIds ?? [TEST_PRIMARY_PROFILE_ID];
   authStoreMocks.state.store = {
-    ...createAuthStoreWithProfiles({
-      profiles: Object.fromEntries(
-        profileIds.map((profileId) => [profileId, createApiKeyCredential("openai", "sk-test")]),
-      ),
-      order: { openai: profileIds },
-    }),
+    version: 1,
+    profiles: Object.fromEntries(
+      profileIds.map((profileId) => [profileId, createApiKeyCredential("openai", "sk-test")]),
+    ),
+    order: { openai: profileIds },
     ...(options.usageStats ? { usageStats: options.usageStats } : {}),
   };
   authStoreMocks.isProfileInCooldown.mockReturnValue(true);
@@ -154,20 +138,19 @@ export async function resolveSession(params: {
   storePath?: string;
   isNewSession?: boolean;
 }): Promise<string | undefined> {
-  return (
-    await resolveSessionAuthSelection({
-      ...params,
-      sessionStore: params.sessionStore ?? {
-        [params.sessionKey ?? "agent:main:main"]: params.sessionEntry,
-      },
-      agentId: "main",
-      cfg: params.cfg ?? {},
-      provider: params.provider ?? "openai",
-      modelId: params.sessionEntry.model ?? "model-x",
-      sessionKey: params.sessionKey ?? "agent:main:main",
-      isNewSession: params.isNewSession ?? false,
-    })
-  )?.profileId;
+  const selection = await resolveSessionAuthSelection({
+    ...params,
+    sessionStore: params.sessionStore ?? {
+      [params.sessionKey ?? "agent:main:main"]: params.sessionEntry,
+    },
+    agentId: "main",
+    cfg: params.cfg ?? {},
+    provider: params.provider ?? "openai",
+    modelId: params.sessionEntry.model ?? "model-x",
+    sessionKey: params.sessionKey ?? "agent:main:main",
+    isNewSession: params.isNewSession ?? false,
+  });
+  return selection?.profileId;
 }
 
 export function createAutomaticSessionEntry(overrides: Partial<SessionEntry> = {}): SessionEntry {

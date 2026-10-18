@@ -78,15 +78,27 @@ function setup(label: string) {
   return { root, agentDir, env: { OPENCLAW_STATE_DIR: root } };
 }
 
-function customStore(id: string, key = "fixture"): AuthProfileStore {
-  return { version: 1, profiles: { [id]: { type: "api_key", provider: "custom", key } } };
+function customStore(id: string, key = "fixture", provider = "custom"): AuthProfileStore {
+  return { version: 1, profiles: { [id]: { type: "api_key", provider, key } } };
 }
 
-function loadRuntime(runtime: ReturnType<typeof createRuntime>, agentDir: string) {
+function loadRuntime(
+  runtime: ReturnType<typeof createRuntime>,
+  agentDir: string | undefined,
+  options: Parameters<typeof runtime.loadAuthProfileStoreForRuntimeAsync>[1] = {},
+) {
   return runtime.loadAuthProfileStoreForRuntimeAsync(agentDir, {
     inheritedAuthDir: agentDir,
     externalCli: { mode: "none" },
+    ...options,
   });
+}
+
+function setupWorker(label: string) {
+  const fixture = setup(label);
+  createCacheDatabase(fixture.agentDir);
+  useAgentWorkerRows();
+  return fixture;
 }
 
 it.each(["agent", "shared"] as const)(
@@ -113,13 +125,9 @@ it.each(["agent", "shared"] as const)(
       return store;
     });
     const selectedDir = source === "agent" ? agentDir : undefined;
-    const options = {
-      inheritedAuthDir: selectedDir,
-      externalCli: { mode: "none" as const },
-    };
     try {
-      await runtime.loadAuthProfileStoreForRuntimeAsync(selectedDir, options);
-      await runtime.loadAuthProfileStoreForRuntimeAsync(selectedDir, { ...options, profileId });
+      await loadRuntime(runtime, selectedDir);
+      await loadRuntime(runtime, selectedDir, { profileId });
       const identity = inspectDatabasePathIdentitySync(databasePath);
       if (!identity) {
         throw new Error("Missing fixture database identity");
@@ -144,10 +152,8 @@ it.each(["snapshot", "requested", "shared", "absent"] as const)(
   async (source) => {
     const { agentDir } = setup("provider-facts");
     const profileId = "team:account";
-    const store = (provider?: string): AuthProfileStore => ({
-      version: 1,
-      profiles: provider ? { [profileId]: { type: "api_key", provider, key: "fixture" } } : {},
-    });
+    const store = (provider?: string): AuthProfileStore =>
+      provider ? customStore(profileId, "fixture", provider) : { version: 1, profiles: {} };
     reader.read.mockResolvedValueOnce(
       readableRows(store(source === "requested" ? "requested" : undefined)),
     );
@@ -178,9 +184,7 @@ it.each(["snapshot", "requested", "shared", "absent"] as const)(
 );
 
 it("keeps cached credentials and selection state separate from mutable runtime views", async () => {
-  const { agentDir: localDir } = setup("cached-mutation");
-  createCacheDatabase(localDir);
-  useAgentWorkerRows();
+  const { agentDir: localDir } = setupWorker("cached-mutation");
   const persisted: AuthProfileStore = {
     version: 1,
     profiles: {
@@ -201,11 +205,7 @@ it("keeps cached credentials and selection state separate from mutable runtime v
         access: "fixture-access",
         refresh: "fixture-refresh",
         expires: 4_102_444_800_000,
-        oauthRef: {
-          source: "openclaw-credentials",
-          provider: "openai-codex",
-          id: "a".repeat(32),
-        },
+        oauthRef: { source: "openclaw-credentials", provider: "openai-codex", id: "a".repeat(32) },
         setup: { replacement: true, modelRef: "custom/model", configJson: "{}" },
       },
     },
@@ -247,9 +247,7 @@ it("keeps cached credentials and selection state separate from mutable runtime v
 });
 
 it("shares canonical rows while keeping scoped read-through credentials separate", async () => {
-  const { agentDir, env } = setup("scope-cache");
-  createCacheDatabase(agentDir);
-  useAgentWorkerRows();
+  const { agentDir, env } = setupWorker("scope-cache");
   reader.read.mockResolvedValue(readableRows());
   const runtime = createRuntime();
   for (const key of ["fixture-one", "fixture-two"]) {
@@ -269,33 +267,24 @@ function createCacheDatabase(agentDir: string): void {
   database.exec("CREATE TABLE cache_fixture (value)");
 }
 
-function prepareCachedRuntimeRead() {
-  const { agentDir } = setup("identity-probes");
-  createCacheDatabase(agentDir);
-  useAgentWorkerRows();
-  prepareSharedAuthStoreOwnershipForNative();
-  const rows = readableRows();
-  reader.read.mockResolvedValue(rows);
-  const runtime = createRuntime();
-  return {
-    agentDir,
-    rows,
-    load: () => loadRuntime(runtime, agentDir),
-  };
-}
-
 it("invalidates warm rows immediately after an owner bookkeeping write", async () => {
-  const { agentDir, rows, load } = prepareCachedRuntimeRead();
+  const { agentDir } = setupWorker("identity-probes");
+  prepareSharedAuthStoreOwnershipForNative();
+  reader.read.mockResolvedValue(readableRows());
+  const runtime = createRuntime();
+  const load = () => loadRuntime(runtime, agentDir);
   await load();
   noteRuntimeAuthProfileStorePersistedMutation(agentDir, {
     credentialsChanged: false,
     stateChanged: true,
     profileIds: [],
   });
-  reader.read.mockResolvedValue({
-    ...rows,
-    state: { status: "readable", raw: { version: 1, lastGood: { custom: "custom:new" } } },
-  });
+  reader.read.mockResolvedValue(
+    readableRows(undefined, {
+      status: "readable",
+      raw: { version: 1, lastGood: { custom: "custom:new" } },
+    }),
+  );
   await expect(load()).resolves.toMatchObject({ lastGood: { custom: "custom:new" } });
   expect(reader.read).toHaveBeenCalledTimes(2);
 });
@@ -318,10 +307,7 @@ it.each([false, true])(
     });
     const runtime = createRuntime();
     const inherited = readableRows(customStore("custom:inherited", "fixture-inherited"));
-    const loading = runtime.loadAuthProfileStoreForRuntimeAsync(localDir, {
-      inheritedAuthDir: inheritedDir,
-      externalCli: { mode: "none" },
-    });
+    const loading = loadRuntime(runtime, localDir, { inheritedAuthDir: inheritedDir });
     try {
       await Promise.race([
         inheritedReadStarted.promise,
@@ -367,9 +353,9 @@ it("rejects a revoked read before publishing host migration facts", async () => 
   const runtime = createRuntime(overlayExternalAuthProfiles);
 
   await expect(
-    runtime.loadAuthProfileStoreForRuntimeAsync("/fixture/agent", {
-      inheritedAuthDir: "/fixture/agent",
+    loadRuntime(runtime, "/fixture/agent", {
       readOnly: true,
+      externalCli: undefined,
     }),
   ).rejects.toBe(revoked);
 
@@ -387,20 +373,16 @@ it.each(["matching inherited", "unrelated inherited", "selected"] as const)(
     const env = { OPENCLAW_STATE_DIR: root };
     vi.stubEnv("OPENCLAW_STATE_DIR", root);
     const local = customStore("custom:local");
-    reader.read.mockResolvedValueOnce(
-      refusedOwner === "selected"
-        ? {
-            store: { status: "unreadable" },
-            state: { status: "missing", reason: "row" },
-            cacheable: false,
-          }
-        : readableRows(local),
-    );
-    reader.read.mockResolvedValue({
+    const unreadable: AuthProfileRowRead = {
       store: { status: "unreadable" },
       state: { status: "missing", reason: "row" },
       cacheable: true,
-    });
+    };
+    reader.read
+      .mockResolvedValueOnce(
+        refusedOwner === "selected" ? { ...unreadable, cacheable: false } : readableRows(local),
+      )
+      .mockResolvedValue(unreadable);
     recordAgentDatabaseAdmissions(
       [
         createAgentDatabaseInspectionRefusal({
@@ -419,10 +401,9 @@ it.each(["matching inherited", "unrelated inherited", "selected"] as const)(
     );
     const runtime = createRuntime();
     try {
-      const result = runtime.loadAuthProfileStoreForRuntimeAsync(localDir, {
+      const result = loadRuntime(runtime, localDir, {
         inheritedAuthDir: inheritedDir,
         readOnly: true,
-        externalCli: { mode: "none" },
       });
       if (refusedOwner === "matching inherited") {
         expect((await result).profiles).toEqual(local.profiles);

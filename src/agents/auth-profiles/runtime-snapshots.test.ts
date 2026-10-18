@@ -34,8 +34,27 @@ import { acquireAuthProfileReadDatabase } from "./sqlite-read-pool.js";
 import { resolveAuthProfileDatabasePath } from "./sqlite.js";
 import type { AuthProfileStore } from "./types.js";
 
-afterEach(() => clearSnapshots());
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0).toReversed()) {
+    cleanup();
+  }
+  vi.restoreAllMocks();
+  clearSnapshots();
+});
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const track = (cleanup: () => void) => cleanups.push(cleanup);
+function apiStore(key: string, cooldownUntil = 20_000): AuthProfileStore {
+  return {
+    version: 1,
+    profiles: { "acme:primary": createApiKeyCredential("acme", key) },
+    usageStats: { "acme:primary": { cooldownUntil } },
+  };
+}
+type Usage = AuthProfileStore["usageStats"];
+function setUsage(store: AuthProfileStore, dir: string, usageStats: Usage) {
+  setSnapshot({ ...store, usageStats }, dir);
+}
 
 const materialization = {
   provider: "openai",
@@ -48,9 +67,7 @@ const materialization = {
 } as const;
 
 describe("runtime auth profile snapshots", () => {
-  beforeEach(() => {
-    prepareSharedAuthStoreOwnershipForNative();
-  });
+  beforeEach(() => void prepareSharedAuthStoreOwnershipForNative());
 
   it("retires only the changed owner's reader until the runtime closes", () => {
     const agentDir = tempDirs.make("auth-snapshot-readers-");
@@ -67,46 +84,32 @@ describe("runtime auth profile snapshots", () => {
     if (reader.status !== "readable") {
       throw new Error("Expected a pooled auth reader");
     }
-    try {
-      const revision = getSnapshotRevision(agentDir);
-      setSnapshot(
-        { ...createStore("reader-owner"), usageStats: { "openai:default": { lastUsed: 2 } } },
-        agentDir,
-      );
-      expect(getSnapshotRevision(agentDir)).not.toBe(revision);
-      expect(reader.db.isOpen).toBe(true);
-      clearSnapshot(path.join(agentDir, "unrelated"));
-      expect(reader.db.isOpen).toBe(true);
-      expect(reader.db.prepare("SELECT value FROM reader_fixture").get()).toEqual({
-        value: "available",
-      });
+    const revision = getSnapshotRevision(agentDir);
+    setUsage(createStore("reader-owner"), agentDir, { "openai:default": { lastUsed: 2 } });
+    expect(getSnapshotRevision(agentDir)).not.toBe(revision);
+    expect(reader.db.isOpen).toBe(true);
+    clearSnapshot(path.join(agentDir, "unrelated"));
+    expect(reader.db.isOpen).toBe(true);
+    expect(reader.db.prepare("SELECT value FROM reader_fixture").get()).toEqual({
+      value: "available",
+    });
 
-      clearSnapshot(agentDir);
-      expect(reader.db.isOpen).toBe(false);
-      const replacement = acquireAuthProfileReadDatabase(databasePath, openSqliteReadOnlyDatabase);
-      expect(replacement.status).toBe("readable");
-      if (replacement.status !== "readable") {
-        throw new Error("Expected the pooled auth reader to reopen");
-      }
-      clearSnapshots();
-      expect(replacement.db.isOpen).toBe(false);
-    } finally {
-      clearSnapshots();
+    clearSnapshot(agentDir);
+    expect(reader.db.isOpen).toBe(false);
+    const replacement = acquireAuthProfileReadDatabase(databasePath, openSqliteReadOnlyDatabase);
+    expect(replacement.status).toBe("readable");
+    if (replacement.status !== "readable") {
+      throw new Error("Expected the pooled auth reader to reopen");
     }
+    clearSnapshots();
+    expect(replacement.db.isOpen).toBe(false);
   });
 
   it("marks default-owner materializations as inherited mutations", () => {
     const listener = vi.fn();
-    const unregister = onMaterialization(listener);
-    try {
-      recordMaterialization(materialization);
-
-      expect(listener).toHaveBeenCalledWith({
-        affectsInheritedStores: true,
-      });
-    } finally {
-      unregister();
-    }
+    track(onMaterialization(listener));
+    recordMaterialization(materialization);
+    expect(listener).toHaveBeenCalledWith({ affectsInheritedStores: true });
   });
 
   it("publishes model auth facts without impersonating credential rotation", () => {
@@ -114,36 +117,29 @@ describe("runtime auth profile snapshots", () => {
     const pluginStoreListener = vi.fn();
     const materializationListener = vi.fn();
     setSnapshot(createStore("materialized"), agentDir);
-    const unregisterStore = onStoreMutation(pluginStoreListener);
-    const unregisterMaterialization = onMaterialization(materializationListener);
-    try {
-      const facts = { ...materialization, authProfileId: "openai:default" };
-      const input = { ...facts, agentDir };
-      expect(recordMaterialization(input)).toBe(true);
-      expect(recordMaterialization(input)).toBe(false);
-      expect(getMaterializations(agentDir)).toEqual([facts]);
-      const sibling = { ...input, modelId: "Model" };
-      const distinctOwner = { ...input, runtimeOwnerId: "other-harness" };
-      expect(recordMaterialization(sibling)).toBe(true);
-      recordMaterialization(distinctOwner);
-      const owner = { agentDir, provider: "openai", runtimeOwnerId: "codex" };
-      expect(revokeMaterializations(owner)).toBe(true);
-      expect(revokeMaterializations(owner)).toBe(false);
-      expect(getMaterializations(agentDir)).toEqual([
-        expect.objectContaining({ runtimeOwnerId: "other-harness", modelId: "model" }),
-      ]);
-      expect(materializationListener).toHaveBeenCalledTimes(4);
-      expect(pluginStoreListener).not.toHaveBeenCalled();
+    track(onStoreMutation(pluginStoreListener));
+    track(onMaterialization(materializationListener));
+    const facts = { ...materialization, authProfileId: "openai:default" };
+    const input = { ...facts, agentDir };
+    expect(recordMaterialization(input)).toBe(true);
+    expect(recordMaterialization(input)).toBe(false);
+    expect(getMaterializations(agentDir)).toEqual([facts]);
+    expect(recordMaterialization({ ...input, modelId: "Model" })).toBe(true);
+    recordMaterialization({ ...input, runtimeOwnerId: "other-harness" });
+    const owner = { agentDir, provider: "openai", runtimeOwnerId: "codex" };
+    expect(revokeMaterializations(owner)).toBe(true);
+    expect(revokeMaterializations(owner)).toBe(false);
+    expect(getMaterializations(agentDir)).toEqual([
+      expect.objectContaining({ runtimeOwnerId: "other-harness", modelId: "model" }),
+    ]);
+    expect(materializationListener).toHaveBeenCalledTimes(4);
+    expect(pluginStoreListener).not.toHaveBeenCalled();
 
-      recordMaterialization(input);
+    recordMaterialization(input);
 
-      setSnapshot(createStore("replaced"), agentDir);
-      expect(getMaterializations(agentDir)).toEqual([]);
-      expect(pluginStoreListener).toHaveBeenCalledOnce();
-    } finally {
-      unregisterMaterialization();
-      unregisterStore();
-    }
+    setSnapshot(createStore("replaced"), agentDir);
+    expect(getMaterializations(agentDir)).toEqual([]);
+    expect(pluginStoreListener).toHaveBeenCalledOnce();
   });
 
   it("keeps metadata stable while replace publishes bookkeeping for rollback readers", () => {
@@ -154,7 +150,7 @@ describe("runtime auth profile snapshots", () => {
     const missingRevision = getMetadataRevision("/tmp/absent-auth-owner");
     const snapshotRevision = getSnapshotRevision(agentDir);
     const listener = vi.fn();
-    const unregister = onStoreMutation(listener);
+    track(onStoreMutation(listener));
     const next = {
       ...store,
       runtimeInheritsMainState: true,
@@ -169,16 +165,12 @@ describe("runtime auth profile snapshots", () => {
         },
       },
     };
-    try {
-      replaceSnapshots([{ agentDir, store: next }]);
-      expect(getSnapshot(agentDir)).toEqual(next);
-      expect(getSnapshotRevision(agentDir)).toBeGreaterThan(snapshotRevision);
-      expect(getMetadataRevision(agentDir)).toBe(metadataRevision);
-      expect(getMetadataRevision("/tmp/absent-auth-owner")).toBe(missingRevision);
-      expect(listener).not.toHaveBeenCalled();
-    } finally {
-      unregister();
-    }
+    replaceSnapshots([{ agentDir, store: next }]);
+    expect(getSnapshot(agentDir)).toEqual(next);
+    expect(getSnapshotRevision(agentDir)).toBeGreaterThan(snapshotRevision);
+    expect(getMetadataRevision(agentDir)).toBe(metadataRevision);
+    expect(getMetadataRevision("/tmp/absent-auth-owner")).toBe(missingRevision);
+    expect(listener).not.toHaveBeenCalled();
   });
 
   it.each(["replace", "remove"] as const)(
@@ -206,17 +198,12 @@ describe("runtime auth profile snapshots", () => {
         expect(getOwnedSnapshot(agentPath)?.store).toEqual(nextLocal.store);
         expect(getOwnedSnapshot(sharedPath)?.store).toEqual(nextShared?.store);
       });
-      const unregister = onStoreMutation(listener);
-      try {
-        replaceOwnedSnapshots(nextShared ? [nextShared, nextLocal] : [nextLocal]);
-        expect(listener).toHaveBeenCalledExactlyOnceWith({
-          affectsInheritedStores: true,
-          profileSetChanged: operation === "remove",
-        });
-      } finally {
-        unregister();
-        clearSnapshots();
-      }
+      track(onStoreMutation(listener));
+      replaceOwnedSnapshots(nextShared ? [nextShared, nextLocal] : [nextLocal]);
+      expect(listener).toHaveBeenCalledExactlyOnceWith({
+        affectsInheritedStores: true,
+        profileSetChanged: operation === "remove",
+      });
     },
   );
 
@@ -252,13 +239,9 @@ describe("runtime auth profile snapshots", () => {
       },
     };
     const stringify = vi.spyOn(JSON, "stringify");
-    let cloned: typeof store;
-    try {
-      cloned = authProfileClone.cloneAuthProfileStore(store);
-      expect(stringify).not.toHaveBeenCalled();
-    } finally {
-      stringify.mockRestore();
-    }
+    const cloned = authProfileClone.cloneAuthProfileStore(store);
+    expect(stringify).not.toHaveBeenCalled();
+    stringify.mockRestore();
     expect(cloned).toEqual(expected);
     expect(Object.getPrototypeOf(cloned.metadata)).toBe(Object.prototype);
     nested.value = "mutated";
@@ -307,7 +290,7 @@ describe("runtime auth profile snapshots", () => {
     });
     setSnapshot(published, agentDir);
     const read = createUsageReader(agentDir, agentDir);
-    setSnapshot({ ...published, usageStats: {} }, agentDir);
+    setUsage(published, agentDir, {});
     const cleared = read(worker);
     expect(cleared.usageStats).toEqual({ "worker:external": { lastUsed: 7 } });
     expect(cleared.profiles).toBe(worker.profiles);
@@ -315,20 +298,10 @@ describe("runtime auth profile snapshots", () => {
     expect(cleared.lastGood).toBe(worker.lastGood);
     expect(worker.usageStats["acme:primary"]).toEqual({ cooldownUntil: 20_000 });
 
-    setSnapshot(
-      {
-        ...published,
-        usageStats: {
-          "acme:primary": { cooldownUntil: 30_000, failureCounts: { rate_limit: 2 } },
-        },
-      },
-      agentDir,
-    );
+    const usage = { cooldownUntil: 30_000, failureCounts: { rate_limit: 2 } };
+    setUsage(published, agentDir, { "acme:primary": usage });
     const blocked = read(worker);
-    expect(blocked.usageStats?.["acme:primary"]).toEqual({
-      cooldownUntil: 30_000,
-      failureCounts: { rate_limit: 2 },
-    });
+    expect(blocked.usageStats?.["acme:primary"]).toEqual(usage);
     expectDefined(blocked.usageStats?.["acme:primary"], "published usage").cooldownUntil = 99;
     expect(read(worker).usageStats?.["acme:primary"]?.cooldownUntil).toBe(30_000);
     expect(cleared.usageStats).toEqual({ "worker:external": { lastUsed: 7 } });
@@ -337,23 +310,12 @@ describe("runtime auth profile snapshots", () => {
   it("keeps usage with the captured physical owner and matching credential", () => {
     const agentDir = "/tmp/openclaw-auth-catalog-owned";
     const siblingDir = "/tmp/openclaw-auth-catalog-sibling";
-    const original: AuthProfileStore = {
-      version: 1,
-      profiles: { "acme:primary": createApiKeyCredential("acme", "owned-not-real") },
-      usageStats: { "acme:primary": { cooldownUntil: 20_000 } },
-    };
+    const original = apiStore("owned-not-real");
     setSnapshot(original, agentDir);
-    setSnapshot({ ...original, usageStats: {} }, siblingDir);
+    setUsage(original, siblingDir, {});
     const read = createUsageReader(agentDir, agentDir);
     expect(read(original)).toBe(original);
-    setSnapshot(
-      {
-        ...original,
-        profiles: { "acme:primary": createApiKeyCredential("acme", "replacement-not-real") },
-        usageStats: {},
-      },
-      agentDir,
-    );
+    setUsage(apiStore("replacement-not-real"), agentDir, {});
     expect(read(original)).toBe(original);
     const current = expectDefined(
       getOwnedSnapshot(resolveAuthProfileDatabasePath(agentDir)),
@@ -375,19 +337,14 @@ describe("runtime auth profile snapshots", () => {
   it("refreshes inherited usage without crossing an agent-local profile override", () => {
     const inheritedAuthDir = "/tmp/openclaw-auth-catalog-inherited";
     const agentDir = "/tmp/openclaw-auth-catalog-local";
-    const inherited: AuthProfileStore = {
-      version: 1,
+    const inherited = {
+      ...apiStore("inherited-not-real"),
       profiles: {
-        "acme:primary": createApiKeyCredential("acme", "inherited-not-real"),
+        ...apiStore("inherited-not-real").profiles,
         "other:primary": createApiKeyCredential("other", "other-not-real"),
       },
-      usageStats: { "acme:primary": { cooldownUntil: 20_000 } },
     };
-    const local: AuthProfileStore = {
-      version: 1,
-      profiles: { "acme:primary": createApiKeyCredential("acme", "local-not-real") },
-      usageStats: { "acme:primary": { cooldownUntil: 30_000 } },
-    };
+    const local = apiStore("local-not-real", 30_000);
     setSnapshot(inherited, inheritedAuthDir);
     setSnapshot(local, agentDir);
     const worker = expectDefined(
@@ -395,20 +352,14 @@ describe("runtime auth profile snapshots", () => {
       "effective catalog auth",
     );
     const read = createUsageReader(agentDir, inheritedAuthDir);
-    setSnapshot(
-      {
-        ...inherited,
-        usageStats: { "other:primary": { cooldownUntil: 40_000 } },
-      },
-      inheritedAuthDir,
-    );
+    setUsage(inherited, inheritedAuthDir, { "other:primary": { cooldownUntil: 40_000 } });
     expect(read(worker).usageStats).toEqual({
       "acme:primary": { cooldownUntil: 30_000 },
       "other:primary": { cooldownUntil: 40_000 },
     });
     expect(read(worker).profiles).toBe(worker.profiles);
     setSnapshot(inherited, inheritedAuthDir);
-    setSnapshot({ ...local, usageStats: {} }, agentDir);
+    setUsage(local, agentDir, {});
     expect(read(worker).usageStats?.["acme:primary"]).toBeUndefined();
   });
 
@@ -429,15 +380,9 @@ describe("runtime auth profile snapshots", () => {
 
     const prepared = getPreparedSnapshot(agentDir, inheritedAuthDir);
 
-    expect(prepared?.profiles["openai:default"]).toMatchObject({
-      type: "oauth",
-      provider: "openai",
-      access: "agent",
-    });
-    expect(prepared?.profiles["anthropic:default"]).toMatchObject({
-      type: "api_key",
-      provider: "anthropic",
-      key: "inherited-key",
+    expect(prepared?.profiles).toMatchObject({
+      "openai:default": { type: "oauth", provider: "openai", access: "agent" },
+      "anthropic:default": { type: "api_key", provider: "anthropic", key: "inherited-key" },
     });
     expect(
       getPreparedSnapshot(
@@ -469,19 +414,11 @@ describe("runtime auth profile snapshots", () => {
     const store = createStore("prepared");
     setSnapshot(store, agentDir);
     const clone = vi.spyOn(authProfileClone, "cloneAuthProfileStore");
-    try {
-      const prepared = expectDefined(
-        getPreparedSnapshot(agentDir, agentDir),
-        "prepared same-owner snapshot",
-      );
-      expect(prepared).toMatchObject(store);
-      expect(clone.mock.calls.length).toBeLessThanOrEqual(1);
-      expectDefined(prepared.order?.openai, "prepared profile order").push("mutated");
-      expect(getSnapshot(agentDir)?.order?.openai).toEqual(["openai:default"]);
-    } finally {
-      clone.mockRestore();
-      clearSnapshots();
-    }
+    const prepared = expectDefined(getPreparedSnapshot(agentDir, agentDir), "prepared snapshot");
+    expect(prepared).toMatchObject(store);
+    expect(clone.mock.calls.length).toBeLessThanOrEqual(1);
+    expectDefined(prepared.order?.openai, "prepared profile order").push("mutated");
+    expect(getSnapshot(agentDir)?.order?.openai).toEqual(["openai:default"]);
   });
 
   it("bounds persisted mutation lineage by owner and profile", () => {

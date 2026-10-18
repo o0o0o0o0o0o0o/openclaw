@@ -526,13 +526,13 @@ it("retains the identified creator when a restricted role creates its first Talk
 });
 
 const realtimeStarts = [
-  { method: "talk.client.create", transport: "webrtc" },
-  { method: "talk.session.create", transport: "gateway-relay" },
+  { method: "talk.client.create", transport: "webrtc", capabilities: ["gateway-control-v1"] },
+  { method: "talk.session.create", transport: "gateway-relay", capabilities: [] },
 ] as const;
 
 it.each(realtimeStarts)(
   "$method restores an archived backing session in place before provider creation",
-  async ({ method, transport }) => {
+  async ({ method, transport, capabilities }) => {
     const sessionId = "archived-talk-session";
     const scope = {
       ...voiceScope,
@@ -582,6 +582,7 @@ it.each(realtimeStarts)(
     const respond = await dispatch(method, {
       ...createParams,
       transport,
+      capabilities,
       sessionKey: scope.sessionKey,
     });
     expectCreated(respond, expect.any(Object));
@@ -597,17 +598,25 @@ it.each(
     (["restart tombstone", "worker placement", "automation"] as const).map((reason) => ({
       method: start.method,
       transport: start.transport,
+      capabilities: start.capabilities,
       reason,
     })),
   ),
 )(
   "$method refuses archived $reason before provider creation",
-  async ({ method, transport, reason }) => {
+  async ({ method, transport, capabilities, reason }) => {
     const sessionId = "refused-talk-session";
     await writeSession(sessionId, {
       archivedAt: 2,
       ...(reason === "restart tombstone"
-        ? { mainRestartRecovery: { tombstone: { reason: "automatic recovery exhausted" } } }
+        ? {
+            mainRestartRecovery: {
+              cycleId: "failed-cycle",
+              revision: 4,
+              chargedAttempts: 3,
+              tombstone: { reason: "automatic recovery exhausted" },
+            },
+          }
         : {}),
     });
     if (reason === "worker placement") {
@@ -621,7 +630,12 @@ it.each(
     } else if (reason === "automation") {
       client.internal = { syntheticClient: true };
     }
-    const respond = await dispatch(method, { ...createParams, transport, sessionKey: "main" });
+    const respond = await dispatch(method, {
+      ...createParams,
+      transport,
+      capabilities,
+      sessionKey: "main",
+    });
     expect(respond).toHaveBeenCalledWith(
       false,
       undefined,

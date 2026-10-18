@@ -7,7 +7,6 @@ import { createSessionMcpRuntime } from "../../agents/agent-bundle-mcp-runtime.j
 import type { McpAppViewLease } from "../../agents/mcp-ui-resource.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import { mcpAppHandlers } from "./mcp-app.js";
-import { expectRpcError } from "./rpc-response.test-support.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
 const mocks = vi.hoisted(() => ({ transport: vi.fn(), view: vi.fn(), question: vi.fn() }));
@@ -156,7 +155,10 @@ function invoke() {
 }
 
 function expectTimeout(respond: unknown) {
-  expectRpcError(respond, { code: "UNAVAILABLE", message: "Request timed out" });
+  expect(respond).toHaveBeenCalledWith(false, undefined, {
+    code: "UNAVAILABLE",
+    message: "Request timed out",
+  });
 }
 
 describe("MCP tool human-input timeouts", () => {

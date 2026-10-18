@@ -84,16 +84,11 @@ describe("Codex app-server attempt client cleanup", () => {
     async ({ cause, matches, retireBefore }) => {
       const harness = trackedHarness();
       const signal = new AbortController().signal;
+      const refuse = () => {
+        throw cause;
+      };
       const before = await harness.client
-        .request(
-          "thread/start",
-          {},
-          {
-            assertCurrent: () => {
-              throw cause;
-            },
-          },
-        )
+        .request("thread/start", {}, { assertCurrent: refuse })
         .catch((error: unknown) => error);
       expect(before).toBeInstanceOf(CodexAppServerScopedRequestRejectedError);
       expect(before).toMatchObject({ cause });
@@ -120,21 +115,15 @@ describe("Codex app-server attempt client cleanup", () => {
     },
   );
 
-  it.each([
-    { terminated: true, oneShot: false },
-    { terminated: true, oneShot: true },
-  ])(
-    "drains native terminals without claiming OS cleanup (terminated=$terminated, oneShot=$oneShot)",
-    async ({ terminated, oneShot }) => {
+  it.each([false, true])(
+    "drains native terminals without claiming OS cleanup (oneShot=%s)",
+    async (oneShot) => {
       const request = vi
         .fn()
-        .mockResolvedValueOnce({
-          data: [{ processId: "10" }, { processId: "20" }],
-          nextCursor: null,
-        })
-        .mockResolvedValueOnce({ terminated })
+        .mockResolvedValueOnce({ data: [{ processId: "10" }, { processId: "20" }] })
         .mockResolvedValueOnce({ terminated: true })
-        .mockResolvedValueOnce({ data: [], nextCursor: null });
+        .mockResolvedValueOnce({ terminated: true })
+        .mockResolvedValueOnce({ data: [] });
       const cleanup = terminateCodexBackgroundTerminals({ request } as never, "thread-1", oneShot);
       if (oneShot) {
         await expect(cleanup).rejects.toThrow("Codex background-terminal cleanup");
@@ -153,18 +142,16 @@ describe("Codex app-server attempt client cleanup", () => {
   it("reports a terminal that remains running after termination", async () => {
     const request = vi
       .fn()
-      .mockResolvedValueOnce({ data: [{ processId: "10" }], nextCursor: null })
+      .mockResolvedValueOnce({ data: [{ processId: "10" }] })
       .mockResolvedValueOnce({ terminated: false })
-      .mockResolvedValueOnce({ data: [{ processId: "10" }], nextCursor: null });
+      .mockResolvedValueOnce({ data: [{ processId: "10" }] });
     await expect(
       terminateCodexBackgroundTerminals({ request } as never, "thread-1"),
     ).rejects.toThrow("Codex background-terminal cleanup failed");
   });
 
   it("keeps strict startup retirement failures visible to lifecycle owners", async () => {
-    const closeAndWait = vi.fn(async () => {
-      throw new Error("strict client retirement failed");
-    });
+    const closeAndWait = vi.fn().mockRejectedValue(new Error("strict client retirement failed"));
 
     await expect(closeCodexStartupClientBestEffort({ closeAndWait } as never)).rejects.toThrow(
       "strict client retirement failed",
@@ -328,9 +315,7 @@ describe("Codex app-server attempt client cleanup", () => {
   });
 
   it("swallows unsubscribe cleanup failures", async () => {
-    const request = vi.fn(async () => {
-      throw new Error("already gone");
-    });
+    const request = vi.fn().mockRejectedValue(new Error("already gone"));
 
     await expect(
       unsubscribeCodexThreadBestEffort({ request } as never, {

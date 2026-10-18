@@ -595,7 +595,8 @@ it.each(realtimeStarts)(
 it.each(
   realtimeStarts.flatMap((start) =>
     (["restart tombstone", "worker placement", "automation"] as const).map((reason) => ({
-      ...start,
+      method: start.method,
+      transport: start.transport,
       reason,
     })),
   ),

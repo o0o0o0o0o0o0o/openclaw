@@ -1,11 +1,22 @@
 // Load context tests cover agent and workspace context resolution for plugin runtimes.
 import { inspect } from "node:util";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { freezeJsonSnapshot } from "../../shared/immutable-data.js";
 import { createPluginCache, withPluginCache } from "../plugin-cache.js";
-import type { PluginMetadataSnapshot } from "../plugin-metadata-snapshot.types.js";
+import { clearPluginMetadataLifecycleCaches } from "../plugin-metadata-lifecycle.js";
+import { createPluginMetadataSnapshotFixture } from "../plugin-metadata.test-support.js";
 import { createEmptyPluginRegistry } from "../registry-empty.js";
+import {
+  buildPluginRuntimeLoadOptions,
+  setPluginRuntimeLoadContext,
+  getPluginRuntimeLoadContext,
+  getReusablePluginRuntimeActivation,
+} from "./load-context.js";
 import { resolvePluginRuntimeLoadContext } from "./load-context.resolve.js";
 
 const loadConfigMock = vi.hoisted(() =>
@@ -14,68 +25,13 @@ const loadConfigMock = vi.hoisted(() =>
 const applyPluginAutoEnableMock = vi.hoisted(() =>
   vi.fn<typeof import("../../config/plugin-auto-enable.js").applyPluginAutoEnable>(),
 );
-const resolvePluginControlPlaneWorkspaceMock = vi.hoisted(() =>
-  vi.fn((params: { config: OpenClawConfig; env?: NodeJS.ProcessEnv; workspaceDir?: string }) => ({
-    workspaceDir: params.workspaceDir ?? "/resolved-workspace",
-    workspaceScope: "selected" as const,
-  })),
-);
-const manifestRegistry = { diagnostics: [], plugins: [] };
-const index: PluginMetadataSnapshot["index"] = {
-  version: 1,
-  hostContractVersion: "test",
-  compatRegistryVersion: "test",
-  migrationVersion: 1,
-  generatedAtMs: 1,
-  installRecords: {},
-  plugins: [],
-  policyHash: "policy",
-  diagnostics: [],
-};
-const metadataSnapshot: PluginMetadataSnapshot = {
-  configFingerprint: "fingerprint",
-  diagnostics: [],
-  index,
-  registryIndex: index,
-  manifestRegistry,
-  registryDiagnostics: [],
-  plugins: [],
-  byPluginId: new Map(),
-  normalizePluginId: (id) => id,
-  declaredProviderOwners: new Map(),
-  owners: {
-    channels: new Map(),
-    channelConfigs: new Map(),
-    providers: new Map(),
-    modelCatalogProviders: new Map(),
-    cliBackends: new Map(),
-    setupProviders: new Map(),
-    commandAliases: new Map(),
-    contracts: new Map(),
-    providerAuthContributions: [],
-    modelIdNormalizationPolicies: new Map(),
-  },
-  metrics: {
-    registrySnapshotMs: 0,
-    manifestRegistryMs: 0,
-    ownerMapsMs: 0,
-    totalMs: 0,
-    indexPluginCount: 0,
-    manifestPluginCount: 0,
-  },
-  policyHash: "policy",
+const metadataSnapshot = {
+  ...createPluginMetadataSnapshotFixture(),
   workspaceDir: "/resolved-workspace",
 };
+const { manifestRegistry } = metadataSnapshot;
 const resolvePluginMetadataSnapshotMock = vi.hoisted(() => vi.fn(() => metadataSnapshot));
 const resolveConfigWidePluginMetadataSnapshotMock = vi.hoisted(() => vi.fn(() => metadataSnapshot));
-
-let buildPluginRuntimeLoadOptions: typeof import("./load-context.js").buildPluginRuntimeLoadOptions;
-let setPluginRuntimeLoadContext: typeof import("./load-context.js").setPluginRuntimeLoadContext;
-let getPluginRuntimeLoadContext: typeof import("./load-context.js").getPluginRuntimeLoadContext;
-let getReusablePluginRuntimeActivation: typeof import("./load-context.js").getReusablePluginRuntimeActivation;
-let clearRuntimeConfigSnapshot: typeof import("../../config/runtime-snapshot.js").clearRuntimeConfigSnapshot;
-let setRuntimeConfigSnapshot: typeof import("../../config/runtime-snapshot.js").setRuntimeConfigSnapshot;
-let clearPluginMetadataLifecycleCaches: typeof import("../plugin-metadata-lifecycle.js").clearPluginMetadataLifecycleCaches;
 
 vi.mock("../../config/config.js", () => ({
   getRuntimeConfig: loadConfigMock,
@@ -87,7 +43,10 @@ vi.mock("../../config/plugin-auto-enable.js", () => ({
 }));
 
 vi.mock("../control-plane-workspace.js", () => ({
-  resolvePluginControlPlaneWorkspace: resolvePluginControlPlaneWorkspaceMock,
+  resolvePluginControlPlaneWorkspace: (params: { workspaceDir?: string }) => ({
+    workspaceDir: params.workspaceDir ?? "/resolved-workspace",
+    workspaceScope: "selected",
+  }),
 }));
 
 vi.mock("../../config/io.plugin-metadata.js", () => ({
@@ -100,24 +59,11 @@ vi.mock("../plugin-metadata-snapshot.js", async (importOriginal) => ({
 }));
 
 describe("resolvePluginRuntimeLoadContext", () => {
-  beforeAll(async () => {
-    ({ clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } =
-      await import("../../config/runtime-snapshot.js"));
-    ({ clearPluginMetadataLifecycleCaches } = await import("../plugin-metadata-lifecycle.js"));
-    ({
-      buildPluginRuntimeLoadOptions,
-      setPluginRuntimeLoadContext,
-      getPluginRuntimeLoadContext,
-      getReusablePluginRuntimeActivation,
-    } = await import("./load-context.js"));
-  });
-
   beforeEach(() => {
     loadConfigMock.mockReset();
     applyPluginAutoEnableMock.mockReset();
     resolvePluginMetadataSnapshotMock.mockReset().mockReturnValue(metadataSnapshot);
     resolveConfigWidePluginMetadataSnapshotMock.mockReset().mockReturnValue(metadataSnapshot);
-    resolvePluginControlPlaneWorkspaceMock.mockClear();
 
     loadConfigMock.mockReturnValue({ plugins: {} });
     applyPluginAutoEnableMock.mockImplementation((params) => ({
@@ -132,11 +78,7 @@ describe("resolvePluginRuntimeLoadContext", () => {
   it("uses the source runtime snapshot for plugin activation source config", () => {
     const env = { HOME: "/tmp/openclaw-home" };
     const runtimeConfig = { plugins: {} };
-    const sourceConfig = {
-      plugins: {
-        allow: ["trusted-plugin"],
-      },
-    };
+    const sourceConfig = { plugins: { allow: ["trusted-plugin"] } };
 
     setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
     loadConfigMock.mockReturnValue(runtimeConfig);
@@ -240,16 +182,10 @@ describe("resolvePluginRuntimeLoadContext", () => {
   });
 
   it("hashes immutable fleet activation inputs once across registry rebindings", () => {
-    const config = freezeJsonSnapshot({
-      agents: {
-        entries: Object.fromEntries(
-          Array.from({ length: 200 }, (_, agentIndex) => [
-            `agent-${agentIndex}`,
-            { name: `${agentIndex}` },
-          ]),
-        ),
-      },
-    });
+    const entries = Object.fromEntries(
+      Array.from({ length: 200 }, (_, i) => [`agent-${i}`, { name: `${i}` }]),
+    );
+    const config = freezeJsonSnapshot({ agents: { entries } });
     const env = { HOME: "/tmp/openclaw-activation-fleet" };
     const context = resolvePluginRuntimeLoadContext({ config, env });
     const registry = createEmptyPluginRegistry();

@@ -38,6 +38,7 @@ function catalog(id: string, hosts: ReturnType<typeof host>[], error?: object) {
   return { id, hosts, ...(error ? { error } : {}) };
 }
 const page = (...catalogs: ReturnType<typeof catalog>[]) => ({ catalogs });
+const stale = (message: string) => ({ code: "catalog_stale", message });
 
 const imported = {
   sessionKey: "agent:main:imported-session",
@@ -131,13 +132,8 @@ describe("sessions import CLI", () => {
         page(
           catalog(
             "claude",
-            [
-              host(["visible"], {
-                nextCursor: "stale-cursor",
-                error: { code: "catalog_stale", message: "Host refresh failed" },
-              }),
-            ],
-            { code: "catalog_stale", message: "Showing the last successful page" },
+            [host(["visible"], { nextCursor: "stale", error: stale("Host stale") })],
+            stale("Catalog stale"),
           ),
         ),
       )
@@ -149,8 +145,8 @@ describe("sessions import CLI", () => {
     expect(output()).toMatchObject({
       ok: false,
       results: [
-        { catalogId: "claude", status: "failed", error: "Showing the last successful page" },
-        { hostId: "gateway:local", status: "failed", error: "Host refresh failed" },
+        { catalogId: "claude", status: "failed", error: "Catalog stale" },
+        { hostId: "gateway:local", status: "failed", error: "Host stale" },
         { threadId: "visible", status: "imported", importedItems: 2 },
       ],
       summary: { imported: 1, failed: 2 },

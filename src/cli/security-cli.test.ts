@@ -46,8 +46,7 @@ vi.mock("../security/fix.js", () => ({
 }));
 
 vi.mock("./command-secret-gateway.js", () => ({
-  resolveCommandSecretRefsViaGateway: (opts: unknown) =>
-    mocks.resolveCommandSecretRefsViaGateway(opts),
+  resolveCommandSecretRefsViaGateway: mocks.resolveCommandSecretRefsViaGateway,
 }));
 
 vi.mock("./command-secret-targets.js", () => ({

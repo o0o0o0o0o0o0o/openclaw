@@ -124,31 +124,19 @@ describe("skills verify CLI", () => {
     await fs.mkdir(path.join(skillDir, ".clawhub"), { recursive: true });
     await fs.writeFile(path.join(skillDir, "SKILL.md"), `# ${slug}\n`);
     await fs.writeFile(path.join(skillDir, ".clawhub", "origin.json"), JSON.stringify(metadata));
-    await fs.mkdir(path.join(mocks.workspaceDir, ".clawhub"), { recursive: true });
-    await fs.writeFile(
-      path.join(mocks.workspaceDir, ".clawhub", "lock.json"),
-      JSON.stringify({
-        version: 1,
-        skills: { [slug]: { ...metadata, version: metadata.installedVersion } },
-      }),
-    );
+    const lockDir = path.join(mocks.workspaceDir, ".clawhub");
+    const lockEntry = { ...metadata, version: metadata.installedVersion };
+    const lock = { version: 1, skills: { [slug]: lockEntry } };
+    await fs.mkdir(lockDir, { recursive: true });
+    await fs.writeFile(path.join(lockDir, "lock.json"), JSON.stringify(lock));
     return skillDir;
   }
 
   it("verifies an installed skills.sh skill by its exact reference without a version selector", async () => {
     const requestedReference = "skills-sh:patrick-erichsen/skills/html";
     await writeInstalledSkill("html", requestedReference);
-    mockVerification({
-      decision: "unscanned",
-      reasons: ["security.not_scanned_by_clawhub"],
-      skill: { slug: "html" },
-      publisher: { handle: "patrick-erichsen" },
-      version: { version: "a".repeat(40) },
-      security: { status: "not-scanned", passed: false },
-    });
-
+    mockVerification({ decision: "unscanned" });
     await expect(runCommand(requestedReference)).rejects.toThrow("__exit__:1");
-
     expectVerification({ slug: "html", requestedReference });
     expect(payload().openclaw?.trust).toEqual({
       state: "not-scanned-by-clawhub",
@@ -156,28 +144,20 @@ describe("skills verify CLI", () => {
     });
   });
 
-  it("rejects an installed skills.sh reference from another owner in JSON", async () => {
-    await writeInstalledSkill("html", "skills-sh:owner-a/repo-a/html");
-    await expect(runCommand("skills-sh:owner-b/repo-b/html", "--json")).rejects.toThrow(
-      "__exit__:1",
-    );
-    expect(payload()).toEqual({
-      ok: false,
-      error: {
-        type: "cli_error",
-        message: 'Skill "html" is not tracked from skills-sh:owner-b/repo-b/html.',
-      },
-    });
+  it.each([
+    [
+      ["skills-sh:owner-b/repo-b/html", "--json"],
+      'Skill "html" is not tracked from skills-sh:owner-b/repo-b/html.',
+      "skills-sh:owner-a/repo-a/html",
+    ],
+    [["weather", "--agent", " "], "--agent must not be blank", undefined],
+  ])("reports invalid target %s as JSON before verification", async (args, message, installed) => {
+    if (installed) {
+      await writeInstalledSkill("html", installed);
+    }
+    await expect(runCommand(...args)).rejects.toThrow("__exit__:1");
+    expect(payload()).toEqual({ ok: false, error: { type: "cli_error", message } });
     expect(mocks.errors).toStrictEqual([]);
-    expect(mocks.verify).not.toHaveBeenCalled();
-  });
-
-  it("reports workspace resolution exceptions as JSON", async () => {
-    await expect(runCommand("weather", "--agent", " ")).rejects.toThrow("__exit__:1");
-    expect(payload()).toEqual({
-      ok: false,
-      error: { type: "cli_error", message: "--agent must not be blank" },
-    });
     expect(mocks.verify).not.toHaveBeenCalled();
   });
 
@@ -215,7 +195,6 @@ describe("skills verify CLI", () => {
     });
 
     await runCommand("agentreceipt", "--json");
-
     expectVerification({ slug: "agentreceipt", version: "1.2.3" });
     const result = payload();
     expect(result.ok).toBe(true);
@@ -232,18 +211,13 @@ describe("skills verify CLI", () => {
 
   it("prints cards for owner-qualified tag verification", async () => {
     mockVerification({
-      skill: { slug: "weather" },
-      publisher: { handle: "demo-owner" },
-      version: { version: "2.0.0" },
       card: {
         available: true,
         url: "https://cards.example.test/generated/weather.md",
       },
     });
     mocks.card.mockResolvedValueOnce("# Weather\n");
-
     await runCommand("@demo-owner/weather", "--tag", "latest", "--card");
-
     expectVerification({
       slug: "weather",
       ownerHandle: "demo-owner",
@@ -260,10 +234,7 @@ describe("skills verify CLI", () => {
 
   it("does not promote unavailable provenance URLs in verify JSON", async () => {
     mockVerification({
-      provenance: {
-        source: "unavailable",
-        url: "https://github.com/openclaw/skills/tree/unverified/agentreceipt",
-      },
+      provenance: { source: "unavailable", url: "https://github.com/o/r/tree/unverified/s" },
     });
 
     await runCommand("agentreceipt");

@@ -248,12 +248,11 @@ describe("secrets store CLI", () => {
   });
 
   it("imports quoted and multiline dotenv values without exposing them", async () => {
+    const privateKey = "-----BEGIN PRIVATE KEY-----\nmultiline-body\n-----END PRIVATE KEY-----";
     const dotenvPath = await inputFile(
       [
         'SERVICE_URL="https://service.test/path with spaces"',
-        'SERVICE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----',
-        "multiline-body",
-        '-----END PRIVATE KEY-----"',
+        `SERVICE_PRIVATE_KEY="${privateKey}"`,
         "SERVICE_EMPTY=",
       ].join("\n"),
     );
@@ -263,11 +262,7 @@ describe("secrets store CLI", () => {
     expect(mocks.writeBatch.mock.calls[0]?.[0]?.entries).toEqual(
       [
         ["SERVICE_URL", "https://service.test/path with spaces", "env"],
-        [
-          "SERVICE_PRIVATE_KEY",
-          "-----BEGIN PRIVATE KEY-----\nmultiline-body\n-----END PRIVATE KEY-----",
-          "secret",
-        ],
+        ["SERVICE_PRIVATE_KEY", privateKey, "secret"],
         ["SERVICE_EMPTY", "", "env"],
       ].map(([name, value, kind]) => ({ name, value, kind })),
     );

@@ -53,17 +53,8 @@ describe("skills formatting", () => {
       }),
     ]);
     const output = formatSkillsList(mixed, { verbose: true });
-    expectContains(
-      output,
-      "1/4 ready",
-      "📸",
-      "✓",
-      "excluded",
-      "disabled",
-      "needs setup",
-      "anyBins",
-      "os:",
-    );
+    expectContains(output, "1/4 ready", "📸", "✓", "excluded", "disabled", "needs setup");
+    expectContains(output, "anyBins", "os:");
     const detail = formatSkillInfo(mixed, "agent-excluded", {});
     expectContains(detail, "Excluded by agent allowlist", "excludes this skill");
     const eligible = formatSkillsList(mixed, { eligible: true });
@@ -81,25 +72,23 @@ describe("skills formatting", () => {
     expect(info([entry], "excel-xlsx")).toContain("Spreadsheet helpers");
   });
 
-  it("prefers an exact skill name over another skill's key in either discovery order", () => {
-    const alias = skill("another-skill", { skillKey: "requested-skill" });
-    const target = skill("requested-skill", { skillKey: "target-key" });
-    for (const entries of [
-      [alias, target],
-      [target, alias],
-    ]) {
-      expect(JSON.parse(info(entries, "requested-skill", true)).name).toBe("requested-skill");
-    }
-  });
-
-  it("rejects ambiguous exact key selectors regardless of discovery order", () => {
-    const query = "shared-key";
-    const skills = [skill("first", { skillKey: query }), skill("second", { skillKey: query })];
+  it.each([
+    [
+      "requested-skill",
+      [
+        skill("another-skill", { skillKey: "requested-skill" }),
+        skill("requested-skill", { skillKey: "target-key" }),
+      ],
+      { name: "requested-skill" },
+    ],
+    [
+      "shared-key",
+      [skill("first", { skillKey: "shared-key" }), skill("second", { skillKey: "shared-key" })],
+      { ok: false, skill: "shared-key" },
+    ],
+  ])("resolves %s consistently in either discovery order", (query, skills, expected) => {
     for (const entries of [skills, skills.toReversed()]) {
-      expect(JSON.parse(info(entries, query, true))).toMatchObject({
-        ok: false,
-        skill: query,
-      });
+      expect(JSON.parse(info(entries, query, true))).toMatchObject(expected);
     }
   });
 
@@ -113,15 +102,8 @@ describe("skills formatting", () => {
         skill("agent-filtered", { blockedByAgentFilter: true }),
         skill("excluded-missing", filtered),
         skill("missing-bin", { eligible: false, missing, emoji: "🎙\uFE0E" }),
-        skill("disabled", {
-          ...filtered,
-          disabled: true,
-          blockedByAllowlist: true,
-        }),
-        skill("blocked-bundled", {
-          ...filtered,
-          blockedByAllowlist: true,
-        }),
+        skill("disabled", { ...filtered, disabled: true, blockedByAllowlist: true }),
+        skill("blocked-bundled", { ...filtered, blockedByAllowlist: true }),
       ]),
       agentId: "specialist",
       agentSkillFilter: ["ready", "prompt-hidden", "slash-hidden", "missing-bin"],

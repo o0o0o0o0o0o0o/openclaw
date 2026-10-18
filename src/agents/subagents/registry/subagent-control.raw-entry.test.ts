@@ -833,7 +833,7 @@ it.each([
           sessionKey,
           agentId: "main",
           expectedRunId: "unbound-incarnation",
-          expectedGeneration: 1,
+          expectedGeneration: 2,
         }),
       ).toEqual({ found: false, killed: false });
       expect(getSubagentRunByRunId("unbound-incarnation")?.execution.status).toBe("running");

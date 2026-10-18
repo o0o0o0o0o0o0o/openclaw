@@ -1,9 +1,7 @@
 import type {
   ExecApprovalPendingView,
-  ExpiredApprovalView,
   PendingApprovalView,
   PluginApprovalPendingView,
-  ResolvedApprovalView,
 } from "openclaw/plugin-sdk/approval-handler-runtime";
 import type {
   ExecApprovalRequest,
@@ -47,7 +45,12 @@ const cfg: OpenClawConfig = {
   },
 };
 
-const approveAction = { decision: "allow-once", label: "Approve once", style: "success" } as const;
+const approveAction = {
+  decision: "allow-once",
+  label: "Approve once",
+  style: "success",
+  command: "",
+} as const;
 
 function createExecPendingView(): ExecApprovalPendingView {
   return {
@@ -55,25 +58,9 @@ function createExecPendingView(): ExecApprovalPendingView {
     approvalKind: "exec",
     phase: "pending",
     title: "Exec Approval Required",
-    description: "A command needs your approval.",
-    metadata: [
-      { label: "Agent", value: "operations" },
-      { label: "Host", value: "gateway" },
-    ],
+    metadata: [],
     commandText: "deploy --production",
-    cwd: "/srv/service",
-    actions: [
-      {
-        ...approveAction,
-        command: "/approve exec-approval-1 allow-once",
-      },
-      {
-        decision: "deny",
-        label: "Deny",
-        style: "danger",
-        command: "/approve exec-approval-1 deny",
-      },
-    ],
+    actions: [approveAction, { decision: "deny", label: "Deny", style: "danger", command: "" }],
     expiresAtMs: Date.now() + 60_000,
   };
 }
@@ -86,19 +73,9 @@ function createPluginPendingView(): PluginApprovalPendingView {
     approvalKind: "plugin",
     title: "Deploy production service",
     description: "The deployment plugin requests access.",
-    metadata: [
-      { label: "Plugin", value: "deployments" },
-      { label: "Tool", value: "deploy_service" },
-    ],
-    pluginId: "deployments",
-    toolName: "deploy_service",
+    metadata: [],
     severity: "critical",
-    actions: [
-      {
-        ...approveAction,
-        command: "/approve plugin-approval-1 allow-once",
-      },
-    ],
+    actions: [approveAction],
   };
 }
 
@@ -113,8 +90,6 @@ function createRequest(view: PendingApprovalView): ExecApprovalRequest | PluginA
             title: view.title,
             description: view.description ?? "",
             severity: view.severity,
-            pluginId: view.pluginId ?? undefined,
-            toolName: view.toolName ?? undefined,
           }
         : { command: view.commandText },
   };
@@ -274,7 +249,7 @@ describe("msTeamsApprovalNativeRuntime", () => {
 
   it("delivers and binds pending cards, then replaces resolved cards without actions", async () => {
     const scenario = await deliverScenario();
-    const { view, request, pendingPayload, entry } = scenario;
+    const { view, request, pendingPayload } = scenario;
     expect(sendAdaptiveCardMSTeams).toHaveBeenCalledWith({
       cfg,
       accountId: "default",
@@ -298,12 +273,6 @@ describe("msTeamsApprovalNativeRuntime", () => {
       });
     }
 
-    const resolvedView: ResolvedApprovalView = {
-      ...view,
-      phase: "resolved",
-      decision: "allow-once",
-      resolvedBy: "00000000-0000-4000-8000-000000000001",
-    };
     const final = await msTeamsApprovalNativeRuntime.presentation.buildResolvedResult({
       ...scenario,
       resolved: {
@@ -312,15 +281,18 @@ describe("msTeamsApprovalNativeRuntime", () => {
         resolvedBy: "00000000-0000-4000-8000-000000000001",
         ts: Date.now(),
       },
-      view: resolvedView,
-      entry,
+      view: {
+        ...view,
+        phase: "resolved",
+        decision: "allow-once",
+        resolvedBy: "00000000-0000-4000-8000-000000000001",
+      },
     });
     if (final.kind !== "update") {
       throw new Error("Expected resolved Microsoft Teams approval card update");
     }
     await msTeamsApprovalNativeRuntime.transport.updateEntry?.({
       ...scenario,
-      entry,
       payload: final.payload,
       phase: "resolved",
     });
@@ -336,7 +308,6 @@ describe("msTeamsApprovalNativeRuntime", () => {
 
     await msTeamsApprovalNativeRuntime.interactions?.unbindPending?.({
       ...scenario,
-      entry,
       binding,
     });
     for (const token of binding) {
@@ -357,7 +328,6 @@ describe("msTeamsApprovalNativeRuntime", () => {
     );
     await msTeamsApprovalNativeRuntime.transport.updateEntry?.({
       ...scenario,
-      entry,
       payload: { type: "AdaptiveCard" },
       phase: "resolved",
     });
@@ -396,21 +366,17 @@ describe("msTeamsApprovalNativeRuntime", () => {
 
   it("replaces expired approvals without actions and releases canceled deliveries", async () => {
     const scenario = await deliverScenario(createPluginPendingView());
-    const { entry } = scenario;
     const binding = await bindScenario(scenario);
 
-    const expiredView: ExpiredApprovalView = { ...scenario.view, phase: "expired" };
     const final = await msTeamsApprovalNativeRuntime.presentation.buildExpiredResult({
       ...scenario,
-      view: expiredView,
-      entry,
+      view: { ...scenario.view, phase: "expired" },
     });
     if (final.kind !== "update") {
       throw new Error("Expected expired Microsoft Teams approval card update");
     }
     await msTeamsApprovalNativeRuntime.transport.updateEntry?.({
       ...scenario,
-      entry,
       payload: final.payload,
       phase: "expired",
     });
@@ -423,10 +389,7 @@ describe("msTeamsApprovalNativeRuntime", () => {
     expect(JSON.stringify(final.payload)).toContain("Plugin Approval Expired");
     expect(final.payload).not.toHaveProperty("actions");
 
-    await msTeamsApprovalNativeRuntime.interactions?.cancelDelivered?.({
-      ...scenario,
-      entry,
-    });
+    await msTeamsApprovalNativeRuntime.interactions?.cancelDelivered?.(scenario);
     for (const token of binding) {
       expect(msTeamsApprovalControls.get(token)).toBeNull();
     }

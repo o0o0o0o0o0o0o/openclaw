@@ -43,14 +43,8 @@ const cfg = {
   channels: {
     msteams: {
       appId: "default-app-id",
-      appPassword: "default-secret",
-      tenantId: "tenant-id",
       accounts: {
-        secondary: {
-          appId: "secondary-app-id",
-          appPassword: "secondary-secret",
-          webhook: { path: "/api/messages/secondary" },
-        },
+        secondary: { appId: "secondary-app-id" },
       },
     },
   },
@@ -69,6 +63,8 @@ describe("msteams directory live", () => {
     vi.clearAllMocks();
     normalizeQueryMock.mockImplementation((value?: string | null) => value?.trim() ?? "");
     resolveGraphTokenMock.mockResolvedValue("graph-token");
+    searchGraphUsersMock.mockResolvedValue([]);
+    listTeamsByNameMock.mockResolvedValue([]);
   });
 
   it("returns normalized peer entries and skips users without ids", async () => {
@@ -91,18 +87,12 @@ describe("msteams directory live", () => {
     });
   });
 
-  it("resolves directory graph credentials with the named account id", async () => {
-    searchGraphUsersMock.mockResolvedValue([]);
-
-    await listMSTeamsDirectoryPeersLive({
-      cfg,
-      accountId: "secondary",
-      query: "alice",
-    });
-
-    expect(resolveGraphTokenMock).toHaveBeenCalledWith(cfg, {
-      accountId: "secondary",
-    });
+  it.each([
+    ["peers", listMSTeamsDirectoryPeersLive, "alice"],
+    ["groups", listMSTeamsDirectoryGroupsLive, "platform"],
+  ] as const)("resolves %s with the named account", async (_kind, list, query) => {
+    await list({ cfg, accountId: "secondary", query });
+    expect(resolveGraphTokenMock).toHaveBeenCalledWith(cfg, { accountId: "secondary" });
   });
 
   it("returns team entries without channel queries and honors limits", async () => {
@@ -140,19 +130,5 @@ describe("msteams directory live", () => {
     ]);
 
     expect(listTeamsByNameMock).toHaveBeenCalledWith("graph-token", "plat");
-  });
-
-  it("resolves group directory graph credentials with the named account id", async () => {
-    listTeamsByNameMock.mockResolvedValue([]);
-
-    await listMSTeamsDirectoryGroupsLive({
-      cfg,
-      accountId: "secondary",
-      query: "platform",
-    });
-
-    expect(resolveGraphTokenMock).toHaveBeenCalledWith(cfg, {
-      accountId: "secondary",
-    });
   });
 });

@@ -13,32 +13,24 @@ afterEach(() => {
   lookupMock.mockReset();
 });
 
-const publicResolve = async () => ({ address: "13.107.136.10" });
-const privateResolve = (ip: string) => async () => ({ address: ip });
 const multiResolve = (ips: string[]) => async () => ips.map((address) => ({ address }));
+const publicResolve = multiResolve(["13.107.136.10"]);
 const failingResolve = async () => {
   throw new Error("DNS failure");
-};
-
-type ConsentValidationOptions = {
-  resolveFn?: (hostname: string) => Promise<{ address: string } | { address: string }[]>;
 };
 
 function uploadToConsentUrl({
   url = "https://contoso.sharepoint.com/upload",
   buffer = Buffer.from("test"),
   fetchFn = async () => new Response(null, { status: 200 }),
-  validationOpts,
+  resolveFn = publicResolve,
   ...params
 }: Partial<Parameters<typeof uploadConsentFile>[0]> & {
   fetchFn?: typeof fetch;
-  validationOpts?: ConsentValidationOptions;
+  resolveFn?: typeof publicResolve;
 }) {
   vi.stubGlobal("fetch", fetchFn);
-  lookupMock.mockImplementation(async (hostname: string) => {
-    const result = await (validationOpts?.resolveFn ?? publicResolve)(hostname);
-    return Array.isArray(result) ? result : [result];
-  });
+  lookupMock.mockImplementation(resolveFn);
   return uploadConsentFile({ url, buffer, ...params });
 }
 
@@ -72,7 +64,7 @@ describe("validateConsentUploadUrl", () => {
   const dnsUrl = "https://evil.sharepoint.com/path";
   it.each([
     ["invalid URLs", "not a url", publicResolve, "not a valid URL"],
-    ["IPv6 loopback", dnsUrl, privateResolve("::1"), "private/reserved IP"],
+    ["IPv6 loopback", dnsUrl, multiResolve(["::1"]), "private/reserved IP"],
     [
       "mixed DNS answers",
       dnsUrl,
@@ -87,7 +79,7 @@ describe("validateConsentUploadUrl", () => {
       "not in the allowed domains",
     ],
   ] as const)("rejects %s", async (_name, url, resolveFn, error) => {
-    await expect(uploadToConsentUrl({ url, validationOpts: { resolveFn } })).rejects.toThrow(error);
+    await expect(uploadToConsentUrl({ url, resolveFn })).rejects.toThrow(error);
   });
 });
 
@@ -125,10 +117,7 @@ describe("uploadToConsentUrl", () => {
     expect(completionMs).toBeGreaterThan(baseTimeoutMs);
     expect(completionMs).toBeLessThan(resolvedTimeoutMs);
 
-    const uploadPromise = uploadToConsentUrl({
-      buffer,
-      fetchFn: request.fetchFn,
-    });
+    const uploadPromise = uploadToConsentUrl({ buffer, fetchFn: request.fetchFn });
 
     await vi.advanceTimersByTimeAsync(0);
     expect(request.fetchFn).toHaveBeenCalledOnce();
@@ -150,7 +139,7 @@ describe("uploadToConsentUrl", () => {
     });
     const resolveFn = vi.fn(async () => {
       await resolutionReady;
-      return { address: "13.107.136.10" };
+      return publicResolve();
     });
     const mockFetch = vi.fn<typeof fetch>(async (_url, init) => {
       backing.fill(0);
@@ -163,7 +152,7 @@ describe("uploadToConsentUrl", () => {
       buffer,
       contentType: "application/pdf",
       fetchFn: mockFetch,
-      validationOpts: { resolveFn },
+      resolveFn,
     });
     await vi.waitFor(() => expect(resolveFn).toHaveBeenCalledOnce());
     expect(mockFetch).not.toHaveBeenCalled();
@@ -189,11 +178,9 @@ describe("uploadToConsentUrl", () => {
     const { response, cancel } = responseWithCancel(403, "Forbidden");
     const mockFetch = vi.fn<typeof fetch>(async () => response);
 
-    await expect(
-      uploadToConsentUrl({
-        fetchFn: mockFetch,
-      }),
-    ).rejects.toThrow("File upload to consent URL failed: 403 Forbidden");
+    await expect(uploadToConsentUrl({ fetchFn: mockFetch })).rejects.toThrow(
+      "File upload to consent URL failed: 403 Forbidden",
+    );
     expect(cancel).toHaveBeenCalledOnce();
   });
 

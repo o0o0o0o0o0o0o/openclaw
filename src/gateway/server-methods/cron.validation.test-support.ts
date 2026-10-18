@@ -13,6 +13,7 @@ import {
   createChannelTestPluginBase,
   createTestRegistry,
 } from "../../test-utils/channel-plugins.js";
+import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
 import type { CronCreatorAuthorityGrant } from "../cron-creator-authority-grant.types.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
@@ -122,11 +123,8 @@ export function createCronTestContext(
       writeScratch: vi.fn(
         async (_id: string, params: { content: string | null; commitGuard?: () => void }) => {
           params.commitGuard?.();
-          return {
-            ok: true as const,
-            scratch: { content: params.content, revision: 1 },
-            currentRevision: 1,
-          };
+          const scratch = { content: params.content, revision: 1 };
+          return { ok: true as const, scratch, currentRevision: scratch.revision };
         },
       ),
       list: vi.fn(async () => jobs),
@@ -138,8 +136,7 @@ export function createCronTestContext(
         const filteredJobs = matchesJob ? agentJobs.filter(matchesJob) : agentJobs;
         const total = filteredJobs.length;
         const offset = Math.max(0, Math.min(total, Math.floor(opts?.offset ?? 0)));
-        const defaultLimit = total === 0 ? 50 : total;
-        const limit = Math.max(1, Math.min(200, Math.floor(opts?.limit ?? defaultLimit)));
+        const limit = Math.max(1, Math.min(200, Math.floor(opts?.limit ?? (total || 50))));
         const pageJobs = filteredJobs.slice(offset, offset + limit);
         const nextOffset = offset + pageJobs.length;
         return {
@@ -156,9 +153,8 @@ export function createCronTestContext(
     logGateway: { info: vi.fn(), warn: vi.fn() },
     cronStorePath: "cron-validation-test.json",
     getRuntimeConfig,
-    validateAgentRuntimeApprovalAuthority: undefined as
-      | GatewayRequestContext["validateAgentRuntimeApprovalAuthority"]
-      | undefined,
+    validateAgentRuntimeApprovalAuthority:
+      undefined as GatewayRequestContext["validateAgentRuntimeApprovalAuthority"],
   };
 }
 
@@ -193,11 +189,8 @@ export function telegramConfig(): OpenClawConfig {
 }
 
 export function telegramSlackConfig(params: { includeMainSession?: boolean } = {}): OpenClawConfig {
-  return {
-    ...slackConfig(params),
-    channels: { ...telegramConfig().channels, ...slackConfig().channels },
-    plugins: pluginEntries("telegram", "slack"),
-  };
+  const channels = { ...telegramConfig().channels, ...slackConfig().channels };
+  return { ...slackConfig(params), ...channelConfig(channels) };
 }
 
 export function telegramDisabledAccountConfig(): OpenClawConfig {
@@ -219,10 +212,7 @@ export function msteamsConfig(): OpenClawConfig {
 }
 
 export function slackSynologyConfig(): OpenClawConfig {
-  return {
-    channels: { ...slackConfig().channels, "synology-chat": { token: "synology-token" } },
-    plugins: pluginEntries("slack", "synology-chat"),
-  };
+  return channelConfig({ ...slackConfig().channels, "synology-chat": { token: "synology-token" } });
 }
 
 function channelConfig(channels: NonNullable<OpenClawConfig["channels"]>): OpenClawConfig {
@@ -244,31 +234,30 @@ export function createCronCallerClient(
   currentJobExpiresAtMs = Date.now() + 60_000,
 ): GatewayClient {
   const operationalRunInstance = createOperationalRunInstanceRef("run-cron-validation");
+  const identity: AgentRuntimeIdentity = {
+    kind: "agentRuntime",
+    agentId,
+    sessionKey: sessionKey ?? `agent:${agentId}:main`,
+    operationalRunInstance,
+    delegatedAuthority: {
+      kind: "local",
+      operationalRunInstance,
+      lifecycleGeneration: "test-generation",
+      claimId: "test-claim",
+    },
+  };
+  if (accountId) {
+    identity.turnSourceAccountId = accountId;
+  }
+  if (currentJobId) {
+    identity.cronSelfManagementContext = {
+      jobId: currentJobId,
+      expiresAtMs: currentJobExpiresAtMs,
+    };
+  }
   return {
     connect: {} as GatewayClient["connect"],
-    internal: {
-      agentRuntimeIdentity: {
-        kind: "agentRuntime",
-        agentId,
-        sessionKey: sessionKey ?? `agent:${agentId}:main`,
-        operationalRunInstance,
-        delegatedAuthority: {
-          kind: "local",
-          operationalRunInstance,
-          lifecycleGeneration: "test-generation",
-          claimId: "test-claim",
-        },
-        ...(accountId ? { turnSourceAccountId: accountId } : {}),
-        ...(currentJobId
-          ? {
-              cronSelfManagementContext: {
-                jobId: currentJobId,
-                expiresAtMs: currentJobExpiresAtMs,
-              },
-            }
-          : {}),
-      },
-    },
+    internal: { agentRuntimeIdentity: identity },
   };
 }
 

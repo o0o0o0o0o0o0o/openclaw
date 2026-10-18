@@ -48,14 +48,8 @@ const createUpgradeContext = () => ({
 
 const owner = { deviceId: "device-1", publicKey: "public-key-1" };
 const upgradeRequest = { requestId: "request-1" };
-const rolePolicy = (scopes: string[] | undefined) =>
-  scopes
-    ? ({
-        sessions: { others: "view" },
-        agents: "*",
-        scopes,
-      } satisfies GatewayOperatorRoleDefinition)
-    : undefined;
+const rolePolicy = (scopes: string[] | undefined): GatewayOperatorRoleDefinition | undefined =>
+  scopes ? { sessions: { others: "view" }, agents: "*", scopes } : undefined;
 const denial = (message: string) =>
   expect.objectContaining({ code: "INVALID_REQUEST", message: expect.stringContaining(message) });
 

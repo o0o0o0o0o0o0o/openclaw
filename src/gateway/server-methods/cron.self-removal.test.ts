@@ -7,7 +7,6 @@ import {
   prepareAgentRunAdmission,
 } from "../../agents/admitted-run-context.js";
 import { getActiveCronJobCount } from "../../cron/active-jobs.js";
-import type { CronEvent } from "../../cron/service.js";
 import {
   createCronServiceWithStateForTest,
   setupCronServiceSuite,
@@ -26,7 +25,7 @@ import {
 } from "../cron-creator-authority-grant.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import { callCron } from "./cron-read.test-support.js";
-import { createCronCallerClient } from "./cron.validation.test-support.js";
+import { agentTurnCronParams, createCronCallerClient } from "./cron.validation.test-support.js";
 
 const { logger, makeStorePath } = setupCronServiceSuite({ prefix: "cron-self-removal-" });
 
@@ -43,24 +42,26 @@ it.each([
     const { storePath } = await makeStorePath();
     const clock = createGatewaySchedulerClock(Date.now());
     const scheduler = createTestGatewayScheduler(clock.clock);
-    const events: CronEvent[] = [];
-    const finished = createDeferred<CronEvent>();
+    const finished = createDeferred<void>();
+    const onEvent = vi.fn<NonNullable<CronServiceDeps["onEvent"]>>((event) => {
+      if (event.action === "finished") {
+        finished.resolve();
+      }
+    });
     const outcome = { status: "ok" as const, summary: "final reply after self-cleanup" };
-    const runJob = async ({
-      job,
-      abortSignal,
-      executionIdentity,
-    }: Parameters<NonNullable<CronServiceDeps["runScriptJob"]>>[0]) => {
+    const runJob: NonNullable<CronServiceDeps["runScriptJob"]> = async (run) => {
+      const { job, abortSignal, executionIdentity } = run;
+      const runId = `run-${job.id}`;
       const admission = prepareAgentRunAdmission({
         cfg: {},
-        operationalRunInstance: createOperationalRunInstanceRef(`run-${job.id}`),
+        operationalRunInstance: createOperationalRunInstanceRef(runId),
         facts: {
-          runId: `run-${job.id}`,
+          runId,
           agentId: "main",
           ingress: { kind: "schedule", boundary: "cron.isolated-agent", state: "present" },
         },
       });
-      const creatorScope = createCronCreatorAuthorityRunScope(`run-${job.id}`, { kind: "local" });
+      const creatorScope = createCronCreatorAuthorityRunScope(runId, { kind: "local" });
       try {
         const admitted = await admission.admit("embedded");
         if (owner !== "unbound") {
@@ -76,7 +77,7 @@ it.each([
           ...client.internal!.agentRuntimeIdentity!,
           operationalRunInstance:
             owner === "different instance"
-              ? createOperationalRunInstanceRef(`run-${job.id}`)
+              ? createOperationalRunInstanceRef(runId)
               : admitted.operationalRunInstance,
           delegatedAuthority: { kind: "local", ...delegatedAuthority },
           cronCreatorAuthorityGrant: mintCronCreatorAuthorityGrant(
@@ -90,24 +91,21 @@ it.each([
         const respond = await callCron(
           createDirectChatContext({
             cron,
-            cronStorePath: storePath,
             validateAgentRuntimeApprovalAuthority: createAgentRuntimeApprovalAuthorityValidator(),
           }),
           "cron.remove",
           { id: job.id },
           { client },
         );
-        if (owner === "exact") {
-          expect(respond).toHaveBeenCalledWith(true, { ok: true, removed: true }, undefined);
-        } else {
-          expect(respond).toHaveBeenCalledWith(
-            false,
-            undefined,
-            expect.objectContaining({ message: expect.stringContaining("job was not removed") }),
-          );
-        }
-        expect(abortSignal?.aborted).toBe(false);
-        expect(getActiveCronJobCount()).toBeGreaterThan(0);
+        const refusal = expect.objectContaining({
+          message: expect.stringContaining("job was not removed"),
+        });
+        expect(respond.mock.calls).toContainEqual(
+          owner === "exact"
+            ? [true, { ok: true, removed: true }, undefined]
+            : [false, undefined, refusal],
+        );
+        expect([abortSignal?.aborted, getActiveCronJobCount() > 0]).toEqual([false, true]);
         return { ...outcome, notify: outcome.summary };
       } finally {
         revokeCronCreatorAuthorityRunScope(creatorScope);
@@ -118,34 +116,24 @@ it.each([
       scheduler,
       storePath,
       cronEnabled: true,
-      defaultAgentId: "main",
       log: logger,
       enqueueSystemEvent: vi.fn(),
       requestHeartbeat: vi.fn(),
-      onEvent: (event) => {
-        events.push(event);
-        if (event.action === "finished") {
-          finished.resolve(event);
-        }
-      },
+      onEvent,
       runIsolatedAgentJob: runJob,
       runScriptJob: runJob,
     });
     try {
       const job = await cron.add(
-        {
-          name: "self-cleanup",
-          enabled: true,
-          deleteAfterRun: false,
+        agentTurnCronParams({
           schedule: { kind: "at", at: new Date(clock.clock.now() + 1_000).toISOString() },
-          sessionTarget: "isolated",
-          wakeMode: "next-heartbeat",
           payload:
             payloadKind === "script"
               ? { kind: "script", script: "return {}", timeoutSeconds }
               : { kind: "agentTurn", message: "remove this job, then finish", timeoutSeconds },
+          deleteAfterRun: false,
           delivery: { mode: "none" },
-        },
+        }),
         { scheduledToolPolicy: { version: 1, mode: "trusted" } },
       );
       if (path === "manual") {
@@ -156,6 +144,7 @@ it.each([
         await onTimer(state);
       }
       await finished.promise;
+      const events = onEvent.mock.calls.map(([event]) => event);
       expect(events.filter((event) => event.action === "finished")).toEqual([
         expect.objectContaining({ jobId: job.id, completionStatus: "succeeded", ...outcome }),
       ]);

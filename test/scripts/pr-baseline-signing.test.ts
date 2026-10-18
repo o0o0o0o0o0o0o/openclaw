@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncOptionsWithBufferEncoding } from "node:child_process";
 import {
   appendFileSync,
   existsSync,
@@ -18,6 +18,15 @@ const describePosix = process.platform === "win32" ? describe.skip : describe;
 describePosix("native baseline signing handoff", () => {
   it("seals a published successor request, rejects changed inputs, and recovers the same signed candidate", () => {
     const f = createBaselineFixture(dirs.make("openclaw-pr-signing-"));
+    const gitBytes = (
+      cwd: string,
+      args: string[],
+      options: SpawnSyncOptionsWithBufferEncoding = {},
+    ) => {
+      const result = spawnSync("git", args, { cwd, env: f.env, ...options });
+      expect(result.status, result.stderr.toString()).toBe(0);
+      return result.stdout;
+    };
     f.pass("prepare-baseline-refresh", f.manifest(f.advanceMain("initial upstream")));
     f.approve();
     const source = f.publish();
@@ -159,19 +168,11 @@ if (process.argv[1]?.endsWith('/baseline-refresh.mjs') && process.argv[2] === 'c
     const headers = unsigned.subarray(0, split).toString();
     const tree = /^tree ([a-f0-9]{40})$/mu.exec(headers)![1]!;
     const parents = [...headers.matchAll(/^parent ([a-f0-9]{40})$/gmu)].map((m) => m[1]!);
-    const pack = spawnSync("git", ["pack-objects", "--stdout", "--revs"], {
-      cwd: f.worktree,
-      env: f.env,
+    const pack = gitBytes(f.worktree, ["pack-objects", "--stdout", "--revs"], {
       maxBuffer: 16 * 1024 * 1024,
       input: [tree, ...parents].join("\n") + "\n",
     });
-    expect(pack.status, pack.stderr.toString()).toBe(0);
-    const imported = spawnSync("git", ["index-pack", "--stdin"], {
-      cwd: spool,
-      env: f.env,
-      input: pack.stdout,
-    });
-    expect(imported.status, imported.stderr.toString()).toBe(0);
+    gitBytes(spool, ["index-pack", "--stdin"], { input: pack });
     const identity: NodeJS.ProcessEnv = {};
     for (const role of ["author", "committer"]) {
       const [, name, email, date] = new RegExp(`^${role} (.*) <([^>]*)> (.*)$`, "mu").exec(
@@ -181,29 +182,15 @@ if (process.argv[1]?.endsWith('/baseline-refresh.mjs') && process.argv[2] === 'c
       identity[`GIT_${role.toUpperCase()}_EMAIL`] = email;
       identity[`GIT_${role.toUpperCase()}_DATE`] = date;
     }
+    const signingCommand = ["-c", "gpg.format=ssh", "commit-tree"];
+    const parentArgs = parents.flatMap((parent) => ["-p", parent]);
     const sign = (key: string) => {
-      const result = spawnSync(
-        "git",
-        [
-          "-c",
-          "gpg.format=ssh",
-          "commit-tree",
-          `-S${key}`,
-          tree,
-          ...parents.flatMap((parent) => ["-p", parent]),
-        ],
-        {
-          cwd: spool,
-          env: { ...f.env, ...identity },
-          input: unsigned.subarray(split + 2),
-          encoding: "utf8",
-        },
-      );
-      expect(result.status, result.stderr).toBe(0);
-      const target = result.stdout.trim();
-      const commit = spawnSync("git", ["cat-file", "commit", target], { cwd: spool, env: f.env });
-      expect(commit.status, commit.stderr.toString()).toBe(0);
-      return { target, bytes: commit.stdout };
+      const result = gitBytes(spool, [...signingCommand, `-S${key}`, tree, ...parentArgs], {
+        env: { ...f.env, ...identity },
+        input: unsigned.subarray(split + 2),
+      });
+      const target = result.toString().trim();
+      return { target, bytes: gitBytes(spool, ["cat-file", "commit", target]) };
     };
     const signed = sign(f.key);
     const response = f.local("signed-commit");

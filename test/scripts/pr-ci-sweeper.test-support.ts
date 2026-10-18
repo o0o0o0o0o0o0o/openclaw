@@ -32,6 +32,10 @@ export function fakeGithub(options: {
   const record = (method: string, args: Record<string, unknown>) => {
     calls.push({ method, args });
   };
+  const mutation = (method: string) => (args: Record<string, unknown>) => {
+    record(method, args);
+    return Promise.resolve({});
+  };
   const github = {
     paginate: (
       endpoint: { endpointName: string },
@@ -91,24 +95,15 @@ export function fakeGithub(options: {
             : (configured ?? options.prs.find((entry) => entry.number === pullNumber));
           return Promise.resolve({ data: match });
         },
-        update: (args: Record<string, unknown>) => {
-          record("pulls.update", args);
-          return Promise.resolve({});
-        },
+        update: mutation("pulls.update"),
       },
       actions: {
         listWorkflowRuns: { endpointName: "actions.listWorkflowRuns" },
-        reRunWorkflow: (args: Record<string, unknown>) => {
-          record("actions.reRunWorkflow", args);
-          return Promise.resolve({});
-        },
+        reRunWorkflow: mutation("actions.reRunWorkflow"),
       },
       issues: {
         listEvents: { endpointName: "issues.listEvents" },
-        createComment: (args: Record<string, unknown>) => {
-          record("issues.createComment", args);
-          return Promise.resolve({});
-        },
+        createComment: mutation("issues.createComment"),
       },
     },
   };

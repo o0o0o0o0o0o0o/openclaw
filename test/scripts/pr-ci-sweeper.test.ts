@@ -66,25 +66,23 @@ describe("runPrCiSweeper", () => {
     expect(calls.filter((call) => call.method === "pulls.update")).toEqual([]);
   });
 
-  it.each(["cancelled"])(
-    "logs attached %s CI on a non-auto-merge PR without re-executing it",
-    async (conclusion) => {
-      const attached = listedPr(21, "5".repeat(40));
-      const { github, calls } = fakeGithub({
-        prs: [attached],
-        runsBySha: {
-          [attached.head.sha]: [{ id: 100, status: "completed", conclusion }],
-        },
-      });
-      const { core: loggedCore, logs } = recordingCore();
-      const results = await sweep(github, { core: loggedCore });
-      expect(results).toEqual([
-        { number: 21, sha: "5".repeat(12), action: "skip", reason: "ci-attached" },
-      ]);
-      expect(logs).toContain(`pr-ci-sweeper: skip #21 (ci-attached: 100:completed/${conclusion})`);
-      expectNoMutation(calls);
-    },
-  );
+  it("logs cancelled CI without re-executing a non-auto-merge PR", async () => {
+    const conclusion = "cancelled";
+    const attached = listedPr(21, "5".repeat(40));
+    const { github, calls } = fakeGithub({
+      prs: [attached],
+      runsBySha: {
+        [attached.head.sha]: [{ id: 100, status: "completed", conclusion }],
+      },
+    });
+    const { core: loggedCore, logs } = recordingCore();
+    const results = await sweep(github, { core: loggedCore });
+    expect(results).toEqual([
+      { number: 21, sha: "5".repeat(12), action: "skip", reason: "ci-attached" },
+    ]);
+    expect(logs).toContain(`pr-ci-sweeper: skip #21 (ci-attached: 100:completed/${conclusion})`);
+    expectNoMutation(calls);
+  });
 
   it("logs draft skips so every scanned PR has a decision", async () => {
     const draft = listedPr(22, "6".repeat(40), { draft: true });
@@ -97,36 +95,32 @@ describe("runPrCiSweeper", () => {
     expect(calls.filter((call) => call.method === "actions.listWorkflowRuns")).toEqual([]);
   });
 
-  it.each([{ name: "startup_failure-only CI", ciRuns: [{ conclusion: "startup_failure" }] }])(
-    "does not re-fire $name when the final PR read becomes draft",
-    async ({ ciRuns }) => {
-      const candidate = listedPr(23, "7".repeat(40));
-      const { github, calls } = fakeGithub({
-        prs: [candidate],
-        runsBySha: { [candidate.head.sha]: ciRuns },
-        pullsGetByNumber: {
-          [candidate.number]: [candidate, { ...candidate, draft: true }],
-        },
-      });
-      const { core: loggedCore, logs } = recordingCore();
+  it("does not re-fire startup-failed CI when the final PR read becomes draft", async () => {
+    const ciRuns = [{ conclusion: "startup_failure" }];
+    const candidate = listedPr(23, "7".repeat(40));
+    const { github, calls } = fakeGithub({
+      prs: [candidate],
+      runsBySha: { [candidate.head.sha]: ciRuns },
+      pullsGetByNumber: {
+        [candidate.number]: [candidate, { ...candidate, draft: true }],
+      },
+    });
+    const { core: loggedCore, logs } = recordingCore();
 
-      const results = await sweep(github, { core: loggedCore });
+    const results = await sweep(github, { core: loggedCore });
 
-      expectNoMutation(calls);
-      expect(results).toEqual([
-        { number: 23, sha: "7".repeat(12), action: "skip", reason: "changed-during-sweep" },
-      ]);
-      expect(logs).toContain("pr-ci-sweeper: #23 changed during sweep; leaving it alone");
-      expect(logs.at(-1)).toContain("0 re-fires");
-      expect(
-        calls
-          .filter(
-            (call) => call.method === "pulls.get" || call.method === "actions.listWorkflowRuns",
-          )
-          .map((call) => call.method),
-      ).toEqual(["actions.listWorkflowRuns", "pulls.get", "pulls.get"]);
-    },
-  );
+    expectNoMutation(calls);
+    expect(results).toEqual([
+      { number: 23, sha: "7".repeat(12), action: "skip", reason: "changed-during-sweep" },
+    ]);
+    expect(logs).toContain("pr-ci-sweeper: #23 changed during sweep; leaving it alone");
+    expect(logs.at(-1)).toContain("0 re-fires");
+    expect(
+      calls
+        .filter((call) => call.method === "pulls.get" || call.method === "actions.listWorkflowRuns")
+        .map((call) => call.method),
+    ).toEqual(["actions.listWorkflowRuns", "pulls.get", "pulls.get"]);
+  });
 
   it("keeps logging decisions after the per-sweep re-fire cap", async () => {
     const dropped = Array.from({ length: 11 }, (_, index) =>

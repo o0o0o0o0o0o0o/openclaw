@@ -287,113 +287,98 @@ describe("shell lazy events", () => {
     },
   );
 
-  it.each(["unavailable", "denied", "replacement-write-failed"] as const)(
-    "retries in place without replaying an older action when storage is %s",
-    async (mode) => {
-      const storage = createStorageMock();
-      if (mode === "replacement-write-failed") {
-        storage.setItem(storageKey, JSON.stringify({ eventType: SHELL_APPROVALS_OPEN_EVENT }));
+  it.each([
+    "unavailable",
+    "denied",
+    "replacement-write-failed",
+    "close",
+    "context-replaced",
+    "disconnected",
+    "new-request",
+    "reload",
+  ] as const)("owns a stale palette retry through %s", async (mode) => {
+    const storage = createStorageMock();
+    const inPlace = ["unavailable", "denied", "replacement-write-failed"].includes(mode);
+    if (mode === "replacement-write-failed") {
+      storage.setItem(storageKey, JSON.stringify({ eventType: SHELL_APPROVALS_OPEN_EVENT }));
+    }
+    vi.stubGlobal("sessionStorage", mode === "unavailable" ? null : storage);
+    if (mode === "denied") {
+      Object.defineProperty(globalThis, "sessionStorage", {
+        configurable: true,
+        get() {
+          throw new DOMException("Storage blocked", "SecurityError");
+        },
+      });
+    }
+    const probe = createDeferred<Response>();
+    const head = vi.fn(() =>
+      inPlace ? Promise.resolve(new Response(null, { status: 200 })) : probe.promise,
+    );
+    vi.stubGlobal("fetch", head);
+    const element = stalePalette();
+    const open = vi.fn();
+    const shell = paletteShell(element, open);
+    if (mode === "replacement-write-failed") {
+      vi.spyOn(storage, "setItem").mockImplementation(() => {
+        throw new DOMException("Storage full", "QuotaExceededError");
+      });
+    }
+    try {
+      if (mode !== "reload") {
+        shell.connect();
       }
-      vi.stubGlobal("sessionStorage", mode === "unavailable" ? null : storage);
-      if (mode === "denied") {
-        Object.defineProperty(globalThis, "sessionStorage", {
-          configurable: true,
-          get() {
-            throw new DOMException("Storage blocked", "SecurityError");
-          },
-        });
+      shell.openPalette();
+      await vi.waitFor(() => expect(shell.lazyCustomElements.visibleState?.status).toBe("error"));
+      if (mode === "reload") {
+        storage.setItem(storageKey, "{}");
       }
-      const head = vi.fn(async () => new Response(null, { status: 200 }));
-      vi.stubGlobal("fetch", head);
-      const open = vi.fn();
-      const shell = paletteShell(stalePalette(), open);
-      if (mode === "replacement-write-failed") {
-        vi.spyOn(storage, "setItem").mockImplementation(() => {
-          throw new DOMException("Storage full", "QuotaExceededError");
-        });
-      }
-
-      await withConnectedShell(shell, async () => {
-        shell.openPalette();
-        await vi.waitFor(() => expect(shell.lazyCustomElements.visibleState?.status).toBe("error"));
-        shell.lazyCustomElements.retry();
+      shell.lazyCustomElements.retry();
+      if (inPlace) {
         await Promise.all(recovery.pending);
-
         await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
         expect(recovery.reload).not.toHaveBeenCalled();
         expect(head).not.toHaveBeenCalled();
         expect(readLazyShellAction()).toBeNull();
-      });
-    },
-  );
-
-  it.each(["close", "context-replaced", "disconnected", "new-request"] as const)(
-    "does not reload a retired retry after %s while the document probe is pending",
-    async (retirement) => {
-      const probe = createDeferred<Response>();
-      const head = vi.fn(() => probe.promise);
-      vi.stubGlobal("fetch", head);
-      const open = vi.fn();
-      const shell = paletteShell(stalePalette(), open);
-
-      try {
-        await withConnectedShell(shell, async () => {
-          shell.openPalette();
-          await vi.waitFor(() =>
-            expect(shell.lazyCustomElements.visibleState?.status).toBe("error"),
-          );
-          shell.lazyCustomElements.retry();
-          await vi.waitFor(() => expect(head).toHaveBeenCalledOnce());
-
-          if (retirement === "close") {
+      } else {
+        await vi.waitFor(() => expect(head).toHaveBeenCalledOnce());
+        switch (mode) {
+          case "close":
             shell.lazyCustomElements.close();
-          } else if (retirement === "context-replaced") {
+            break;
+          case "context-replaced":
             shell.shellChrome.abandonPendingLazyActionForContext();
-          } else if (retirement === "disconnected") {
+            break;
+          case "disconnected":
             shell.disconnect();
-          } else {
+            break;
+          case "new-request":
             shell.lazyCustomElements.request(createLazyElementSpec("new request"));
-          }
-          probe.resolve(new Response(null, { status: 200 }));
-          await expect(Promise.all(recovery.pending)).resolves.toEqual([false]);
-
+            break;
+        }
+        probe.resolve(new Response(null, { status: 200 }));
+        await expect(Promise.all(recovery.pending)).resolves.toEqual([mode === "reload"]);
+        if (mode === "reload") {
+          expect(recovery.reload).toHaveBeenCalledOnce();
+          expect(readLazyShellAction()).toEqual({ eventType: COMMAND_PALETTE_OPEN_EVENT });
+          const replacement = paletteShell(element, open);
+          await withConnectedShell(replacement, async () => {
+            replacement.restorePendingLazyAction();
+            await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
+            replacement.restorePendingLazyAction();
+            expect(open).toHaveBeenCalledOnce();
+            expect(readLazyShellAction()).toBeNull();
+          });
+        } else {
           expect(recovery.reload).not.toHaveBeenCalled();
           expect(open).not.toHaveBeenCalled();
-        });
-      } finally {
-        probe.resolve(new Response(null, { status: 503 }));
-        await Promise.all(recovery.pending);
+        }
       }
-    },
-  );
-
-  it("repairs stale stored intent before reloading and replays the current action once", async () => {
-    const storage = createStorageMock();
-    vi.stubGlobal("sessionStorage", storage);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response(null, { status: 200 })),
-    );
-    const element = stalePalette();
-    const open = vi.fn();
-    const shell = paletteShell(element, open);
-
-    shell.openPalette();
-    await vi.waitFor(() => expect(shell.lazyCustomElements.visibleState?.status).toBe("error"));
-    storage.setItem(storageKey, "{}");
-    shell.lazyCustomElements.retry();
-    await expect(Promise.all(recovery.pending)).resolves.toEqual([true]);
-    expect(recovery.reload).toHaveBeenCalledOnce();
-    expect(readLazyShellAction()).toEqual({ eventType: COMMAND_PALETTE_OPEN_EVENT });
-
-    const replacement = paletteShell(element, open);
-    await withConnectedShell(replacement, async () => {
-      replacement.restorePendingLazyAction();
-      await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
-      replacement.restorePendingLazyAction();
-      expect(open).toHaveBeenCalledOnce();
-      expect(readLazyShellAction()).toBeNull();
-    });
+    } finally {
+      shell.disconnect();
+      probe.resolve(new Response(null, { status: 503 }));
+      await Promise.all(recovery.pending);
+    }
   });
 
   it.each(["shortcuts", "approvals"] as const)(
@@ -435,56 +420,55 @@ describe("shell lazy events", () => {
     },
   );
 
-  it("requests the keyboard shortcuts dialog even from a focused text input", async () => {
-    const requested = vi.fn();
-    const shell = shellFixture();
-    const dialog = mountOverlay(shell, "keyboardShortcuts", KEYBOARD_SHORTCUTS_ELEMENT.tagName, {});
-    const input = document.body.appendChild(document.createElement("input"));
-    const shortcut = keydown("/", "Slash", true);
-    window.addEventListener(KEYBOARD_SHORTCUTS_REQUEST_EVENT, requested);
-    document.body.append(shell.element);
-
-    try {
-      await withConnectedShell(shell, async () => {
-        input.focus();
-        expect(document.activeElement).toBe(input);
-        input.dispatchEvent(shortcut);
-
-        expect(shortcut.defaultPrevented).toBe(true);
-        expect(requested).toHaveBeenCalledOnce();
-        await vi.dynamicImportSettled();
-        await vi.waitFor(() => expect(dialog).toMatchObject({ isOpen: true }));
-      });
-    } finally {
-      shell.element.remove();
-      input.remove();
-      window.removeEventListener(KEYBOARD_SHORTCUTS_REQUEST_EVENT, requested);
-    }
-  });
-
-  it("loads the debug overlay shortcut and ignores editable targets", async () => {
-    const toggled = vi.fn();
-    const shell = shellFixture();
-    mountOverlay(shell, "debugOverlay", "openclaw-debug-overlay", {
-      toggle: toggled,
-      open: toggled,
-    });
-    document.body.append(shell.element);
-    const shortcut = keydown("d", "KeyD");
-
-    await withConnectedShell(shell, async () => {
-      shell.handleDocumentKeydown(shortcut);
-      expect(shortcut.defaultPrevented).toBe(true);
-      await vi.dynamicImportSettled();
-      await vi.waitFor(() => expect(toggled).toHaveBeenCalledOnce());
-
+  it.each(["shortcuts", "debug"] as const)(
+    "handles the %s shortcut and its editable-target policy",
+    async (surface) => {
+      const requested = vi.fn();
+      const toggled = vi.fn();
+      const shell = shellFixture();
+      const isDebug = surface === "debug";
+      const overlay = mountOverlay(
+        shell,
+        isDebug ? "debugOverlay" : "keyboardShortcuts",
+        isDebug ? "openclaw-debug-overlay" : KEYBOARD_SHORTCUTS_ELEMENT.tagName,
+        isDebug ? { toggle: toggled, open: toggled } : {},
+      );
       const input = document.body.appendChild(document.createElement("input"));
-      onTestFinished(() => input.remove());
-      input.addEventListener("keydown", (event) => shell.handleDocumentKeydown(event));
-      input.dispatchEvent(keydown("d", "KeyD", true));
-      expect(toggled).toHaveBeenCalledOnce();
-    });
-  });
+      document.body.append(shell.element);
+      const shortcut = isDebug ? keydown("d", "KeyD") : keydown("/", "Slash", true);
+      if (!isDebug) {
+        window.addEventListener(KEYBOARD_SHORTCUTS_REQUEST_EVENT, requested);
+      }
+      try {
+        await withConnectedShell(shell, async () => {
+          if (isDebug) {
+            shell.handleDocumentKeydown(shortcut);
+          } else {
+            input.focus();
+            expect(document.activeElement).toBe(input);
+            input.dispatchEvent(shortcut);
+          }
+          expect(shortcut.defaultPrevented).toBe(true);
+          if (!isDebug) {
+            expect(requested).toHaveBeenCalledOnce();
+          }
+          await vi.dynamicImportSettled();
+          if (isDebug) {
+            await vi.waitFor(() => expect(toggled).toHaveBeenCalledOnce());
+            input.addEventListener("keydown", (event) => shell.handleDocumentKeydown(event));
+            input.dispatchEvent(keydown("d", "KeyD", true));
+            expect(toggled).toHaveBeenCalledOnce();
+          } else {
+            await vi.waitFor(() => expect(overlay).toMatchObject({ isOpen: true }));
+          }
+        });
+      } finally {
+        shell.element.remove();
+        input.remove();
+        window.removeEventListener(KEYBOARD_SHORTCUTS_REQUEST_EVENT, requested);
+      }
+    },
+  );
 
   it.each(["close", "context", "replacement", "unmounted", "detached"] as const)(
     "keeps the pending debug frame intent owned through %s",

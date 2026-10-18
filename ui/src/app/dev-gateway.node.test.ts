@@ -1,13 +1,16 @@
 // @vitest-environment node
-import { once } from "node:events";
+import { once, type EventEmitter } from "node:events";
 import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
 import path from "node:path";
-import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { createLogger, createServer as createViteServer } from "vite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
+import {
+  closeHttpServer,
+  listenLoopback,
+} from "../../../test/helpers/gateway-integration-fixtures.ts";
+import { withTestTimeout } from "../../../test/helpers/promise.js";
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
 import { createControlUiDevGateway } from "../../config/control-ui-dev-gateway.ts";
 import controlUiViteConfig from "../../vite.config.ts";
@@ -30,12 +33,12 @@ describe("configured UI development Gateway", () => {
     const events: Array<{
       phase: string;
       event: string;
-      code?: string | number;
+      code?: number | string;
       message?: string;
     }> = [];
-    const proxyCloses: Promise<void>[] = [];
-    const peerCloses: Promise<number>[] = [];
-    const websocketCloses: Promise<number>[] = [];
+    const proxyCloses: Promise<number | undefined>[] = [];
+    const peerCloses: Promise<number | undefined>[] = [];
+    const socketCloses: Promise<number | undefined>[] = [];
     const pendingWrites: Promise<void>[] = [];
     const eventWait = new AbortController();
     let phase = "normal";
@@ -43,15 +46,14 @@ describe("configured UI development Gateway", () => {
     const recordError = (event: string, error: { message: string; code?: string }) => {
       events.push({ phase, event, code: error.code, message: error.message });
     };
-    const closed = (socket: WebSocket, endpoint: string) => {
-      const promise = new Promise<number>((resolve) => {
-        socket.on("error", (error) => recordError(`${endpoint}-error`, error));
-        socket.once("close", (code) => {
-          events.push({ phase, event: `${endpoint}-close`, code });
-          resolve(code);
+    const closed = (socket: EventEmitter, endpoint: string) => {
+      const promise = new Promise<number | undefined>((resolve) => {
+        socket.on("error", (error: Error) => recordError(`${endpoint}-error`, error));
+        socket.once("close", (code: unknown) => {
+          resolve(typeof code === "number" ? code : undefined);
         });
       });
-      websocketCloses.push(promise);
+      socketCloses.push(promise);
       return promise;
     };
     const nextEvent = (socket: WebSocket, event: "open" | "message") => {
@@ -60,30 +62,8 @@ describe("configured UI development Gateway", () => {
       void promise.catch(() => undefined);
       return promise;
     };
-    const trackProxy = (socket: Duplex, endpoint: string) => {
-      socket.on("error", (error) => recordError(`${endpoint}-error`, error));
-      proxyCloses.push(
-        new Promise((resolve) => {
-          socket.once("close", () => {
-            events.push({ phase, event: `${endpoint}-close` });
-            resolve();
-          });
-        }),
-      );
-    };
-    const withinDeadline = async <T>(promise: Promise<T>) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        return await Promise.race([
-          promise,
-          new Promise<never>((_resolve, reject) => {
-            timer = setTimeout(() => reject(new Error(JSON.stringify(events))), 5_000);
-          }),
-        ]);
-      } finally {
-        clearTimeout(timer);
-      }
-    };
+    const withinDeadline = <T>(promise: Promise<T>) =>
+      withTestTimeout(promise, 5_000, JSON.stringify(events));
     const upstream = createServer((request, response) => {
       requests.push({
         path: request.url ?? "",
@@ -119,9 +99,7 @@ describe("configured UI development Gateway", () => {
     let socket: WebSocket | undefined;
     await runQaGatewayFixture(
       async () => {
-        upstream.listen(0, "127.0.0.1");
-        await once(upstream, "listening");
-        const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+        const upstreamUrl = await listenLoopback(upstream);
         vi.stubEnv("OPENCLAW_UI_DEV_GATEWAY_URL", upstreamUrl);
         const config = controlUiViteConfig({ command: "serve" });
         for (const options of Object.values(config.server?.proxy ?? {})) {
@@ -133,9 +111,9 @@ describe("configured UI development Gateway", () => {
             configure?.(proxy, resolved);
             proxy.on("error", (error) => recordError("proxy-error", error));
             proxy.on("proxyReqWs", (request, _incoming, downstream) => {
-              trackProxy(downstream, "downstream");
+              proxyCloses.push(closed(downstream, "downstream"));
               request.once("upgrade", (_response, upstreamSocket) => {
-                trackProxy(upstreamSocket, "upstream");
+                proxyCloses.push(closed(upstreamSocket, "upstream"));
               });
             });
           };
@@ -158,12 +136,8 @@ describe("configured UI development Gateway", () => {
         const gateway = createControlUiDevGateway(upstreamUrl)!.gateway;
         vi.stubGlobal("OPENCLAW_UI_DEV_GATEWAY", gateway);
         const httpServer = server.httpServer!;
-        const listening = once(httpServer, "listening");
-        // Vite's listen(0) probes and releases a port before binding it. Bind its
-        // native server directly so the kernel retains the fixture's allocation.
-        httpServer.listen(0, "127.0.0.1");
-        await listening;
-        const uiOrigin = `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}`;
+        // Bind the native server directly; Vite's listen(0) releases its probed port.
+        const uiOrigin = await listenLoopback(httpServer);
         vi.stubGlobal("location", new URL(uiOrigin));
         const webSocketOptions = {
           // Removal: use ws's `origin` option after Bun's built-in client honors it.
@@ -293,13 +267,8 @@ describe("configured UI development Gateway", () => {
         new Promise<void>((resolve) => {
           sockets.close(() => resolve());
         }),
-      () => {
-        upstream.closeAllConnections();
-        return new Promise<void>((resolve) => {
-          upstream.close(() => resolve());
-        });
-      },
-      () => withinDeadline(Promise.all([...proxyCloses, ...websocketCloses, ...pendingWrites])),
+      () => closeHttpServer(upstream),
+      () => withinDeadline(Promise.all([...proxyCloses, ...socketCloses, ...pendingWrites])),
     );
   });
 

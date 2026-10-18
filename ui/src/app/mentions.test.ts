@@ -295,13 +295,10 @@ describe("application mention Inbox", () => {
     ["refresh", "profile"],
   ] as const)("clears the Inbox when %s reports %s access loss", async (operation, failure) => {
     vi.useFakeTimers();
-    let revoked = false;
-    const request = vi.fn<RequestFn>(() =>
-      revoked ? Promise.reject(accessError(failure === "profile")) : Promise.resolve(result(1)),
-    );
+    const request = vi.fn<RequestFn>().mockResolvedValue(result(1));
     const { capability } = inboxFixture(request);
     await capability.refresh();
-    revoked = true;
+    request.mockRejectedValue(accessError(failure === "profile"));
 
     if (operation === "refresh") {
       await capability.refresh();
@@ -315,7 +312,7 @@ describe("application mention Inbox", () => {
       dismissing: [],
       error: "Mention access revoked",
     });
-    revoked = false;
+    request.mockResolvedValue(result(1));
     if (failure === "profile") {
       await vi.advanceTimersByTimeAsync(1_000);
     }

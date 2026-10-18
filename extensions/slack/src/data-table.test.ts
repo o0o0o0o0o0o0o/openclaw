@@ -55,10 +55,10 @@ describe("Slack data table blocks", () => {
       buildSlackDataTableBlock({
         type: "table",
         caption: "Pipeline report",
-        headers: ["Account", "Stage", "ARR"],
+        headers: ["Account", "ARR"],
         rows: [
-          ["Acme", "Won", 125_000],
-          ["Globex", "Review", 82_000],
+          ["Acme", 125_000],
+          ["Globex", 82_000],
         ],
         rowHeaderColumnIndex: 0,
       }),
@@ -66,9 +66,9 @@ describe("Slack data table blocks", () => {
       type: "data_table",
       caption: "Pipeline report",
       rows: [
-        [rawText("Account"), rawText("Stage"), rawText("ARR")],
-        [rawText("Acme"), rawText("Won"), rawNumber(125_000, "125000")],
-        [rawText("Globex"), rawText("Review"), rawNumber(82_000, "82000")],
+        [rawText("Account"), rawText("ARR")],
+        [rawText("Acme"), rawNumber(125_000, "125000")],
+        [rawText("Globex"), rawNumber(82_000, "82000")],
       ],
       row_header_column_index: 0,
     });

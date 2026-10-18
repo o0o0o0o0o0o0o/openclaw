@@ -1,5 +1,4 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-// Slack tests cover channel type plugin behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveSlackChannelType, resolveSlackConversationInfo } from "./channel-type.js";
 
@@ -10,15 +9,14 @@ function slackConfig(slack: NonNullable<OpenClawConfig["channels"]>["slack"]): O
 const slackClientMocks = vi.hoisted(() => {
   const conversationsInfo = vi.fn();
   const conversationsOpen = vi.fn();
+  const createClient = () => ({
+    conversations: { info: conversationsInfo, open: conversationsOpen },
+  });
   return {
     conversationsInfo,
     conversationsOpen,
-    createSlackReadClient: vi.fn(() => ({
-      conversations: { info: conversationsInfo, open: conversationsOpen },
-    })),
-    createSlackWebClient: vi.fn(() => ({
-      conversations: { info: conversationsInfo, open: conversationsOpen },
-    })),
+    createSlackReadClient: vi.fn(createClient),
+    createSlackWebClient: vi.fn(createClient),
   };
 });
 const {
@@ -69,56 +67,49 @@ describe("resolveSlackChannelType", () => {
     expect(conversationsInfoMock).not.toHaveBeenCalled();
   });
 
-  it("uses an env user token for native IM reads with a configured bot token", async () => {
-    vi.stubEnv("SLACK_USER_TOKEN", "envUsr");
-    conversationsInfoMock.mockResolvedValueOnce({
-      channel: { id: "DENVUSERREAD1", is_im: true, user: "U09G2DJ0275" },
-    });
-
-    await expect(
-      resolveSlackConversationInfo({
-        cfg: slackConfig({ botToken: "botB" }),
-        channelId: "DENVUSERREAD1",
-        operation: "read",
-      }),
-    ).resolves.toEqual({ type: "dm", user: "U09G2DJ0275" });
-    expect(createSlackReadClientMock).toHaveBeenCalledWith(
-      "envUsr",
-      { teamId: undefined },
-      undefined,
-      undefined,
-    );
-    expect(createSlackWebClientMock).not.toHaveBeenCalled();
-    expect(conversationsInfoMock).toHaveBeenCalledWith({ channel: "DENVUSERREAD1" });
-    expect(conversationsOpenMock).not.toHaveBeenCalled();
-  });
-
-  it("uses an env bot token for native IM writes with a configured user token", async () => {
-    vi.stubEnv("SLACK_BOT_TOKEN", "envBot");
-    conversationsOpenMock.mockResolvedValueOnce({
-      channel: { id: "DENVBOTWRITE1", is_im: true, user: "U09G2DJ0275" },
-    });
-
-    await expect(
-      resolveSlackConversationInfo({
-        cfg: slackConfig({ userToken: "usrB" }),
-        channelId: "DENVBOTWRITE1",
-        operation: "write",
-      }),
-    ).resolves.toEqual({ type: "dm", user: "U09G2DJ0275" });
-    expect(createSlackWebClientMock).toHaveBeenCalledWith(
-      "envBot",
-      { teamId: undefined },
-      undefined,
-    );
-    expect(createSlackReadClientMock).not.toHaveBeenCalled();
-    expect(conversationsOpenMock).toHaveBeenCalledWith({
-      channel: "DENVBOTWRITE1",
-      prevent_creation: true,
-      return_im: true,
-    });
-    expect(conversationsInfoMock).not.toHaveBeenCalled();
-  });
+  it.each([
+    {
+      operation: "read",
+      env: "SLACK_USER_TOKEN",
+      token: "envUsr",
+      slack: { botToken: "botB" },
+      channelId: "DENVUSERREAD1",
+    },
+    {
+      operation: "write",
+      env: "SLACK_BOT_TOKEN",
+      token: "envBot",
+      slack: { userToken: "usrB" },
+      channelId: "DENVBOTWRITE1",
+    },
+  ] as const)(
+    "uses the env credential for native IM $operation",
+    async ({ operation, env, token, slack, channelId }) => {
+      vi.stubEnv(env, token);
+      const read = operation === "read";
+      const lookup = read ? conversationsInfoMock : conversationsOpenMock;
+      const createClient = read ? createSlackReadClientMock : createSlackWebClientMock;
+      lookup.mockResolvedValueOnce({
+        channel: { id: channelId, is_im: true, user: "U09G2DJ0275" },
+      });
+      await expect(
+        resolveSlackConversationInfo({ cfg: slackConfig(slack), channelId, operation }),
+      ).resolves.toEqual({ type: "dm", user: "U09G2DJ0275" });
+      expect(createClient).toHaveBeenCalledWith(
+        token,
+        { teamId: undefined },
+        undefined,
+        ...(read ? [undefined] : []),
+      );
+      expect(read ? createSlackWebClientMock : createSlackReadClientMock).not.toHaveBeenCalled();
+      expect(lookup).toHaveBeenCalledWith(
+        read
+          ? { channel: channelId }
+          : { channel: channelId, prevent_creation: true, return_im: true },
+      );
+      expect(read ? conversationsOpenMock : conversationsInfoMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("uses the read credential to classify C-prefixed MPIMs and returns their name", async () => {
     conversationsInfoMock.mockResolvedValueOnce({

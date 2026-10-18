@@ -75,32 +75,32 @@ describe("optional custom element requests", () => {
     return { requests, retryStale, cancelStale };
   }
 
-  it("publishes loading and error before retrying the canonical load and replaying once", async () => {
-    const firstError = new Error("chunk unavailable");
-    const { requests } = createRequestHarness();
+  it.each([false, true])("retries a failed load and replays once (stale: %s)", async (stale) => {
+    const error = new Error(
+      stale ? "Failed to fetch dynamically imported module: panel-abc.js" : "chunk unavailable",
+    );
+    const { requests, retryStale } = createRequestHarness();
     const observed: Array<string | undefined> = [];
     const unsubscribe = requests.subscribe(() => observed.push(requests.visibleState?.status));
     const continuation = vi.fn();
-    const element = failedElement(firstError, true);
-
+    const element = failedElement(error, true);
     requests.request(element, continuation);
-
     expect(requests.visibleState).toMatchObject({ status: "loading", element });
     await waitForFast(() =>
-      expect(requests.visibleState).toMatchObject({
-        status: "error",
-        element,
-        error: firstError,
-        stale: false,
-      }),
+      expect(requests.visibleState).toMatchObject({ status: "error", element, error, stale }),
     );
     expect(continuation).not.toHaveBeenCalled();
     expect(observed).toContain("error");
-
     requests.retry();
-
     expect(requests.visibleState).toMatchObject({ status: "loading", element });
+    if (stale) {
+      expect(retryStale.mock.calls[0]?.[0]?.canReload?.()).toBe(true);
+    }
     await waitForFast(() => expect(continuation).toHaveBeenCalledOnce());
+    expect(retryStale).toHaveBeenCalledTimes(stale ? 1 : 0);
+    if (stale) {
+      expect(retryStale.mock.calls[0]?.[0]?.canReload?.()).toBe(false);
+    }
     expect(element.loadModule).toHaveBeenCalledTimes(2);
     expect(requests.visibleState).toBeUndefined();
     expect(observed.at(-1)).toBeUndefined();
@@ -204,25 +204,6 @@ describe("optional custom element requests", () => {
     await waitForFast(() => expect(element.loadModule).toHaveBeenCalledTimes(2));
   });
 
-  it("delegates stale recovery before falling back to the same in-place load", async () => {
-    const staleError = new Error("Failed to fetch dynamically imported module: panel-abc.js");
-    const { requests, retryStale } = createRequestHarness();
-    const continuation = vi.fn();
-    const element = failedElement(staleError, true);
-
-    requests.request(element, continuation);
-    await waitForFast(() => expect(requests.visibleState?.status).toBe("error"));
-    expect(requests.visibleState).toMatchObject({ stale: true });
-
-    requests.retry();
-    expect(retryStale.mock.calls[0]?.[0]?.canReload?.()).toBe(true);
-
-    await waitForFast(() => expect(continuation).toHaveBeenCalledOnce());
-    expect(retryStale).toHaveBeenCalledOnce();
-    expect(retryStale.mock.calls[0]?.[0]?.canReload?.()).toBe(false);
-    expect(element.loadModule).toHaveBeenCalledTimes(2);
-  });
-
   it("cancels pending page recovery only when a stale failure surface is retired", async () => {
     const staleError = new Error("Failed to fetch dynamically imported module: panel-abc.js");
     const { requests, cancelStale } = createRequestHarness();
@@ -264,36 +245,30 @@ describe("optional custom element requests", () => {
     expect(continuation).not.toHaveBeenCalled();
   });
 
-  it("keeps preload failures silent until an explicit request owns visibility", async () => {
-    const error = new Error("chunk unavailable");
-    const { requests } = createRequestHarness();
-    const element = failedElement(error);
-
-    requests.preload(element);
-    requests.preload(element);
-
-    await waitForFast(() => expect(element.loadModule).toHaveBeenCalledOnce());
-    expect(requests.visibleState).toBeUndefined();
-
-    requests.request(element);
-    await waitForFast(() => expect(requests.visibleState?.status).toBe("error"));
-    expect(element.loadModule).toHaveBeenCalledTimes(2);
-  });
-
-  it("reports a preload failure when an active surface opts into recovery", async () => {
-    const error = new Error("chunk unavailable");
-    const { requests } = createRequestHarness();
-    const element = failedElement(error);
-
-    requests.preload(element, { reportError: true });
-
-    await waitForFast(() =>
-      expect(requests.visibleState).toMatchObject({
-        element,
-        error,
-        stale: false,
-        status: "error",
-      }),
-    );
-  });
+  it.each([false, true])(
+    "publishes preload failures only when requested (reportError: %s)",
+    async (reportError) => {
+      const error = new Error("chunk unavailable");
+      const { requests } = createRequestHarness();
+      const element = failedElement(error);
+      requests.preload(element, { reportError });
+      requests.preload(element, { reportError });
+      await waitForFast(() => expect(element.loadModule).toHaveBeenCalledOnce());
+      if (reportError) {
+        await waitForFast(() =>
+          expect(requests.visibleState).toMatchObject({
+            element,
+            error,
+            stale: false,
+            status: "error",
+          }),
+        );
+      } else {
+        expect(requests.visibleState).toBeUndefined();
+        requests.request(element);
+        await waitForFast(() => expect(requests.visibleState?.status).toBe("error"));
+        expect(element.loadModule).toHaveBeenCalledTimes(2);
+      }
+    },
+  );
 });

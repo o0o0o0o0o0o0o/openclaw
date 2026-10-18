@@ -169,19 +169,17 @@ describe("configured UI development Gateway", () => {
           // Removal: use ws's `origin` option after Bun's built-in client honors it.
           headers: { Origin: uiOrigin },
         };
-        const connect = async () => {
+        const connect = async (frame: string) => {
           socket = new WebSocket(
             gatewayWebSocketTransportUrl(gateway.gatewayUrl),
             webSocketOptions,
           );
           const close = closed(socket, "client");
           await withinDeadline(nextEvent(socket, "open"));
-          return { close };
-        };
-        const echo = async (frame: string) => {
-          const message = nextEvent(socket!, "message");
-          socket!.send(frame);
+          const message = nextEvent(socket, "message");
+          socket.send(frame);
           expect(String((await withinDeadline(message))[0])).toBe(frame);
+          return { close };
         };
         expect(server.httpServer?.address()).toMatchObject({ address: "127.0.0.1" });
         const resourcePath = `${uiDevGatewayResourceBasePath()}/control-ui-config.json`;
@@ -230,8 +228,7 @@ describe("configured UI development Gateway", () => {
         await retired.body?.cancel();
         expect(requests).toHaveLength(gatewayRequests);
 
-        const { close: firstClose } = await connect();
-        await echo("normal-gateway-frame");
+        const { close: firstClose } = await connect("normal-gateway-frame");
         expect(requests.at(-1)).toEqual({ path: "/", origin: uiOrigin });
 
         events.push({ phase, event: "client-close-requested" });
@@ -242,8 +239,7 @@ describe("configured UI development Gateway", () => {
         expect(events.filter(({ event }) => event.endsWith("-error"))).toEqual([]);
 
         phase = "upstream-abort";
-        const { close: interruptedClose } = await connect();
-        await echo("reconnected-gateway-frame");
+        const { close: interruptedClose } = await connect("reconnected-gateway-frame");
         interruptUpstream = true;
         const writes = Array.from(
           { length: 32 },
@@ -263,8 +259,7 @@ describe("configured UI development Gateway", () => {
         await withinDeadline(Promise.all([...proxyCloses, ...writes]));
 
         phase = "recovered";
-        const { close: recoveredClose } = await connect();
-        await echo("recovered-gateway-frame");
+        const { close: recoveredClose } = await connect("recovered-gateway-frame");
         socket!.close(1000, "fixture-complete");
         expect(await withinDeadline(recoveredClose)).toBe(1000);
         expect(await withinDeadline(peerCloses[2]!)).toBe(1000);

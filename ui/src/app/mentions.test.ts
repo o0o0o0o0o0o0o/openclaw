@@ -66,6 +66,15 @@ function inboxFixture(
   const harness = gatewayForMentions(request);
   return { harness, capability: createCapability(harness.gateway, options) };
 }
+function accessError(profile = false) {
+  return new GatewayRequestError({
+    code: profile ? "UNAVAILABLE" : "FORBIDDEN",
+    message: "Mention access revoked",
+    ...(profile
+      ? { details: { code: ConnectErrorDetailCodes.AUTHENTICATED_PROFILE_UNAVAILABLE } }
+      : {}),
+  });
+}
 const capabilities: MentionsCapability[] = [];
 
 function createCapability(...args: Parameters<typeof createMentionsCapability>) {
@@ -197,7 +206,7 @@ describe("application mention Inbox", () => {
     expect(request).toHaveBeenCalledExactlyOnceWith("mentions.list", {});
   });
 
-  it.each([1, 3])("refreshes invalidations newer than snapshot %s", async (revision) => {
+  it.each(["join", 1, 3] as const)("coalesces in-flight refreshes (%s)", async (revision) => {
     const initial = deferred<MentionsListResult>();
     const latest = deferred<MentionsListResult>();
     const request = vi
@@ -205,37 +214,31 @@ describe("application mention Inbox", () => {
       .mockReturnValueOnce(initial.promise)
       .mockReturnValue(latest.promise);
     const { harness, capability } = inboxFixture(request);
-    const hydration = capability.refresh();
-    await flushMicrotasks();
-
-    harness.changed(2);
-    harness.changed(3);
-    initial.resolve(result(revision));
-    await flushMicrotasks();
-    expect(request).toHaveBeenCalledTimes(revision === 1 ? 2 : 1);
-
-    const current = { ...mention, id: "mention-current" };
-    latest.resolve(result(3, [current]));
-    await hydration;
-    expect(capability.snapshot.items).toEqual(revision === 1 ? [current] : [mention]);
-    harness.changed(3);
-    harness.changed(2);
-    await flushMicrotasks();
-    expect(request).toHaveBeenCalledTimes(revision === 1 ? 2 : 1);
-  });
-
-  it("joins explicit refreshes to the same in-flight Inbox snapshot", async () => {
-    const response = deferred<MentionsListResult>();
-    const request = vi.fn<RequestFn>(() => response.promise);
-    const { capability } = inboxFixture(request);
     await flushMicrotasks();
     const refreshes = [capability.refresh(), capability.refresh()];
-
-    response.resolve(result(1));
+    if (revision !== "join") {
+      harness.changed(2);
+      harness.changed(3);
+    }
+    initial.resolve(result(revision === "join" ? 1 : revision));
+    await flushMicrotasks();
+    const calls = revision === 1 ? 2 : 1;
+    expect(request).toHaveBeenCalledTimes(calls);
+    const current = { ...mention, id: "mention-current" };
+    latest.resolve(result(3, [current]));
     await Promise.all(refreshes);
-
-    expect(capability.snapshot).toMatchObject({ phase: "ready", items: [mention] });
-    expect(request).toHaveBeenCalledExactlyOnceWith("mentions.list", {});
+    expect(capability.snapshot).toMatchObject({
+      phase: "ready",
+      items: revision === 1 ? [current] : [mention],
+    });
+    if (revision !== "join") {
+      harness.changed(3);
+      harness.changed(2);
+      await flushMicrotasks();
+      expect(request).toHaveBeenCalledTimes(calls);
+    } else {
+      expect(request).toHaveBeenCalledExactlyOnceWith("mentions.list", {});
+    }
   });
 
   it("reconciles an invalidation arriving as the previous snapshot settles", async () => {
@@ -294,17 +297,7 @@ describe("application mention Inbox", () => {
     vi.useFakeTimers();
     let revoked = false;
     const request = vi.fn<RequestFn>(() =>
-      revoked
-        ? Promise.reject(
-            new GatewayRequestError({
-              code: failure === "role" ? "FORBIDDEN" : "UNAVAILABLE",
-              message: "Mention access revoked",
-              ...(failure === "profile"
-                ? { details: { code: ConnectErrorDetailCodes.AUTHENTICATED_PROFILE_UNAVAILABLE } }
-                : {}),
-            }),
-          )
-        : Promise.resolve(result(1)),
+      revoked ? Promise.reject(accessError(failure === "profile")) : Promise.resolve(result(1)),
     );
     const { capability } = inboxFixture(request);
     await capability.refresh();
@@ -339,9 +332,7 @@ describe("application mention Inbox", () => {
         if (method === "mentions.dismiss") {
           return outcome === "dismissed"
             ? Promise.resolve(result(3, []))
-            : Promise.reject(
-                new GatewayRequestError({ code: "FORBIDDEN", message: "Mention access revoked" }),
-              );
+            : Promise.reject(accessError());
         }
         return ++reads === 1 ? Promise.resolve(result(1)) : stale.promise;
       });

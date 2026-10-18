@@ -1,5 +1,5 @@
 /* @vitest-environment jsdom */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ControlUiLinkReaderDescriptor } from "../../../src/shared/control-ui-link-reader.js";
 import { linkReaderResponseMatchesTarget } from "../components/link-reader-response.ts";
 import { linkReaderTargetKey, resolveLinkReaderTarget } from "../components/link-reader-target.ts";
@@ -7,6 +7,7 @@ import {
   BROWSER_PANEL_TOGGLE_EVENT,
   LINK_READER_PANEL_TOGGLE_EVENT,
 } from "../components/panel-toggle-contract.ts";
+import { listen } from "../lib/reactive/listener.ts";
 import { createTestGatewayClient } from "../test-helpers/gateway-client.ts";
 import { gatewayHelloForMethods } from "../test-helpers/gateway-methods.ts";
 import type { ApplicationGatewaySnapshot } from "./gateway.ts";
@@ -24,9 +25,7 @@ const reader: ControlUiLinkReaderDescriptor = {
   },
 };
 const itemUrl = "https://forge.example/items/123";
-const cleanups: Array<() => void> = [];
 afterEach(() => {
-  cleanups.splice(0).forEach((cleanup) => cleanup());
   document.body.replaceChildren();
   vi.unstubAllGlobals();
 });
@@ -50,10 +49,9 @@ function setup(shouldOpenExternally?: () => boolean) {
     },
   };
   const router = startLinkReaderRouting(() => snapshot, { shouldOpenExternally });
-  cleanups.push(router.dispose);
+  onTestFinished(router.dispose);
   const accept = vi.fn((event: Event) => event.preventDefault());
-  window.addEventListener(LINK_READER_PANEL_TOGGLE_EVENT, accept);
-  cleanups.push(() => window.removeEventListener(LINK_READER_PANEL_TOGGLE_EVENT, accept));
+  onTestFinished(listen(window, LINK_READER_PANEL_TOGGLE_EVENT, accept));
   const shell = document.createElement("openclaw-app-shell");
   const anchor = document.createElement("a");
   anchor.href = itemUrl;
@@ -66,9 +64,7 @@ function setup(shouldOpenExternally?: () => boolean) {
       cancelable: true,
       ...init,
     });
-    // The document capture handlers decide ownership before this test suppresses jsdom navigation.
-    const allowed = anchor.dispatchEvent(event);
-    return { event, allowed };
+    return anchor.dispatchEvent(event);
   };
   return { snapshot, anchor, accept, click };
 }
@@ -117,33 +113,21 @@ describe("Plugin reader link routing", () => {
         });
       }
       const panel = vi.fn();
-      window.addEventListener(BROWSER_PANEL_TOGGLE_EVENT, panel);
-      cleanups.push(() => window.removeEventListener(BROWSER_PANEL_TOGGLE_EVENT, panel));
+      onTestFinished(listen(window, BROWSER_PANEL_TOGGLE_EVENT, panel));
       const routing = startNativeLinkRouting({
         shouldOpenExternally,
         shouldOpenInControlUiBrowser: () => true,
       });
-      cleanups.push(() => routing.dispose());
+      onTestFinished(() => routing.dispose());
 
-      expect(click().allowed).toBe(!native);
+      expect(click()).toBe(!native);
       expect(accept).not.toHaveBeenCalled();
       expect(panel).not.toHaveBeenCalled();
-      expect(postMessage.mock.calls).toEqual(
-        native
-          ? [
-              [
-                {
-                  type: "open-link",
-                  url: itemUrl,
-                  target: "external",
-                },
-              ],
-            ]
-          : [],
-      );
+      const message = { type: "open-link", url: itemUrl, target: "external" };
+      expect(postMessage.mock.calls).toEqual(native ? [[message]] : []);
 
       external = false;
-      expect(click().allowed).toBe(false);
+      expect(click()).toBe(false);
       expect(accept).toHaveBeenCalledOnce();
       const request = accept.mock.calls[0]?.[0];
       expect(request).toBeInstanceOf(CustomEvent);
@@ -165,7 +149,7 @@ describe("Plugin reader link routing", () => {
       if (variant !== "modified") {
         anchor.setAttribute(variant, "");
       }
-      expect(click({ metaKey: variant === "modified" }).allowed).toBe(true);
+      expect(click({ metaKey: variant === "modified" })).toBe(true);
       expect(accept).not.toHaveBeenCalled();
     },
   );
@@ -173,19 +157,19 @@ describe("Plugin reader link routing", () => {
   it("does not swallow links without an available and accepting shell", () => {
     const { snapshot, accept, click } = setup();
     snapshot.pluginCapabilities!.methods = [];
-    expect(click().allowed).toBe(true);
+    expect(click()).toBe(true);
     snapshot.pluginCapabilities!.methods = ["forge.item"];
     snapshot.pluginCapabilities!.controlUiLinkReaders = [];
-    expect(click().allowed).toBe(true);
+    expect(click()).toBe(true);
     snapshot.pluginCapabilities!.controlUiLinkReaders = [reader];
     snapshot.phase = "offline";
-    expect(click().allowed).toBe(true);
+    expect(click()).toBe(true);
     snapshot.phase = "connected";
     snapshot.hello!.auth!.scopes = [];
-    expect(click().allowed).toBe(true);
+    expect(click()).toBe(true);
     snapshot.hello!.auth!.scopes = ["operator.read"];
     window.removeEventListener(LINK_READER_PANEL_TOGGLE_EVENT, accept);
-    expect(click().allowed).toBe(true);
+    expect(click()).toBe(true);
     expect(accept).not.toHaveBeenCalled();
   });
 });

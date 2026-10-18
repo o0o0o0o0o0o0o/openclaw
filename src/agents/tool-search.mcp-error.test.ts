@@ -20,14 +20,6 @@ import {
 import { jsonResult, type AnyAgentTool } from "./tools/common.js";
 
 function makeMcpRuntime(result: CallToolResult): SessionMcpRuntime {
-  const tool = {
-    serverName: "searchServer",
-    safeServerName: "searchServer",
-    toolName: "query",
-    description: "Query the search backend",
-    inputSchema: { type: "object", properties: {} },
-    fallbackDescription: "Query the search backend",
-  };
   const catalog = {
     version: 1 as const,
     generatedAt: 0,
@@ -39,7 +31,16 @@ function makeMcpRuntime(result: CallToolResult): SessionMcpRuntime {
         supportsParallelToolCalls: false,
       },
     },
-    tools: [tool],
+    tools: [
+      {
+        serverName: "searchServer",
+        safeServerName: "searchServer",
+        toolName: "query",
+        description: "Query the search backend",
+        fallbackDescription: "Query the search backend",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ],
   };
   return {
     sessionId: "session-tool-search-mcp-error",
@@ -111,7 +112,6 @@ describe("Tool Search MCP failures", () => {
         id: target.name,
         args: {},
       });
-
       expect(wrappedResult.details).toMatchObject({
         result: { details: { status: innerStatus } },
         status: outerStatus,
@@ -138,8 +138,7 @@ describe("Tool Search MCP failures", () => {
       {
         model,
         convertToLlm: (agentMessages) => agentMessages as Message[],
-        // Mirror the embedded extension's production classification rule here
-        // to isolate agent-core lifecycle and transcript propagation.
+        // Match the embedded extension's lifecycle/transcript error classification.
         afterToolCall: async ({ result, isError }) => ({
           isError: isError || isToolResultError(result),
         }),
@@ -148,7 +147,6 @@ describe("Tool Search MCP failures", () => {
       undefined,
       streamFn,
     );
-
     expect(
       events.find(
         (event) =>

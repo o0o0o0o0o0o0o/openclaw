@@ -1,6 +1,6 @@
-import { Type } from "typebox";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferredCore } from "../shared/deferred.js";
+import { createStubTool } from "./test-helpers/agent-tool-stubs.js";
 import {
   clearToolSearchCatalog,
   createToolSearchCatalogRef,
@@ -8,7 +8,11 @@ import {
   restrictToolSearchCatalog,
 } from "./tool-search-catalog.js";
 import { ToolSearchRuntime } from "./tool-search-runtime.js";
-import type { ToolSearchConfig, ToolSearchToolContext } from "./tool-search-types.js";
+import type {
+  ToolSearchCallOptions,
+  ToolSearchConfig,
+  ToolSearchToolContext,
+} from "./tool-search-types.js";
 import { jsonResult, type AnyAgentTool } from "./tools/common.js";
 
 const config: ToolSearchConfig = {
@@ -17,197 +21,164 @@ const config: ToolSearchConfig = {
   searchDefaultLimit: 8,
   maxSearchLimit: 50,
 };
+type Mode = AnyAgentTool["executionMode"];
 
-function fixture(tools: AnyAgentTool[], extra: Partial<ToolSearchToolContext> = {}) {
-  const catalogRef = createToolSearchCatalogRef();
-  registerHeadlessToolSearchCatalog({ catalogRef, tools });
-  const ctx: ToolSearchToolContext = { catalogRef, ...extra };
-  return { ctx, catalogRef, runtime: new ToolSearchRuntime(ctx, config) };
-}
-
-function gated(name: string, executionMode: AnyAgentTool["executionMode"], events: string[]) {
-  const started = createDeferredCore();
-  const release = createDeferredCore();
-  const tool: AnyAgentTool = {
-    name,
-    label: name,
-    description: name,
-    parameters: Type.Object({}),
-    executionMode,
-    execute: vi.fn(async () => {
-      events.push(`${name}:start`);
-      started.resolve();
-      await release.promise;
-      events.push(`${name}:done`);
-      return jsonResult({ name });
-    }),
-  };
-  return { tool, started: started.promise, release: () => release.resolve() };
-}
-
-async function cleanup(
-  ctx: ToolSearchToolContext,
-  gates: ReturnType<typeof gated>[],
-  calls: Promise<unknown>[],
+function fixture(
+  modes: [Mode, Mode] = ["sequential", "sequential"],
+  extra: Partial<ToolSearchToolContext> = {},
 ) {
-  gates.forEach((gate) => gate.release());
-  await Promise.allSettled(calls);
-  clearToolSearchCatalog(ctx);
-}
-
-async function hostTurn() {
-  await new Promise<void>((resolve) => {
-    setImmediate(resolve);
+  const events: string[] = [];
+  const releases: (() => void)[] = [];
+  const calls: Promise<unknown>[] = [];
+  const catalogRef = createToolSearchCatalogRef();
+  const ctx: ToolSearchToolContext = { catalogRef, ...extra };
+  const runtime = new ToolSearchRuntime(ctx, config);
+  const gate = (name: string, executionMode: Mode) => {
+    const started = createDeferredCore();
+    const release = createDeferredCore();
+    releases.push(() => release.resolve());
+    const tool: AnyAgentTool = {
+      ...createStubTool(name),
+      executionMode,
+      execute: vi.fn(async () => {
+        events.push(name + ":start");
+        started.resolve();
+        await release.promise;
+        events.push(name + ":done");
+        return jsonResult({ name });
+      }),
+    };
+    return { tool, started: started.promise, release: () => release.resolve() };
+  };
+  const a = gate("a", modes[0]),
+    b = gate("b", modes[1]);
+  const register = (tools = [a.tool, b.tool]) =>
+    registerHeadlessToolSearchCatalog({ catalogRef, tools });
+  register();
+  const call = (name: string, options: ToolSearchCallOptions = {}, executor = runtime) => {
+    const result = executor.call(name, {}, options);
+    calls.push(result);
+    return result;
+  };
+  onTestFinished(async () => {
+    releases.forEach((release) => release());
+    await Promise.allSettled(calls);
+    clearToolSearchCatalog(ctx);
   });
+  return { a, b, gate, call, register, events, ctx, catalogRef, runtime, releases };
 }
 
 describe("Tool Search execution scheduling", () => {
   it("shares FIFO exclusion across runtimes while allowing the parallel prefix", async () => {
-    const events: string[] = [];
-    const a = gated("a", undefined, events);
-    const b = gated("b", "parallel", events);
-    const c = gated("c", "sequential", events);
-    const d = gated("d", "parallel", events);
-    const e = gated("e", "sequential", events);
-    const gates = [a, b, c, d, e];
-    const { ctx, runtime, catalogRef } = fixture(gates.map((g) => g.tool));
+    const { a, b, gate, call, register, events, ctx, catalogRef } = fixture([
+      undefined,
+      "parallel",
+    ]);
+    const c = gate("c", "sequential"),
+      d = gate("d", "parallel"),
+      e = gate("e", "sequential");
+    register([a.tool, b.tool, c.tool, d.tool, e.tool]);
     const sibling = new ToolSearchRuntime(ctx, config);
-    const calls = [
-      runtime.call("a"),
-      sibling.call("b"),
-      runtime.call("c"),
-      sibling.call("d"),
-      runtime.call("e"),
-    ];
-    try {
-      await Promise.all([a.started, b.started]);
-      expect(events).toEqual(["a:start", "b:start"]);
-      a.release();
-      await calls[0];
-      expect(events).not.toContain("c:start");
-      b.release();
-      await c.started;
-      expect(events).toEqual(["a:start", "b:start", "a:done", "b:done", "c:start"]);
-      c.release();
-      await d.started;
-      expect(events).not.toContain("e:start");
-      d.release();
-      await e.started;
-      e.release();
-      await Promise.all(calls);
-      expect(catalogRef.onDispose?.size ?? 0).toBe(0);
-    } finally {
-      await cleanup(ctx, gates, calls);
-    }
+    const calls = [call("a"), call("b", {}, sibling), call("c"), call("d", {}, sibling), call("e")];
+    await Promise.all([a.started, b.started]);
+    expect(events).toEqual(["a:start", "b:start"]);
+    a.release();
+    await calls[0];
+    expect(events).not.toContain("c:start");
+    b.release();
+    await c.started;
+    expect(events).toEqual(["a:start", "b:start", "a:done", "b:done", "c:start"]);
+    c.release();
+    await d.started;
+    expect(events).not.toContain("e:start");
+    d.release();
+    await e.started;
+    e.release();
+    await Promise.all(calls);
+    expect(catalogRef.onDispose?.size ?? 0).toBe(0);
   });
 
   it.each(["call", "context"] as const)(
-    "cancels queued work from the %s signal without releasing an active exclusive call",
+    "cancels queued %s work without releasing exclusion",
     async (source) => {
-      const events: string[] = [];
-      const a = gated("a", "sequential", events);
-      const b = gated("b", "sequential", events);
-      const c = gated("c", "parallel", events);
-      const { ctx, runtime } = fixture([a.tool, b.tool, c.tool]);
+      const { a, b, gate, call, register, events, ctx, runtime } = fixture();
+      const c = gate("c", "parallel");
+      register([a.tool, b.tool, c.tool]);
       const controller = new AbortController();
       const queuedRuntime =
         source === "context"
           ? new ToolSearchRuntime({ ...ctx, abortSignal: controller.signal }, config)
           : runtime;
-      const first = runtime.call("a");
+      const first = call("a");
       await a.started;
-      const queued = queuedRuntime.call(
+      const queued = call(
         "b",
-        {},
         { signal: source === "call" ? controller.signal : new AbortController().signal },
+        queuedRuntime,
       );
       const rejected = expect(queued).rejects.toThrow(/aborted/i);
-      const tail = runtime.call("c");
-      try {
-        controller.abort();
-        await rejected;
-        await hostTurn();
-        expect(events).toEqual(["a:start"]);
-        a.release();
-        await c.started;
-        c.release();
-        await Promise.all([first, tail]);
-        expect(b.tool.execute).not.toHaveBeenCalled();
-      } finally {
-        await cleanup(ctx, [a, b, c], [first, queued, tail]);
-      }
+      const tail = call("c");
+      controller.abort();
+      await rejected;
+      await hostTurn();
+      expect(events).toEqual(["a:start"]);
+      a.release();
+      await c.started;
+      c.release();
+      await Promise.all([first, tail]);
+      expect(b.tool.execute).not.toHaveBeenCalled();
     },
   );
 
   it("cancels a disposed generation without blocking a reopened catalog", async () => {
-    const events: string[] = [];
-    const old = gated("old", "sequential", events);
-    const queued = gated("queued", "sequential", events);
-    const fresh = gated("fresh", "sequential", events);
-    const { ctx, catalogRef, runtime } = fixture([old.tool, queued.tool]);
-    const active = runtime.call("old");
-    await old.started;
-    const waiting = runtime.call("queued");
+    const { a, b, gate, call, register, ctx, catalogRef } = fixture();
+    const fresh = gate("fresh", "sequential");
+    const active = call("a");
+    await a.started;
+    const waiting = call("b");
     const rejected = expect(waiting).rejects.toThrow(/aborted/i);
     clearToolSearchCatalog(ctx);
     await rejected;
-    registerHeadlessToolSearchCatalog({ catalogRef, tools: [fresh.tool] });
-    const replacement = runtime.call("fresh");
-    try {
-      await fresh.started;
-      old.release();
-      await active;
-      fresh.release();
-      await replacement;
-      expect(queued.tool.execute).not.toHaveBeenCalled();
-      expect(catalogRef.onDispose?.size ?? 0).toBe(0);
-    } finally {
-      await cleanup(ctx, [old, queued, fresh], [active, waiting, replacement]);
-    }
+    register([fresh.tool]);
+    const replacement = call("fresh");
+    await fresh.started;
+    a.release();
+    await active;
+    fresh.release();
+    await replacement;
+    expect(b.tool.execute).not.toHaveBeenCalled();
+    expect(catalogRef.onDispose?.size ?? 0).toBe(0);
   });
 
   it.each(["remove", "replace", "append"] as const)(
-    "revalidates queued targets after catalog %s",
+    "revalidates queued targets after %s",
     async (change) => {
-      const events: string[] = [];
-      const a = gated("a", "sequential", events);
-      const b = gated("b", "sequential", events);
-      const other = gated("other", "parallel", events);
-      const { ctx, runtime, catalogRef } = fixture([a.tool, b.tool]);
-      const active = runtime.call("a");
+      const { a, b, gate, call, register, catalogRef } = fixture();
+      const other = gate("other", "parallel");
+      const active = call("a");
       await a.started;
-      const queued = runtime.call("b");
+      const queued = call("b");
       const result =
         change === "append" ? queued : expect(queued).rejects.toThrow(/changed|available/);
       if (change === "remove") {
         restrictToolSearchCatalog({ catalogRef, allowedToolNames: new Set(["a"]) });
       } else {
-        registerHeadlessToolSearchCatalog({
-          catalogRef,
-          tools: change === "append" ? [a.tool, b.tool, other.tool] : [a.tool, { ...b.tool }],
-        });
+        register(change === "append" ? [a.tool, b.tool, other.tool] : [a.tool, { ...b.tool }]);
       }
-      try {
-        a.release();
-        if (change === "append") {
-          await b.started;
-          b.release();
-        }
-        await Promise.all([active, result]);
-        expect(b.tool.execute).toHaveBeenCalledTimes(change === "append" ? 1 : 0);
-      } finally {
-        await cleanup(ctx, [a, b, other], [active, queued]);
+      a.release();
+      if (change === "append") {
+        await b.started;
+        b.release();
       }
+      await Promise.all([active, result]);
+      expect(b.tool.execute).toHaveBeenCalledTimes(change === "append" ? 1 : 0);
     },
   );
 
   it("keeps exclusion until executor acceptance settles", async () => {
-    const events: string[] = [];
-    const a = gated("a", "sequential", events);
-    const b = gated("b", "parallel", events);
-    const accepting = createDeferredCore();
-    const releaseAcceptance = createDeferredCore();
-    const { ctx, runtime } = fixture([a.tool, b.tool], {
+    const accepting = createDeferredCore(),
+      releaseAcceptance = createDeferredCore();
+    const { a, b, call, events, releases } = fixture(["sequential", "parallel"], {
       executeTool: async (params) => {
         const result = await params.tool.execute(
           params.toolCallId,
@@ -223,21 +194,18 @@ describe("Tool Search execution scheduling", () => {
         return await params.acceptResultBeforeProjection(result);
       },
     });
-    const first = runtime.call("a");
-    const second = runtime.call("b");
-    try {
-      await a.started;
-      a.release();
-      await accepting.promise;
-      await hostTurn();
-      expect(events).toEqual(["a:start", "a:done"]);
-      releaseAcceptance.resolve();
-      await b.started;
-      b.release();
-      await Promise.all([first, second]);
-    } finally {
-      releaseAcceptance.resolve();
-      await cleanup(ctx, [a, b], [first, second]);
-    }
+    releases.push(() => releaseAcceptance.resolve());
+    const first = call("a"),
+      second = call("b");
+    await a.started;
+    a.release();
+    await accepting.promise;
+    await hostTurn();
+    expect(events).toEqual(["a:start", "a:done"]);
+    releaseAcceptance.resolve();
+    await b.started;
+    b.release();
+    await Promise.all([first, second]);
   });
 });
+import { setImmediate as hostTurn } from "node:timers/promises";

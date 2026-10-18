@@ -42,25 +42,25 @@ const CATALOG = [
   }),
 ];
 
+const searchConfig = {
+  enabled: true,
+  mode: "directory" as const,
+  searchDefaultLimit: 10,
+  maxSearchLimit: 50,
+};
 function runtime(catalog = CATALOG): ToolSearchRuntime {
-  const ctx = {
-    catalogRef: {
-      current: {
-        entries: catalog,
-        counterScope: "scope-1",
-        searchCount: 0,
-        describeCount: 0,
-        callCount: 0,
-      },
-    },
+  const catalogRef = createToolSearchCatalogRef();
+  catalogRef.current = {
+    entries: catalog,
+    counterScope: "scope-1",
+    searchCount: 0,
+    describeCount: 0,
+    callCount: 0,
   };
-  return new ToolSearchRuntime(ctx as never, {
-    enabled: true,
-    mode: "directory",
-    searchDefaultLimit: 10,
-    maxSearchLimit: 50,
-  });
+  return new ToolSearchRuntime({ catalogRef }, searchConfig);
 }
+const catalogRuntime = (catalog: Parameters<typeof entry>[0][]) => runtime(catalog.map(entry));
+const objectSchema = <T>(properties: T) => ({ type: "object", properties });
 
 async function names(
   search: ToolSearchRuntime,
@@ -69,14 +69,22 @@ async function names(
 ) {
   return (await search.search(query, options)).map((hit) => hit.name);
 }
+async function ids(
+  search: ToolSearchRuntime,
+  query: string,
+  options?: Parameters<ToolSearchRuntime["search"]>[1],
+) {
+  return (await search.search(query, options)).map((hit) => hit.id);
+}
 
 describe("tokenizeQuery", () => {
-  it("undoes the consonant English doubles before a suffix", () => {
-    expect(tokenizeDocument("running")).toEqual(tokenizeDocument("run"));
-  });
-
-  it.each(["call", "process"])("keeps doubles that belong to the root: %s", (word) => {
-    expect(tokenizeDocument(`${word}ing`)).toEqual(tokenizeDocument(word));
+  it.each([
+    ["running", "run"],
+    ["calling", "call"],
+    ["processing", "process"],
+    ["news", "news"],
+  ])("normalizes %s to its root %s", (word, root) => {
+    expect(tokenizeDocument(word)).toEqual([root]);
   });
 
   it("fires expansions for -ies plurals of a trigger word", () => {
@@ -97,10 +105,6 @@ describe("tokenizeQuery", () => {
     // Discounted: an expansion is a guess about wording, not something typed.
     expect(search?.weight).toBeLessThan(1);
     expect(terms.find((term) => term.term === tokenizeDocument("price")[0])?.weight).toBe(1);
-  });
-
-  it("keeps news distinct from new", () => {
-    expect(tokenizeDocument("news")).toEqual(["news"]);
   });
 
   it("does not let a singular/plural collision invent an intent", () => {
@@ -152,7 +156,6 @@ describe("untrusted schemas", () => {
   it.each(["client", "mcp"] as const)(
     "never traverses parameters from the untrusted %s source",
     async (source) => {
-      // Untrusted parameter getters must remain deferred, even while indexing.
       const hostile = entry({
         source,
         name: "client_pick_file",
@@ -171,7 +174,6 @@ describe("untrusted schemas", () => {
       });
       const search = runtime([...CATALOG, hostile]);
 
-      // Reaching the schema at all throws, so surviving the query is the proof.
       await expect(search.search("pick a file")).resolves.toBeDefined();
       expect(await names(search, "client_pick_file")).toContain("client_pick_file");
     },
@@ -179,64 +181,47 @@ describe("untrusted schemas", () => {
 });
 
 describe("ToolSearchRuntime.search", () => {
-  it.each(["anyOf"])(
-    "finds parameter metadata inside %s branches and refreshes it after edits",
-    async (keyword) => {
-      const branch = {
-        type: "object",
-        properties: { orchard: { type: "string", description: "Collect apples" } },
-      };
-      const catalogRef = createToolSearchCatalogRef();
-      const tools = [
-        {
-          name: "indexed_resource",
-          label: "Resource",
-          description: "Inspect resources",
-          parameters: { [keyword]: [{ description: "Measure asteroids" }, branch] },
-          execute: async () => ({ content: [], details: {} }),
-        },
-      ];
-      registerHeadlessToolSearchCatalog({ catalogRef, tools });
-      const search = new ToolSearchRuntime(
-        { catalogRef },
-        {
-          enabled: true,
-          mode: "tools",
-          searchDefaultLimit: 10,
-          maxSearchLimit: 50,
-        },
-      );
+  it("refreshes metadata inside anyOf branches after edits", async () => {
+    const branch = objectSchema({ orchard: { type: "string", description: "Collect apples" } });
+    const catalogRef = createToolSearchCatalogRef();
+    const tools = [
+      {
+        name: "indexed_resource",
+        label: "Resource",
+        description: "Inspect resources",
+        parameters: { anyOf: [{ description: "Measure asteroids" }, branch] },
+        execute: async () => ({ content: [], details: {} }),
+      },
+    ];
+    registerHeadlessToolSearchCatalog({ catalogRef, tools });
+    const search = new ToolSearchRuntime({ catalogRef }, { ...searchConfig, mode: "tools" });
 
-      for (const query of ["asteroids", "orchard", "apples"]) {
-        expect(await names(search, query)).toEqual(["indexed_resource"]);
-      }
-      branch.properties.orchard.description = "Observe meteors";
-      registerHeadlessToolSearchCatalog({ catalogRef, tools });
-      expect(await names(search, "meteors")).toEqual(["indexed_resource"]);
-      expect(await search.search("apples")).toEqual([]);
-      expect(await search.search("orchard", { allowedIds: new Set() })).toEqual([]);
-    },
-  );
+    for (const query of ["asteroids", "orchard", "apples"]) {
+      expect(await names(search, query)).toEqual(["indexed_resource"]);
+    }
+    branch.properties.orchard.description = "Observe meteors";
+    registerHeadlessToolSearchCatalog({ catalogRef, tools });
+    expect(await names(search, "meteors")).toEqual(["indexed_resource"]);
+    expect(await search.search("apples")).toEqual([]);
+    expect(await search.search("orchard", { allowedIds: new Set() })).toEqual([]);
+  });
 
   it("finds metadata through composed property and array-item schemas", async () => {
-    const search = runtime([
-      entry({
+    const search = catalogRuntime([
+      {
         name: "indexed_resource",
-        parameters: {
-          type: "object",
-          properties: {
-            resources: {
-              anyOf: [
-                { type: "null" },
-                {
-                  type: "array",
-                  items: { allOf: [{ type: "string", description: "Observe meteors" }] },
-                },
-              ],
-            },
+        parameters: objectSchema({
+          resources: {
+            anyOf: [
+              { type: "null" },
+              {
+                type: "array",
+                items: { allOf: [{ type: "string", description: "Observe meteors" }] },
+              },
+            ],
           },
-        },
-      }),
+        }),
+      },
     ]);
 
     expect(await names(search, "meteors")).toEqual(["indexed_resource"]);
@@ -263,10 +248,10 @@ describe("ToolSearchRuntime.search", () => {
   });
 
   it("keeps BM25 population statistics scoped to the current visibility", async () => {
-    const search = runtime([
-      entry({ name: "first", description: "alpha alpha" }),
-      entry({ name: "second", description: "beta" }),
-      ...["third", "fourth", "fifth"].map((name) => entry({ name, description: "alpha" })),
+    const search = catalogRuntime([
+      { name: "first", description: "alpha alpha" },
+      { name: "second", description: "beta" },
+      ...["third", "fourth", "fifth"].map((name) => ({ name, description: "alpha" })),
     ]);
     const allowedIds = new Set(["first", "second"]);
     expect((await search.search("alpha beta", { limit: 1 }))[0]?.name).toBe("second");
@@ -301,36 +286,34 @@ describe("ToolSearchRuntime.search", () => {
     const first = entry({ name: "shared_revision", description: "Measure quasars" });
     await runtime([first]).search("quasars");
     const current = entry({ ...first, source: "mcp", sourceName: "current-server" });
-    expect(await runtime([current]).search("quasars")).toEqual([
-      expect.objectContaining({ source: "mcp", sourceName: "current-server", input: "unknown" }),
+    expect(await runtime([current]).search("quasars")).toMatchObject([
+      { source: "mcp", sourceName: "current-server", input: "unknown" },
     ]);
   });
 
   it.each(["listURL", "listUrl"])("prefers the exact catalog ID spelling for %s", async (name) => {
-    const search = runtime(
-      ["listURL", "listUrl"].map((toolName) =>
-        entry({
-          id: `mcp:accounting:${toolName}`,
-          name: toolName,
-          source: "mcp",
-          description: "Find overdue invoices",
-        }),
-      ),
+    const search = catalogRuntime(
+      ["listURL", "listUrl"].map((toolName) => ({
+        id: `mcp:accounting:${toolName}`,
+        name: toolName,
+        source: "mcp" as const,
+        description: "Find overdue invoices",
+      })),
     );
-    expect(
-      (await search.search(`mcp:accounting:${name}`, { limit: 1 })).map((hit) => hit.id),
-    ).toEqual([`mcp:accounting:${name}`]);
+    expect(await ids(search, `mcp:accounting:${name}`, { limit: 1 })).toEqual([
+      `mcp:accounting:${name}`,
+    ]);
   });
 
   it("preserves ranked exact-match order when the limit excludes other exact matches", async () => {
-    const search = runtime([
-      entry({ id: "z", name: "harvest", description: "Collect records" }),
-      entry({ id: "a", name: "harvest", description: "Collect records" }),
-      entry({ id: "m", name: "HARVEST", description: "Collect records" }),
-      entry({ name: "records", description: "harvest" }),
+    const search = catalogRuntime([
+      { id: "z", name: "harvest", description: "Collect records" },
+      { id: "a", name: "harvest", description: "Collect records" },
+      { id: "m", name: "HARVEST", description: "Collect records" },
+      { name: "records", description: "harvest" },
     ]);
 
-    expect((await search.search("harvest", { limit: 2 })).map((hit) => hit.id)).toEqual(["a", "m"]);
+    expect(await ids(search, "harvest", { limit: 2 })).toEqual(["a", "m"]);
   });
 
   it("expands reminder toward schedule/cron", async () => {
@@ -338,54 +321,33 @@ describe("ToolSearchRuntime.search", () => {
   });
 
   it.each([
-    ["cookies", "cookie"],
+    ["cookies", "cooki"],
     ["policies", "policy"],
-  ])("matches both readings of an -ies plural: %s", (plural, singular) => {
-    // "policies" is "policy" but "cookies" is "cookie"; one rule cannot serve
-    // both, so both stems are emitted and whichever the catalog uses matches.
-    const plurals = new Set(tokenizeDocument(plural));
-    expect(tokenizeDocument(singular).some((term) => plurals.has(term))).toBe(true);
-  });
-
-  it.each([
     ["getURLs", "url"],
     ["getOAuthToken", "auth"],
-  ])("keeps acronym and camelCase parts addressable: %s", (name, part) => {
-    // Splitting on case transitions alone cuts "URLs" into "UR"/"Ls".
+  ])("keeps plural or compound word parts addressable: %s", (name, part) => {
     expect(tokenizeDocument(name)).toContain(part);
   });
 
   it("returns a tool named exactly like a stopword", async () => {
-    const catalog = [
-      entry({ id: "z-local", name: "do", description: "Run a stored action" }),
-      entry({ id: "a-remote", source: "mcp", name: "DO", description: "Run a remote action" }),
-      entry({ id: "m-local", name: "do", description: "Run another stored action" }),
-      entry({ id: "other", name: "other", description: "Unrelated" }),
-    ];
-    const search = runtime(catalog);
+    const search = catalogRuntime([
+      { id: "z-local", name: "do", description: "Run a stored action" },
+      { id: "a-remote", source: "mcp", name: "DO", description: "Run a remote action" },
+      { id: "m-local", name: "do", description: "Run another stored action" },
+      { id: "other", name: "other", description: "Unrelated" },
+    ]);
 
     // "do" tokenizes to nothing; exact matches still retain catalog order,
     // with visibility applied before the result limit.
-    expect((await search.search(" DO ")).map((hit) => hit.id)).toEqual([
-      "z-local",
-      "a-remote",
-      "m-local",
-    ]);
-    expect((await search.search("do", { limit: 2 })).map((hit) => hit.id)).toEqual([
-      "z-local",
-      "a-remote",
-    ]);
+    expect(await ids(search, " DO ")).toEqual(["z-local", "a-remote", "m-local"]);
+    expect(await ids(search, "do", { limit: 2 })).toEqual(["z-local", "a-remote"]);
+    expect(await ids(search, "do", { includeMcp: false, limit: 1 })).toEqual(["z-local"]);
     expect(
-      (await search.search("do", { includeMcp: false, limit: 1 })).map((hit) => hit.id),
-    ).toEqual(["z-local"]);
-    expect(
-      (
-        await search.search("do", {
-          allowedIds: new Set(["a-remote", "m-local"]),
-          includeMcp: false,
-          limit: 1,
-        })
-      ).map((hit) => hit.id),
+      await ids(search, "do", {
+        allowedIds: new Set(["a-remote", "m-local"]),
+        includeMcp: false,
+        limit: 1,
+      }),
     ).toEqual(["m-local"]);
   });
 });

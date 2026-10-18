@@ -1,4 +1,14 @@
-import { Agent, type AgentEvent, type AgentTool } from "openclaw/plugin-sdk/agent-core";
+import {
+  Agent,
+  type AgentEvent,
+  type AgentTool,
+  type StreamFn,
+} from "openclaw/plugin-sdk/agent-core";
+import {
+  type AssistantMessage,
+  createAssistantMessageEventStream,
+  type Model,
+} from "openclaw/plugin-sdk/llm";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
@@ -15,15 +25,12 @@ import {
 import { wrapToolWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
 import { codeModeReplayIdForToolCall } from "./code-mode-bridge.js";
 import { createCodeModeCatalogProjection } from "./code-mode-catalog.js";
+import { createZeroUsageFixture } from "./test-helpers/usage-fixtures.js";
 import { assertCompleteToolResult, resolveToolResultBudget } from "./tool-result-limits.js";
 import {
   addClientToolsToToolCatalog,
   compactToolSearchCatalogEntry,
 } from "./tool-search-catalog.js";
-import {
-  singleToolCallStreamFn,
-  toolSearchTestModel as model,
-} from "./tool-search-loop.test-support.js";
 import {
   prepareToolSearchDispatcherArguments,
   readToolSearchCallArgs,
@@ -74,45 +81,6 @@ function createRuntime(tools: AnyAgentTool[]) {
   };
 }
 
-const strictInstruction = () =>
-  fakeTool(
-    "strict_instruction",
-    Type.Object({ instruction: Type.String() }, { additionalProperties: false }),
-  );
-
-function beforeCall(
-  hook: () => Promise<
-    { params: { instruction: string | number } } | { block: boolean; blockReason: string }
-  >,
-) {
-  const handler = vi.fn(hook);
-  initializeGlobalHookRunner(createMockPluginRegistry([{ hookName: "before_tool_call", handler }]));
-  return handler;
-}
-
-async function rejectedInput(
-  target: AnyAgentTool,
-  input: unknown,
-  runtime = createRuntime([target]).runtime,
-) {
-  const error = await runtime.call(target.name, input).catch((caught: unknown) => caught);
-  expect(error).toBeInstanceOf(Error);
-  expect(target.execute).not.toHaveBeenCalled();
-  return (error as Error).message;
-}
-
-function control(
-  catalogRef: ReturnType<typeof createToolSearchCatalogRef>,
-  config: ReturnType<typeof createRuntime>["config"],
-  name = TOOL_CALL_RAW_TOOL_NAME,
-) {
-  const tool = createToolSearchTools({ catalogRef, config }).find(
-    (candidate) => candidate.name === name,
-  );
-  expect(tool).toBeDefined();
-  return tool!;
-}
-
 describe("Tool Search flattened call arguments", () => {
   it.each([
     {
@@ -139,33 +107,42 @@ describe("Tool Search flattened call arguments", () => {
     });
   });
 
-  it("dispatches flattened arguments beside an empty input wrapper", async () => {
-    const target = fakeTool(
-      "inspect_resource",
-      Type.Object(
+  it.each([
+    {
+      label: "empty input wrapper with flattened target arguments",
+      arguments: { id: "inspect_resource", input: {}, command: "list", timeout_ms: 5_000 },
+      parameters: Type.Object(
         { command: Type.String(), timeout_ms: Type.Number() },
         { additionalProperties: false },
       ),
-    );
-    const { catalogRef, config } = createRuntime([target]);
-    await control(catalogRef, config).execute("structured-call", {
-      id: target.name,
-      input: {},
-      command: "list",
-      timeout_ms: 5_000,
-    });
-    expect(target.execute).toHaveBeenCalledOnce();
-    expect(vi.mocked(target.execute).mock.calls[0]?.[1]).toEqual({
-      command: "list",
-      timeout_ms: 5_000,
-    });
-  });
+      expected: { command: "list", timeout_ms: 5_000 },
+    },
+  ])(
+    "dispatches $label through the real structured tool",
+    async ({ arguments: args, parameters, expected }) => {
+      const target = fakeTool("inspect_resource", parameters);
+      const { catalogRef, config } = createRuntime([target]);
+      const callTool = createToolSearchTools({ catalogRef, config }).find(
+        (tool) => tool.name === TOOL_CALL_RAW_TOOL_NAME,
+      );
+
+      expect(callTool).toBeDefined();
+      await callTool!.execute("structured-call", args);
+
+      expect(target.execute).toHaveBeenCalledOnce();
+      expect(vi.mocked(target.execute).mock.calls[0]?.[1]).toEqual(expected);
+    },
+  );
 
   it("rejects flattened selectors that identify different catalog tools", async () => {
     const intended = fakeTool("inspect_resource");
     const colliding = fakeTool("search");
     const { catalogRef, config } = createRuntime([intended, colliding]);
-    const callTool = control(catalogRef, config);
+    const callTool = createToolSearchTools({ catalogRef, config }).find(
+      (tool) => tool.name === TOOL_CALL_RAW_TOOL_NAME,
+    );
+
+    expect(callTool).toBeDefined();
     await expect(
       callTool!.execute("ambiguous-call", { name: "inspect_resource", id: "search" }),
     ).rejects.toThrow("Ambiguous tool selectors");
@@ -187,13 +164,80 @@ describe("Tool Search dispatcher argument preparation", () => {
   });
 
   describe("through the real agent loop", () => {
+    const model: Model = {
+      id: "test-model",
+      name: "Test Model",
+      api: "test-api",
+      provider: "test-provider",
+      baseUrl: "https://example.test",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 1000,
+      maxTokens: 1000,
+    };
+
+    function makeAssistantMessage(
+      content: AssistantMessage["content"],
+    ): AssistantMessage & { stopReason: "toolUse" | "stop" } {
+      return {
+        role: "assistant",
+        content,
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: createZeroUsageFixture(),
+        stopReason: content.some((item) => item.type === "toolCall") ? "toolUse" : "stop",
+        timestamp: 1,
+      };
+    }
+
+    function createSingleToolCallStreamFn(toolCall: {
+      id: string;
+      name: string;
+      arguments: Record<string, unknown>;
+    }): StreamFn {
+      // The stop turn terminates the loop after the tool result.
+      const turns: AssistantMessage["content"][] = [
+        [{ type: "toolCall", ...toolCall }],
+        [{ type: "text", text: "done" }],
+      ];
+      let turnIndex = 0;
+      return () => {
+        const content = turns[turnIndex];
+        if (!content) {
+          throw new Error("unexpected extra model turn");
+        }
+        turnIndex += 1;
+        const stream = createAssistantMessageEventStream();
+        queueMicrotask(() => {
+          const message = makeAssistantMessage(content);
+          stream.push({ type: "done", reason: message.stopReason, message });
+          stream.end();
+        });
+        return stream;
+      };
+    }
+
+    function findToolExecutionEnd(
+      events: AgentEvent[],
+    ): Extract<AgentEvent, { type: "tool_execution_end" }> | undefined {
+      return events.find(
+        (event): event is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+          event.type === "tool_execution_end",
+      );
+    }
+
     it("dispatches a real double-wrapped tool_describe payload through prepareToolCallArguments", async () => {
       const target = fakeTool("inspect_resource");
       const { catalogRef, config } = createRuntime([target]);
-      const describeTool = control(catalogRef, config, TOOL_DESCRIBE_RAW_TOOL_NAME);
+      const describeTool = createToolSearchTools({ catalogRef, config }).find(
+        (tool) => tool.name === TOOL_DESCRIBE_RAW_TOOL_NAME,
+      );
+      expect(describeTool).toBeDefined();
 
       const doubleWrapped = { input: { id: "inspect_resource" } };
-      const streamFn = singleToolCallStreamFn({
+      const streamFn = createSingleToolCallStreamFn({
         id: "call-1",
         name: TOOL_DESCRIBE_RAW_TOOL_NAME,
         arguments: doubleWrapped,
@@ -203,16 +247,17 @@ describe("Tool Search dispatcher argument preparation", () => {
         initialState: { model, tools: [describeTool] as AgentTool[] },
         streamFn,
       });
-      agent.subscribe((event) => events.push(event));
+      agent.subscribe((event) => {
+        events.push(event);
+      });
 
       await agent.prompt("describe inspect_resource with a double-wrapped payload");
 
-      const end = events.find((event) => event.type === "tool_execution_end");
-      expect(end).toMatchObject({
+      expect(findToolExecutionEnd(events)).toMatchObject({
         toolCallId: "call-1",
         isError: false,
       });
-      expect(end?.errorKind).toBeUndefined();
+      expect(findToolExecutionEnd(events)?.errorKind).toBeUndefined();
     });
   });
 });
@@ -292,26 +337,47 @@ describe("Tool Search input schemas", () => {
     ["value", "https://example.invalid/?token=synthetic-private-credential"],
   ])("redacts rejected %s values while retaining their type", async (field, value) => {
     const target = fakeTool("private_limit", Type.Object({ [field]: Type.Boolean() }));
-    const message = await rejectedInput(target, { [field]: value });
+    const { runtime } = createRuntime([target]);
+    const failure = await runtime
+      .call("private_limit", { [field]: value })
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
     expect(message).toContain(`expected boolean; received [redacted] (${typeof value})`);
     expect(message).not.toContain(String(value));
+    expect(target.execute).not.toHaveBeenCalled();
   });
 
   it.each(["123456789", 123456789])("withholds registered scalar secrets %j", async (value) => {
     registerSecretValueForRedaction("123456789");
     const target = fakeTool("registered_limit", Type.Object({ value: Type.Boolean() }));
-    const message = await rejectedInput(target, { value });
-    expect(message).toContain(`received [redacted] (${typeof value})`);
-    expect(message).not.toContain("123456789");
+    const { runtime } = createRuntime([target]);
+
+    const failure = await runtime
+      .call("registered_limit", { value })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain(`received [redacted] (${typeof value})`);
+    expect((failure as Error).message).not.toContain("123456789");
+    expect(target.execute).not.toHaveBeenCalled();
   });
 
   it("redacts registered secrets in rejected property names before truncating details", async () => {
     registerSecretValueForRedaction("synthetic-private-key");
     const target = fakeTool("private_keys", Type.Object({}, { additionalProperties: false }));
-    const message = await rejectedInput(target, { ["synthetic-private-key".repeat(100)]: true });
-    expect(message).toContain("[redacted]");
-    expect(message).not.toContain("synthetic-private-key");
-    expect(message.length).toBeLessThan(1_000);
+    const { runtime } = createRuntime([target]);
+    const failure = await runtime
+      .call("private_keys", {
+        ["synthetic-private-key".repeat(100)]: true,
+      })
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("[redacted]");
+    expect((failure as Error).message).not.toContain("synthetic-private-key");
+    expect((failure as Error).message.length).toBeLessThan(1_000);
+    expect(target.execute).not.toHaveBeenCalled();
   });
 
   it("uses exact nested paths rather than similarly spelled sensitive fields", async () => {
@@ -325,13 +391,19 @@ describe("Tool Search input schemas", () => {
         "literal: must be number": Type.String(),
       }),
     );
-    const message = await rejectedInput(target, {
-      "a.b": "10",
-      a: { b: "synthetic-private-credential" },
-      credentials: [{ token: "12345" }],
-      "a/b~c": 42,
-      "literal: must be number": false,
-    });
+    const { runtime } = createRuntime([target]);
+
+    const failure = await runtime
+      .call("nested_limit", {
+        "a.b": "10",
+        a: { b: "synthetic-private-credential" },
+        credentials: [{ token: "12345" }],
+        "a/b~c": 42,
+        "literal: must be number": false,
+      })
+      .catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
     expect(message).toContain('a.b: expected integer; received "10" (string)');
     expect(message).toContain(
       "credentials.0.token: expected integer; received [redacted] (string)",
@@ -340,6 +412,7 @@ describe("Tool Search input schemas", () => {
     expect(message).toContain("literal: must be number: expected string; received false (boolean)");
     expect(message).not.toContain("synthetic-private-credential");
     expect(message).not.toContain("12345");
+    expect(target.execute).not.toHaveBeenCalled();
   });
 
   it("bounds oversized rejected values and validation details without exposing payloads", async () => {
@@ -347,15 +420,19 @@ describe("Tool Search input schemas", () => {
       Array.from({ length: 20 }, (_, i) => [`limit${i}`, Type.Integer()]),
     );
     const target = fakeTool("large_limits", Type.Object(properties));
+    const { runtime } = createRuntime([target]);
     const value = Object.fromEntries(
       Object.keys(properties).map((name) => [name, "7".repeat(1_000_000)]),
     );
 
-    const message = await rejectedInput(target, value);
+    const failure = await runtime.call("large_limits", value).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
     expect(message).toContain("received [redacted] (string)");
     expect(message).toContain("additional validation issues omitted");
     expect(message.length).toBeLessThan(2_500);
     expect(message).not.toContain("7".repeat(65));
+    expect(target.execute).not.toHaveBeenCalled();
   });
 
   it("bounds oversized unexpected property names without losing validation failure", async () => {
@@ -363,19 +440,32 @@ describe("Tool Search input schemas", () => {
       "strict_keys",
       Type.Object({ instruction: Type.String() }, { additionalProperties: false }),
     );
-    const message = await rejectedInput(target, {
-      instruction: "valid",
-      ["unexpected".repeat(30_000)]: "synthetic-private-payload",
-    });
+    const { runtime } = createRuntime([target]);
+    const failure = await runtime
+      .call("strict_keys", {
+        instruction: "valid",
+        ["unexpected".repeat(30_000)]: "synthetic-private-payload",
+      })
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const message = (failure as Error).message;
     expect(message).toContain("must not have additional properties");
     expect(message).toContain("[truncated]");
     expect(message.length).toBeLessThan(1_000);
     expect(message).not.toContain("synthetic-private-payload");
+    expect(target.execute).not.toHaveBeenCalled();
   });
 
   it("validates arguments after a policy hook repairs them", async () => {
-    const hook = beforeCall(async () => ({ params: { instruction: "repaired" } }));
-    const target = strictInstruction();
+    const hook = vi.fn(async () => ({ params: { instruction: "repaired" } }));
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "before_tool_call", handler: hook }]),
+    );
+    const target = fakeTool(
+      "strict_instruction",
+      Type.Object({ instruction: Type.String() }, { additionalProperties: false }),
+    );
     const { runtime } = createRuntime([target]);
 
     await expect(runtime.call("strict_instruction", {})).resolves.toMatchObject({
@@ -387,8 +477,14 @@ describe("Tool Search input schemas", () => {
   });
 
   it("rejects invalid hook-adjusted arguments before target execution", async () => {
-    const hook = beforeCall(async () => ({ params: { instruction: 42 } }));
-    const target = strictInstruction();
+    const hook = vi.fn(async () => ({ params: { instruction: 42 } }));
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "before_tool_call", handler: hook }]),
+    );
+    const target = fakeTool(
+      "strict_instruction",
+      Type.Object({ instruction: Type.String() }, { additionalProperties: false }),
+    );
     const { runtime } = createRuntime([target]);
 
     await expect(runtime.call("strict_instruction", { instruction: "valid" })).rejects.toThrow(
@@ -399,8 +495,14 @@ describe("Tool Search input schemas", () => {
   });
 
   it("lets policy hooks block invalid arguments before schema validation", async () => {
-    const hook = beforeCall(async () => ({ block: true, blockReason: "blocked by policy" }));
-    const target = strictInstruction();
+    const hook = vi.fn(async () => ({ block: true, blockReason: "blocked by policy" }));
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "before_tool_call", handler: hook }]),
+    );
+    const target = fakeTool(
+      "strict_instruction",
+      Type.Object({ instruction: Type.String() }, { additionalProperties: false }),
+    );
     const { runtime } = createRuntime([target]);
 
     await expect(runtime.call("strict_instruction", {})).resolves.toMatchObject({
@@ -416,7 +518,10 @@ describe("Tool Search input schemas", () => {
       Type.Object({ marker: Type.String() }, { additionalProperties: false }),
     );
     const wrappedNested = wrapToolWithBeforeToolCallHook(nested);
-    const target = strictInstruction();
+    const target = fakeTool(
+      "strict_instruction",
+      Type.Object({ instruction: Type.String() }, { additionalProperties: false }),
+    );
     target.execute = vi.fn(async () =>
       wrappedNested.execute("nested-policy-call", { marker: "nested" }),
     );
@@ -460,9 +565,16 @@ describe("Tool Search input schemas", () => {
   });
 
   it("rejects invalid structured dispatch_action arguments without executing the target", async () => {
-    const target = strictInstruction();
+    const target = fakeTool(
+      "strict_instruction",
+      Type.Object({ instruction: Type.String() }, { additionalProperties: false }),
+    );
     const { catalogRef, config } = createRuntime([target]);
-    const callTool = control(catalogRef, config);
+    const callTool = createToolSearchTools({ catalogRef, config }).find(
+      (tool) => tool.name === TOOL_CALL_RAW_TOOL_NAME,
+    );
+
+    expect(callTool).toBeDefined();
     const call = callTool!.execute("invalid-structured-call", {
       id: "strict_instruction",
       args: { instruction: 42, instructions: "run" },

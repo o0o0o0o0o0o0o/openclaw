@@ -47,11 +47,11 @@ describe("runtime tool input schema projection", () => {
     });
   });
 
-  it("keeps empty property names in non-finite diagnostic paths", () => {
-    expectInvalid(
-      objectSchema({ "": { type: "number", maximum: Infinity } }),
-      "properties..maximum",
-    );
+  it.each<[string, unknown, string]>([
+    ["", Infinity, "properties..maximum"],
+    ["score", Object(Infinity), "properties.score.maximum"],
+  ])("reports non-finite limits at %s", (name, maximum, path) => {
+    expectInvalid(objectSchema({ [name]: { type: "number", maximum } }), path);
   });
 
   it("tracks repeated descendants through each toJSON replacement without rereading getters", () => {
@@ -78,29 +78,17 @@ describe("runtime tool input schema projection", () => {
     expect(reads).toEqual(["first", "maximum", "second", "maximum"]);
   });
 
-  it("reports boxed non-finite numeric schema values", () => {
-    expectInvalid(
-      objectSchema({ score: { type: "number", maximum: Object(Infinity) } }),
-      "properties.score.maximum",
-    );
-  });
-
-  it("does not treat a spoofed Number tag as a boxed number", () => {
-    expectFiniteDefault({ [Symbol.toStringTag]: "Number", value: "finite" });
-  });
-
-  it("ignores an unreadable Number tag that JSON serialization does not use", () => {
-    expectFiniteDefault({
+  it.each([
+    { [Symbol.toStringTag]: "Number", value: "finite" },
+    {
       get [Symbol.toStringTag](): string {
         throw new Error("unreadable tag");
       },
       value: "finite",
-    });
-  });
+    },
+  ])("ignores non-JSON Number tags (%#)", expectFiniteDefault);
 
   it("does not report schema map field names as dynamic JSON Schema keywords", () => {
-    // Dynamic keywords are only invalid as JSON Schema control fields; property
-    // names and definitions can legally contain the same strings.
     expect(
       projectRuntimeToolInputSchema({
         type: "object",

@@ -35,6 +35,10 @@ const notice = {
   updated_at: requestedAt,
   body: `${marker}\n<!-- openclaw:approval-request ${JSON.stringify({ head: headSha, base: "main" })} -->\nReview this revision.`,
 };
+const requestNotice = (record: object) => ({
+  ...notice,
+  body: `${marker}\n<!-- openclaw:approval-request ${JSON.stringify(record)} -->`,
+});
 const approval = {
   id: 11,
   user: approver,
@@ -43,6 +47,10 @@ const approval = {
   created_at: "2026-01-01T00:01:00Z",
   updated_at: "2026-01-01T00:01:00Z",
 };
+const withApproval = (changes: Partial<typeof approval>) => [notice, { ...approval, ...changes }];
+const guardFiles = (script: Options["script"]) => [
+  { filename: script === "dependency-guard" ? "pnpm-workspace.yaml" : "src/gateway/auth.ts" },
+];
 const commentEvent = {
   action: "created",
   issue: { number: 7, pull_request: {} },
@@ -204,92 +212,84 @@ describe("security-sensitive guard entry point", () => {
     expect(result.stderr).toMatch(/Skipping comment creation.*Fixture API failure/u);
   });
 
-  it.each([
-    { name: "an external author", options: {} },
-    { name: "write access", options: { authorRole: "write" } },
-    { name: "an admin bot", options: { authorRole: "admin", authorType: "Bot" } },
-    {
-      name: "a normal GitHub Approve review without the command",
-      options: { reviews: [{ user: approver, state: "APPROVED", commit_id: headSha }] },
-    },
-    {
-      name: "a write-only approver",
-      options: { comments: [notice, approval], approverRole: "write" },
-    },
-    {
-      name: "a bot command",
-      options: { comments: [notice, { ...approval, user: { ...approver, type: "Bot" } }] },
-    },
-    {
-      name: "a removed maintainer",
-      options: {
-        comments: [notice, approval],
+  it.each<[string, Options]>([
+    ["an external author", {}],
+    ["write access", { authorRole: "write" }],
+    ["an admin bot", { authorRole: "admin", authorType: "Bot" }],
+    [
+      "a normal GitHub Approve review without the command",
+      {
+        reviews: [{ user: approver, state: "APPROVED", commit_id: headSha }],
+      },
+    ],
+    ["a write-only approver", { comments: withApproval({}), approverRole: "write" }],
+    ["a bot command", { comments: withApproval({ user: { ...approver, type: "Bot" } }) }],
+    [
+      "a removed maintainer",
+      {
+        comments: withApproval({}),
         routes: {
           "GET /repos/openclaw/openclaw/collaborators/maintainer/permission": { httpError: 404 },
         },
       },
-    },
-    { name: "a command before the first notice", options: { comments: [approval] } },
-    {
-      name: "a command simultaneous with the notice",
-      options: {
-        comments: [notice, { ...approval, created_at: requestedAt, updated_at: requestedAt }],
+    ],
+    ["a command before the first notice", { comments: [approval] }],
+    [
+      "a command simultaneous with the notice",
+      {
+        comments: withApproval({ created_at: requestedAt, updated_at: requestedAt }),
       },
-    },
-    {
-      name: "an old comment edited to add the command",
-      options: { comments: [notice, { ...approval, created_at: requestedAt }] },
-    },
-    {
-      name: "an edited command",
-      options: { comments: [notice, { ...approval, updated_at: "2026-01-01T00:02:00Z" }] },
-    },
-    {
-      name: "a comment posted before a new revision's sticky notice update",
-      options: { comments: [{ ...notice, updated_at: "2026-01-01T00:02:00Z" }, approval] },
-    },
-    {
-      name: "a different guard's command",
-      options: { comments: [notice, { ...approval, body: "/allow-dependencies-change" }] },
-    },
-    {
-      name: "a quoted command",
-      options: { comments: [notice, { ...approval, body: "> /allow-security-sensitive-change" }] },
-    },
-    {
-      name: "a command inside a code block",
-      options: {
-        comments: [notice, { ...approval, body: "```\n/allow-security-sensitive-change\n```" }],
+    ],
+    [
+      "an old comment edited to add the command",
+      { comments: withApproval({ created_at: requestedAt }) },
+    ],
+    ["an edited command", { comments: withApproval({ updated_at: "2026-01-01T00:02:00Z" }) }],
+    [
+      "a comment posted before a new revision's sticky notice update",
+      {
+        comments: [{ ...notice, updated_at: "2026-01-01T00:02:00Z" }, approval],
       },
-    },
-    {
-      name: "an untrusted notice copied by the contributor",
-      options: { comments: [{ ...notice, user: author }, approval] },
-    },
-    {
-      name: "a malformed request record",
-      options: {
+    ],
+    [
+      "a different guard's command",
+      { comments: withApproval({ body: "/allow-dependencies-change" }) },
+    ],
+    [
+      "a quoted command",
+      { comments: withApproval({ body: "> /allow-security-sensitive-change" }) },
+    ],
+    [
+      "a command inside a code block",
+      {
+        comments: withApproval({ body: "```\n/allow-security-sensitive-change\n```" }),
+      },
+    ],
+    [
+      "an untrusted notice copied by the contributor",
+      { comments: [{ ...notice, user: author }, approval] },
+    ],
+    [
+      "a malformed request record",
+      {
         comments: [
           { ...notice, body: `${marker}\n<!-- openclaw:approval-request { -->` },
           approval,
         ],
       },
-    },
-    {
-      name: "a future request timestamp",
-      options: {
+    ],
+    [
+      "a future request timestamp",
+      {
         comments: [
-          {
-            ...notice,
-            body: `${marker}\n<!-- openclaw:approval-request ${JSON.stringify({ head: headSha, base: "main", requestedAt: "2026-01-02T00:00:00Z" })} -->`,
-          },
+          requestNotice({ head: headSha, base: "main", requestedAt: "2026-01-02T00:00:00Z" }),
           approval,
         ],
       },
-    },
-    {
-      name: "a legacy authorized bot comment",
-      options: {
+    ],
+    [
+      "a legacy authorized bot comment",
+      {
         comments: [
           {
             ...notice,
@@ -298,8 +298,8 @@ describe("security-sensitive guard entry point", () => {
           approval,
         ],
       },
-    },
-  ])("requires a fresh command for $name", ({ options }) => {
+    ],
+  ])("requires a fresh command for %s", (_name, options) => {
     const result = runGuard(options);
     expect(result.status, result.stderr).toBe(0);
     expect(result.statuses).toEqual(["failure", "failure"]);
@@ -337,10 +337,7 @@ describe("security-sensitive guard entry point", () => {
     { name: "head", oldRecord: { head: "c".repeat(40), base: "main" } },
     { name: "target branch", oldRecord: { head: headSha, base: "stable" } },
   ])("rejects a delayed or replayed command after the $name changes", ({ oldRecord }) => {
-    const oldNotice = {
-      ...notice,
-      body: `${marker}\n<!-- openclaw:approval-request ${JSON.stringify({ ...oldRecord, requestedAt })} -->`,
-    };
+    const oldNotice = requestNotice({ ...oldRecord, requestedAt });
     const result = runGuard({ comments: [oldNotice, approval], event: commentEvent });
     expect(result.statuses).toEqual(["failure", "failure"]);
     expect(result.comment).toContain(JSON.stringify({ head: headSha, base: "main" }));
@@ -434,11 +431,7 @@ describe("security-sensitive guard entry point", () => {
       const pr = pullRequest;
       const result = runGuard({
         script,
-        files: [
-          {
-            filename: script === "dependency-guard" ? "pnpm-workspace.yaml" : "src/gateway/auth.ts",
-          },
-        ],
+        files: guardFiles(script),
         authorRole: "maintain",
         comments: [notice, approval],
         routes: {
@@ -467,9 +460,7 @@ describe("security-sensitive guard entry point", () => {
   describe.each(["security-sensitive-guard", "dependency-guard"] as const)(
     "%s rollout enforcement",
     (script) => {
-      const files = [
-        { filename: script === "dependency-guard" ? "pnpm-workspace.yaml" : "src/gateway/auth.ts" },
-      ];
+      const files = guardFiles(script);
 
       it.each([
         { status: "diverged", ancestor: "b".repeat(40), enforced: false },

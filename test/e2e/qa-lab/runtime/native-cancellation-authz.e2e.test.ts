@@ -290,10 +290,19 @@ it("allows the owner and rejects foreign or replaced backing runs before termina
               };
             });
           try {
+            if (!sameId) {
+              expect(
+                await subagentRegistry.replaceSubagentRunAfterSteerCore({
+                  previousRunId: runId,
+                  nextRunId: replacementRunId,
+                }),
+              ).toBe(true);
+              expect(getSubagentRunByRunId(runId)).toBeUndefined();
+            }
             await registerRunningSubagent(replacementRunId, childSessionKey);
             expect(released).toBe(true);
             await withinTest(activation.mock.results[0]!.value, signal);
-            expect(getGatewayContextResolver(subagentRuns.get(runId)!)).toBeDefined();
+            expect(getGatewayContextResolver(subagentRuns.get(replacementRunId)!)).toBeDefined();
           } finally {
             releaseActivation.resolve();
             registration.mockRestore();

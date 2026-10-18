@@ -22,33 +22,30 @@ export function registerGatewayCallDispatchPreparationTests(
   },
 ): void {
   it.each([
-    {
-      method: "secrets.resolve",
-      requiredMethods: ["secrets.resolve"],
-      requiredCapabilities: undefined,
-      error:
-        /does not support required method "secrets\.resolve".*update or restart the active gateway/i,
+    [
+      { method: "secrets.resolve", requiredMethods: ["secrets.resolve"] },
+      /does not support required method "secrets\.resolve".*update or restart the active gateway/i,
+    ],
+    [
+      {
+        method: "gateway.restart.request",
+        requiredCapabilities: ["gateway-restart-target-safe-v1"],
+      },
+      /does not support required capability "gateway-restart-target-safe-v1".*update or restart the active gateway/i,
+    ],
+    [
+      { method: "agent", requiredCapabilities: [GATEWAY_SERVER_CAPS.AGENT_SESSION_ID_CREATE] },
+      /does not support required capability "agent-session-id-create-v1".*update or restart the active gateway/i,
+    ],
+  ] satisfies Array<[Parameters<typeof callGateway>[0], RegExp]>)(
+    "requires supported features before calling %j",
+    async (options, error) => {
+      const harness = setup();
+      harness.setFeatures(["health"], []);
+      await expect(harness.call(options)).rejects.toThrow(error);
+      expect(harness.request()).toBeNull();
     },
-    {
-      method: "gateway.restart.request",
-      requiredMethods: undefined,
-      requiredCapabilities: ["gateway-restart-target-safe-v1"],
-      error:
-        /does not support required capability "gateway-restart-target-safe-v1".*update or restart the active gateway/i,
-    },
-    {
-      method: "agent",
-      requiredMethods: undefined,
-      requiredCapabilities: [GATEWAY_SERVER_CAPS.AGENT_SESSION_ID_CREATE],
-      error:
-        /does not support required capability "agent-session-id-create-v1".*update or restart the active gateway/i,
-    },
-  ])("requires supported features before calling $method", async ({ error, ...options }) => {
-    const harness = setup();
-    harness.setFeatures(["health"], []);
-    await expect(harness.call(options)).rejects.toThrow(error);
-    expect(harness.request()).toBeNull();
-  });
+  );
 
   it.each([
     {
@@ -117,14 +114,10 @@ export function registerGatewayCallDispatchPreparationTests(
         await cleanup.promise;
       },
     });
-    void pending.then(
-      () => {
-        settled = true;
-      },
-      () => {
-        settled = true;
-      },
-    );
+    const markSettled = () => {
+      settled = true;
+    };
+    void pending.then(markSettled, markSettled);
     const rejected = expect(pending).rejects.toThrow("gateway closed");
     await entered.promise;
     harness.close(1001, "gone");

@@ -1,9 +1,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  closeHttpServer,
+  listenLoopback,
+} from "../../test/helpers/gateway-integration-fixtures.js";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { readBoardHtml, createTestBoardStore } from "../boards/board-store.test-support.js";
@@ -45,20 +48,9 @@ const gatewayBAuthority = {
 };
 
 beforeAll(async () => {
-  await store.putWidget({
-    sessionKey: "agent:main:main",
-    name: "status",
-    content: { kind: "html", html: statusHtml },
-  });
-  await store.putWidget({
-    sessionKey: "agent:main:main",
-    name: "revisioned",
-    content: { kind: "html", html: "<p>one</p>" },
-  });
-  await store.putWidget({
-    sessionKey: "agent:main:main",
-    name: "grantable",
-    content: { kind: "html", html: "<script>pending()</script>" },
+  await putHtml("status", statusHtml);
+  await putHtml("revisioned", "<p>one</p>");
+  await putHtml("grantable", "<script>pending()</script>", {
     declared: { netOrigins: ["https://example.com"] },
   });
   server = createServer((req, res) => {
@@ -77,23 +69,11 @@ beforeAll(async () => {
         res.destroy(new Error("Board HTTP test request failed", { cause: error })),
     );
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  baseUrl = await listenLoopback(server);
 });
 
 afterAll(async () => {
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    });
-  });
+  await closeHttpServer(server);
   await closeOpenClawAgentDatabasesAsync(stateDir);
   closeOpenClawAgentDatabasesForTest();
   await closeOpenClawStateDatabaseAsync();
@@ -101,28 +81,38 @@ afterAll(async () => {
   rmSync(stateDir, { recursive: true, force: true });
 });
 
-async function ticketFor(name: string, revision = 1, issuedAtMs = nowMs): Promise<string> {
-  const document = await readBoardHtml(store, mainSession, name);
+function putHtml(
+  name: string,
+  html: string,
+  options: Partial<Parameters<typeof store.putWidget>[0]> = {},
+) {
+  return store.putWidget({
+    sessionKey: mainSession.sessionKey,
+    name,
+    content: { kind: "html", html },
+    ...options,
+  });
+}
+
+async function ticketFor(
+  name: string,
+  revision = 1,
+  issuedAtMs = nowMs,
+  authority: Parameters<typeof createBoardViewTicket>[0]["authority"] = gatewayAAuthority,
+  target: { sessionKey: string; agentId?: string } = { sessionKey: mainSession.sessionKey },
+): Promise<string> {
+  const document = await readBoardHtml(store, target, name);
   if (!document) {
     throw new Error(`missing HTML widget: ${name}`);
   }
-  return issueTicket({
-    sessionKey: "agent:main:main",
+  return createBoardViewTicket({
+    ...target,
     name,
     revision,
     viewGeneration: document.viewGeneration,
     nowMs: issuedAtMs,
-  }).ticket;
-}
-
-function issueTicket(
-  params: Omit<Parameters<typeof createBoardViewTicket>[0], "authority">,
-  authority: Parameters<typeof createBoardViewTicket>[0]["authority"] = gatewayAAuthority,
-): ReturnType<typeof createBoardViewTicket> {
-  return createBoardViewTicket({
-    ...params,
     authority,
-  });
+  }).ticket;
 }
 
 function request(
@@ -140,40 +130,24 @@ describe("board widget HTTP", () => {
   it("fences direct-listener replay of an ingress ticket when its grant ends", async () => {
     const grant = new AbortController();
     const ingress = createRemoteControlUiIngressTestContext({ signal: grant.signal });
-    const document = (await readBoardHtml(store, mainSession, "status"))!;
-    const { ticket } = issueTicket(
-      {
-        sessionKey: mainSession.sessionKey,
-        name: "status",
-        revision: document.revision,
-        viewGeneration: document.viewGeneration,
-        nowMs,
-      },
-      { ...gatewayAAuthority, remoteIngressPrincipal: ingress.resolvePrincipal() },
-    );
+    const ticket = await ticketFor("status", 1, nowMs, {
+      ...gatewayAAuthority,
+      remoteIngressPrincipal: ingress.resolvePrincipal(),
+    });
     expect((await request("status", { ticket })).status).toBe(200);
     grant.abort();
     expect((await request("status", { ticket })).status).toBe(503);
   });
   it("binds global widget tickets to their canonical session and selected owner", async () => {
     for (const agentId of ["main", "work"]) {
-      await store.putWidget({
+      await putHtml("global-status", `<p>${agentId}</p>`, {
         sessionKey: "global",
         agentId,
-        name: "global-status",
-        content: { kind: "html", html: `<p>${agentId}</p>` },
       });
     }
     for (const agentId of ["main", "work"]) {
       const target = { sessionKey: "global", agentId };
-      const document = (await readBoardHtml(store, target, "global-status"))!;
-      const { ticket } = issueTicket({
-        ...target,
-        name: "global-status",
-        revision: document.revision,
-        viewGeneration: document.viewGeneration,
-        nowMs,
-      });
+      const ticket = await ticketFor("global-status", 1, nowMs, gatewayAAuthority, target);
       const read = (owner: string) =>
         fetch(
           `${baseUrl}/__openclaw__/board/agent%3A${owner}%3Aglobal/global-status/index.html?bt=${encodeURIComponent(ticket)}`,
@@ -193,20 +167,7 @@ describe("board widget HTTP", () => {
 
     requestGatewayContext = gatewayB;
     expect((await request("status", { ticket })).status).toBe(503);
-    const document = await readBoardHtml(store, mainSession, "status");
-    if (!document) {
-      throw new Error("missing status widget");
-    }
-    const replacementTicket = issueTicket(
-      {
-        sessionKey: "agent:main:main",
-        name: "status",
-        revision: document.revision,
-        viewGeneration: document.viewGeneration,
-        nowMs,
-      },
-      gatewayBAuthority,
-    ).ticket;
+    const replacementTicket = await ticketFor("status", 1, nowMs, gatewayBAuthority);
     expect((await request("status", { ticket: replacementTicket })).status).toBe(200);
 
     requestGatewayContext = gatewayA;
@@ -253,10 +214,11 @@ describe("board widget HTTP", () => {
       expect(body).toEqual(method === "GET" ? Buffer.from(testCase.body) : Buffer.alloc(0));
 
       if (testCase.status === 200) {
-        expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
-        expect(response.headers.get("content-security-policy")).toContain("connect-src 'none'");
-        expect(response.headers.get("content-security-policy")).toContain("webrtc 'block'");
-        expect(response.headers.get("content-security-policy")).toContain("sandbox allow-scripts");
+        const csp = response.headers.get("content-security-policy");
+        expect(csp).toContain("default-src 'none'");
+        expect(csp).toContain("connect-src 'none'");
+        expect(csp).toContain("webrtc 'block'");
+        expect(csp).toContain("sandbox allow-scripts");
         expect(response.headers.get("cache-control")).toBe("no-cache");
       }
     }
@@ -303,11 +265,7 @@ describe("board widget HTTP", () => {
   });
 
   it("sends widget HTML in the authorized read turn before a queued removal", async () => {
-    await store.putWidget({
-      ...mainSession,
-      name: "handoff",
-      content: { kind: "html", html: "handoff" },
-    });
+    await putHtml("handoff", "handoff");
     const ticket = await ticketFor("handoff");
     let servingResponse: ServerResponse | undefined;
     let responseEndedBeforeRemoval = false;
@@ -363,11 +321,7 @@ describe("board widget HTTP", () => {
 
   it("rejects a ticket after the widget revision changes", async () => {
     const stale = await ticketFor("revisioned");
-    await store.putWidget({
-      sessionKey: "agent:main:main",
-      name: "revisioned",
-      content: { kind: "html", html: "<p>two</p>" },
-    });
+    await putHtml("revisioned", "<p>two</p>");
     expect((await request("revisioned", { ticket: stale })).status).toBe(401);
     const current = await request("revisioned", { ticket: await ticketFor("revisioned", 2) });
     expect(current.status).toBe(200);
@@ -375,18 +329,10 @@ describe("board widget HTTP", () => {
   });
 
   it("rejects a stale ticket when a widget name and revision are reused", async () => {
-    await store.putWidget({
-      sessionKey: "agent:main:main",
-      name: "recreated",
-      content: { kind: "html", html: "<p>old</p>" },
-    });
+    await putHtml("recreated", "<p>old</p>");
     const stale = await ticketFor("recreated");
     await store.applyOps(mainSession, [{ kind: "widget_remove", name: "recreated" }]);
-    await store.putWidget({
-      sessionKey: "agent:main:main",
-      name: "recreated",
-      content: { kind: "html", html: "<p>old</p>" },
-    });
+    await putHtml("recreated", "<p>old</p>");
 
     expect((await request("recreated", { ticket: stale })).status).toBe(401);
     expect((await request("recreated", { ticket: await ticketFor("recreated") })).status).toBe(200);

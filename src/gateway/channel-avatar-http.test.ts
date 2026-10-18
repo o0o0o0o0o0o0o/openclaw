@@ -1,6 +1,9 @@
 import { createServer, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  closeHttpServer,
+  listenLoopback,
+} from "../../test/helpers/gateway-integration-fixtures.js";
 import { memorySessionActorOwners } from "../config/sessions/session-actor-memory-owner.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { resolveIncognitoOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.paths.js";
@@ -49,19 +52,32 @@ const PNG_BYTES = Buffer.from(
 );
 const AVATAR_REFERENCE = "/state/media/inbound/channel-avatar.png";
 
-function avatarEntry(reference = AVATAR_REFERENCE) {
+function avatarEntry(
+  reference = AVATAR_REFERENCE,
+  origin: { provider?: string; accountId?: string; from?: string; chatType?: "direct" } = {},
+) {
   return {
     delivery: {
       kind: "external" as const,
       route: { channel: "discord", target: { to: "user:1" } },
       context: { channel: "discord", to: "user:1" },
-      origin: { provider: "discord", to: "user:1", avatar: reference },
+      origin: { provider: "discord", to: "user:1", avatar: reference, ...origin },
     },
   };
 }
 
+function holdMediaRead(release = createDeferredCore()) {
+  const reading = createDeferredCore();
+  mocks.readMedia.mockImplementationOnce(async () => {
+    reading.resolve();
+    await release.promise;
+    return { buffer: PNG_BYTES };
+  });
+  return { reading, release };
+}
+
 describe("handleChannelAvatarHttpRequest", () => {
-  let port = 0;
+  let baseUrl: string;
   let server: ReturnType<typeof createServer>;
   let authorityCurrent = true;
 
@@ -78,19 +94,11 @@ describe("handleChannelAvatarHttpRequest", () => {
         })
         .catch(() => finishFailedGatewayHttpResponse(res));
     });
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        port = (server.address() as AddressInfo).port;
-        resolve();
-      });
-    });
+    baseUrl = await listenLoopback(server);
   });
 
   afterAll(async () => {
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve());
-    });
+    await closeHttpServer(server);
   });
 
   afterEach(() => {
@@ -125,7 +133,7 @@ describe("handleChannelAvatarHttpRequest", () => {
   });
 
   const avatarRoute = (sessionKey: string) =>
-    `http://127.0.0.1:${port}${buildControlUiChannelAvatarUrl("", sessionKey, "test-revision")}`;
+    `${baseUrl}${buildControlUiChannelAvatarUrl("", sessionKey, "test-revision")}`;
 
   it("serves current memory avatars and refuses bytes after the captured owner closes", async () => {
     vi.stubEnv("OPENCLAW_STATE_DIR", "/synthetic/channel-avatar");
@@ -168,12 +176,7 @@ describe("handleChannelAvatarHttpRequest", () => {
         authority,
       );
       expect(patch.kind).toBe("committed");
-      const reading = createDeferredCore();
-      mocks.readMedia.mockImplementationOnce(async () => {
-        reading.resolve();
-        await release.promise;
-        return { buffer: PNG_BYTES };
-      });
+      const { reading } = holdMediaRead(release);
       pending = fetch(avatarRoute(sessionKey));
       await reading.promise;
       memorySessionActorOwners.closeDatabase(owner);
@@ -190,21 +193,13 @@ describe("handleChannelAvatarHttpRequest", () => {
   });
 
   it("binds transcript avatar bytes to the exact native sender and media snapshot", async () => {
-    const entry = avatarEntry();
     mocks.loadEntry.mockReturnValue({
-      entry: {
-        ...entry,
-        delivery: {
-          ...entry.delivery,
-          origin: {
-            ...entry.delivery.origin,
-            provider: "telegram",
-            accountId: "sample-bot",
-            from: "telegram:1000000001",
-            chatType: "direct",
-          },
-        },
-      },
+      entry: avatarEntry(AVATAR_REFERENCE, {
+        provider: "telegram",
+        accountId: "sample-bot",
+        from: "telegram:1000000001",
+        chatType: "direct",
+      }),
     });
     const url = new URL(avatarRoute("agent:main:portrait-binding"));
     url.searchParams.set("v", channelAvatarRevision(AVATAR_REFERENCE));
@@ -227,13 +222,7 @@ describe("handleChannelAvatarHttpRequest", () => {
   });
 
   it("rejects revoked authority while channel avatar bytes are loading", async () => {
-    const reading = createDeferredCore();
-    const release = createDeferredCore();
-    mocks.readMedia.mockImplementationOnce(async () => {
-      reading.resolve();
-      await release.promise;
-      return { buffer: PNG_BYTES };
-    });
+    const { reading, release } = holdMediaRead();
 
     const pending = fetch(avatarRoute("agent:main:revoked"));
     await reading.promise;
@@ -259,15 +248,15 @@ describe("handleChannelAvatarHttpRequest", () => {
       const response = await fetch(route);
 
       expect(response.status).toBe(200);
-      expect(response.headers.get("content-type")).toBe("image/png");
-      expect(response.headers.get("content-length")).toBe(String(buffer.byteLength));
-      expect(response.headers.get("cache-control")).toBe("private, max-age=3600");
-      expect(response.headers.get("cross-origin-resource-policy")).toBe("same-origin");
-      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(Object.fromEntries(response.headers)).toMatchObject({
+        "content-type": "image/png",
+        "content-length": String(buffer.byteLength),
+        "cache-control": "private, max-age=3600",
+        "cross-origin-resource-policy": "same-origin",
+        "x-content-type-options": "nosniff",
+        "content-disposition": 'attachment; filename="channel-avatar"',
+      });
       expect(response.headers.get("content-security-policy")).toContain("sandbox");
-      expect(response.headers.get("content-disposition")).toBe(
-        'attachment; filename="channel-avatar"',
-      );
       expect(Buffer.from(await response.arrayBuffer())).toEqual(buffer);
       expect(mocks.resolveReference).toHaveBeenCalledWith(AVATAR_REFERENCE);
       expect(mocks.readMedia).toHaveBeenCalledWith(
@@ -309,9 +298,11 @@ describe("handleChannelAvatarHttpRequest", () => {
     expect(etag).toBeTruthy();
     for (const [index, response] of responses.entries()) {
       expect(response.status).toBe(200);
-      expect(response.headers.get("etag")).toBe(etag);
-      expect(response.headers.get("content-type")).toBe("image/png");
-      expect(response.headers.get("content-length")).toBe(String(PNG_BYTES.byteLength));
+      expect(Object.fromEntries(response.headers)).toMatchObject({
+        etag,
+        "content-type": "image/png",
+        "content-length": String(PNG_BYTES.byteLength),
+      });
       expect(Buffer.from(await response.arrayBuffer())).toEqual(
         index % 2 ? Buffer.alloc(0) : PNG_BYTES,
       );
@@ -395,7 +386,7 @@ describe("handleChannelAvatarHttpRequest", () => {
   it.each(["/__openclaw__/channel-avatar/", "/__openclaw__/channel-avatar/a/b"])(
     "claims malformed route %s as a 404",
     async (pathname) => {
-      const response = await fetch(`http://127.0.0.1:${port}${pathname}`);
+      const response = await fetch(`${baseUrl}${pathname}`);
 
       expect(response.status).toBe(404);
       expect(mocks.loadEntry).not.toHaveBeenCalled();
@@ -404,7 +395,7 @@ describe("handleChannelAvatarHttpRequest", () => {
 
   it("rejects non-read methods and leaves unrelated paths unhandled", async () => {
     const rejected = await fetch(avatarRoute("agent:main:one"), { method: "POST" });
-    const unhandled = await fetch(`http://127.0.0.1:${port}/__openclaw__/workspace-icon/one`);
+    const unhandled = await fetch(`${baseUrl}/__openclaw__/workspace-icon/one`);
 
     expect(rejected.status).toBe(405);
     expect(rejected.headers.get("allow")).toBe("GET, HEAD");

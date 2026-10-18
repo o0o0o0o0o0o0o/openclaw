@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { readBoardHtml } from "../boards/board-store.test-support.js";
@@ -8,6 +8,7 @@ import { buildWidgetDocument } from "../canvas/wrap.js";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../config/io.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.entry.js";
 import * as historyReaders from "../config/sessions/session-transcript-worker-readers.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { invalidateRegisteredAgentDatabasesMemo } from "../state/openclaw-agent-db-registry-listing.js";
 import { registerOpenClawAgentDatabase } from "../state/openclaw-agent-db-registry.js";
 import {
@@ -27,28 +28,46 @@ import { createBoardHarness } from "./server-methods/board.test-support.js";
 import { createProgressCardHandlers } from "./server-methods/progress-card.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+let stateDir: string;
+beforeEach(() => {
+  stateDir = tempDirs.make("openclaw-gateway-boards-");
+  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+});
 
-afterEach(async () => {
+async function closeDatabases() {
   await closeOpenClawAgentDatabasesAsync();
   closeOpenClawAgentDatabasesForTest();
   await closeOpenClawStateDatabaseAsync();
   closeOpenClawStateDatabaseForTest();
+}
+
+function progressHarness(cfg: OpenClawConfig) {
+  setRuntimeConfigSnapshot(cfg, cfg);
+  const harness = createBoardHarness(undefined, {}, boardStore, { getRuntimeConfig: () => cfg });
+  Object.assign(harness.handlers, createProgressCardHandlers());
+  return harness;
+}
+
+function expectCard(response: unknown, card: Record<string, unknown> | null) {
+  expect(response).toHaveBeenCalledWith(
+    true,
+    { card: card === null ? null : expect.objectContaining(card) },
+    undefined,
+  );
+}
+
+afterEach(async () => {
+  await closeDatabases();
   clearRuntimeConfigSnapshot();
   vi.unstubAllEnvs();
 });
 
 it("keeps global boards and progress under each owner's canonical row across reopen", async () => {
-  const stateDir = tempDirs.make("openclaw-gateway-global-boards-");
-  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
   const cfg = {
     agents: { ownership: "explicit" as const, entries: { main: {}, work: {} } },
     session: { scope: "global" as const },
   };
-  setRuntimeConfigSnapshot(cfg, cfg);
-  const { invoke, handlers, broadcast } = createBoardHarness(undefined, {}, boardStore, {
-    getRuntimeConfig: () => cfg,
-  });
-  Object.assign(handlers, createProgressCardHandlers());
+  const { invoke, broadcast } = progressHarness(cfg);
 
   for (const agentId of ["main", "work"]) {
     const database = openOpenClawAgentDatabase({ agentId });
@@ -77,11 +96,7 @@ it("keeps global boards and progress under each owner's canonical row across reo
       agentId,
       plan: [{ step: `${agentId} done`, status: "completed" }],
     });
-    expect(progress).toHaveBeenCalledWith(
-      true,
-      { card: expect.objectContaining({ sessionKey: `agent:${agentId}:global`, revision: 1 }) },
-      undefined,
-    );
+    expectCard(progress, { sessionKey: `agent:${agentId}:global`, revision: 1 });
     expect(database.db.prepare("SELECT session_key FROM session_progress_cards").all()).toEqual([
       expect.objectContaining({ session_key: "global" }),
     ]);
@@ -89,10 +104,7 @@ it("keeps global boards and progress under each owner's canonical row across reo
       expect.objectContaining({ session_key: "global" }),
     ]);
   }
-  await closeOpenClawAgentDatabasesAsync();
-  closeOpenClawAgentDatabasesForTest();
-  await closeOpenClawStateDatabaseAsync();
-  closeOpenClawStateDatabaseForTest();
+  await closeDatabases();
 
   for (const agentId of ["main", "work"]) {
     const target = { sessionKey: "global", agentId };
@@ -118,17 +130,11 @@ it("keeps global boards and progress under each owner's canonical row across reo
     const parentSql = observeMainThreadSql();
     try {
       const progress = await invoke("progressCard.get", { sessionKey: "global", agentId });
-      expect(progress).toHaveBeenCalledWith(
-        true,
-        {
-          card: expect.objectContaining({
-            sessionKey: `agent:${agentId}:global`,
-            revision: 1,
-            steps: [{ step: `${agentId} done`, status: "completed" }],
-          }),
-        },
-        undefined,
-      );
+      expectCard(progress, {
+        sessionKey: `agent:${agentId}:global`,
+        revision: 1,
+        steps: [{ step: `${agentId} done`, status: "completed" }],
+      });
       await closeOpenClawAgentDatabasesAsync();
       await closeOpenClawStateDatabaseAsync();
       parentSql.expectIdle();
@@ -143,7 +149,7 @@ it("keeps global boards and progress under each owner's canonical row across reo
     agentId: "work",
     expectedRevision: 1,
   });
-  expect(cleared).toHaveBeenCalledWith(true, { card: null }, undefined);
+  expectCard(cleared, null);
   expect(broadcast).toHaveBeenLastCalledWith(
     "progressCard.changed",
     {
@@ -156,8 +162,6 @@ it("keeps global boards and progress under each owner's canonical row across reo
 });
 
 it("keeps retained global progress separate from an ordinary qualified global row in per-sender mode", async () => {
-  const stateDir = tempDirs.make("openclaw-gateway-retained-global-progress-");
-  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
   const cfg = {
     agents: {
       ownership: "explicit" as const,
@@ -166,11 +170,7 @@ it("keeps retained global progress separate from an ordinary qualified global ro
     },
     session: { scope: "per-sender" as const },
   };
-  setRuntimeConfigSnapshot(cfg, cfg);
-  const { invoke, handlers } = createBoardHarness(undefined, {}, boardStore, {
-    getRuntimeConfig: () => cfg,
-  });
-  Object.assign(handlers, createProgressCardHandlers());
+  const { invoke } = progressHarness(cfg);
   const targets = [
     { sessionKey: "global", agentId: "main" },
     { sessionKey: "global", agentId: "work" },
@@ -187,53 +187,32 @@ it("keeps retained global progress separate from an ordinary qualified global ro
       markdown: `${target.agentId}/${target.sessionKey}`,
       plan: [{ step: "Done", status: "completed" }],
     });
-    expect(written).toHaveBeenCalledWith(
-      true,
-      { card: expect.objectContaining({ revision: 1 }) },
-      undefined,
-    );
+    expectCard(written, { revision: 1 });
   }
-  await closeOpenClawAgentDatabasesAsync();
-  closeOpenClawAgentDatabasesForTest();
-  await closeOpenClawStateDatabaseAsync();
-  closeOpenClawStateDatabaseForTest();
+  await closeDatabases();
 
   for (const target of targets) {
     const read = await invoke("progressCard.get", target);
-    expect(read).toHaveBeenCalledWith(
-      true,
-      {
-        card: expect.objectContaining({
-          sessionKey: `agent:${target.agentId}:global`,
-          markdown: `${target.agentId}/${target.sessionKey}`,
-          revision: 1,
-        }),
-      },
-      undefined,
-    );
+    expectCard(read, {
+      sessionKey: `agent:${target.agentId}:global`,
+      markdown: `${target.agentId}/${target.sessionKey}`,
+      revision: 1,
+    });
   }
   const unqualified = await invoke("progressCard.get", { sessionKey: "global" });
-  expect(unqualified).toHaveBeenCalledWith(
-    true,
-    { card: expect.objectContaining({ markdown: "main/global" }) },
-    undefined,
-  );
+  expectCard(unqualified, { markdown: "main/global" });
   const stale = await invoke("progressCard.put", {
     sessionKey: "global",
     agentId: "work",
     expectedRevision: 2,
   });
-  expect(stale).toHaveBeenCalledWith(
-    true,
-    { card: expect.objectContaining({ markdown: "work/global", revision: 1 }) },
-    undefined,
-  );
+  expectCard(stale, { markdown: "work/global", revision: 1 });
   const cleared = await invoke("progressCard.put", {
     sessionKey: "global",
     agentId: "work",
     expectedRevision: 1,
   });
-  expect(cleared).toHaveBeenCalledWith(true, { card: null }, undefined);
+  expectCard(cleared, null);
   expect(await progressCardStore.get("global", "work")).toBeNull();
   expect((await progressCardStore.get("global", "main"))?.markdown).toBe("main/global");
   expect((await progressCardStore.get("agent:work:global", "work"))?.markdown).toBe(
@@ -242,10 +221,8 @@ it("keeps retained global progress separate from an ordinary qualified global ro
 });
 
 it("prepares custom board targets off-thread and observes a newly registered store owner", async () => {
-  const stateDir = tempDirs.make("openclaw-gateway-board-registry-");
   const storePath = path.join(stateDir, "custom", "sessions.json");
   const databasePath = path.join(stateDir, "custom", "openclaw-agent.sqlite");
-  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
   const cfg = {
     agents: { ownership: "explicit" as const, entries: { main: {}, ops: {} } },
     session: { store: storePath },
@@ -280,9 +257,7 @@ it("prepares custom board targets off-thread and observes a newly registered sto
 });
 
 it("reopens separate boards and progress cards in a shared database owned by another agent", async () => {
-  const stateDir = tempDirs.make("openclaw-gateway-shared-boards-");
   const storePath = path.join(stateDir, "shared.sqlite");
-  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
   const cfg = {
     agents: {
       ownership: "explicit" as const,
@@ -309,10 +284,7 @@ it("reopens separate boards and progress cards in a shared database owned by ano
     });
     await progressCardStore.put(sessionKey, { markdown: `${agentId} progress` });
   }
-  await closeOpenClawAgentDatabasesAsync();
-  closeOpenClawAgentDatabasesForTest();
-  await closeOpenClawStateDatabaseAsync();
-  closeOpenClawStateDatabaseForTest();
+  await closeDatabases();
 
   const { invoke } = createBoardHarness(undefined, {}, boardStore, { getRuntimeConfig: () => cfg });
   const create = historyReaders.createSessionHistoryWorkerReaders;
@@ -413,8 +385,6 @@ it("reopens separate boards and progress cards in a shared database owned by ano
 });
 
 it("keeps missing progress-card storage absent and reports unreadable stored cards", async () => {
-  const stateDir = tempDirs.make("openclaw-gateway-progress-reader-");
-  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
   const cfg = { agents: { ownership: "explicit" as const, entries: { main: {} } } };
   setRuntimeConfigSnapshot(cfg, cfg);
   const key = "agent:main:main";

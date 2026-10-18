@@ -5,17 +5,18 @@ import {
   resolveChannelRestartReason,
 } from "./channel-health-policy.js";
 
+const policy = {
+  channelId: "discord",
+  now: 100_000,
+  channelConnectGraceMs: 10_000,
+  staleEventThresholdMs: 30_000,
+};
+
 function evaluateHealth(
   account: Record<string, unknown>,
   opts: { now?: number; channelId?: string } = {},
 ) {
-  const { now = 100_000, channelId = "discord" } = opts;
-  return evaluateChannelHealth(account, {
-    channelId,
-    now,
-    channelConnectGraceMs: 10_000,
-    staleEventThresholdMs: 30_000,
-  });
+  return evaluateChannelHealth(account, { ...policy, ...opts });
 }
 
 function runningAccount(overrides: Record<string, unknown> = {}) {
@@ -49,12 +50,7 @@ function inheritedTransportAccount() {
 
 describe("evaluateChannelHealth", () => {
   it("treats explicitly unlinked accounts as healthy unmanaged", () => {
-    const evaluation = evaluateHealth({
-      running: false,
-      enabled: true,
-      configured: true,
-      linked: false,
-    });
+    const evaluation = evaluateHealth(runningAccount({ running: false, linked: false }));
     expect(evaluation).toEqual({ healthy: true, reason: "unmanaged" });
   });
 
@@ -67,43 +63,13 @@ describe("evaluateChannelHealth", () => {
   });
 
   it.each([
-    {
-      name: "uses reconnect grace for a fresh typed disconnect",
-      lastStartAt: 0,
-      lastDisconnect: { at: 95_000, error: "socket closed" },
-      expected: { healthy: true, reason: "reconnect-grace" },
-    },
-    {
-      name: "expires reconnect grace after 120 seconds",
-      lastStartAt: 0,
-      lastDisconnect: { at: -20_001, error: "socket closed" },
-      expected: { healthy: false, reason: "disconnected" },
-    },
-    {
-      name: "ignores a legacy string disconnect",
-      lastStartAt: 0,
-      lastDisconnect: "socket closed",
-      expected: { healthy: false, reason: "disconnected" },
-    },
-    {
-      name: "ignores a malformed typed disconnect",
-      lastStartAt: 0,
-      lastDisconnect: { at: Number.NaN, error: "socket closed" },
-      expected: { healthy: false, reason: "disconnected" },
-    },
-    {
-      name: "ignores a disconnect from the previous lifecycle",
-      lastStartAt: 80_000,
-      lastDisconnect: { at: 79_000, error: "socket closed" },
-      expected: { healthy: false, reason: "disconnected" },
-    },
-    {
-      name: "ignores a disconnect dated after the current clock",
-      lastStartAt: 0,
-      lastDisconnect: { at: 101_000, error: "socket closed" },
-      expected: { healthy: false, reason: "disconnected" },
-    },
-  ] as const)("$name", ({ lastStartAt, lastDisconnect, expected }) => {
+    ["uses reconnect grace for a fresh typed disconnect", 0, { at: 95_000 }, true],
+    ["expires reconnect grace after 120 seconds", 0, { at: -20_001 }, false],
+    ["ignores a legacy string disconnect", 0, "socket closed", false],
+    ["ignores a malformed typed disconnect", 0, { at: Number.NaN }, false],
+    ["ignores a disconnect from the previous lifecycle", 80_000, { at: 79_000 }, false],
+    ["ignores a disconnect dated after the current clock", 0, { at: 101_000 }, false],
+  ] as const)("%s", (_name, lastStartAt, lastDisconnect, healthy) => {
     expect(
       evaluateHealth(
         runningAccount({
@@ -113,7 +79,7 @@ describe("evaluateChannelHealth", () => {
           lastDisconnect,
         }),
       ),
-    ).toEqual(expected);
+    ).toEqual({ healthy, reason: healthy ? "reconnect-grace" : "disconnected" });
   });
 
   it("maps recorded stopped lifecycle to the existing restartable verdict", () => {
@@ -179,56 +145,42 @@ describe("evaluateChannelHealth", () => {
   });
 
   it.each([
-    {
-      name: "distinguishes a stopped terminal channel",
-      snapshot: { running: false, terminalDisconnect: true, linked: false },
-      expected: { healthy: false, reason: "terminal-disconnect" },
-    },
-    {
-      name: "keeps ordinary stopped channels restartable",
-      snapshot: { running: false, terminalDisconnect: false },
-      expected: { healthy: false, reason: "not-running" },
-    },
-    {
-      name: "ignores stale terminal state while running",
-      snapshot: { running: true, connected: true, terminalDisconnect: true },
-      expected: { healthy: true, reason: "healthy" },
-    },
-  ] as const)("$name", ({ snapshot, expected }) => {
+    [{ running: false, terminalDisconnect: true, linked: false }, "terminal-disconnect"],
+    [{ running: false, terminalDisconnect: false }, "not-running"],
+    [{ running: true, connected: true, terminalDisconnect: true }, "healthy"],
+  ] as const)("evaluates terminal state %j as %s", (snapshot, reason) => {
     expect(
       evaluateHealth({ enabled: true, configured: true, ...snapshot }, { channelId: "whatsapp" }),
-    ).toEqual(expected);
+    ).toEqual({ healthy: reason === "healthy", reason });
   });
 
   describe("inbound ingress dimension", () => {
     it("keeps the ingress reason for the stopped state a failed start lands in", () => {
-      // server-channels records the verdict only after the start task rejects, so
-      // this is the shape the real failure has. Collapsing it into not-running
-      // would throw the cause away exactly where it matters.
-      const evaluation = evaluateHealth({
-        running: false,
-        enabled: true,
-        configured: true,
-        linked: false,
-        restartPending: true,
-        ingressUnavailable: true,
-      });
+      // Failed ingress starts publish their cause after the start task stops.
+      const evaluation = evaluateHealth(
+        runningAccount({
+          running: false,
+          linked: false,
+          restartPending: true,
+          ingressUnavailable: true,
+        }),
+      );
       expect(evaluation).toEqual({ healthy: false, reason: "ingress-unavailable" });
     });
 
     it.each([{ enabled: false }, { configured: false }])(
       "keeps disabled or unconfigured accounts unmanaged (%j)",
       (unmanaged) => {
-        const evaluation = evaluateHealth({
-          running: false,
-          enabled: true,
-          configured: true,
-          linked: false,
-          terminalDisconnect: true,
-          lifecycle: "blocked",
-          ingressUnavailable: true,
-          ...unmanaged,
-        });
+        const evaluation = evaluateHealth(
+          runningAccount({
+            running: false,
+            linked: false,
+            terminalDisconnect: true,
+            lifecycle: "blocked",
+            ingressUnavailable: true,
+            ...unmanaged,
+          }),
+        );
         expect(evaluation).toEqual({ healthy: true, reason: "unmanaged" });
       },
     );
@@ -247,24 +199,14 @@ describe("resolveChannelHealthState", () => {
     const evaluation = evaluateHealth(snapshot);
 
     expect(evaluation).toEqual({ healthy: false, reason: "terminal-disconnect" });
-    expect(
-      resolveChannelHealthState(snapshot, {
-        channelId: "discord",
-        now: 100_000,
-        channelConnectGraceMs: 10_000,
-        staleEventThresholdMs: 30_000,
-      }),
-    ).toBe("conflict");
+    expect(resolveChannelHealthState(snapshot, policy)).toBe("conflict");
   });
 });
 
 describe("resolveChannelRestartReason", () => {
   it("maps not-running + high reconnect attempts to gave-up", () => {
     const reason = resolveChannelRestartReason(
-      {
-        running: false,
-        reconnectAttempts: 10,
-      },
+      { running: false, reconnectAttempts: 10 },
       { healthy: false, reason: "not-running" },
     );
     expect(reason).toBe("gave-up");

@@ -1,5 +1,3 @@
-// Auth rate-limit tests cover sliding-window, lockout, scope, loopback, and
-// cleanup behavior shared by gateway secret and device-token authentication.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GatewayScheduler } from "../infra/gateway-scheduler.js";
 import {
@@ -25,7 +23,8 @@ describe("auth rate limiter", () => {
   function createClockedAuthRateLimiter(
     config?: Parameters<typeof createGatewayAuthRateLimiter>[0],
   ) {
-    return createGatewayAuthRateLimiter(config, { scheduler });
+    limiter = createGatewayAuthRateLimiter(config, { scheduler });
+    return limiter;
   }
   async function advancePenaltyClock(delayMs: number) {
     await clock.advanceBy(delayMs);
@@ -33,21 +32,21 @@ describe("auth rate limiter", () => {
   }
   const baseConfig = { maxAttempts: 2, windowMs: 60_000, lockoutMs: 60_000 };
 
-  function createLimiter(
-    overrides?: Partial<{
-      maxAttempts: number;
-      windowMs: number;
-      lockoutMs: number;
-      exemptLoopback: boolean;
-      pruneIntervalMs: number;
-      maxEntries: number;
-    }>,
-  ) {
-    limiter = createClockedAuthRateLimiter({
-      ...baseConfig,
-      ...overrides,
+  function createLimiter(overrides?: Parameters<typeof createGatewayAuthRateLimiter>[0]) {
+    return createClockedAuthRateLimiter({ ...baseConfig, ...overrides });
+  }
+
+  async function expectPenalty(delayMs: number) {
+    const pending = limiter.recordFailureAndDelay("127.0.0.1");
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
     });
-    return limiter;
+    await advancePenaltyClock(delayMs - 1);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    await advancePenaltyClock(1);
+    await pending;
   }
 
   afterEach(async () => {
@@ -156,13 +155,7 @@ describe("auth rate limiter", () => {
   });
 
   it("preserves overflow and tracked lockouts when policy changes while the table is full", async () => {
-    limiter = createClockedAuthRateLimiter({
-      maxAttempts: 1,
-      windowMs: 60_000,
-      lockoutMs: 60_000,
-      maxEntries: 2,
-      pruneIntervalMs: 0,
-    });
+    createLimiter({ maxAttempts: 1, maxEntries: 2, pruneIntervalMs: 0 });
 
     limiter.recordFailure("10.0.3.1");
     limiter.recordFailure("10.0.3.2");
@@ -191,28 +184,24 @@ describe("auth rate limiter", () => {
   });
 
   it("treats ipv4 and ipv4-mapped ipv6 forms as the same client", () => {
-    limiter = createClockedAuthRateLimiter({ maxAttempts: 1, windowMs: 60_000, lockoutMs: 60_000 });
+    createLimiter({ maxAttempts: 1 });
     limiter.recordFailure("1.2.3.4");
     expect(limiter.check("::ffff:1.2.3.4").allowed).toBe(false);
   });
 
   it("tracks synthetic browser-origin limiter keys independently", () => {
-    limiter = createClockedAuthRateLimiter({ maxAttempts: 1, windowMs: 60_000, lockoutMs: 60_000 });
+    createLimiter({ maxAttempts: 1 });
     limiter.recordFailure("browser-origin:http://127.0.0.1:18789");
     expect(limiter.check("browser-origin:http://127.0.0.1:18789").allowed).toBe(false);
     expect(limiter.check("browser-origin:http://localhost:5173").allowed).toBe(true);
   });
 
-  // ---------- loopback exemption ----------
-
   it.each([false, true])(
     "escalates and caps loopback delay with an existing lockout: %s",
     async (locked) => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      limiter = createClockedAuthRateLimiter({
+      createLimiter({
         maxAttempts: 1,
-        windowMs: 60_000,
-        lockoutMs: 60_000,
         exemptLoopback: !locked,
         pruneIntervalMs: 0,
       });
@@ -224,41 +213,13 @@ describe("auth rate limiter", () => {
       }
       const firstDelay = locked ? 500 : 250;
 
-      const first = limiter.recordFailureAndDelay(ip);
-      await advancePenaltyClock(firstDelay - 1);
-      let settled = false;
-      void first.then(() => {
-        settled = true;
-      });
-      await Promise.resolve();
-      expect(settled).toBe(false);
-      await advancePenaltyClock(1);
-      await first;
-
-      const second = limiter.recordFailureAndDelay(ip);
-      await advancePenaltyClock(firstDelay * 2 - 1);
-      settled = false;
-      void second.then(() => {
-        settled = true;
-      });
-      await Promise.resolve();
-      expect(settled).toBe(false);
-      await advancePenaltyClock(1);
-      await second;
+      await expectPenalty(firstDelay);
+      await expectPenalty(firstDelay * 2);
 
       for (let attempt = 0; attempt < 100; attempt += 1) {
         limiter.recordFailure(ip);
       }
-      const capped = limiter.recordFailureAndDelay(ip);
-      await advancePenaltyClock(4_999);
-      settled = false;
-      void capped.then(() => {
-        settled = true;
-      });
-      await Promise.resolve();
-      expect(settled).toBe(false);
-      await advancePenaltyClock(1);
-      await capped;
+      await expectPenalty(5_000);
       expect(limiter.check(ip).allowed).toBe(true);
       if (locked) {
         limiter.updateConfig({ exemptLoopback: false });
@@ -294,7 +255,7 @@ describe("auth rate limiter", () => {
   // without penalty. Concurrency must never buy a faster answer than one attempt.
   it("still delays loopback failures when many are already pending", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    limiter = createClockedAuthRateLimiter({ pruneIntervalMs: 0 });
+    createClockedAuthRateLimiter({ pruneIntervalMs: 0 });
     const pending = Array.from({ length: 64 }, (_, index) =>
       limiter.recordFailureAndDelay("127.0.0.1", `scope-${index}`),
     );
@@ -318,7 +279,7 @@ describe("auth rate limiter", () => {
   // a fresh short timer, so fanning out cannot outrun the escalating penalty.
   it("preserves earned delay across history reset, policy changes, and scheduler shutdown", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    limiter = createClockedAuthRateLimiter({ maxAttempts: 2, pruneIntervalMs: 0 });
+    createClockedAuthRateLimiter({ maxAttempts: 2, pruneIntervalMs: 0 });
     const settled: string[] = [];
     const first = limiter.recordFailureAndDelay("127.0.0.1", "shared").then(() => {
       settled.push("first");
@@ -342,14 +303,14 @@ describe("auth rate limiter", () => {
   });
 
   it("does not exempt opaque identity keys", () => {
-    limiter = createClockedAuthRateLimiter({ maxAttempts: 1, windowMs: 60_000, lockoutMs: 60_000 });
+    createLimiter({ maxAttempts: 1 });
     const key = buildRateLimitIdentityKey("node", "node-1");
     limiter.recordFailure(key);
     expect(limiter.check(key).allowed).toBe(false);
   });
 
   it("reset only clears the requested scope for an IP", () => {
-    limiter = createClockedAuthRateLimiter({ maxAttempts: 1, windowMs: 60_000, lockoutMs: 60_000 });
+    createLimiter({ maxAttempts: 1 });
     limiter.recordFailure("10.0.0.21", AUTH_RATE_LIMIT_SCOPE_SHARED_SECRET);
     limiter.recordFailure("10.0.0.21", AUTH_RATE_LIMIT_SCOPE_DEVICE_TOKEN);
     expect(limiter.check("10.0.0.21", AUTH_RATE_LIMIT_SCOPE_SHARED_SECRET).allowed).toBe(false);
@@ -363,7 +324,7 @@ describe("auth rate limiter", () => {
   it.each([5_000, 60_000])(
     "prune retires expired lock histories with a %sms window",
     async (windowMs) => {
-      limiter = createClockedAuthRateLimiter({ maxAttempts: 1, windowMs, lockoutMs: 30_000 });
+      createLimiter({ maxAttempts: 1, windowMs, lockoutMs: 30_000 });
       limiter.recordFailure("10.0.0.31");
       expect(limiter.check("10.0.0.31").allowed).toBe(false);
 
@@ -397,7 +358,7 @@ describe("auth rate limiter", () => {
 
   it("dispose settles pending loopback failure delays immediately", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    limiter = createClockedAuthRateLimiter({ pruneIntervalMs: 0 });
+    createClockedAuthRateLimiter({ pruneIntervalMs: 0 });
     const pending = limiter.recordFailureAndDelay("127.0.0.1");
 
     limiter.dispose();

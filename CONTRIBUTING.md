@@ -160,6 +160,21 @@ for check behavior and enforcement setup.
 
 ## Local commit hook
 
+`pnpm format` and `pnpm format:check` use the pinned OpenClaw Bun fork's
+`bun fmt` locally, with the repository's `.oxfmtrc.jsonc` configuration (100-column
+print width). The same selector handles the formatting hook. Windows, unsupported
+platforms, and an unavailable fork fall back to oxfmt with one local notice.
+Use `OPENCLAW_FORMAT_TOOL=oxfmt pnpm format` to force oxfmt, or select `bun`
+explicitly to fail if the fork is unavailable. CI keeps oxfmt as the gate and
+checks that Bun identifies exactly the same files needing formatting, regardless
+of the override.
+
+`pnpm lint` still defaults to oxlint. `OPENCLAW_LINT_TOOL=bun pnpm lint` opts in
+to the pinned fork while preserving the existing lint shards and resource limits.
+Bun will become the default only after the required upstream lint fix and parity
+validation. Generated artifacts and the dedicated docs formatting check retain
+oxfmt for reproducible CI output. See the [formatter caller inventory](scripts/README.md#formatting-and-lint-selection).
+
 The normal `pnpm install` setup enables the repository's pre-commit formatting hook
 when `core.hooksPath` is unset. Existing hook selections, including an explicitly
 empty value, are preserved. Git scopes initialization to the current checkout.

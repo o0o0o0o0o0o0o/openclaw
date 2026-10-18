@@ -12,17 +12,14 @@ import type { DummyRuleMap, OxlintConfig } from "oxlint";
 import { ensureKyselyTypes } from "./generate-kysely-types.mts";
 import { limitsAreAdvisory, reportLimitViolations } from "./lib/check-limits.mts";
 import { parseStaticDiagnostics } from "./lib/ci-static-check-evidence.mjs";
+import { resolveDevTool } from "./lib/dev-tool.mts";
 import { isDirectRunUrl } from "./lib/direct-run.mjs";
 import {
   distArtifactEntryArgs,
   resolveDistArtifactLockPath,
   withDistArtifactOwnership,
 } from "./lib/dist-artifact-ownership.mts";
-import {
-  applyLocalOxlintPolicy,
-  resolveLocalCheckEnv,
-  resolveRepoToolBinPath,
-} from "./lib/local-check-runtime.mts";
+import { applyLocalOxlintPolicy, resolveLocalCheckEnv } from "./lib/local-check-runtime.mts";
 import { createManagedCommandInvocation, runManagedCommand } from "./lib/managed-child-process.mts";
 import { resolveUntouchedOxlintExclusions } from "./lib/oxlint-changed-scope.mts";
 import { readProcessMemoryCapacity } from "./lib/process-memory.mts";
@@ -643,8 +640,9 @@ export async function runOxlint(
         platform: process.platform,
       });
   const sparseTargets = filterSparseMissingOxlintTargets(policyArgs);
-  const finalArgs = sparseTargets.args;
-  const oxlintPath = resolveRepoToolBinPath("oxlint");
+  const tool = resolveDevTool("lint", env);
+  const finalArgs = [...tool.args, ...sparseTargets.args];
+  const oxlintPath = tool.command;
   const needsArtifactPreparation =
     !focusedConfig &&
     env.OPENCLAW_OXLINT_SKIP_PREPARE !== "1" &&
@@ -678,7 +676,7 @@ export async function runOxlint(
     return await runWithAdvisoryLimits(
       oxlintPath,
       finalArgs,
-      resolveOxlintToolchainEnv(oxlintPath, env),
+      resolveOxlintToolchainEnv(oxlintPath, tool.env),
       ownedDirectory,
     );
   };

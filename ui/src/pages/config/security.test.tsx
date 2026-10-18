@@ -34,8 +34,11 @@ function expectRowByTitle(container: Element, text: string): HTMLElement {
   return row;
 }
 
-function createProps(overrides: Partial<SecurityViewProps> = {}): SecurityViewProps {
-  return {
+function renderSecurity(
+  security: Partial<SecurityViewProps["security"]> = {},
+  overrides: Partial<Omit<SecurityViewProps, "security">> = {},
+) {
+  const props: SecurityViewProps = {
     security: {
       gatewayAuth: "token",
       execPolicy: "allowlist",
@@ -43,6 +46,7 @@ function createProps(overrides: Partial<SecurityViewProps> = {}): SecurityViewPr
       browserEnabledOverridden: true,
       toolProfile: "coding",
       toolProfileOverridden: true,
+      ...security,
     },
     configBusy: false,
     canPairDevice: true,
@@ -52,29 +56,15 @@ function createProps(overrides: Partial<SecurityViewProps> = {}): SecurityViewPr
     editor: undefined,
     ...overrides,
   };
+  return { ...mountSolid(() => <Security {...props} />), ...props };
 }
 
 describe("Security", () => {
   it("lets operators change browser and tool profile from the overview", () => {
-    const onBrowserEnabledToggle = vi.fn();
-    const onToolProfileChange = vi.fn();
-
-    const { container } = mountSolid(() => (
-      <Security
-        {...createProps({
-          security: {
-            gatewayAuth: "token",
-            execPolicy: "allowlist",
-            browserEnabled: false,
-            browserEnabledOverridden: true,
-            toolProfile: "messaging",
-            toolProfileOverridden: true,
-          },
-          onBrowserEnabledToggle,
-          onToolProfileChange,
-        })}
-      />
-    ));
+    const { container, onBrowserEnabledToggle, onToolProfileChange } = renderSecurity({
+      browserEnabled: false,
+      toolProfile: "messaging",
+    });
 
     const browserRow = expectRowByTitle(container, "Browser enabled");
     const browserInput = browserRow.querySelector<HTMLInputElement>(".settings-toggle__input");
@@ -92,43 +82,13 @@ describe("Security", () => {
     expect(activeProfile.classList.contains("settings-segmented__btn--active")).toBe(true);
   });
 
-  it("locks config-backed controls while a config operation is pending", () => {
-    const onToolProfileChange = vi.fn();
-
-    const { container } = mountSolid(() => (
-      <Security {...createProps({ configBusy: true, onToolProfileChange })} />
-    ));
-
-    const profileButton = expectButtonByText(
-      expectRowByTitle(container, "Available tools"),
-      "Full",
-    );
-    expect(
-      profileButton.querySelector<HTMLInputElement>(".settings-segmented__input")?.disabled,
-    ).toBe(true);
-    profileButton.click();
-    expect(onToolProfileChange).not.toHaveBeenCalled();
-    const browserRow = expectRowByTitle(container, "Browser enabled");
-    expect(browserRow.querySelector<HTMLInputElement>(".settings-toggle__input")?.disabled).toBe(
-      true,
-    );
-  });
-
   it("shows gateway auth as a dot status, not a pill", () => {
-    const { container } = mountSolid(() => (
-      <Security
-        {...createProps({
-          security: {
-            gatewayAuth: "none",
-            execPolicy: "allowlist",
-            browserEnabled: true,
-            browserEnabledOverridden: false,
-            toolProfile: "",
-            toolProfileOverridden: false,
-          },
-        })}
-      />
-    ));
+    const { container } = renderSecurity({
+      gatewayAuth: "none",
+      browserEnabledOverridden: false,
+      toolProfile: "",
+      toolProfileOverridden: false,
+    });
 
     const authRow = expectRowByTitle(container, "Gateway auth");
     const authStatus = authRow.querySelector(".settings-status");
@@ -137,9 +97,7 @@ describe("Security", () => {
   });
 
   it("opens mobile pairing from the overview", () => {
-    const onPairMobile = vi.fn();
-
-    const { container } = mountSolid(() => <Security {...createProps({ onPairMobile })} />);
+    const { container, onPairMobile } = renderSecurity();
 
     expectRowByTitle(container, "Pair a device");
     const button = expectButtonByText(container, "Pair device");
@@ -149,9 +107,7 @@ describe("Security", () => {
   });
 
   it("embeds the schema editor below the curated overview", () => {
-    const { container } = mountSolid(() => (
-      <Security {...createProps({ editor: <div data-testid="security-editor" /> })} />
-    ));
+    const { container } = renderSecurity({}, { editor: <div data-testid="security-editor" /> });
 
     const page = container.querySelector(".security-page");
     expect(page).not.toBeNull();
@@ -159,20 +115,11 @@ describe("Security", () => {
   });
 
   it("shows inherited default descriptions", () => {
-    const { container } = mountSolid(() => (
-      <Security
-        {...createProps({
-          security: {
-            gatewayAuth: "token",
-            execPolicy: "allowlist",
-            browserEnabled: true,
-            browserEnabledOverridden: false,
-            toolProfile: "",
-            toolProfileOverridden: false,
-          },
-        })}
-      />
-    ));
+    const { container } = renderSecurity({
+      browserEnabledOverridden: false,
+      toolProfile: "",
+      toolProfileOverridden: false,
+    });
 
     expect(expectRowByTitle(container, "Browser enabled").textContent).not.toContain(
       "Using default:",
@@ -189,22 +136,10 @@ describe("Security", () => {
   ])(
     "selects Full without a reselection path: $profile/$busy",
     ({ profile, overridden, busy, writes }) => {
-      const props = createProps();
-      const onToolProfileChange = vi.fn();
-      const { container } = mountSolid(() => (
-        <Security
-          {...{
-            ...props,
-            security: {
-              ...props.security,
-              toolProfile: profile,
-              toolProfileOverridden: overridden,
-            },
-            configBusy: busy,
-            onToolProfileChange,
-          }}
-        />
-      ));
+      const { container, onToolProfileChange } = renderSecurity(
+        { toolProfile: profile, toolProfileOverridden: overridden },
+        { configBusy: busy },
+      );
 
       expect(onToolProfileChange).not.toHaveBeenCalled();
       expect(container.querySelectorAll(".settings-segmented__input")).toHaveLength(4);
@@ -212,6 +147,13 @@ describe("Security", () => {
         overridden ? 1 : 0,
       );
       const full = expectButtonByText(container, "Full");
+      expect(full.querySelector<HTMLInputElement>(".settings-segmented__input")?.disabled).toBe(
+        busy,
+      );
+      expect(
+        expectRowByTitle(container, "Browser enabled").querySelector<HTMLInputElement>("input")
+          ?.disabled,
+      ).toBe(busy);
       if (busy || overridden) {
         full.click();
       } else {

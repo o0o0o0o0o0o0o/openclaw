@@ -3,7 +3,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveThemeBranding } from "../../../../packages/gateway-protocol/src/theme.ts";
 import { setCurrentThemeBranding } from "../../app/theme-branding.ts";
 import { i18n } from "../../i18n/index.ts";
+import type { JsonSchema } from "../../lib/config-form-utils.ts";
 import { findSettingsSearchBlocks } from "./settings-search.ts";
+
+function object(
+  properties: Record<string, JsonSchema>,
+  options: Partial<JsonSchema> = {},
+): JsonSchema {
+  return { type: "object", properties, ...options };
+}
+
+function search(
+  query: string,
+  options: Partial<Parameters<typeof findSettingsSearchBlocks>[0]> = {},
+) {
+  return findSettingsSearchBlocks({ query, schema: null, value: null, uiHints: {}, ...options });
+}
 
 afterEach(async () => {
   await i18n.setLocale("en");
@@ -12,8 +27,6 @@ afterEach(async () => {
 
 describe("findSettingsSearchBlocks", () => {
   it("does not advertise hidden Lobsterdex choices while retaining the rest of tab icon settings", () => {
-    const search = (query: string) =>
-      findSettingsSearchBlocks({ query, schema: null, value: {}, uiHints: {} });
     setCurrentThemeBranding(resolveThemeBranding({ lobsterdex: false }));
     expect(search("Lobsterdex")).toEqual([]);
     expect(search("favicon")).toContainEqual(expect.objectContaining({ routeId: "appearance" }));
@@ -53,8 +66,8 @@ describe("findSettingsSearchBlocks", () => {
       for (const key of lazyKeys) {
         expect(runtime.t(key), key).toBe(key);
       }
-      const { findSettingsSearchBlocks: search } = await import("./settings-search.ts");
-      const find = (query: string) => search({ query, schema: null, value: null, uiHints: {} });
+      const { findSettingsSearchBlocks: coldSearch } = await import("./settings-search.ts");
+      const find = (query: string) => coldSearch({ query, schema: null, value: null, uiHints: {} });
 
       expect(find("check for updates")).toEqual([
         expect.objectContaining({ routeId: "updates", label: "Updates" }),
@@ -106,41 +119,26 @@ describe("findSettingsSearchBlocks", () => {
 
   it.each(["securityAcknowledgedAt"])("does not offer machine-owned %s in search", (key) => {
     expect(
-      findSettingsSearchBlocks({
-        query: "internal bookkeeping",
-        schema: {
-          type: "object",
-          properties: {
-            wizard: {
-              type: "object",
-              properties: {
-                [key]: { type: "string", title: "Internal Bookkeeping" },
-                accessMode: { type: "string" },
-              },
-            },
-          },
-        },
+      search("internal bookkeeping", {
+        schema: object({
+          wizard: object({
+            [key]: { type: "string", title: "Internal Bookkeeping" },
+            accessMode: { type: "string" },
+          }),
+        }),
         value: { wizard: { [key]: "internal bookkeeping" } },
-        uiHints: {},
       }),
     ).toEqual([]);
   });
 
   it("opens every Memory schema match on the merged Settings tab", () => {
-    const memorySchema = {
-      type: "object",
-      properties: {
-        memory: {
-          type: "object",
-          properties: {
-            search: {
-              type: "object",
-              properties: { embeddingModel: { type: "string", title: "Embedding model" } },
-            },
-          },
-        },
-      },
-    };
+    const memorySchema = object({
+      memory: object({
+        search: object({
+          embeddingModel: { type: "string", title: "Embedding model" },
+        }),
+      }),
+    });
     const uiHints = {
       "memory.search": { advanced: false },
       "memory.search.embeddingModel": { advanced: false },
@@ -175,23 +173,14 @@ describe("findSettingsSearchBlocks", () => {
   });
 
   it("refreshes prepared schema tiers while searching current draft keys and access", () => {
-    const schema = {
-      type: "object",
-      properties: {
-        mcp: {
+    const schema = object({
+      mcp: object({
+        servers: {
           type: "object",
-          properties: {
-            servers: {
-              type: "object",
-              additionalProperties: {
-                type: "object",
-                properties: { command: { type: "string" } },
-              },
-            },
-          },
+          additionalProperties: object({ command: { type: "string" } }),
         },
-      },
-    };
+      }),
+    });
     const servers: Record<string, { command: string }> = {};
     const params = {
       query: "zephyr",
@@ -217,10 +206,7 @@ describe("findSettingsSearchBlocks", () => {
     expect(
       findSettingsSearchBlocks({
         ...params,
-        schema: {
-          type: "object",
-          properties: { mcp: { type: "object", properties: { endpoint: { type: "string" } } } },
-        },
+        schema: object({ mcp: object({ endpoint: { type: "string" } }) }),
       }),
     ).toEqual([]);
     expect(findSettingsSearchBlocks(params)).toEqual([common]);
@@ -230,33 +216,24 @@ describe("findSettingsSearchBlocks", () => {
 
   it("omits admin-only static and schema results for non-admin viewers", () => {
     expect(
-      findSettingsSearchBlocks({
-        query: "security",
-        schema: {
-          type: "object",
-          properties: { security: { type: "object", title: "Security" } },
-        },
+      search("security", {
+        schema: object({ security: { type: "object", title: "Security" } }),
         value: {},
-        uiHints: {},
         canAdmin: false,
       }),
     ).toEqual([]);
   });
 
   it("routes global plugin policy to Plugin Settings without indexing plugin entries", () => {
-    const schema = {
-      type: "object",
-      properties: {
-        plugins: {
-          type: "object",
-          title: "Plugin policy",
-          properties: {
-            enabled: { type: "boolean", title: "Enable plugins" },
-            entries: { type: "object", title: "Plugin entries" },
-          },
+    const schema = object({
+      plugins: object(
+        {
+          enabled: { type: "boolean", title: "Enable plugins" },
+          entries: { type: "object", title: "Plugin entries" },
         },
-      },
-    };
+        { title: "Plugin policy" },
+      ),
+    });
     const common = {
       schema,
       value: { plugins: { enabled: true, entries: { workboard: {} } } },
@@ -276,12 +253,7 @@ describe("findSettingsSearchBlocks", () => {
   it("searches and displays static settings blocks in the active locale", async () => {
     await i18n.setLocale("es");
 
-    const matches = findSettingsSearchBlocks({
-      query: "modelo",
-      schema: null,
-      value: null,
-      uiHints: {},
-    });
+    const matches = search("modelo");
 
     expect(matches).toEqual([
       expect.objectContaining({
@@ -296,28 +268,17 @@ describe("findSettingsSearchBlocks", () => {
   });
 
   it("does not create block results for an empty query", () => {
-    expect(
-      findSettingsSearchBlocks({
-        query: "  ",
-        schema: null,
-        value: null,
-        uiHints: {},
-      }),
-    ).toEqual([]);
+    expect(search("  ")).toEqual([]);
   });
 
   it("only exposes the identity block when the connection has an identity", () => {
-    const search = (identityAvailable: boolean) =>
-      findSettingsSearchBlocks({
-        query: "avatar",
-        schema: null,
-        value: null,
-        uiHints: {},
-        identityAvailable,
-      }).filter((entry) => entry.hash === "#settings-profile-identity");
+    const identity = (identityAvailable: boolean) =>
+      search("avatar", { identityAvailable }).filter(
+        (entry) => entry.hash === "#settings-profile-identity",
+      );
 
-    expect(search(false)).toEqual([]);
-    expect(search(true)).toEqual([
+    expect(identity(false)).toEqual([]);
+    expect(identity(true)).toEqual([
       expect.objectContaining({
         routeId: "profile",
         hash: "#settings-profile-identity",
@@ -327,19 +288,12 @@ describe("findSettingsSearchBlocks", () => {
 });
 
 it("only offers personal instructions search on a multi-user Gateway", () => {
-  const search = (multipleProfiles: boolean) =>
-    findSettingsSearchBlocks({
-      query: "personal instructions",
-      schema: null,
-      value: null,
-      uiHints: {},
-      identityAvailable: true,
-      multipleProfiles,
-    });
+  const personal = (multipleProfiles: boolean) =>
+    search("personal instructions", { identityAvailable: true, multipleProfiles });
   expect(
-    search(false).some((block) => block.hash === "#settings-profile-personal-instructions"),
+    personal(false).some((block) => block.hash === "#settings-profile-personal-instructions"),
   ).toBe(false);
   expect(
-    search(true).some((block) => block.hash === "#settings-profile-personal-instructions"),
+    personal(true).some((block) => block.hash === "#settings-profile-personal-instructions"),
   ).toBe(true);
 });

@@ -13,17 +13,37 @@ import type { ApplicationContext } from "../../app/context.ts";
 import { pages } from "./route.ts";
 
 type RouteModule = Awaited<ReturnType<(typeof pages)[number]["component"]>>;
+type Page = PageDefinition<RouteId, ApplicationContext, RouteModule>;
 
-const removedGeneralPage = pages.find((page) => page.id === "config") as PageDefinition<
-  RouteId,
-  ApplicationContext,
-  RouteModule
->;
-const updatesPage = pages.find((page) => page.id === "updates") as PageDefinition<
-  RouteId,
-  ApplicationContext,
-  RouteModule
->;
+const removedGeneralPage = pages.find((page) => page.id === "config") as Page;
+const updatesPage = pages.find((page) => page.id === "updates") as Page;
+
+function memoryHistory(origin: RouteLocation) {
+  const entries = [origin];
+  let cursor = 0;
+  let onPop: (location: RouteLocation) => void = () => undefined;
+  const location = () => entries[cursor]!;
+  const replace = vi.fn((next: RouteLocation) => {
+    entries[cursor] = next;
+  });
+  const push = vi.fn((next: RouteLocation) => {
+    entries.splice(++cursor, entries.length, next);
+  });
+  const history: RouterHistory = {
+    location,
+    push,
+    replace,
+    listen: (listener) => {
+      onPop = listener;
+      return () => undefined;
+    },
+  };
+  const pop = (offset: number) => {
+    cursor += offset;
+    onPop(location());
+  };
+  return { entries, history, replace, push, pop };
+}
 
 function locationFromUrl(url: string): RouteLocation {
   const parsed = new URL(url, "https://control.test");
@@ -41,67 +61,37 @@ function loaderOptions(location: RouteLocation): RouteLoaderOptions {
   };
 }
 
-async function loadRemovedGeneral(url: string, basePath = "") {
-  const location = locationFromUrl(url);
-  const context = { basePath } as ApplicationContext;
-  return await removedGeneralPage.loader?.(context, loaderOptions(location));
-}
-
 function targetPage(id: RouteId) {
   return definePage({
     ...routePageSpec(id),
     component: async () => ({ header: true, renderSolid: () => null }),
-  }) as PageDefinition<RouteId, ApplicationContext, RouteModule>;
+  }) as Page;
 }
 
 describe("removed General route", () => {
-  it("preserves the base path when redirecting General to Appearance", async () => {
-    await expect(
-      loadRemovedGeneral("/ui/settings/general?section=env#config-section-env", "/ui"),
-    ).resolves.toEqual({
-      type: "redirect",
-      location: {
-        pathname: "/ui/settings/appearance",
-        search: "?section=__appearance__",
-        hash: "#settings-language",
-      },
-    });
-  });
-
   it.each([
     [
-      "/settings/general?section=env#config-section-env",
-      "/settings/appearance?section=__appearance__#settings-language",
+      "/ui/settings/general?section=env#config-section-env",
+      "/ui/settings/appearance?section=__appearance__#settings-language",
     ],
     ["/config#settings-general-model", "/settings/model-providers#settings-model-behavior"],
   ])("performs at most one replace for %s and never oscillates", async (sourceUrl, targetUrl) => {
-    let current = locationFromUrl(sourceUrl);
-    const replace = vi.fn((next: RouteLocation) => {
-      current = next;
-    });
-    const push = vi.fn((next: RouteLocation) => {
-      current = next;
-    });
-    const history: RouterHistory = {
-      location: () => current,
-      push,
-      replace,
-      listen: () => () => undefined,
-    };
+    const { history, replace, push } = memoryHistory(locationFromUrl(sourceUrl));
     const router = createRouter<RouteId, ApplicationContext, RouteModule>({
       routes: [removedGeneralPage, targetPage("appearance"), targetPage("model-providers")],
     });
-    const context = { basePath: "" } as ApplicationContext;
+    const basePath = sourceUrl.startsWith("/ui/") ? "/ui" : "";
+    const context = { basePath } as ApplicationContext;
 
     try {
-      await router.start(history, "", context);
+      await router.start(history, basePath, context);
       for (let cycle = 0; cycle < 3; cycle += 1) {
-        await router.navigateLocation({ ...current }, context);
+        await router.navigateLocation({ ...history.location() }, context);
       }
 
       expect(replace).toHaveBeenCalledOnce();
       expect(push).not.toHaveBeenCalled();
-      expect(current).toEqual(locationFromUrl(targetUrl));
+      expect(history.location()).toEqual(locationFromUrl(targetUrl));
       expect(router.getState().resolvedLocation).toEqual(locationFromUrl(targetUrl));
     } finally {
       router.stop();
@@ -171,30 +161,7 @@ describe("moved Settings sections", () => {
         const hash = `#config-section-${section}`;
         const origin = locationFromUrl(`${basePath}/settings/updates`);
         const destination = { pathname: pathForRoute(targetId, basePath), search, hash };
-        const entries = [origin];
-        let cursor = 0;
-        const currentLocation = () => {
-          const location = entries[cursor];
-          if (!location) {
-            throw new Error("History cursor is outside the navigation stack");
-          }
-          return location;
-        };
-        let onPop: (location: RouteLocation) => void = () => undefined;
-        const replace = vi.fn((next: RouteLocation) => {
-          entries[cursor] = next;
-        });
-        const history: RouterHistory = {
-          location: currentLocation,
-          push: (next) => {
-            entries.splice(++cursor, entries.length, next);
-          },
-          replace,
-          listen: (listener) => {
-            onPop = listener;
-            return () => undefined;
-          },
-        };
+        const { entries, history, replace, pop } = memoryHistory(origin);
         const ensureLoaded = vi.fn(() => Promise.resolve());
         const ensureSchemaLoaded = vi.fn(() => Promise.resolve());
         const context = {
@@ -204,11 +171,7 @@ describe("moved Settings sections", () => {
         const router = createRouter<RouteId, ApplicationContext, RouteModule>({
           routes: [
             {
-              id: sourcePage.id,
-              path: sourcePage.path,
-              aliases: sourcePage.aliases,
-              loader: sourcePage.loader,
-              loaderDeps: sourcePage.loaderDeps,
+              ...sourcePage,
               component: async () => ({ header: true, renderSolid: () => null }),
             },
             targetPage("updates"),
@@ -233,11 +196,9 @@ describe("moved Settings sections", () => {
           expect(ensureSchemaLoaded).not.toHaveBeenCalled();
           expect(router.getState().resolvedLocation).toEqual(destination);
 
-          cursor -= 1;
-          onPop(currentLocation());
+          pop(-1);
           await expect.poll(() => router.getState().resolvedLocation).toEqual(origin);
-          cursor += 1;
-          onPop(currentLocation());
+          pop(1);
           await expect.poll(() => router.getState().resolvedLocation).toEqual(destination);
           expect(entries).toEqual([origin, destination]);
           expect(replace).toHaveBeenCalledOnce();

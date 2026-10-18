@@ -21,23 +21,47 @@ const userPreferences = {
   agentIds: [],
 };
 
+type NotificationProps = Parameters<typeof NotificationsSection>[0];
+function renderSection(props: Partial<NotificationProps>) {
+  return mountSolid(() => <NotificationsSection connected={true} {...props} />);
+}
+
+function webPush(
+  loading = false,
+  user = userPreferences,
+  device: { enabled: boolean; label: string; agentIds?: string[] } = {
+    enabled: true,
+    label: "phone",
+  },
+): WebPushSnapshot {
+  return {
+    supported: true,
+    permission: "granted",
+    subscription: "registered",
+    loading,
+    preferences: {
+      durableIdentity: true,
+      user,
+      device,
+      effective: { ...user, ...device },
+    },
+  };
+}
+
+function select(container: Element, label: string) {
+  return expectDefined(
+    container.querySelector<HTMLSelectElement>(`select[aria-label="${label}"]`),
+    label,
+  );
+}
+
 describe("native notification test outcome", () => {
   it("renders pending immediately and disables duplicate sends", () => {
     const onSend = vi.fn();
-    const container = document.createElement("div");
-
-    mountSolid(
-      () => (
-        <NotificationsSection
-          {...{
-            connected: true,
-            nativeNotifications: { permission: "granted", test: { state: "pending" } },
-            onNativeNotificationsSendTest: onSend,
-          }}
-        />
-      ),
-      { container },
-    );
+    const { container } = renderSection({
+      nativeNotifications: { permission: "granted", test: { state: "pending" } },
+      onNativeNotificationsSendTest: onSend,
+    });
 
     const button = container.querySelector<HTMLButtonElement>("button");
     expect(button?.disabled).toBe(true);
@@ -47,22 +71,12 @@ describe("native notification test outcome", () => {
   });
 
   it("renders an actionable error without replacing granted permission", () => {
-    const container = document.createElement("div");
-
-    mountSolid(
-      () => (
-        <NotificationsSection
-          {...{
-            connected: true,
-            nativeNotifications: {
-              permission: "granted",
-              test: { state: "error", message: "Open System Settings and try again." },
-            },
-          }}
-        />
-      ),
-      { container },
-    );
+    const { container } = renderSection({
+      nativeNotifications: {
+        permission: "granted",
+        test: { state: "error", message: "Open System Settings and try again." },
+      },
+    });
 
     expect(container.textContent).toContain("Granted");
     expect(container.textContent).toContain("Open System Settings and try again.");
@@ -70,18 +84,9 @@ describe("native notification test outcome", () => {
   });
 
   it("renders queued success independently from permission", () => {
-    const container = document.createElement("div");
-    mountSolid(
-      () => (
-        <NotificationsSection
-          {...{
-            connected: true,
-            nativeNotifications: { permission: "granted", test: { state: "sent" } },
-          }}
-        />
-      ),
-      { container },
-    );
+    const { container } = renderSection({
+      nativeNotifications: { permission: "granted", test: { state: "sent" } },
+    });
 
     expect(container.textContent).toContain("Granted");
     expect(container.textContent).toContain("Test notification queued");
@@ -92,27 +97,11 @@ describe("Web Push preference saves", () => {
   it("lets recipients opt in to mentions and override them for one browser", () => {
     const onUserPreferences = vi.fn();
     const onDevicePreferences = vi.fn();
-    const view = mountSolid(() => (
-      <NotificationsSection
-        {...{
-          connected: true,
-          webPush: {
-            supported: true,
-            permission: "granted",
-            subscription: "registered",
-            loading: false,
-            preferences: {
-              durableIdentity: true,
-              user: userPreferences,
-              device: { enabled: true, label: "phone" },
-              effective: { ...userPreferences, enabled: true, label: "phone" },
-            },
-          },
-          onWebPushSetUserPreferences: onUserPreferences,
-          onWebPushSetDevicePreferences: onDevicePreferences,
-        }}
-      />
-    ));
+    const view = renderSection({
+      webPush: webPush(),
+      onWebPushSetUserPreferences: onUserPreferences,
+      onWebPushSetDevicePreferences: onDevicePreferences,
+    });
     const { container } = view;
 
     const accountToggle = view.getByRole("switch", { name: "Someone mentions me" });
@@ -126,10 +115,7 @@ describe("Web Push preference saves", () => {
       categories: { ...userPreferences.categories, humanMentioned: true },
     });
 
-    const browserOverride = expectDefined(
-      container.querySelector<HTMLSelectElement>('select[aria-label="Someone mentions me"]'),
-      "mention browser preference",
-    );
+    const browserOverride = select(container, "Someone mentions me");
     expect(browserOverride.value).toBe("inherit");
     browserOverride.value = "off";
     browserOverride.dispatchEvent(new Event("change"));
@@ -141,30 +127,7 @@ describe("Web Push preference saves", () => {
   });
 
   it("disables every preference control while a save is in flight", () => {
-    const container = document.createElement("div");
-
-    mountSolid(
-      () => (
-        <NotificationsSection
-          {...{
-            connected: true,
-            webPush: {
-              supported: true,
-              permission: "granted",
-              subscription: "registered",
-              loading: true,
-              preferences: {
-                durableIdentity: true,
-                user: userPreferences,
-                device: { enabled: true, label: "phone" },
-                effective: { ...userPreferences, enabled: true, label: "phone" },
-              },
-            },
-          }}
-        />
-      ),
-      { container },
-    );
+    const { container } = renderSection({ webPush: webPush(true) });
 
     // Preference sections stack inside the page column; a nested .settings-page
     // would reapply the 760px max-width and inset them from the card above.
@@ -198,46 +161,27 @@ describe("Web Push preference controls", () => {
       },
     });
     const device = { enabled: true, label: "phone", agentIds: ["main"] };
-    const mounted = mountSolid(() => (
-      <NotificationsSection
-        {...{
-          connected: true,
-          onWebPushSetDevicePreferences: options.onDevice,
-          onWebPushSetUserPreferences: options.onUser,
-          get webPush(): WebPushSnapshot {
-            return {
-              supported: true,
-              permission: "granted",
-              subscription: "registered",
-              loading: false,
-              preferences: {
-                durableIdentity: true,
-                user: user(),
-                device,
-                effective: { ...user(), ...device },
-              },
-            };
-          },
-        }}
-      />
-    ));
+    const mounted = renderSection({
+      onWebPushSetDevicePreferences: options.onDevice,
+      onWebPushSetUserPreferences: options.onUser,
+      get webPush(): WebPushSnapshot {
+        return webPush(false, user(), device);
+      },
+    });
     return { ...mounted, setTimeZone };
   }
 
   it("preserves a saved timezone alias and saves a native selection", () => {
     const onUser = vi.fn();
     const { container, setTimeZone } = renderPreferences({ onUser, timeZone: "US/Pacific" });
-    const select = expectDefined(
-      container.querySelector<HTMLSelectElement>('select[aria-label="Time zone"]'),
-      "timezone select",
-    );
-    expect(select.value).toBe("US/Pacific");
-    select.value = "Europe/London";
-    select.dispatchEvent(new Event("change"));
+    const timeZone = select(container, "Time zone");
+    expect(timeZone.value).toBe("US/Pacific");
+    timeZone.value = "Europe/London";
+    timeZone.dispatchEvent(new Event("change"));
     setTimeZone("Europe/London");
     flush();
-    expect(select.value).toBe("Europe/London");
-    expect(container.querySelector('select[aria-label="Time zone"]')).toBe(select);
+    expect(timeZone.value).toBe("Europe/London");
+    expect(container.querySelector('select[aria-label="Time zone"]')).toBe(timeZone);
     expect(onUser).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         quietHours: expect.objectContaining({ timeZone: "Europe/London" }),
@@ -262,10 +206,7 @@ describe("Web Push preference controls", () => {
       expect.objectContaining({ enabled: false, label: "phone", agentIds: ["main"] }),
     );
 
-    const detail = expectDefined(
-      deviceGroup.querySelector<HTMLSelectElement>('select[aria-label="Lock-screen detail"]'),
-      "device lock-screen detail select",
-    );
+    const detail = select(deviceGroup, "Lock-screen detail");
     detail.value = "detailed";
     detail.dispatchEvent(new Event("change"));
     expect(onDevice).toHaveBeenLastCalledWith(expect.objectContaining({ detailLevel: "detailed" }));

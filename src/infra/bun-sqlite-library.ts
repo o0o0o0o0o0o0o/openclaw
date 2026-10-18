@@ -90,6 +90,9 @@ function createCapabilities(select: () => unknown) {
     initialize() {
       initialization ??= (async () => {
         select();
+        // Publish the loaded library's facts before any worker inherits its environment.
+        const { requireNodeSqlite } = await import("./node-sqlite.js");
+        requireNodeSqlite();
         const ready = settled();
         if (ready) {
           return ready;

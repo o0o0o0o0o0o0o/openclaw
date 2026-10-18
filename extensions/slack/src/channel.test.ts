@@ -74,11 +74,7 @@ beforeEach(async () => {
   usersInfoMock.mockReset();
   authTeamsListMock.mockReset();
   getSlackWriteClientMock.mockClear();
-  setSlackRuntime({
-    channel: {
-      slack: { handleSlackAction: handleSlackActionMock },
-    },
-  } as never);
+  setSlackRuntime({ channel: { slack: { handleSlackAction: handleSlackActionMock } } } as never);
 });
 
 async function getSlackConfiguredState(cfg: OpenClawConfig) {
@@ -103,23 +99,19 @@ function requireArray(value: unknown, label: string): unknown[] {
   return value;
 }
 
-function expectRecordFields(value: unknown, label: string, expected: Record<string, unknown>) {
-  const record = requireRecord(value, label);
+function expectFields(value: unknown, expected: Record<string, unknown>) {
+  const record = requireRecord(value, "record");
   for (const [key, expectedValue] of Object.entries(expected)) {
     expect(record[key]).toEqual(expectedValue);
   }
 }
 
-function requireMockCallArgValue(
-  mock: ReturnType<typeof vi.fn>,
-  callIndex: number,
-  argIndex: number,
-): unknown {
+function callArg(mock: ReturnType<typeof vi.fn>, argIndex = 0, callIndex = 0): unknown {
   return mock.mock.calls[callIndex]?.[argIndex];
 }
 
-function requireMockCallArg(mock: ReturnType<typeof vi.fn>, callIndex: number, argIndex: number) {
-  return requireRecord(requireMockCallArgValue(mock, callIndex, argIndex), "mock call argument");
+function callRecord(mock: ReturnType<typeof vi.fn>, argIndex = 0, callIndex = 0) {
+  return requireRecord(callArg(mock, argIndex, callIndex), "mock call argument");
 }
 
 describe("slackPlugin actions", () => {
@@ -165,17 +157,15 @@ describe("slackPlugin actions", () => {
   it("uses configured defaultAccount for pairing approval notifications", async () => {
     const cfg = slackConfig({
       defaultAccount: "work",
-      accounts: {
-        work: { botToken: "xoxb-work" },
-      },
+      accounts: { work: { botToken: "xoxb-work" } },
     });
     const notify = slackPlugin.pairing!.notifyApproval!;
 
     await notify({ cfg, id: "U12345678" });
 
-    expect(requireMockCallArgValue(sendMessageSlackMock, 0, 0)).toBe("user:U12345678");
-    expect(String(requireMockCallArgValue(sendMessageSlackMock, 0, 1))).toContain("approved");
-    expectRecordFields(requireMockCallArg(sendMessageSlackMock, 0, 2), "send options", {
+    expect(callArg(sendMessageSlackMock)).toBe("user:U12345678");
+    expect(String(callArg(sendMessageSlackMock, 1))).toContain("approved");
+    expectFields(callRecord(sendMessageSlackMock, 2), {
       accountId: "work",
       cfg,
       token: "xoxb-work",
@@ -191,11 +181,7 @@ describe("slackPlugin actions", () => {
       }),
     ).toBe("team:T12345678:user:U12345678");
 
-    const cfg = slackConfig({
-      accounts: {
-        org: { botToken: "xoxb-org" },
-      },
-    });
+    const cfg = slackConfig({ accounts: { org: { botToken: "xoxb-org" } } });
     await pairing.notifyApproval!({
       cfg,
       id: "team:T12345678:user:U12345678",
@@ -203,14 +189,8 @@ describe("slackPlugin actions", () => {
       meta: { senderId: "U12345678", teamId: "T12345678" },
     });
 
-    expect(requireMockCallArgValue(sendMessageSlackMock, 0, 0)).toBe(
-      "team:T12345678:user:U12345678",
-    );
-    expectRecordFields(requireMockCallArg(sendMessageSlackMock, 0, 2), "send options", {
-      accountId: "org",
-      cfg,
-      token: "xoxb-org",
-    });
+    expect(callArg(sendMessageSlackMock)).toBe("team:T12345678:user:U12345678");
+    expectFields(callRecord(sendMessageSlackMock, 2), { accountId: "org", cfg, token: "xoxb-org" });
   });
 
   it("treats interactive reply payloads as structured Slack payloads", () => {
@@ -237,21 +217,17 @@ describe("slackPlugin actions", () => {
       channel: "slack",
       accountId: "default",
       cfg: {},
-      params: {
-        channelId: "C123",
-        threadId: "1712345678.123456",
-        messageId: "1712345678.654321",
-      },
+      params: { channelId: "C123", threadId: "1712345678.123456", messageId: "1712345678.654321" },
     });
 
-    expectRecordFields(requireMockCallArg(handleSlackActionMock, 0, 0), "Slack action", {
+    expectFields(callRecord(handleSlackActionMock), {
       action: "readMessages",
       channelId: "C123",
       threadId: "1712345678.123456",
       messageId: "1712345678.654321",
     });
-    expect(requireMockCallArgValue(handleSlackActionMock, 0, 1)).toEqual({});
-    expect(requireMockCallArgValue(handleSlackActionMock, 0, 2)).toBeUndefined();
+    expect(callArg(handleSlackActionMock, 1)).toEqual({});
+    expect(callArg(handleSlackActionMock, 2)).toBeUndefined();
   });
 
   it.each([
@@ -293,8 +269,8 @@ describe("slackPlugin actions", () => {
       },
     } as never);
 
-    expect(requireMockCallArg(handleSlackActionMock, 0, 0).action).toBe(testCase.runtimeAction);
-    const actionContext = requireMockCallArg(handleSlackActionMock, 0, 2);
+    expect(callRecord(handleSlackActionMock).action).toBe(testCase.runtimeAction);
+    const actionContext = callRecord(handleSlackActionMock, 2);
     expect(actionContext.mediaAccess).toBe(mediaAccess);
     expect(actionContext.mediaLocalRoots).toEqual(mediaAccess.localRoots);
     expect(actionContext.mediaReadFile).toBeUndefined();
@@ -326,7 +302,7 @@ describe("slackPlugin actions", () => {
       },
     } as never);
 
-    const actionContext = requireMockCallArg(handleSlackActionMock, 0, 2);
+    const actionContext = callRecord(handleSlackActionMock, 2);
     expect(actionContext.mediaAccess).toBeUndefined();
     expect(actionContext.mediaLocalRoots).toBeUndefined();
     expect(actionContext.mediaReadFile).toBeUndefined();
@@ -365,10 +341,7 @@ describe("slackPlugin status", () => {
       expect(probeSpy).toHaveBeenCalledWith(
         identity === "user" ? "test-user-token" : "xoxb-work",
         2500,
-        {
-          accountId: "work",
-          ...(identity === "user" ? { identity } : {}),
-        },
+        { accountId: "work", ...(identity === "user" ? { identity } : {}) },
       );
     },
   );
@@ -421,13 +394,13 @@ describe("slackPlugin status", () => {
       target: "team:T123:user:U456",
     });
 
-    expectRecordFields(channelRoute, "Enterprise Slack channel route", {
+    expectFields(channelRoute, {
       baseSessionKey: "agent:main:slack:channel:team:t123:channel:c456",
       sessionKey: "agent:main:slack:channel:team:t123:channel:c456:thread:1712345678.123456",
       threadId: "1712345678.123456",
       to: "team:T123:channel:C456",
     });
-    expectRecordFields(dmRoute, "Enterprise Slack DM route", {
+    expectFields(dmRoute, {
       baseSessionKey: "agent:main:main:account:default:team:t123",
       to: "team:T123:user:U456",
     });
@@ -453,12 +426,12 @@ describe("slackPlugin status", () => {
           deliveryPurpose,
         });
         if (!deliveryPurpose) {
-          expectRecordFields(route, "Detached Enterprise Slack DM route", { to: "user:u12345678" });
+          expectFields(route, { to: "user:u12345678" });
           expect(usersInfoMock).not.toHaveBeenCalled();
           expect(authTeamsListMock).not.toHaveBeenCalled();
           return;
         }
-        expectRecordFields(route, "Enterprise Slack owner DM route", {
+        expectFields(route, {
           baseSessionKey: "agent:main:main:account:default:team:t11111111",
           to: "team:T11111111:user:U12345678",
           recipientSessionExact: true,
@@ -717,11 +690,7 @@ describe("slackPlugin outbound", () => {
   });
 
   it.each([
-    {
-      name: "inherited",
-      replyToIsExplicit: false,
-      expectedReplyToId: "1712345678.123456",
-    },
+    { name: "inherited", replyToIsExplicit: false, expectedReplyToId: "1712345678.123456" },
   ])(
     "routes $name child replies to $expectedReplyToId",
     ({ replyToIsExplicit, expectedReplyToId }) => {
@@ -786,11 +755,11 @@ describe("slackPlugin outbound", () => {
       deps: { sendSlack },
     });
 
-    expect(requireMockCallArgValue(sendSlack, 0, 0)).toBe("user:U123");
-    expect(requireMockCallArgValue(sendSlack, 0, 1)).toBe(
+    expect(callArg(sendSlack)).toBe("user:U123");
+    expect(callArg(sendSlack, 1)).toBe(
       "Slack interactive smoke.\n\nApprove\nReject\n\nChoose a target\nCanary\nProduction",
     );
-    expect(requireMockCallArg(sendSlack, 0, 2).blocks).toMatchObject([
+    expect(callRecord(sendSlack, 2).blocks).toMatchObject([
       { type: "section" },
       {
         type: "actions",
@@ -840,7 +809,7 @@ describe("slackPlugin outbound", () => {
         deps: { sendSlack },
       });
       const batches = sendSlack.mock.calls.map((_call, index) =>
-        requireArray(requireMockCallArg(sendSlack, index, 2).blocks, "Slack blocks"),
+        requireArray(callRecord(sendSlack, 2, index).blocks, "Slack blocks"),
       );
       const delivered = batches.flat().flatMap((entry) => {
         const block = requireRecord(entry, "Slack block");
@@ -927,14 +896,7 @@ describe("slackPlugin directory", () => {
     const listPeers = slackPlugin.directory!.listPeers!;
 
     await expect(
-      listPeers({
-        cfg: slackConfig({
-          dms: {
-            U123: {},
-          },
-        }),
-        runtime: createRuntimeEnv(),
-      }),
+      listPeers({ cfg: slackConfig({ dms: { U123: {} } }), runtime: createRuntimeEnv() }),
     ).resolves.toEqual([{ id: "user:u123", kind: "user" }]);
   });
 });
@@ -971,11 +933,7 @@ describe("slackPlugin config", () => {
   it.each([
     {
       name: "Socket Mode",
-      slack: {
-        postAs: "user" as const,
-        userToken: "test-user-token",
-        appToken: "test-app-token",
-      },
+      slack: { postAs: "user" as const, userToken: "test-user-token", appToken: "test-app-token" },
       expectedTransportSource: { appTokenSource: "config" },
     },
     {

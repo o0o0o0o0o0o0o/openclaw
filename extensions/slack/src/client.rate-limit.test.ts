@@ -48,10 +48,7 @@ function createRateLimitTransport(
               },
             })
           : JSON.stringify({ ok: false, error: "ratelimited" });
-        return new Response(body, {
-          status: 429,
-          headers: { "retry-after": "0" },
-        });
+        return new Response(body, { status: 429, headers: { "retry-after": "0" } });
       }
       if (terminal === "socket") {
         throw new Error("synthetic lost acknowledgment");
@@ -153,11 +150,7 @@ describe("Slack explicit rate-limit recovery", () => {
         await expect(send(scoped, "late")).rejects.toThrow("fixture effect authority closed");
         if (cache === "listener") {
           expect(
-            getSlackListenerWriteClient({
-              listenerClient,
-              teamId: "TOTHER",
-              clientOptions,
-            }),
+            getSlackListenerWriteClient({ listenerClient, teamId: "TOTHER", clientOptions }),
           ).toBeUndefined();
         }
         await expect(send(getClient(), "ordinary")).resolves.toMatchObject({ ok: true });
@@ -276,10 +269,7 @@ describe("Slack explicit rate-limit recovery", () => {
         fetch: async () => {
           attempts += 1;
           authorized = false;
-          return new Response("rate limited", {
-            status: 429,
-            headers: { "retry-after": "0" },
-          });
+          return new Response("rate limited", { status: 429, headers: { "retry-after": "0" } });
         },
       },
       () => {
@@ -322,10 +312,7 @@ describe("Slack explicit rate-limit recovery", () => {
     const options = resolveSlackWriteClientOptions({
       fetch: async () => {
         attempts += 1;
-        return new Response("rate limited", {
-          status: 429,
-          headers: { "retry-after": "0" },
-        });
+        return new Response("rate limited", { status: 429, headers: { "retry-after": "0" } });
       },
     });
     const client = createSlackWriteClient("synthetic-reused-fixture", options);

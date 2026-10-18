@@ -43,39 +43,6 @@ const PROXY_KEYS = [
   "OPENCLAW_PROXY_ACTIVE",
   "OPENCLAW_PROXY_CA_FILE",
 ] as const;
-const originalEnv = { ...process.env };
-
-function clearProxyEnvForTest() {
-  for (const key of PROXY_KEYS) {
-    delete process.env[key];
-  }
-}
-
-function restoreProxyEnvForTest() {
-  for (const key of PROXY_KEYS) {
-    if (originalEnv[key] !== undefined) {
-      process.env[key] = originalEnv[key];
-    } else {
-      delete process.env[key];
-    }
-  }
-}
-
-function clearSlackApiUrlEnvForTest() {
-  for (const key of SLACK_API_URL_KEYS) {
-    delete process.env[key];
-  }
-}
-
-function restoreSlackApiUrlEnvForTest() {
-  for (const key of SLACK_API_URL_KEYS) {
-    if (originalEnv[key] !== undefined) {
-      process.env[key] = originalEnv[key];
-    } else {
-      delete process.env[key];
-    }
-  }
-}
 
 function requireFetch(options: WebClientOptions): NonNullable<WebClientOptions["fetch"]> {
   if (!options.fetch) {
@@ -98,14 +65,14 @@ beforeAll(async () => {
 
 beforeEach(() => {
   WebClient.mockClear();
-  clearSlackApiUrlEnvForTest();
-  clearProxyEnvForTest();
+  for (const key of [...SLACK_API_URL_KEYS, ...PROXY_KEYS]) {
+    vi.stubEnv(key, undefined);
+  }
   isDebugProxyGlobalFetchPatchInstalledMock.mockReturnValue(false);
 });
 
 afterEach(() => {
-  restoreSlackApiUrlEnvForTest();
-  restoreProxyEnvForTest();
+  vi.unstubAllEnvs();
 });
 
 describe("slack web client config", () => {
@@ -125,29 +92,20 @@ describe("slack web client config", () => {
     expect(reused).toBe(first);
     expect(second).not.toBe(first);
     expect(WebClient).toHaveBeenCalledTimes(2);
-    expect(WebClient).toHaveBeenNthCalledWith(1, "xoxb-org", {
+    const writeOptions = {
       fetch: expect.any(Function),
       rejectRateLimitedCalls: true,
       retryConfig: SLACK_WRITE_RETRY_OPTIONS,
-      teamId: "T1",
-    });
-    expect(WebClient).toHaveBeenNthCalledWith(2, "xoxb-org", {
-      fetch: expect.any(Function),
-      rejectRateLimitedCalls: true,
-      retryConfig: SLACK_WRITE_RETRY_OPTIONS,
-      teamId: "T2",
-    });
+    };
+    expect(WebClient.mock.calls).toEqual([
+      ["xoxb-org", { ...writeOptions, teamId: "T1" }],
+      ["xoxb-org", { ...writeOptions, teamId: "T2" }],
+    ]);
   });
 
   it("keeps write clients separated by Slack API URL client options", () => {
-    const firstOptions = {
-      slackApiUrl: "http://127.0.0.1:49152/api/",
-    };
-    const secondOptions = {
-      slackApiUrl: "http://127.0.0.1:49153/api/",
-    };
-    const first = getSlackWriteClient("xoxb-test", firstOptions);
-    const second = getSlackWriteClient("xoxb-test", secondOptions);
+    const first = getSlackWriteClient("xoxb-test", { slackApiUrl: "http://127.0.0.1:49152/api/" });
+    const second = getSlackWriteClient("xoxb-test", { slackApiUrl: "http://127.0.0.1:49153/api/" });
 
     expect(second).not.toBe(first);
     expect(WebClient).toHaveBeenCalledTimes(2);

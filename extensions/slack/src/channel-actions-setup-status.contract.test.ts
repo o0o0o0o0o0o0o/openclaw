@@ -12,6 +12,25 @@ import { SlackConfigSchema } from "../config-api.js";
 import { slackSetupPlugin } from "../setup-plugin-api.js";
 import { inspectSlackAccount } from "./account-inspect.js";
 
+function slackConfig(slack: NonNullable<OpenClawConfig["channels"]>["slack"]): OpenClawConfig {
+  return { channels: { slack } };
+}
+
+function promote(cfg: OpenClawConfig) {
+  return moveSingleAccountChannelSectionToDefaultAccount({
+    cfg,
+    channelKey: "slack",
+    setupSurface: slackSetupPlugin.setupContract,
+  });
+}
+
+function expectSharedSigningSecret(cfg: OpenClawConfig, accountId: string) {
+  expect(inspectSlackAccount({ cfg, accountId })).toMatchObject({
+    configured: true,
+    signingSecret: "shared-signing-secret",
+  });
+}
+
 const slackDefaultActions = [
   "send",
   "conversation-open",
@@ -40,26 +59,13 @@ describe("slack actions contract", () => {
     cases: [
       {
         name: "configured account exposes default Slack actions",
-        cfg: {
-          channels: {
-            slack: {
-              botToken: "xoxb-test",
-              appToken: "xapp-test",
-            },
-          },
-        } as OpenClawConfig,
+        cfg: slackConfig({ botToken: "xoxb-test", appToken: "xapp-test" }),
         expectedActions: slackDefaultActions,
         expectedCapabilities: ["presentation"],
       },
       {
         name: "missing tokens disables the actions surface",
-        cfg: {
-          channels: {
-            slack: {
-              enabled: true,
-            },
-          },
-        } as OpenClawConfig,
+        cfg: slackConfig({ enabled: true }),
         expectedActions: [],
         expectedCapabilities: [],
       },
@@ -69,32 +75,19 @@ describe("slack actions contract", () => {
 
 describe("slack setup contract", () => {
   it("keeps a shared HTTP signing secret at the channel root during account promotion", () => {
-    const cfg = {
-      channels: {
-        slack: {
-          enabled: true,
-          mode: "http",
-          botToken: "xoxb-default",
-          signingSecret: "shared-signing-secret",
-        },
-      },
-    } as OpenClawConfig;
-
-    const next = moveSingleAccountChannelSectionToDefaultAccount({
-      cfg,
-      channelKey: "slack",
-      setupSurface: slackSetupPlugin.setupContract,
+    const cfg = slackConfig({
+      enabled: true,
+      mode: "http",
+      botToken: "xoxb-default",
+      signingSecret: "shared-signing-secret",
     });
+
+    const next = promote(cfg);
 
     expect(next.channels?.slack?.signingSecret).toBe("shared-signing-secret");
     expect(next.channels?.slack).not.toHaveProperty("botToken");
-    expect(next.channels?.slack?.accounts?.default).toMatchObject({
-      botToken: "xoxb-default",
-    });
-    expect(inspectSlackAccount({ cfg: next, accountId: "default" })).toMatchObject({
-      configured: true,
-      signingSecret: "shared-signing-secret",
-    });
+    expect(next.channels?.slack?.accounts?.default).toMatchObject({ botToken: "xoxb-default" });
+    expectSharedSigningSecret(next, "default");
     expect(SlackConfigSchema.safeParse(next.channels?.slack).success).toBe(true);
   });
 
@@ -124,49 +117,31 @@ describe("slack setup contract", () => {
       },
     },
   ])("preserves sibling HTTP credentials when promoting $name", ({ account }) => {
-    const cfg = {
-      channels: {
-        slack: {
-          enabled: true,
-          mode: "http",
-          signingSecret: "shared-signing-secret",
-          accounts: {
-            default: account,
-            bot: { mode: "http", botToken: "xoxb-sibling" },
-            user: { mode: "http", postAs: "user", userToken: "xoxp-sibling" },
-          },
-        },
+    const cfg = slackConfig({
+      enabled: true,
+      mode: "http",
+      signingSecret: "shared-signing-secret",
+      accounts: {
+        default: account,
+        bot: { mode: "http", botToken: "xoxb-sibling" },
+        user: { mode: "http", postAs: "user", userToken: "xoxp-sibling" },
       },
-    } as OpenClawConfig;
-
-    const next = moveSingleAccountChannelSectionToDefaultAccount({
-      cfg,
-      channelKey: "slack",
-      setupSurface: slackSetupPlugin.setupContract,
     });
+
+    const next = promote(cfg);
 
     expect(next.channels?.slack?.signingSecret).toBe("shared-signing-secret");
     expect(SlackConfigSchema.safeParse(next.channels?.slack).success).toBe(true);
-    expect(inspectSlackAccount({ cfg: next, accountId: "bot" })).toMatchObject({
-      configured: true,
-      signingSecret: "shared-signing-secret",
-    });
-    expect(inspectSlackAccount({ cfg: next, accountId: "user" })).toMatchObject({
-      configured: true,
-      signingSecret: "shared-signing-secret",
-    });
+    expectSharedSigningSecret(next, "bot");
+    expectSharedSigningSecret(next, "user");
   });
 
   it("recognizes HTTP bot accounts at the setup plugin boundary without an app token", () => {
-    const cfg = {
-      channels: {
-        slack: {
-          mode: "http",
-          botToken: "xoxb-test",
-          signingSecret: "test-signing-secret",
-        },
-      },
-    } as OpenClawConfig;
+    const cfg = slackConfig({
+      mode: "http",
+      botToken: "xoxb-test",
+      signingSecret: "test-signing-secret",
+    });
     const account = slackSetupPlugin.config.resolveAccount(cfg, "default");
 
     expect(slackSetupPlugin.config.isConfigured?.(account, cfg)).toBe(true);
@@ -181,10 +156,7 @@ describe("slack setup contract", () => {
       {
         name: "default account stores tokens and enables the channel",
         cfg: {} as OpenClawConfig,
-        input: {
-          botToken: "xoxb-test",
-          appToken: "xapp-test",
-        },
+        input: { botToken: "xoxb-test", appToken: "xapp-test" },
         expectedAccountId: "default",
         assertPatchedConfig: (cfg) => {
           expect(cfg.channels?.slack?.enabled).toBe(true);
@@ -196,25 +168,14 @@ describe("slack setup contract", () => {
         name: "non-default env setup is rejected",
         cfg: {} as OpenClawConfig,
         accountId: "ops",
-        input: {
-          useEnv: true,
-        },
+        input: { useEnv: true },
         expectedAccountId: "ops",
         expectedValidation: "Slack env tokens can only be used for the default account.",
       },
       {
         name: "HTTP env setup accepts a configured signing secret without an app token",
-        cfg: {
-          channels: {
-            slack: {
-              mode: "http",
-              signingSecret: "test-signing-secret",
-            },
-          },
-        } as OpenClawConfig,
-        input: {
-          useEnv: true,
-        },
+        cfg: slackConfig({ mode: "http", signingSecret: "test-signing-secret" }),
+        input: { useEnv: true },
         beforeTest: () => {
           expect(
             slackSetupPlugin.setupContract?.metadata.fields.find((field) => field.key === "useEnv"),
@@ -234,9 +195,7 @@ describe("slack setup contract", () => {
       {
         name: "Socket Mode env setup rejects a missing app token",
         cfg: {} as OpenClawConfig,
-        input: {
-          useEnv: true,
-        },
+        input: { useEnv: true },
         beforeTest: () => {
           vi.stubEnv("SLACK_BOT_TOKEN", "xoxb-test");
           vi.stubEnv("SLACK_APP_TOKEN", "");
@@ -246,9 +205,7 @@ describe("slack setup contract", () => {
       {
         name: "Socket Mode env setup accepts bot and app tokens",
         cfg: {} as OpenClawConfig,
-        input: {
-          useEnv: true,
-        },
+        input: { useEnv: true },
         beforeTest: () => {
           vi.stubEnv("SLACK_BOT_TOKEN", "xoxb-test");
           vi.stubEnv("SLACK_APP_TOKEN", "xapp-test");
@@ -260,11 +217,7 @@ describe("slack setup contract", () => {
       {
         name: "user identity stores the user and Socket Mode transport tokens",
         cfg: {} as OpenClawConfig,
-        input: {
-          identity: "user",
-          userToken: "test-user-token",
-          appToken: "test-app-token",
-        },
+        input: { identity: "user", userToken: "test-user-token", appToken: "test-app-token" },
         expectedAccountId: "default",
         assertPatchedConfig: (cfg) => {
           expect(cfg.channels?.slack).toMatchObject({
@@ -300,20 +253,12 @@ describe("slack setup contract", () => {
       },
       {
         name: "existing user identity stores an HTTP mode update",
-        cfg: {
-          channels: {
-            slack: {
-              postAs: "user",
-              userToken: "test-old-user-token",
-              appToken: "test-old-app-token",
-            },
-          },
-        } as OpenClawConfig,
-        input: {
-          mode: "http",
-          userToken: "test-user-token",
-          signingSecret: "test-signing-secret",
-        },
+        cfg: slackConfig({
+          postAs: "user",
+          userToken: "test-old-user-token",
+          appToken: "test-old-app-token",
+        }),
+        input: { mode: "http", userToken: "test-user-token", signingSecret: "test-signing-secret" },
         expectedAccountId: "default",
         assertPatchedConfig: (cfg) => {
           expect(cfg.channels?.slack).toMatchObject({
@@ -327,18 +272,8 @@ describe("slack setup contract", () => {
       },
       {
         name: "user identity rejects relay mode",
-        cfg: {
-          channels: {
-            slack: {
-              mode: "relay",
-            },
-          },
-        } as OpenClawConfig,
-        input: {
-          identity: "user",
-          userToken: "test-user-token",
-          appToken: "test-app-token",
-        },
+        cfg: slackConfig({ mode: "relay" }),
+        input: { identity: "user", userToken: "test-user-token", appToken: "test-app-token" },
         expectedAccountId: "default",
         expectedValidation:
           'Slack user identity setup supports mode "socket" or "http", not "relay".',
@@ -346,10 +281,7 @@ describe("slack setup contract", () => {
       {
         name: "user identity rejects the bot-only env shortcut",
         cfg: {} as OpenClawConfig,
-        input: {
-          identity: "user",
-          useEnv: true,
-        },
+        input: { identity: "user", useEnv: true },
         expectedAccountId: "default",
         expectedValidation:
           "Slack user identity setup does not support --use-env; configure userToken and the transport credential explicitly.",
@@ -398,19 +330,8 @@ describe("slack status contract", () => {
     cases: [
       {
         name: "configured account produces a configured status snapshot",
-        cfg: {
-          channels: {
-            slack: {
-              botToken: "xoxb-test",
-              appToken: "xapp-test",
-            },
-          },
-        } as OpenClawConfig,
-        runtime: {
-          accountId: "default",
-          connected: true,
-          running: true,
-        },
+        cfg: slackConfig({ botToken: "xoxb-test", appToken: "xapp-test" }),
+        runtime: { accountId: "default", connected: true, running: true },
         probe: { ok: true },
         assertSnapshot: (snapshot) => {
           expect(snapshot.accountId).toBe("default");

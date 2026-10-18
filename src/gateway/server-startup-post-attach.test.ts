@@ -1714,50 +1714,62 @@ describe("startGatewayPostAttachRuntime", () => {
     expect(onPluginServices).toHaveBeenCalledOnce();
   });
 
-  it("does not start services when close begins during lazy loading", async () => {
-    const actualServices =
-      await vi.importActual<typeof import("../plugins/services.js")>("../plugins/services.js");
-    const registry = createEmptyPluginRegistry();
-    const service = { id: "admission", start: vi.fn(), stop: vi.fn() };
-    registry.services.push(createServiceRegistration(service, { pluginId: "admission" }));
-    const scheduler = createTestGatewayScheduler(vi.isFakeTimers() ? "fake-timers" : undefined);
-    hoisted.startPluginServices.mockImplementationOnce(actualServices.startPluginServices);
-    let closing = false;
-    const onPluginServices = vi.fn<(handle: PluginServicesHandle | null) => void>();
-    const trace = createStartupTraceRecorder();
-    const runtime = await startGatewayPostAttachRuntime(
-      createPostAttachParams({
-        scheduler,
-        sidecarStartup: "defer",
-        pluginRegistry: registry,
-        onPluginServices,
-        isClosing: () => closing,
-        startupTrace: {
-          ...trace.startupTrace,
-          measure: async <T>(name: string, run: () => T | Promise<T>) => {
-            const operation = run();
-            if (name === "sidecars.plugin-services") {
-              // Close while the lazy import yields; the final eligibility check owns startup.
-              closing = true;
-            }
-            return await operation;
+  it.each(["close", "reload"] as const)(
+    "does not start services when %s begins during lazy loading",
+    async (action) => {
+      const actualServices =
+        await vi.importActual<typeof import("../plugins/services.js")>("../plugins/services.js");
+      const registry = createEmptyPluginRegistry();
+      const service = { id: "admission", start: vi.fn(), stop: vi.fn() };
+      registry.services.push(createServiceRegistration(service, { pluginId: "admission" }));
+      const scheduler = createTestGatewayScheduler(vi.isFakeTimers() ? "fake-timers" : undefined);
+      hoisted.startPluginServices.mockImplementationOnce(actualServices.startPluginServices);
+      let closing = false;
+      const generation = createGatewayPluginRuntimeGeneration({
+        getServices: () => null,
+        setServices: () => {},
+      });
+      const onPluginServices = vi.fn<(handle: PluginServicesHandle | null) => void>();
+      const trace = createStartupTraceRecorder();
+      const runtime = await startGatewayPostAttachRuntime(
+        createPostAttachParams({
+          scheduler,
+          sidecarStartup: "defer",
+          pluginRegistry: registry,
+          onPluginServices,
+          isClosing: () => closing,
+          shouldStartPluginServices: () => generation.getReloadStatus() === undefined,
+          startupTrace: {
+            ...trace.startupTrace,
+            measure: async <T>(name: string, run: () => T | Promise<T>) => {
+              const operation = run();
+              if (name === "sidecars.plugin-services") {
+                // The final eligibility check runs after the lazy import yields.
+                if (action === "close") {
+                  closing = true;
+                } else {
+                  generation.setReloadStatus({ phase: "reloading", pluginIds: ["admission"] });
+                }
+              }
+              return await operation;
+            },
           },
-        },
-      }),
-      createPostAttachRuntimeDeps({ startGatewaySidecars }),
-    );
-    try {
-      await runtime.startupSettled;
-      expect(service.start).not.toHaveBeenCalled();
-      expect(hoisted.startPluginServices).not.toHaveBeenCalled();
-      expect(onPluginServices).not.toHaveBeenCalled();
-    } finally {
-      await runtime.startupSettled;
-      for (const [handle] of onPluginServices.mock.calls) {
-        await handle?.stop();
+        }),
+        createPostAttachRuntimeDeps({ startGatewaySidecars }),
+      );
+      try {
+        await runtime.startupSettled;
+        expect(service.start).not.toHaveBeenCalled();
+        expect(hoisted.startPluginServices).not.toHaveBeenCalled();
+        expect(onPluginServices).not.toHaveBeenCalled();
+      } finally {
+        await runtime.startupSettled;
+        for (const [handle] of onPluginServices.mock.calls) {
+          await handle?.stop();
+        }
       }
-    }
-  });
+    },
+  );
 
   it("publishes models when channels are skipped", async () => {
     const trace = createStartupTraceRecorder();

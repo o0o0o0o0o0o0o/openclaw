@@ -95,7 +95,6 @@ export async function reloadGatewayPlugins(
   const previousRegistry = pluginRuntime.registry;
   const previousConfig = getRuntimeConfig();
   const { pluginRuntimeGeneration } = kernel;
-  const previousServices = pluginRuntimeGeneration.currentServices();
   const previousMetadata = runtime.pluginMetadataSnapshot;
   const previousLoadContext = getPluginRuntimeLoadContext(previousRegistry);
   const recovery = createPluginReloadRecovery(previousRegistry, preparePlugins);
@@ -328,7 +327,11 @@ export async function reloadGatewayPlugins(
       resourceHandoffIds.size > 0 || memoryReplacement.retainedPluginIds.size > 0;
     const serviceStopIds = new Set([...changedPluginIds, ...memoryReplacement.retainedPluginIds]);
     await stopOwner(strictServiceStop, "Plugin service cleanup failed", () =>
-      stopPreviousServices(previousServices, strictServiceStop, serviceStopIds),
+      stopPreviousServices(
+        pluginRuntimeGeneration.currentServices(),
+        strictServiceStop,
+        serviceStopIds,
+      ),
     );
     // Finish admitted work before legacy stop hooks can close shared connections.
     // Removal has no replacement to protect and keeps its bounded, deferred cleanup.

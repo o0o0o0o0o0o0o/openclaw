@@ -539,7 +539,7 @@ export async function startGatewayPostAttachRuntime(
       retireGatewayRuntimeBindings?: () => void;
     }) => Awaitable<boolean>;
     getCurrentPluginRegistry?: () => PluginRegistry;
-    getCurrentPluginServices?: () => PluginServicesHandle | null;
+    shouldStartPluginServices?: () => boolean;
     getCronService?: () => PluginServiceCronHost | null | undefined;
     onChannelsStarted?: () => Awaitable<void>;
     onPluginServices?: (pluginServices: PluginServicesHandle | null) => void;
@@ -777,12 +777,8 @@ export async function startGatewayPostAttachRuntime(
                   onPluginServices: params.onPluginServices,
                   onPostReadySidecars: params.onPostReadySidecars,
                   shouldCreatePostReadySidecars: () => params.isClosing?.() !== true,
-                  shouldStartPluginServices: () => {
-                    const current = params.getCurrentPluginServices?.();
-                    return (
-                      params.isClosing?.() !== true && (current === undefined || current === null)
-                    );
-                  },
+                  shouldStartPluginServices: () =>
+                    params.isClosing?.() !== true && params.shouldStartPluginServices?.() !== false,
                   broadcastPluginEvent: params.broadcastPluginEvent,
                   startupOutcomes,
                   internalHookSelection,

@@ -74,7 +74,8 @@ export async function startTranscriptReloadFixtureSidecars(
       unlockStartupMethods: () => {},
       waitForPostReadyWork,
       getCurrentPluginRegistry: () => fixture.registryOwner.registry,
-      getCurrentPluginServices: () => fixture.owner.currentServices() ?? null,
+      shouldStartPluginServices: () =>
+        fixture.owner.currentServices() === null && fixture.owner.getReloadStatus() === undefined,
       onPostReadySidecars: runtime.runtimeState.postReadySidecars.publish,
       onGatewayLifetimeSidecars: sidecars.publish,
       unregisterConnectionDependentSidecar: vi.fn(),

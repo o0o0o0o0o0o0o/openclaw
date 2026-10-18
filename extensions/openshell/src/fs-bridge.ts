@@ -29,14 +29,7 @@ type ResolvedMountPath = SandboxResolvedPath & {
   writable: boolean;
 };
 
-export function createOpenShellFsBridge(params: {
-  sandbox: OpenShellFsBridgeContext;
-  backend: OpenShellMirrorBackend;
-}) {
-  return new OpenShellFsBridge(params.sandbox, params.backend);
-}
-
-class OpenShellFsBridge implements SandboxFsBridge {
+export class OpenShellFsBridge implements SandboxFsBridge {
   private readonly resolveRenameTargets = createWritableRenameTargetResolver(
     (target) => this.resolveTarget(target),
     (target, action) => this.ensureWritable(target, action, true),

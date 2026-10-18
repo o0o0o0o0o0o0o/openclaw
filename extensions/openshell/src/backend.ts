@@ -40,7 +40,7 @@ import { safeParseJson } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { OpenShellFsBridgeContext, OpenShellSandboxBackend } from "./backend.types.js";
 import { createOpenShellSshSession, runOpenShellCli, type OpenShellExecContext } from "./cli.js";
 import { resolveOpenShellPluginConfig, type ResolvedOpenShellPluginConfig } from "./config.js";
-import { createOpenShellFsBridge } from "./fs-bridge.js";
+import { OpenShellFsBridge } from "./fs-bridge.js";
 import {
   DEFAULT_OPEN_SHELL_MIRROR_EXCLUDE_DIRS,
   replaceDirectoryContents,
@@ -269,16 +269,13 @@ class OpenShellSandboxBackendImpl {
   }
 
   private createMirrorFsBridge(sandbox: OpenShellFsBridgeContext): SandboxFsBridge {
-    const bridge = createOpenShellFsBridge({
-      sandbox,
-      backend: {
-        remoteAgentWorkspaceDir: this.params.remoteAgentWorkspaceDir,
-        mkdirpRemotePath: (remotePath, signal) => this.mkdirpRemotePath(remotePath, signal),
-        removeRemotePath: (remotePath, params) => this.removeRemotePath(remotePath, params),
-        renameRemotePath: (from, to, signal) => this.renameRemotePath(from, to, signal),
-        syncLocalPathToRemote: (localPath, remotePath) =>
-          this.syncLocalPathToRemote(localPath, remotePath),
-      },
+    const bridge = new OpenShellFsBridge(sandbox, {
+      remoteAgentWorkspaceDir: this.params.remoteAgentWorkspaceDir,
+      mkdirpRemotePath: (remotePath, signal) => this.mkdirpRemotePath(remotePath, signal),
+      removeRemotePath: (remotePath, params) => this.removeRemotePath(remotePath, params),
+      renameRemotePath: (from, to, signal) => this.renameRemotePath(from, to, signal),
+      syncLocalPathToRemote: (localPath, remotePath) =>
+        this.syncLocalPathToRemote(localPath, remotePath),
     });
     // Hold one lease across validation and both commits, not just the remote step.
     // Otherwise exec publication can erase a successful file-tool write or expose partial reads.

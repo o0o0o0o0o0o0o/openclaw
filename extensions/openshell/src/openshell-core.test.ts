@@ -1229,8 +1229,8 @@ describe("openshell fs bridges", () => {
         containerWorkdir: "/sandbox",
       },
     });
-    const { createOpenShellFsBridge } = await import("./fs-bridge.js");
-    const bridge = createOpenShellFsBridge({ sandbox, backend: createMirrorBackendMock() });
+    const { OpenShellFsBridge } = await import("./fs-bridge.js");
+    const bridge = new OpenShellFsBridge(sandbox, createMirrorBackendMock());
 
     expect(() => bridge.resolvePath({ filePath: "/agent/../outside.txt" })).toThrow(
       "Sandbox path escapes allowed mounts",

@@ -24,7 +24,11 @@ export function ApplicationProvider(props: {
   // The native transport belongs to this mounted host; the capability value stays reactive.
   const initialHost = untrack(() => props.host);
   const applicationValue = () => props.value;
+  // Solid context snapshots this capability; native transport below owns replacements.
+  const initialValue = untrack(applicationValue);
   if (initialHost) {
+    // Native requests can arrive during another owner's effect; serve the last publication.
+    let publishedValue = initialValue;
     const subscribers = new Map<
       ApplicationContextRequest["callback"],
       { target: HTMLElement; unsubscribe: () => void }
@@ -46,7 +50,7 @@ export function ApplicationProvider(props: {
         };
         subscribers.set(incoming.callback, subscription);
       }
-      incoming.callback(applicationValue(), subscription?.unsubscribe);
+      incoming.callback(publishedValue, subscription?.unsubscribe);
     };
     const provider = (event: Event) => {
       // SAFETY: Provider announcements carry the same context token as requests.
@@ -74,6 +78,7 @@ export function ApplicationProvider(props: {
     const stopRequest = listen(initialHost, "context-request", request);
     const stopProvider = listen(initialHost, "context-provider", provider);
     createEffect(applicationValue, (value) => {
+      publishedValue = value;
       for (const [callback, subscription] of subscribers) {
         callback(value, subscription.unsubscribe);
       }
@@ -90,8 +95,6 @@ export function ApplicationProvider(props: {
       }),
     );
   }
-  // Solid context snapshots this capability; native transport above owns replacements.
-  const initialValue = untrack(applicationValue);
   return createComponent(ApplicationContext, {
     value: initialValue,
     get children() {

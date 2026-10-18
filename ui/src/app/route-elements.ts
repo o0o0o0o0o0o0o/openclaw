@@ -1,12 +1,3 @@
-import type { ChatPage } from "../pages/chat/chat-page.ts";
-import type { ChatPaneElement } from "../pages/chat/chat-pane.tsx";
-
-type RouteElementMap = {
-  "openclaw-chat-page": ChatPage;
-  "openclaw-chat-pane": ChatPaneElement;
-  "openclaw-new-session-page": HTMLElement & { focusComposer(): void };
-};
-
 type RouteElementRegistration = {
   element: HTMLElement;
   registered: (unregister: () => void) => void;
@@ -48,13 +39,15 @@ export class RouteElements {
     });
   };
 
-  renderedElement<K extends keyof RouteElementMap>(tagName: K): RouteElementMap[K] | undefined;
+  renderedElement<K extends keyof HTMLElementTagNameMap>(
+    tagName: K,
+  ): HTMLElementTagNameMap[K] | undefined;
   renderedElement(tagName: string): HTMLElement | undefined;
   renderedElement(tagName: string): HTMLElement | undefined {
     return this.renderedElements(tagName)[0];
   }
 
-  renderedElements<K extends keyof RouteElementMap>(tagName: K): RouteElementMap[K][];
+  renderedElements<K extends keyof HTMLElementTagNameMap>(tagName: K): HTMLElementTagNameMap[K][];
   renderedElements(tagName: string): HTMLElement[];
   renderedElements(tagName: string): HTMLElement[] {
     return [...(this.elements.get(tagName) ?? [])].filter((element) => element.isConnected);

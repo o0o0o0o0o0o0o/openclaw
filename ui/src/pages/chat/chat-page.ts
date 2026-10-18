@@ -46,3 +46,9 @@ defineSolidBridge<ChatPageProps>(
 
 // SAFETY: defineSolidBridge synchronously registers this exact host contract.
 export const ChatPage = customElements.get("openclaw-chat-page") as { new (): ChatPage };
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "openclaw-chat-page": ChatPage;
+  }
+}

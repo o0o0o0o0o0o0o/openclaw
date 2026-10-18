@@ -73,6 +73,7 @@ class ToastOwner {
   private deadline = 0;
   private hovered = false;
   private timerSyncPending = false;
+  private homeLayer: HTMLElement | undefined;
 
   hover(hovered: boolean) {
     this.hovered = hovered;
@@ -87,6 +88,9 @@ class ToastOwner {
 
   connect() {
     connectedHosts.add(this.host);
+    if (!this.host.closest("openclaw-modal-dialog")) {
+      this.homeLayer = this.host.parentElement ?? undefined;
+    }
     this.host.style.display = "contents";
     this.host.dataset.toastPlacement = this.host.parentElement?.matches(".shell")
       ? "shell"
@@ -108,12 +112,24 @@ class ToastOwner {
       return;
     }
     connectedHosts.delete(this.host);
-    const target = activeModalToastLayer()?.container ?? restingToastLayer();
-    if (this.host.closest("openclaw-modal-dialog") && target) {
-      target.append(this.host);
-    } else {
-      this.dismiss("disconnected");
+    if (this.host.closest("openclaw-modal-dialog") && this.restorePresentationLayer()) {
+      return;
     }
+    this.homeLayer = undefined;
+    this.dismiss("disconnected");
+  }
+
+  restorePresentationLayer(): boolean {
+    // Native hosts can present a toast before their shell registers its layers.
+    const target =
+      activeModalToastLayer()?.container ??
+      restingToastLayer() ??
+      (this.homeLayer?.isConnected ? this.homeLayer : undefined);
+    if (!target) {
+      return false;
+    }
+    target.append(this.host);
+    return true;
   }
 
   show(options: ToastOptions) {
@@ -248,9 +264,7 @@ export function showToast(options: ToastOptions): boolean {
         return;
       }
       stopHandoff();
-      queueMicrotask(() =>
-        (activeModalToastLayer()?.container ?? restingToastLayer())?.append(host),
-      );
+      queueMicrotask(() => toastOwnerFor(host).restorePresentationLayer());
     };
     const stopHandoff = listen(modal.owner, "overlay-after-hide", handoff);
   }

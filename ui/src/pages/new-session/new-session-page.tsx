@@ -424,6 +424,12 @@ defineSolidBridge<
   },
 });
 
+declare global {
+  interface HTMLElementTagNameMap {
+    "openclaw-new-session-page": PageHost;
+  }
+}
+
 declare module "@solidjs/web" {
   namespace JSX {
     interface IntrinsicElements {

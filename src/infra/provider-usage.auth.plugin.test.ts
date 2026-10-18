@@ -1,32 +1,29 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
+import type { ProviderResolveUsageAuthContext as AuthContext } from "../plugins/types.js";
 import { resolveProviderAuths } from "./provider-usage.auth.js";
 
-const {
-  resolvePlugin,
-  hasSource,
-  emptyStore: createEmptyStore,
-  loadStore,
-  loadLocalStore,
-  order,
-  resolveKey,
-} = vi.hoisted(() => {
-  const emptyStore = (): AuthProfileStore => ({ version: 1, profiles: {} });
-  return {
-    resolvePlugin:
-      vi.fn<typeof import("../plugins/provider-runtime.js").resolveProviderUsageAuthWithPlugin>(),
-    hasSource: vi.fn(() => false),
-    emptyStore,
-    loadStore: vi.fn(emptyStore),
-    loadLocalStore: vi.fn(emptyStore),
-    order: vi.fn((_params: { provider: string }): string[] => []),
-    resolveKey: vi.fn(
-      async (_params: {
-        profileId: string;
-      }): Promise<{ apiKey: string; provider: string } | null> => null,
-    ),
-  };
-});
+const { resolvePlugin, hasSource, createStore, loadStore, loadLocalStore, order, resolveKey } =
+  vi.hoisted(() => {
+    const buildStore = (profiles: AuthProfileStore["profiles"] = {}): AuthProfileStore => ({
+      version: 1,
+      profiles,
+    });
+    return {
+      resolvePlugin:
+        vi.fn<typeof import("../plugins/provider-runtime.js").resolveProviderUsageAuthWithPlugin>(),
+      hasSource: vi.fn(() => false),
+      createStore: buildStore,
+      loadStore: vi.fn(buildStore),
+      loadLocalStore: vi.fn(buildStore),
+      order: vi.fn((_params: { provider: string }): string[] => []),
+      resolveKey: vi.fn(
+        async (_params: {
+          profileId: string;
+        }): Promise<{ apiKey: string; provider: string } | null> => null,
+      ),
+    };
+  });
 
 // mock-isolation: Plugin auth precedence uses seeded stores and source flags without host credential discovery.
 vi.mock("../agents/auth-profiles.js", () => ({
@@ -36,7 +33,7 @@ vi.mock("../agents/auth-profiles.js", () => ({
   ensureAuthProfileStoreWithoutExternalProfilesAsync: () => loadLocalStore(),
   hasAnyAuthProfileStoreSourceAsync: () => hasSource(),
   listProfilesForProvider: () => [],
-  resolveApiKeyForProfile: (params: { profileId: string }) => resolveKey(params),
+  resolveApiKeyForProfile: resolveKey,
   resolveAuthProfileOrder: (params: { provider: string }) => order(params),
 }));
 vi.mock("../plugins/provider-runtime.js", async () => ({
@@ -48,18 +45,12 @@ vi.mock("../plugins/provider-runtime.js", async () => ({
 vi.mock("../plugins/manifest-contract-eligibility.js", () => ({
   loadManifestMetadataSnapshot: () => ({
     plugins: [
-      {
-        id: "minimax",
-        origin: "bundled",
-        providers: ["minimax", "minimax-portal"],
-      },
+      { id: "minimax", origin: "bundled", providers: ["minimax", "minimax-portal"] },
       {
         id: "openai",
         origin: "bundled",
         providers: ["openai"],
-        providerUsageAuthEnvVars: {
-          openai: ["OPENAI_ADMIN_KEY"],
-        },
+        providerUsageAuthEnvVars: { openai: ["OPENAI_ADMIN_KEY"] },
       },
     ],
   }),
@@ -73,11 +64,10 @@ vi.mock("../secrets/provider-env-vars.js", () => {
     zai: ["ZAI_API_KEY"],
   };
   return {
-    listKnownProviderAuthEnvVarNamesCore: () => [
-      "ANTHROPIC_API_KEY",
-      "MINIMAX_CODE_PLAN_KEY",
-      "OPENAI_API_KEY",
-    ],
+    listKnownProviderAuthEnvVarNamesCore: () =>
+      Object.values(envCandidateMap)
+        .flat()
+        .filter((name) => name !== "ZAI_API_KEY"),
     resolveProviderAuthEnvVarCandidatesCore: () => envCandidateMap,
     resolveProviderAuthLookupMaps: () => ({
       aliasMap: {},
@@ -87,14 +77,20 @@ vi.mock("../secrets/provider-env-vars.js", () => {
   };
 });
 
-const resolve = (providers: string[], env: NodeJS.ProcessEnv = {}) =>
-  resolveProviderAuths({ providers, env, config: {}, agentDir: "/tmp/openclaw-agent" });
-function seed(profiles: AuthProfileStore["profiles"], orders: Record<string, string[]>) {
-  const store = { version: 1, profiles };
+const resolve = (
+  providers: string[],
+  env: NodeJS.ProcessEnv = {},
+  options: Pick<Parameters<typeof resolveProviderAuths>[0], "getStore"> = {},
+) =>
+  resolveProviderAuths({ providers, env, config: {}, agentDir: "/tmp/openclaw-agent", ...options });
+function seed(profiles: AuthProfileStore["profiles"]) {
+  const store = createStore(profiles);
   hasSource.mockReturnValue(true);
   loadStore.mockReturnValue(store);
   loadLocalStore.mockReturnValue(store);
-  order.mockImplementation(({ provider }) => orders[provider] ?? []);
+  order.mockImplementation(({ provider }) =>
+    Object.keys(profiles).filter((id) => profiles[id].provider === provider),
+  );
   return store;
 }
 const apiProfile = (key: string) => ({ type: "api_key" as const, provider: "anthropic", key });
@@ -106,61 +102,49 @@ const oauthProfile = (provider: string, access: string, authFlow?: string) => ({
   expires: 1_900_000_000_000,
   ...(authFlow ? { authFlow } : {}),
 });
+function useCandidates(
+  options: Parameters<NonNullable<AuthContext["resolveApiKeyCandidatesFromConfigAndStore"]>>[0],
+  expected: string[],
+) {
+  resolvePlugin.mockImplementationOnce(async ({ context }) => {
+    const candidates = await context.resolveApiKeyCandidatesFromConfigAndStore?.(options);
+    expect(candidates).toEqual(expected);
+    return candidates?.[0] ? { token: candidates[0] } : undefined;
+  });
+}
+async function expectToken(provider: string, token: string, env: NodeJS.ProcessEnv = {}) {
+  expect(await resolve([provider], env)).toEqual([{ provider, token }]);
+}
 
 describe("provider usage auth boundary", () => {
   beforeEach(() => {
     hasSource.mockReset().mockReturnValue(false);
-    loadStore.mockReset().mockImplementation(createEmptyStore);
-    loadLocalStore.mockReset().mockImplementation(createEmptyStore);
+    loadStore.mockReset().mockImplementation(createStore);
+    loadLocalStore.mockReset().mockImplementation(createStore);
     order.mockReset().mockReturnValue([]);
     resolveKey.mockReset().mockResolvedValue(null);
     resolvePlugin.mockReset().mockResolvedValue(undefined);
   });
 
   it("normalizes direct plugin candidates ahead of provider environment credentials", async () => {
-    resolvePlugin.mockImplementationOnce(async ({ context }) => {
-      const token = (
-        await context.resolveApiKeyCandidatesFromConfigAndStore?.({
-          envDirect: [undefined, "first-\r\nkey", "second-key"],
-        })
-      )?.[0];
-      return token ? { token } : undefined;
-    });
-    expect(await resolve(["zai"], { ZAI_API_KEY: "fallback-key" })).toEqual([
-      { provider: "zai", token: "first-key" },
-    ]);
+    useCandidates({ envDirect: [undefined, "first-\r\nkey", "second-key"] }, ["first-key"]);
+    await expectToken("zai", "first-key", { ZAI_API_KEY: "fallback-key" });
   });
 
   it("keeps the supplied store when direct credentials admit a legacy usage hook", async () => {
     const profileId = "anthropic:scoped";
-    const store: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        [profileId]: apiProfile("scoped-key"),
-      },
-    };
+    const store = createStore({ [profileId]: apiProfile("scoped-key") });
     const getStore = vi.fn(async () => store);
-    loadStore.mockReturnValue({
-      version: 1,
-      profiles: {
-        [profileId]: apiProfile("ambient-key"),
-      },
-    });
+    loadStore.mockReturnValue(createStore({ [profileId]: apiProfile("ambient-key") }));
     order.mockImplementation(({ provider }) => (provider === "anthropic" ? [profileId] : []));
     resolvePlugin.mockImplementationOnce(async ({ context }) => {
       const token = context.resolveApiKeyFromConfigAndStore({ providerIds: ["anthropic"] });
       return token ? { token } : undefined;
     });
 
-    await expect(
-      resolveProviderAuths({
-        providers: ["zai"],
-        env: { ZAI_API_KEY: "direct-key" },
-        config: {},
-        agentDir: "/tmp/openclaw-agent",
-        getStore,
-      }),
-    ).resolves.toEqual([{ provider: "zai", token: "scoped-key" }]);
+    await expect(resolve(["zai"], { ZAI_API_KEY: "direct-key" }, { getStore })).resolves.toEqual([
+      { provider: "zai", token: "scoped-key" },
+    ]);
     expect(getStore).toHaveBeenCalledOnce();
     expect(loadStore).not.toHaveBeenCalled();
     expect(loadLocalStore).not.toHaveBeenCalled();
@@ -173,27 +157,16 @@ describe("provider usage auth boundary", () => {
   });
 
   it("resolves SecretRefs before credential classification", async () => {
-    const store = seed(
-      {
-        "anthropic:admin": {
-          type: "api_key",
-          provider: "anthropic",
-          keyRef: { source: "env", provider: "default", id: "ANTHROPIC_ADMIN_KEY" },
-        },
+    const store = seed({
+      "anthropic:admin": {
+        type: "api_key",
+        provider: "anthropic",
+        keyRef: { source: "env", provider: "default", id: "ANTHROPIC_ADMIN_KEY" },
       },
-      { anthropic: ["anthropic:admin"] },
-    );
-    resolveKey.mockResolvedValue({ apiKey: "sk-ant-admin-secretref", provider: "anthropic" });
-    resolvePlugin.mockImplementationOnce(async ({ context }) => {
-      const candidates = await context.resolveApiKeyCandidatesFromConfigAndStore?.({
-        providerIds: ["anthropic"],
-      });
-      expect(candidates).toEqual(["sk-ant-admin-secretref"]);
-      return candidates?.[0] ? { token: candidates[0] } : undefined;
     });
-    expect(await resolve(["anthropic"])).toEqual([
-      { provider: "anthropic", token: "sk-ant-admin-secretref" },
-    ]);
+    resolveKey.mockResolvedValue({ apiKey: "sk-ant-admin-secretref", provider: "anthropic" });
+    useCandidates({ providerIds: ["anthropic"] }, ["sk-ant-admin-secretref"]);
+    await expectToken("anthropic", "sk-ant-admin-secretref");
     expect(resolveKey).toHaveBeenCalledExactlyOnceWith({
       cfg: {},
       store,
@@ -203,13 +176,10 @@ describe("provider usage auth boundary", () => {
   });
 
   it("excludes native profiles while preserving the selected OAuth flow", async () => {
-    seed(
-      {
-        "anthropic:claude-cli": oauthProfile("anthropic", "native-access"),
-        "anthropic:managed": oauthProfile("anthropic", "managed-access", "external-flow"),
-      },
-      { anthropic: ["anthropic:claude-cli", "anthropic:managed"] },
-    );
+    seed({
+      "anthropic:claude-cli": oauthProfile("anthropic", "native-access"),
+      "anthropic:managed": oauthProfile("anthropic", "managed-access", "external-flow"),
+    });
     resolveKey.mockImplementation(async ({ profileId }) => ({
       apiKey: profileId === "anthropic:managed" ? "managed-access" : "native-access",
       provider: "anthropic",
@@ -227,18 +197,16 @@ describe("provider usage auth boundary", () => {
     );
   });
 
-  it("finds credentials through owned aliases without importing unrelated providers", async () => {
-    seed(
-      {
-        "minimax-portal:default": oauthProfile("minimax-portal", "portal-token"),
-      },
-      { "minimax-portal": ["minimax-portal:default"] },
-    );
-    resolvePlugin.mockResolvedValueOnce({ token: "plugin-minimax-token" });
-    expect(await resolve(["minimax", "zai"])).toEqual([
-      { provider: "minimax", token: "plugin-minimax-token" },
-    ]);
-    expect(resolvePlugin.mock.calls.map(([params]) => params.provider)).toEqual(["minimax"]);
+  it.each([
+    ["owned aliases", "minimax", {}],
+    ["usage-only environment credentials", "openai", { OPENAI_ADMIN_KEY: "sk-admin-test" }],
+  ] as const)("admits %s without importing unrelated providers", async (_name, provider, env) => {
+    if (provider === "minimax") {
+      seed({ "minimax-portal:default": oauthProfile("minimax-portal", "portal-token") });
+    }
+    resolvePlugin.mockResolvedValueOnce({ token: "plugin-token" });
+    expect(await resolve([provider, "zai"], env)).toEqual([{ provider, token: "plugin-token" }]);
+    expect(resolvePlugin.mock.calls.map(([params]) => params.provider)).toEqual([provider]);
     expect(loadStore).not.toHaveBeenCalled();
   });
 

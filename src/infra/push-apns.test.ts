@@ -6,10 +6,10 @@ import http2 from "node:http2";
 import net from "node:net";
 import path from "node:path";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
-// Tests APNS push signing and request construction.
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred, withTestTimeout } from "../../test/helpers/promise.js";
+import { TEST_TLS_CERT_PEM, TEST_TLS_KEY_PEM } from "../../test/helpers/tls-fixture.js";
 import { createTrackedTempDirs } from "../test-utils/tracked-temp-dirs.js";
 import { startProxy, stopProxy, type ProxyHandle } from "./net/proxy/proxy-lifecycle.js";
 import {
@@ -32,58 +32,6 @@ import {
 const testAuthPrivateKey = generateKeyPairSync("ec", {
   namedCurve: "prime256v1",
 }).privateKey.export({ format: "pem", type: "pkcs8" });
-
-const testApnsServerKey = `-----BEGIN PRIVATE KEY-----`; // pragma: allowlist secret
-const testApnsServerKeyPem = `${testApnsServerKey}
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC1l/DDGxT//Ma2
-1EC7ON4lb+9IOrHHd437rv5DBhMt7ZXpzmfZuXyJWd/RI3ljiCcJeXwTYdzLsyaR
-aMRUnbzOoaI5/9LRdwmo007Y/US1ZxSjXW3L+vl3+QtiAUt6GDBZo49jB/LSCgu3
-lXYcN96OjpkF2j8rBR8Sn7eTUMIkiCFKn8V68hMRhDuHVJHWSGsMcfq8P7jZZ8S0
-31sUvQw8JaAvEhju3GbxbhQH8RnicR4VxI+bZ3v1JTnWNXCSClRmfDAM0AFrWv8k
-qJXrhat4RsppeRSRDjENdUFS+VvW2s/oyaU9hXl3/G+9Srx5ANOCdLy+pTQdkq3b
-Clg7a917AgMBAAECggEACpyyZolJ7PtiyeMI7pTQSp2XFrOZzKw8bgJk4oBtSE66
-AMIqruSx/Fbch3Zl81gzRWosXMRoNYRzkwwHBfwUp612pqJzUzSV9tNBqHJryWWy
-PsL74rx44R1604N7qGSkfE1ci+JP7h1fLOw9M3Rb+1AmOigHomYRhRjNwhXcmp5u
-spnubpOpJhYANFvQbard7yFmz2n1PcmtKOZussMN9F2w3CJ0pucDDEY+kpHVXiRa
-j65STQi9rxoZVKjzCo4UGIrsURZCfrtZFQ5ga8JhzytY4rsgyF6Wl2gOiZ3E+nMs
-34QDdL8ZMBU6in9lb/iVEvBuUdRFqRVtH+zoQRf1RQKBgQDnZps2u40/55XpeoYW
-6fR5tmgGKN4bpcd7r5zRM+831n5v4MqBfJZEq/TeGSw2ddhQbzeezQg+CRzxuVy/
-MGNOKskGSZ5quamwqD3DDw8hIA6KvVpfBIEKfz4O3lbzP/3UsP3CM+c8FS2b7tzm
-Mfggt1caVAj2dBd8cKyXS3bZRQKBgQDI5d4N2tAopvaRyzFXT4rhZPL1drOKCO0L
-QMN8CRK1seke0W4j+pMqnT6uJd+mTGQH7aAUMFcbHvX1Pn8M5SudyljcleH8taxt
-F8gw1tyH3+tnJqXiQOGFlEL6fX2V3ETThVPyVXQ2sIm17Q961tL+gSQPjYXPKTfU
-IG37/9FnvwKBgBWzV6cAW7S8gSCOLvkDI7wuUP8S4hFxsI124Jv15N81rFHNoPAX
-wPfbsHELp0vMLWcNpwerbrRyolZA7eO4I/f2pzeBu+uCUdmRTYl3ZhHTMcntDAaR
-I5DacfVvAHR7cdB6cLG/sFXAHrDa67hiw0Q+LVr4uoZySKmQ336owxKJAoGBAMdZ
-kicdYkF0rGevwZ5qB93xVkXNLAtlIBNyiIikWDSD/lfeafS5yR8YOgKFApD6bKiR
-W6+s6EK5Tke1ZE1fexBwog0BjeY+QINgff44t0z9HZKV/zWsPB1ZKb12mRAEKyfZ
-vZtSwKckNwKX4ix6z5RMgYQNYyJWPFf6dikBiMHxAoGBALEOli/ZehBqx5Bd7bHm
-HKgZBuBmEDn0wdqB9bGXDdY84bjfNJ8crhiO+zFGzHRvwa+eO2dp0iffIFqXVG15
-/DjMPsMlaX2rmmHE0iYpTo3jbDm4TrGf8uhNFJBW2f7UMAvEK30NXi4aajzIadhD
-LxmTaLeSxjQDE6BXgPlf2dr4
------END PRIVATE KEY-----`;
-
-const testApnsServerCert = `-----BEGIN CERTIFICATE-----
-MIIDaDCCAlCgAwIBAgIUafG6emKuR1YWUNOTWjvy32lTx7YwDQYJKoZIhvcNAQEL
-BQAwJTEjMCEGA1UEAwwaYXBpLnNhbmRib3gucHVzaC5hcHBsZS5jb20wHhcNMjYw
-NTAxMDIzMjM2WhcNMzYwNDI4MDIzMjM2WjAlMSMwIQYDVQQDDBphcGkuc2FuZGJv
-eC5wdXNoLmFwcGxlLmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
-ALWX8MMbFP/8xrbUQLs43iVv70g6scd3jfuu/kMGEy3tlenOZ9m5fIlZ39EjeWOI
-Jwl5fBNh3MuzJpFoxFSdvM6hojn/0tF3CajTTtj9RLVnFKNdbcv6+Xf5C2IBS3oY
-MFmjj2MH8tIKC7eVdhw33o6OmQXaPysFHxKft5NQwiSIIUqfxXryExGEO4dUkdZI
-awxx+rw/uNlnxLTfWxS9DDwloC8SGO7cZvFuFAfxGeJxHhXEj5tne/UlOdY1cJIK
-VGZ8MAzQAWta/ySoleuFq3hGyml5FJEOMQ11QVL5W9baz+jJpT2FeXf8b71KvHkA
-04J0vL6lNB2SrdsKWDtr3XsCAwEAAaOBjzCBjDAdBgNVHQ4EFgQUcS8iUpQu0qs4
-MHxfmbd6WjvplH4wHwYDVR0jBBgwFoAUcS8iUpQu0qs4MHxfmbd6WjvplH4wDwYD
-VR0TAQH/BAUwAwEB/zA5BgNVHREEMjAwghphcGkuc2FuZGJveC5wdXNoLmFwcGxl
-LmNvbYISYXBpLnB1c2guYXBwbGUuY29tMA0GCSqGSIb3DQEBCwUAA4IBAQAVP+Qg
-lAjpy9jINCeVkt4x/tdZvenag7tCD03ATQ/jrbndAkoHnJt7if1PXmH4+R/iW59X
-yEv7o+2cTJa1g1QQgHMdiEBhGSGzNCQl8VhvZ6eZ6eeZuVLHZUPoZhV9+eax1sB/
-346JgSF6z2IIjr7H26jumZKuAqQsZwvQBOS20zZk+gewpHd4Xy3KxhLMz5Qtl7Df
-ILty9ZCz2RlAy1H3bzxFEAVQt/SQ4cjmdI1U0svR3iHhpX9qT6DTZYvisjjpUBgN
-0nu1jQgAYFHA2hQmgChmPJUYhkxjXtgemTYyiurXsi3VK/dQ9yrOBkk1MOwuOYZs
-W8tBzWn/ZhBpWD88
------END CERTIFICATE-----`;
 
 type CapturedApnsRequest = {
   headers: http2.IncomingHttpHeaders;
@@ -175,39 +123,21 @@ function listen(server: HttpServer | http2.Http2SecureServer): Promise<number> {
   });
 }
 
-async function closeServer(server: HttpServer | http2.Http2SecureServer): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    server.close((error?: Error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    });
+const closeServer = (server: HttpServer | http2.Http2SecureServer) =>
+  new Promise<void>((resolve, reject) => {
+    server.close((error?: Error) => (error ? reject(error) : resolve()));
   });
-}
 
 const requireRecord = createRequireRecord("object", "label-not-object");
 
-function expectRecordFields(record: Record<string, unknown>, fields: Record<string, unknown>) {
-  for (const [key, value] of Object.entries(fields)) {
-    expect(record[key]).toEqual(value);
-  }
-}
-
-function expectNoProperties(record: Record<string, unknown>, keys: string[]) {
+function expectNoProperties(record: unknown, keys: string[]) {
   for (const key of keys) {
     expect(record).not.toHaveProperty(key);
   }
 }
 
 function requireSendRequest(send: ReturnType<typeof vi.fn>, label = "APNs send request") {
-  const [call] = send.mock.calls;
-  if (!call) {
-    throw new Error(`expected ${label}`);
-  }
-  const [request] = call;
-  return requireRecord(request, label);
+  return requireRecord(send.mock.calls[0]?.[0], label);
 }
 
 function requirePayload(sendRequest: Record<string, unknown>) {
@@ -215,10 +145,8 @@ function requirePayload(sendRequest: Record<string, unknown>) {
 }
 
 function expectOpenClaw(payload: Record<string, unknown>, fields: Record<string, unknown>) {
-  const metadata = requireRecord(payload.openclaw, "openclaw payload");
-  expectRecordFields(metadata, fields);
-  expect(typeof metadata.ts).toBe("number");
-  return metadata;
+  expect(payload.openclaw).toMatchObject({ ...fields, ts: expect.any(Number) });
+  return payload.openclaw;
 }
 
 async function withProxiedApns(
@@ -248,17 +176,13 @@ async function withProxiedApns(
   }
 }
 
-async function startFakeApnsServer(params?: { responseBody?: string; status?: number }): Promise<{
-  port: number;
-  requests: CapturedApnsRequest[];
-  stop: () => Promise<void>;
-}> {
+async function startFakeApnsServer(params?: { responseBody?: string; status?: number }) {
   const requests: CapturedApnsRequest[] = [];
   const responseBody = params?.responseBody ?? "";
   const status = params?.status ?? 200;
   const server = http2.createSecureServer({
-    key: testApnsServerKeyPem,
-    cert: testApnsServerCert,
+    key: TEST_TLS_KEY_PEM,
+    cert: TEST_TLS_CERT_PEM,
     allowHTTP1: false,
   });
   server.on("stream", (stream: http2.ServerHttp2Stream, headers) => {
@@ -281,11 +205,7 @@ async function startFakeApnsServer(params?: { responseBody?: string; status?: nu
   };
 }
 
-async function startConnectProxy(upstreamPort: number): Promise<{
-  proxyUrl: string;
-  connectTargets: string[];
-  stop: () => Promise<void>;
-}> {
+async function startConnectProxy(upstreamPort: number) {
   const connectTargets: string[] = [];
   const sockets = new Set<DestroyableConnection>();
   const server = createServer((_req, res) => {
@@ -326,10 +246,6 @@ async function startConnectProxy(upstreamPort: number): Promise<{
   };
 }
 
-afterEach(async () => {
-  vi.unstubAllGlobals();
-});
-
 describe("push APNs send semantics", () => {
   it("bounds APNs response body capture", () => {
     const capture = createApnsResponseBodyCapture();
@@ -365,75 +281,53 @@ describe("push APNs send semantics", () => {
     expect(capture).toMatchObject({ capturedBytes: 3, truncated: false });
   });
 
-  it("routes direct APNs HTTP/2 requests through the active managed proxy", async () => {
-    await withProxiedApns(undefined, async (apnsServer, proxy) => {
-      const { registration, auth } = createDirectApnsSendFixture("ios-node-proxied-alert");
-
-      const result = await sendApnsAlert({
-        registration,
-        nodeId: "ios-node-proxied-alert",
-        title: "Wake",
-        body: "Ping",
-        auth,
-        timeoutMs: 2_500,
-      });
-
-      expectRecordFields(requireRecord(result, "APNs result"), {
-        ok: true,
-        status: 200,
-        apnsId: "proxied-apns-id",
-        transport: "direct",
-      });
-      expect(proxy.connectTargets).toEqual(["api.sandbox.push.apple.com:443"]);
-      expect(apnsServer.requests).toHaveLength(1);
-      const request = apnsServer.requests[0];
-      expect(request?.headers[":method"]).toBe("POST");
-      expect(request?.headers[":path"]).toBe("/3/device/abcd1234abcd1234abcd1234abcd1234");
-      expect(request?.headers["apns-topic"]).toBe("ai.openclaw.ios");
-      expect(request?.headers["apns-push-type"]).toBe("alert");
-      expect(request?.headers["apns-priority"]).toBe("10");
-      const payload = requireRecord(JSON.parse(request?.body ?? "null"), "APNs payload");
-      expect(payload.aps).toEqual({
-        alert: { title: "Wake", body: "Ping" },
-        sound: "default",
-      });
-      const openclawPayload = requireRecord(payload.openclaw, "openclaw payload");
-      expectRecordFields(openclawPayload, {
-        kind: "push.test",
-        nodeId: "ios-node-proxied-alert",
-      });
-      expect(typeof openclawPayload.ts).toBe("number");
-    });
-  });
-
-  it("bounds oversized direct APNs error bodies while preserving parseable reasons", async () => {
-    await withProxiedApns(
-      {
-        status: 400,
-        responseBody: '{"reason":"BadDeviceToken"}' + " ".repeat(20_000),
-      },
-      async () => {
-        const { registration, auth } = createDirectApnsSendFixture("ios-node-proxied-error-body");
+  it.each([
+    [200, "", true, undefined],
+    [400, '{"reason":"BadDeviceToken"}' + " ".repeat(20_000), false, "BadDeviceToken"],
+  ] as const)(
+    "sends through the managed proxy and bounds HTTP %s bodies",
+    async (status, responseBody, ok, reason) => {
+      await withProxiedApns({ status, responseBody }, async (apnsServer, proxy) => {
+        const { registration, auth } = createDirectApnsSendFixture("ios-node-proxied-alert");
 
         const result = await sendApnsAlert({
           registration,
-          nodeId: "ios-node-proxied-error-body",
+          nodeId: "ios-node-proxied-alert",
           title: "Wake",
           body: "Ping",
           auth,
           timeoutMs: 2_500,
         });
 
-        expectRecordFields(requireRecord(result, "APNs result"), {
-          ok: false,
-          status: 400,
+        expect(result).toMatchObject({
+          ok,
+          status,
+          reason,
           apnsId: "proxied-apns-id",
-          reason: "BadDeviceToken",
           transport: "direct",
         });
-      },
-    );
-  });
+        expect(proxy.connectTargets).toEqual(["api.sandbox.push.apple.com:443"]);
+        expect(apnsServer.requests).toHaveLength(1);
+        const request = apnsServer.requests[0];
+        expect(request?.headers).toMatchObject({
+          ":method": "POST",
+          ":path": "/3/device/abcd1234abcd1234abcd1234abcd1234",
+          "apns-topic": "ai.openclaw.ios",
+          "apns-push-type": "alert",
+          "apns-priority": "10",
+        });
+        const payload = requireRecord(JSON.parse(request?.body ?? "null"), "APNs payload");
+        expect(payload.aps).toEqual({
+          alert: { title: "Wake", body: "Ping" },
+          sound: "default",
+        });
+        expectOpenClaw(payload, {
+          kind: "push.test",
+          nodeId: "ios-node-proxied-alert",
+        });
+      });
+    },
+  );
 
   it("guards direct wake transport with current ownership and lifecycle", async () => {
     const fixture = createDirectApnsSendFixture("ios-node-guarded-wake", "production");
@@ -451,8 +345,7 @@ describe("push APNs send semantics", () => {
     const sent = requireSendRequest(send);
     expect(sent.signal).toBe(controller.signal);
     expect(sent.isCurrent).toBe(isCurrent);
-    expect(sent.pushType).toBe("background");
-    expect(sent.priority).toBe("5");
+    expect(sent).toMatchObject({ pushType: "background", priority: "5" });
     const payload = requirePayload(sent);
     expect(payload.aps).toEqual({ "content-available": 1 });
     expectOpenClaw(payload, {
@@ -616,8 +509,7 @@ describe("push APNs send semantics", () => {
         gatewayDeviceId: "gateway-device-123",
       });
       expectNoProperties(metadata, forbidden ?? []);
-      expect(result.ok).toBe(true);
-      expect(result.transport).toBe("direct");
+      expect(result).toMatchObject({ ok: true, transport: "direct" });
     },
   );
 
@@ -681,8 +573,8 @@ describe("push APNs send semantics", () => {
 
     expect(send).toHaveBeenCalledTimes(1);
     const sent = requireSendRequest(send);
-    expectRecordFields(sent, {
-      relayConfig,
+    expect(sent.relayConfig).toEqual(relayConfig);
+    expect(sent).toMatchObject({
       sendGrant: "send-grant-123",
       relayHandle: "relay-handle-12345678",
       gatewayDeviceId: "gateway-device-1",
@@ -696,7 +588,7 @@ describe("push APNs send semantics", () => {
       reason: "queue.retry",
       nodeId: "ios-node-relay-wake",
     });
-    expectRecordFields(requireRecord(result, "APNs result"), {
+    expect(result).toMatchObject({
       ok: false,
       status: 429,
       reason: "TooManyRequests",
@@ -725,112 +617,79 @@ describe("push APNs send semantics", () => {
 
 describe("push APNs auth and helper coverage", () => {
   const tempDirs = createTrackedTempDirs();
-  const makeTempDir = () => tempDirs.make("openclaw-push-apns-auth-test-");
-
-  afterEach(async () => {
-    await tempDirs.cleanup();
-  });
+  const authEnv = { OPENCLAW_APNS_TEAM_ID: "TEAM123", OPENCLAW_APNS_KEY_ID: "KEY123" };
+  const rawKey = "-----BEGIN PRIVATE KEY-----\\nline-c\\nline-d\\n-----END PRIVATE KEY-----";
+  const privateKey = "-----BEGIN PRIVATE KEY-----\nline-c\nline-d\n-----END PRIVATE KEY-----";
+  afterEach(() => tempDirs.cleanup());
 
   it("normalizes APNs environment values", () => {
-    expect(normalizeApnsEnvironment("sandbox")).toBe("sandbox");
-    expect(normalizeApnsEnvironment(" PRODUCTION ")).toBe("production");
-    expect(normalizeApnsEnvironment("staging")).toBeNull();
-    expect(normalizeApnsEnvironment(null)).toBeNull();
+    expect(["sandbox", " PRODUCTION ", "staging", null].map(normalizeApnsEnvironment)).toEqual([
+      "sandbox",
+      "production",
+      null,
+      null,
+    ]);
   });
 
-  it("falls back to OPENCLAW_APNS_PRIVATE_KEY when OPENCLAW_APNS_PRIVATE_KEY_P8 is blank", async () => {
-    const resolved = await resolveApnsAuthConfigFromEnv({
-      OPENCLAW_APNS_TEAM_ID: "TEAM123",
-      OPENCLAW_APNS_KEY_ID: "KEY123",
-      OPENCLAW_APNS_PRIVATE_KEY_P8: "   ",
-      OPENCLAW_APNS_PRIVATE_KEY:
-        "-----BEGIN PRIVATE KEY-----\\nline-c\\nline-d\\n-----END PRIVATE KEY-----", // pragma: allowlist secret
-    } as NodeJS.ProcessEnv);
-
-    expect(resolved.ok).toBe(true);
-    if (resolved.ok) {
-      expect(resolved.value.teamId).toBe("TEAM123");
-      expect(resolved.value.keyId).toBe("KEY123");
-      expect(resolved.value.privateKey).toBe(
-        "-----BEGIN PRIVATE KEY-----\nline-c\nline-d\n-----END PRIVATE KEY-----",
-      );
-    }
-  });
-
-  it("reads APNs private keys from OPENCLAW_APNS_PRIVATE_KEY_PATH", async () => {
-    const dir = await makeTempDir();
-    const keyPath = path.join(dir, "apns-key.p8");
-    await fs.writeFile(
-      keyPath,
-      "-----BEGIN PRIVATE KEY-----\\nline-e\\nline-f\\n-----END PRIVATE KEY-----\n",
-      "utf8",
-    );
-
-    const resolved = await resolveApnsAuthConfigFromEnv({
-      OPENCLAW_APNS_TEAM_ID: "TEAM123",
-      OPENCLAW_APNS_KEY_ID: "KEY123",
-      OPENCLAW_APNS_PRIVATE_KEY_PATH: keyPath,
-    } as NodeJS.ProcessEnv);
-
-    expect(resolved.ok).toBe(true);
-    if (resolved.ok) {
-      expect(resolved.value.teamId).toBe("TEAM123");
-      expect(resolved.value.keyId).toBe("KEY123");
-      expect(resolved.value.privateKey).toBe(
-        "-----BEGIN PRIVATE KEY-----\nline-e\nline-f\n-----END PRIVATE KEY-----",
-      );
-    }
-  });
+  it.each(["inline fallback", "file"])(
+    "reads %s private keys and normalizes escaped newlines",
+    async (source) => {
+      const env: NodeJS.ProcessEnv = { ...authEnv };
+      if (source === "file") {
+        const keyPath = path.join(
+          await tempDirs.make("openclaw-push-apns-auth-test-"),
+          "apns-key.p8",
+        );
+        await fs.writeFile(keyPath, rawKey + "\n", "utf8");
+        env.OPENCLAW_APNS_PRIVATE_KEY_PATH = keyPath;
+      } else {
+        env.OPENCLAW_APNS_PRIVATE_KEY_P8 = "   ";
+        env.OPENCLAW_APNS_PRIVATE_KEY = rawKey;
+      }
+      await expect(resolveApnsAuthConfigFromEnv(env)).resolves.toEqual({
+        ok: true,
+        value: { teamId: "TEAM123", keyId: "KEY123", privateKey },
+      });
+    },
+  );
 
   it("reports missing auth fields and path read failures", async () => {
-    const dir = await makeTempDir();
-    const missingPath = path.join(dir, "missing-key.p8");
-
-    await expect(resolveApnsAuthConfigFromEnv({} as NodeJS.ProcessEnv)).resolves.toEqual({
+    const missingPath = path.join(
+      await tempDirs.make("openclaw-push-apns-auth-test-"),
+      "missing-key.p8",
+    );
+    await expect(resolveApnsAuthConfigFromEnv({})).resolves.toEqual({
       ok: false,
       error: "APNs auth missing: set OPENCLAW_APNS_TEAM_ID and OPENCLAW_APNS_KEY_ID",
     });
-
-    const missingKey = await resolveApnsAuthConfigFromEnv({
-      OPENCLAW_APNS_TEAM_ID: "TEAM123",
-      OPENCLAW_APNS_KEY_ID: "KEY123",
-      OPENCLAW_APNS_PRIVATE_KEY_PATH: missingPath,
-    } as NodeJS.ProcessEnv);
-
-    expect(missingKey.ok).toBe(false);
-    if (!missingKey.ok) {
-      expect(missingKey.error).toContain(
+    await expect(
+      resolveApnsAuthConfigFromEnv({ ...authEnv, OPENCLAW_APNS_PRIVATE_KEY_PATH: missingPath }),
+    ).resolves.toEqual({
+      ok: false,
+      error: expect.stringContaining(
         `failed reading OPENCLAW_APNS_PRIVATE_KEY_PATH (${missingPath})`,
-      );
-    }
+      ),
+    });
   });
 
   it("clears only direct registrations without an environment override mismatch", () => {
-    const { registration } = createDirectApnsSendFixture("ios-node-direct");
-    const result = { status: 400, reason: "BadDeviceToken" };
+    const direct = {
+      registration: createDirectApnsSendFixture("ios-node-direct").registration,
+      result: { status: 400, reason: "BadDeviceToken" },
+    };
+    expect(shouldClearStoredApnsRegistration(direct)).toBe(true);
     expect(
-      shouldClearStoredApnsRegistration({
-        registration,
-        result,
-      }),
-    ).toBe(true);
-
-    expect(
-      shouldClearStoredApnsRegistration({
-        registration: createRelayApnsSendFixture({
-          nodeId: "ios-node-relay",
-          relayHandle: "relay-handle-123",
-          sendResult: { ok: true, status: 200, environment: "production" },
-        }).registration,
-        result: { status: 410, reason: "Unregistered" },
-      }),
+      shouldClearStoredApnsRegistration({ ...direct, overrideEnvironment: "production" }),
     ).toBe(false);
-
+    const { registration } = createRelayApnsSendFixture({
+      nodeId: "ios-node-relay",
+      relayHandle: "relay-handle-123",
+      sendResult: { ok: true, status: 200, environment: "production" },
+    });
     expect(
       shouldClearStoredApnsRegistration({
         registration,
-        result,
-        overrideEnvironment: "production",
+        result: { status: 410, reason: "Unregistered" },
       }),
     ).toBe(false);
   });

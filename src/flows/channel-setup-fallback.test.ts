@@ -10,24 +10,17 @@ import {
   makeChannelSetupEntries,
   makeExternalChatSetupPlugin,
   makeMeta,
-  makePluginRegistry,
   makeSetupPlugin,
 } from "./channel-setup.test-helpers.js";
 
 const {
-  resolveAgentWorkspaceDir,
-  resolveDefaultAgentId,
-  listTrustedChannelPluginCatalogEntries,
   getTrustedChannelPluginCatalogEntry,
-  getChannelSetupPlugin,
-  listChannelSetupPlugins,
   listActiveChannelSetupPlugins,
-  loadChannelSetupPluginRegistrySnapshotForChannel,
   ensureChannelSetupPluginInstalled,
   resolveChannelSetupEntries,
   collectChannelStatus,
-  resolveChannelSetupWorkspaceDir,
   isChannelConfigured,
+  reset,
   factories,
 } = await vi.hoisted(async () => {
   const { createChannelSetupMocks } = await import("./channel-setup.test-helpers.js");
@@ -71,39 +64,13 @@ function runChannelSetup(
 
 describe("setupChannels status and catalog fallback plugin reuse", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    resolveAgentWorkspaceDir.mockReturnValue("/tmp/openclaw-workspace");
-    resolveDefaultAgentId.mockReturnValue("default");
-    resolveChannelSetupWorkspaceDir.mockReturnValue("/tmp/openclaw-workspace");
-    listTrustedChannelPluginCatalogEntries.mockReturnValue([
-      {
-        id: "external-chat",
-        pluginId: "@vendor/external-chat-plugin",
-        origin: "bundled",
-      },
-    ]);
+    reset();
     getTrustedChannelPluginCatalogEntry.mockReturnValue(
       makeCatalogEntry("external-chat", "External Chat", {
         pluginId: "@vendor/external-chat-plugin",
         install: { npmSpec: "@vendor/external-chat-plugin" },
       }),
     );
-    getChannelSetupPlugin.mockReturnValue(undefined);
-    listActiveChannelSetupPlugins.mockReturnValue([]);
-    listChannelSetupPlugins.mockReturnValue([]);
-    loadChannelSetupPluginRegistrySnapshotForChannel.mockReturnValue(makePluginRegistry());
-    ensureChannelSetupPluginInstalled.mockImplementation(async ({ cfg, entry }) => ({
-      cfg,
-      installed: true,
-      pluginId: entry?.pluginId,
-      status: "installed",
-    }));
-    resolveChannelSetupEntries.mockReturnValue(makeChannelSetupEntries());
-    collectChannelStatus.mockResolvedValue({
-      statusByChannel: new Map(),
-      statusLines: [],
-    });
-    isChannelConfigured.mockReturnValue(true);
   });
 
   it("localizes the channel status note title in the setup flow", async () => {

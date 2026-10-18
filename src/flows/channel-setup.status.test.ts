@@ -1,4 +1,3 @@
-// Channel setup status tests cover status text and docs link rendering.
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { withEnv, withEnvAsync } from "../test-utils/env.js";
@@ -39,39 +38,26 @@ const formatChannelSelectionLine = vi.hoisted(() =>
 const isChannelConfigured = vi.hoisted(() => vi.fn<IsChannelConfigured>(() => false));
 
 vi.mock("../channels/chat-meta.js", () => ({
-  listChatChannels: () => listChatChannels(),
+  listChatChannels,
 }));
 
 vi.mock("../channels/registry.js", () => ({
-  formatChannelPrimerLine: (meta: Parameters<FormatChannelPrimerLine>[0]) =>
-    formatChannelPrimerLine(meta),
-  formatChannelSelectionLine: (
-    meta: Parameters<FormatChannelSelectionLine>[0],
-    docsLink: Parameters<FormatChannelSelectionLine>[1],
-  ) => formatChannelSelectionLine(meta, docsLink),
+  formatChannelPrimerLine,
+  formatChannelSelectionLine,
   normalizeAnyChannelId: (channelId?: string) => channelId?.trim().toLowerCase() ?? null,
 }));
 
 vi.mock("../commands/channel-setup/discovery.js", () => ({
-  resolveChannelSetupEntries: (params: Parameters<ResolveChannelSetupEntries>[0]) =>
-    resolveChannelSetupEntries(params),
+  resolveChannelSetupEntries,
   shouldShowChannelInSetup: (meta: { exposure?: { setup?: boolean } }) =>
     meta.exposure?.setup !== false,
 }));
 
 vi.mock("../config/channel-configured.js", () => ({
-  isChannelConfigured: (
-    cfg: Parameters<IsChannelConfigured>[0],
-    channelId: Parameters<IsChannelConfigured>[1],
-  ) => isChannelConfigured(cfg, channelId),
+  isChannelConfigured,
 }));
 
-// Avoid touching the real `extensions/<id>` tree from unit tests. Status
-// rendering for installable catalog entries asks `bundled-sources` whether
-// a plugin already lives in-tree to decide between
-// "install plugin to enable" vs "bundled · enable to use". For these tests
-// we want the installable-catalog branch unconditionally, so we stub the
-// bundled lookup to "nothing is bundled".
+// Keep installable-catalog fixtures independent of the bundled extensions tree.
 vi.mock("../plugins/bundled-sources.js", () => ({
   resolveBundledPluginSources: () => new Map(),
   findBundledPluginSourceInMap: () => undefined,
@@ -83,6 +69,31 @@ import {
   resolveChannelSelectionNoteLines,
   resolveChannelSetupSelectionOptions,
 } from "./channel-setup.status.js";
+
+function statusPlugin(id: string, label: string): ChannelSetupPlugin {
+  return {
+    id,
+    meta: makeMeta(id, label),
+    capabilities: { chatTypes: [] },
+    config: {} as ChannelSetupPlugin["config"],
+  };
+}
+
+function statusSummary(overrides: Partial<Parameters<typeof collectChannelStatus>[0]> = {}) {
+  return collectChannelStatus({
+    cfg: {},
+    accountOverrides: {},
+    installedPlugins: [],
+    ...overrides,
+  });
+}
+
+function selectionNotes(
+  overrides: Pick<Parameters<typeof resolveChannelSelectionNoteLines>[0], "selection"> &
+    Partial<Parameters<typeof resolveChannelSelectionNoteLines>[0]>,
+) {
+  return resolveChannelSelectionNoteLines({ cfg: {}, installedPlugins: [], ...overrides });
+}
 
 describe("resolveChannelSetupSelectionOptions", () => {
   beforeEach(() => {
@@ -130,12 +141,8 @@ describe("resolveChannelSetupSelectionOptions", () => {
       },
     } as const;
 
-    await collectChannelStatus({
-      cfg,
-      accountOverrides: {},
-      installedPlugins: [],
-    });
-    resolveChannelSelectionNoteLines({ cfg, installedPlugins: [], selection: [] });
+    await statusSummary({ cfg });
+    selectionNotes({ cfg, selection: [] });
 
     expect(resolveChannelSetupEntries).toHaveBeenNthCalledWith(
       1,
@@ -201,11 +208,7 @@ describe("resolveChannelSetupSelectionOptions", () => {
       }),
     );
 
-    const summary = await collectChannelStatus({
-      cfg: {} as never,
-      accountOverrides: {},
-      installedPlugins: [],
-    });
+    const summary = await statusSummary();
 
     expect(summary.statusLines).toEqual([
       "Discord\\nCore: not configured",
@@ -218,18 +221,8 @@ describe("resolveChannelSetupSelectionOptions", () => {
     "keeps healthy channels selectable after a %s failure",
     async (failurePoint) => {
       const installedPlugins = [
-        {
-          id: "matrix",
-          meta: makeMeta("matrix", "Matrix"),
-          capabilities: { chatTypes: [] },
-          config: {} as ChannelSetupPlugin["config"],
-        },
-        {
-          id: "telegram",
-          meta: makeMeta("telegram", "Telegram"),
-          capabilities: { chatTypes: [] },
-          config: {} as ChannelSetupPlugin["config"],
-        },
+        statusPlugin("matrix", "Matrix"),
+        statusPlugin("telegram", "Telegram"),
       ] satisfies ChannelSetupPlugin[];
       listChatChannels.mockReturnValue([
         makeMeta("matrix", "Matrix"),
@@ -238,9 +231,7 @@ describe("resolveChannelSetupSelectionOptions", () => {
       isChannelConfigured.mockImplementation((_, channelId) => channelId === "matrix");
 
       const failure = new Error("lazy Matrix setup module unavailable");
-      const summary = await collectChannelStatus({
-        cfg: {} as never,
-        accountOverrides: {},
+      const summary = await statusSummary({
         installedPlugins,
         resolveAdapter: (channel) => {
           if (channel === "matrix" && failurePoint === "adapter resolution") {
@@ -286,17 +277,8 @@ describe("resolveChannelSetupSelectionOptions", () => {
 
   it("redacts credentials and terminal controls in failed channel status checks", async () => {
     const token = "sk-abcdefghijklmnopqrstuv";
-    const summary = await collectChannelStatus({
-      cfg: {} as never,
-      accountOverrides: {},
-      installedPlugins: [
-        {
-          id: "matrix",
-          meta: makeMeta("matrix", "Matrix"),
-          capabilities: { chatTypes: [] },
-          config: {} as ChannelSetupPlugin["config"],
-        },
-      ],
+    const summary = await statusSummary({
+      installedPlugins: [statusPlugin("matrix", "Matrix")],
       resolveAdapter: (channel) =>
         ({
           channel,
@@ -329,11 +311,7 @@ describe("resolveChannelSetupSelectionOptions", () => {
     );
 
     await withEnvAsync({ OPENCLAW_LOCALE: "zh-CN" }, async () => {
-      const summary = await collectChannelStatus({
-        cfg: {} as never,
-        accountOverrides: {},
-        installedPlugins: [],
-      });
+      const summary = await statusSummary();
 
       expect(summary.statusLines).toEqual([
         "Discord: 已配置（插件已禁用）",
@@ -402,22 +380,20 @@ describe("resolveChannelSetupSelectionOptions", () => {
       }),
     );
 
-    const lines = resolveChannelSelectionNoteLines({
-      cfg: {} as never,
-      installedPlugins: [],
-      selection: ["zalo"],
-    });
+    const lines = selectionNotes({ selection: ["zalo"] });
 
     expect(formatChannelSelectionLine).toHaveBeenCalledOnce();
     const [selectionMeta, docsLink] = expectDefined(
       formatChannelSelectionLine.mock.calls.at(0),
       "selection line call",
     );
-    expect(selectionMeta?.label).toBe("Zalo\\nBot");
-    expect(selectionMeta?.blurb).toBe("Setup\\nhelp");
-    expect(selectionMeta?.docsLabel).toBe("Docs\\nLabel");
-    expect(selectionMeta?.selectionDocsPrefix).toBe("Docs\\nPrefix");
-    expect(selectionMeta?.selectionExtras).toEqual(["Extra\\nOne"]);
+    expect(selectionMeta).toMatchObject({
+      label: "Zalo\\nBot",
+      blurb: "Setup\\nhelp",
+      docsLabel: "Docs\\nLabel",
+      selectionDocsPrefix: "Docs\\nPrefix",
+      selectionExtras: ["Extra\\nOne"],
+    });
     if (typeof docsLink !== "function") {
       throw new Error("Expected docs link formatter");
     }
@@ -425,40 +401,29 @@ describe("resolveChannelSetupSelectionOptions", () => {
     expect(lines).toEqual(["Zalo\\nBot — Setup\\nhelp"]);
   });
 
-  it.each([["empty", "", ""]] as const)(
-    "normalizes %s selection docs prefixes",
-    (_label, prefix, expected) => {
-      resolveChannelSetupEntries.mockReturnValue(
-        makeChannelSetupEntries({
-          entries: [
-            {
-              id: "custom-chat",
-              meta: {
-                id: "custom-chat",
-                label: "Custom Chat",
-                selectionLabel: "Custom Chat",
-                docsPath: "/channels/custom-chat",
-                blurb: "External channel.",
-                selectionDocsPrefix: prefix,
-              },
-            },
-          ],
-        }),
-      );
+  it("preserves an explicitly empty selection docs prefix", () => {
+    resolveChannelSetupEntries.mockReturnValue(
+      makeChannelSetupEntries({
+        entries: [
+          {
+            id: "custom-chat",
+            meta: makeMeta("custom-chat", "Custom Chat", {
+              blurb: "External channel.",
+              selectionDocsPrefix: "",
+            }),
+          },
+        ],
+      }),
+    );
 
-      resolveChannelSelectionNoteLines({
-        cfg: {} as never,
-        installedPlugins: [],
-        selection: ["custom-chat"],
-      });
+    selectionNotes({ selection: ["custom-chat"] });
 
-      const [selectionMeta] = expectDefined(
-        formatChannelSelectionLine.mock.calls.at(0),
-        "selection line call",
-      );
-      expect(selectionMeta?.selectionDocsPrefix).toBe(expected);
-    },
-  );
+    const [selectionMeta] = expectDefined(
+      formatChannelSelectionLine.mock.calls.at(0),
+      "selection line call",
+    );
+    expect(selectionMeta?.selectionDocsPrefix).toBe("");
+  });
 
   it("localizes built-in channel blurbs before selection notes", () => {
     resolveChannelSetupEntries.mockReturnValue(
@@ -466,25 +431,17 @@ describe("resolveChannelSetupSelectionOptions", () => {
         entries: [
           {
             id: "feishu",
-            meta: {
-              id: "feishu",
-              label: "Feishu",
-              selectionLabel: "Feishu",
-              docsPath: "/channels/feishu",
+            meta: makeMeta("feishu", "Feishu", {
               docsLabel: "feishu",
               blurb: "飞书/Lark enterprise messaging.",
-            },
+            }),
           },
         ],
       }),
     );
 
     withEnv({ OPENCLAW_LOCALE: "zh-CN" }, () => {
-      const lines = resolveChannelSelectionNoteLines({
-        cfg: {} as never,
-        installedPlugins: [],
-        selection: ["feishu"],
-      });
+      const lines = selectionNotes({ selection: ["feishu"] });
 
       expect(formatChannelSelectionLine).toHaveBeenCalledWith(
         expect.objectContaining({

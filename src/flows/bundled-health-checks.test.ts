@@ -1,4 +1,3 @@
-// Bundled health check tests cover built-in doctor checks and repair advice.
 import { linkSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -87,6 +86,22 @@ vi.mock("../plugins/public-surface-loader.js", async (importOriginal) => ({
 }));
 
 let workspaceDir: string;
+function register(
+  cfg: OpenClawConfig = {},
+  options: Omit<Parameters<typeof registerBundledHealthChecks>[0], "cfg" | "cwd"> = {},
+) {
+  return registerBundledHealthChecks({ cfg, cwd: workspaceDir, ...options });
+}
+
+function inspectMemory(env: NodeJS.ProcessEnv = process.env) {
+  const host = mocks.registerMemoryCoreDoctorChecks.mock.calls[0]?.[0];
+  return host?.inspectEmbeddingProviderSetup({
+    config: {},
+    env,
+    agentId: "main",
+    provider: "local",
+  });
+}
 
 describe("registerBundledHealthChecks", () => {
   beforeEach(() => {
@@ -105,74 +120,37 @@ describe("registerBundledHealthChecks", () => {
     rmSync(workspaceDir, { recursive: true, force: true });
   });
 
-  it.each([
-    {
-      title: "defers state for an explicitly selected owner-declared check",
-      selection: { onlyIds: [STATE_DEFERRED_CHECK_ID] },
-      expected: "deferred",
-    },
-    {
-      title: "isolates owner-declared checks included by --all",
-      selection: { includeAllChecks: true },
-      expected: "isolated",
-    },
-    {
-      title: "isolates checks selected by the post-plugin update gate",
-      selection: { updateReadiness: "post-plugin" },
-      expected: "isolated",
-    },
-    {
-      title: "isolates mixed explicit selections",
-      selection: {
-        onlyIds: [STATE_DEFERRED_CHECK_ID, "core/doctor/final-config-validation"],
-      },
-      expected: "isolated",
-    },
-    {
-      title: "uses direct state for ordinary default selection",
-      selection: {},
-      expected: "direct",
-    },
-    {
-      title: "uses direct state for an unrelated explicit check",
-      selection: { onlyIds: ["core/doctor/final-config-validation"] },
-      expected: "direct",
-    },
-  ] as const)("$title", ({ selection, expected }) => {
+  it.each<[Parameters<typeof resolveBundledHealthCheckPluginStateMode>[0], string]>([
+    [{ onlyIds: [STATE_DEFERRED_CHECK_ID] }, "deferred"],
+    [{ includeAllChecks: true }, "isolated"],
+    [{ updateReadiness: "post-plugin" }, "isolated"],
+    [{ onlyIds: [STATE_DEFERRED_CHECK_ID, "core/doctor/final-config-validation"] }, "isolated"],
+    [{}, "direct"],
+    [{ onlyIds: ["core/doctor/final-config-validation"] }, "direct"],
+  ])("resolves plugin state for %j as %s", (selection, expected) => {
     expect(resolveBundledHealthCheckPluginStateMode(selection)).toBe(expected);
     if (selection.onlyIds === undefined && selection.includeAllChecks !== true) {
       expect(mocks.loadBundledPluginPublicArtifactModuleSync).not.toHaveBeenCalled();
     }
   });
 
-  it.each([{ slots: { memory: "none" } }])(
-    "keeps the check addressable but inactive when memory-core does not own memory",
-    (plugins) => {
-      registerBundledHealthChecks({ cfg: { plugins }, cwd: workspaceDir });
+  it("keeps the check inactive when memory-core does not own memory", () => {
+    register({ plugins: { slots: { memory: "none" } } });
 
-      expect(mocks.registerMemoryCoreDoctorChecks).toHaveBeenCalledWith(
-        expect.objectContaining({
-          registerHealthCheck: expect.any(Function),
-          inspectEmbeddingProviderSetup: expect.any(Function),
-          memoryCoreActive: false,
-        }),
-      );
-    },
-  );
+    expect(mocks.registerMemoryCoreDoctorChecks).toHaveBeenCalledWith(
+      expect.objectContaining({
+        registerHealthCheck: expect.any(Function),
+        inspectEmbeddingProviderSetup: expect.any(Function),
+        memoryCoreActive: false,
+      }),
+    );
+  });
 
   it("returns no inspector when the selected provider exposes no policy surface", async () => {
     mocks.resolveProviderPolicySurface.mockReturnValueOnce(null);
-    registerBundledHealthChecks({ cfg: {}, cwd: workspaceDir });
+    register();
 
-    const host = mocks.registerMemoryCoreDoctorChecks.mock.calls[0]?.[0];
-    await expect(
-      host?.inspectEmbeddingProviderSetup({
-        config: {},
-        env: process.env,
-        agentId: "main",
-        provider: "local",
-      }),
-    ).resolves.toBeUndefined();
+    await expect(inspectMemory()).resolves.toBeUndefined();
   });
 
   it("scopes plugin state only while the selected provider setup is inspected", async () => {
@@ -190,23 +168,10 @@ describe("registerBundledHealthChecks", () => {
     };
     mocks.inspectEmbeddingProviderSetup.mockResolvedValueOnce(null);
 
-    registerBundledHealthChecks({
-      cfg: {},
-      cwd: workspaceDir,
-      env: sourceEnv,
-      runWithPluginStateSnapshot,
-    });
+    register({}, { env: sourceEnv, runWithPluginStateSnapshot });
 
     expect(snapshotRuns).toBe(0);
-    const host = mocks.registerMemoryCoreDoctorChecks.mock.calls[0]?.[0];
-    await expect(
-      host?.inspectEmbeddingProviderSetup({
-        config: {},
-        env: sourceEnv,
-        agentId: "main",
-        provider: "local",
-      }),
-    ).resolves.toBeNull();
+    await expect(inspectMemory(sourceEnv)).resolves.toBeNull();
     expect(snapshotRuns).toBe(1);
     expect(mocks.loadPluginManifestRegistryForPluginRegistry).toHaveBeenCalledWith({
       config: {},
@@ -222,10 +187,7 @@ describe("registerBundledHealthChecks", () => {
   });
 
   it("loads CUA Driver artifact health when the plugin is enabled", () => {
-    registerBundledHealthChecks({
-      cfg: { plugins: { entries: { "cua-computer": { enabled: true } } } },
-      cwd: workspaceDir,
-    });
+    register({ plugins: { entries: { "cua-computer": { enabled: true } } } });
 
     expect(mocks.loadBundledPluginPublicArtifactModuleSync).toHaveBeenCalledWith({
       dirName: "cua-computer",
@@ -256,10 +218,7 @@ describe("registerBundledHealthChecks", () => {
       diagnostics: [],
     });
 
-    registerBundledHealthChecks({
-      cfg: { cloudWorkers: { profiles: { aws: { provider: "crabbox" } } } },
-      cwd: workspaceDir,
-    });
+    register({ cloudWorkers: { profiles: { aws: { provider: "crabbox" } } } });
 
     expect(mocks.loadBundledPluginPublicArtifactModuleFromCandidatesSync).toHaveBeenCalledWith({
       dirName: "crabbox",
@@ -291,7 +250,7 @@ describe("registerBundledHealthChecks", () => {
     expect(resolveCodexHealthApi({ cfg: implicitCodexConfig, cwd: workspaceDir })).toEqual({
       status: "not-configured",
     });
-    registerBundledHealthChecks({ cfg: implicitCodexConfig, cwd: workspaceDir });
+    register(implicitCodexConfig);
 
     expect(mocks.registerMemoryCoreDoctorChecks).toHaveBeenCalledOnce();
     expect(mocks.registerPolicyDoctorChecks).toHaveBeenCalledOnce();
@@ -337,7 +296,7 @@ describe("registerBundledHealthChecks", () => {
           host.registerHealthCheck(check);
         }
       });
-      registerBundledHealthChecks({ cfg: {}, cwd: workspaceDir, updateReadiness });
+      register({}, { updateReadiness });
       expect(getHealthCheck(check.id)).toBe(check);
     }
     const callbacks = mocks.registerMemoryCoreDoctorChecks.mock.calls.map(
@@ -362,13 +321,9 @@ describe("registerBundledHealthChecks", () => {
     mocks.loadBundledPluginPublicArtifactModuleSync.mockImplementationOnce(() => {
       throw new MissingPublicSurfaceError("selected readiness artifact unavailable");
     });
-    expect(() =>
-      registerBundledHealthChecks({
-        cfg: codexConfig,
-        cwd: workspaceDir,
-        updateReadiness: "post-plugin",
-      }),
-    ).toThrow("selected readiness artifact unavailable");
+    expect(() => register(codexConfig, { updateReadiness: "post-plugin" })).toThrow(
+      "selected readiness artifact unavailable",
+    );
   });
 
   function codexRecord(
@@ -413,10 +368,7 @@ describe("registerBundledHealthChecks", () => {
       diagnostics: [],
     });
 
-    registerBundledHealthChecks({
-      cfg: { ...codexConfig, plugins: { entries: { policy: { enabled: true } } } },
-      cwd: workspaceDir,
-    });
+    register({ ...codexConfig, plugins: { entries: { policy: { enabled: true } } } });
 
     expect(mocks.registerMemoryCoreDoctorChecks).toHaveBeenCalledOnce();
     expect(mocks.registerPolicyDoctorChecks).toHaveBeenCalledOnce();
@@ -424,14 +376,12 @@ describe("registerBundledHealthChecks", () => {
     expect(mocks.registerCodexManagedAppServerDoctorChecks).not.toHaveBeenCalled();
   });
 
-  it.each([["bundled", "implicit"]] as const)(
-    "registers and runs health from the selected %s Codex public artifact with %s routing",
-    async () => {
-      const cfg = implicitCodexConfig;
-      mkdirSync(join(workspaceDir, "dist"));
-      writeFileSync(
-        join(workspaceDir, "dist", "api.js"),
-        `
+  it("runs the selected bundled Codex health artifact with implicit routing", async () => {
+    const cfg = implicitCodexConfig;
+    mkdirSync(join(workspaceDir, "dist"));
+    writeFileSync(
+      join(workspaceDir, "dist", "api.js"),
+      `
         module.exports.registerCodexManagedAppServerDoctorChecks = (host) => {
           if (!host.getHealthCheck("codex/managed-app-server")) {
             host.registerHealthCheck({
@@ -441,35 +391,34 @@ describe("registerBundledHealthChecks", () => {
           }
         };
       `,
-      );
-      linkSync(join(workspaceDir, "dist", "api.js"), join(workspaceDir, "api-copy.js"));
-      mocks.loadPluginManifestRegistryForPluginRegistry.mockReturnValue({
-        plugins: [codexRecord("bundled", false)],
-        diagnostics: [],
-      });
-      const env = { ...process.env, OPENCLAW_STATE_DIR: join(workspaceDir, "state") };
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        registerBundledHealthChecks({ cfg, cwd: workspaceDir, env });
-      }
-      const check = getHealthCheck("codex/managed-app-server");
-      expect(check?.description).toBe("Selected artifact check");
-      await expect(
-        check?.detect({
-          cfg,
-          env,
-          mode: "lint",
-          runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-        }),
-      ).resolves.toEqual([]);
-      expect(mocks.loadPluginManifestRegistryForPluginRegistry).toHaveBeenCalledWith({
-        config: cfg,
-        workspaceDir,
+    );
+    linkSync(join(workspaceDir, "dist", "api.js"), join(workspaceDir, "api-copy.js"));
+    mocks.loadPluginManifestRegistryForPluginRegistry.mockReturnValue({
+      plugins: [codexRecord("bundled", false)],
+      diagnostics: [],
+    });
+    const env = { ...process.env, OPENCLAW_STATE_DIR: join(workspaceDir, "state") };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      register(cfg, { env });
+    }
+    const check = getHealthCheck("codex/managed-app-server");
+    expect(check?.description).toBe("Selected artifact check");
+    await expect(
+      check?.detect({
+        cfg,
         env,
-        pluginIds: ["codex"],
-      });
-      expect(mocks.registerCodexManagedAppServerDoctorChecks).not.toHaveBeenCalled();
-    },
-  );
+        mode: "lint",
+        runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+      }),
+    ).resolves.toEqual([]);
+    expect(mocks.loadPluginManifestRegistryForPluginRegistry).toHaveBeenCalledWith({
+      config: cfg,
+      workspaceDir,
+      env,
+      pluginIds: ["codex"],
+    });
+    expect(mocks.registerCodexManagedAppServerDoctorChecks).not.toHaveBeenCalled();
+  });
 
   it.each(["missing", "untrusted", "missing-api", "missing-export"])(
     "reports an availability warning for a selected Codex install with %s state",
@@ -487,7 +436,7 @@ describe("registerBundledHealthChecks", () => {
       if (state === "missing-export") {
         writeFileSync(join(workspaceDir, "api.js"), "module.exports = {};");
       }
-      const findings = registerBundledHealthChecks({ cfg: codexConfig, cwd: workspaceDir });
+      const findings = register(codexConfig);
       expect(findings).toEqual([
         expect.objectContaining({
           checkId: "core/doctor/codex-session-routes",
@@ -510,14 +459,11 @@ describe("registerBundledHealthChecks", () => {
     },
   );
 
-  it.each([{ entries: { codex: { enabled: false } } }])(
-    "preserves Codex owner policy without loading plugin code: %j",
-    (plugins) => {
-      registerBundledHealthChecks({ cfg: { ...codexConfig, plugins }, cwd: workspaceDir });
-      expect(mocks.loadPluginManifestRegistryForPluginRegistry).not.toHaveBeenCalled();
-      expect(mocks.registerCodexManagedAppServerDoctorChecks).not.toHaveBeenCalled();
-    },
-  );
+  it("preserves disabled Codex policy without loading plugin code", () => {
+    register({ ...codexConfig, plugins: { entries: { codex: { enabled: false } } } });
+    expect(mocks.loadPluginManifestRegistryForPluginRegistry).not.toHaveBeenCalled();
+    expect(mocks.registerCodexManagedAppServerDoctorChecks).not.toHaveBeenCalled();
+  });
 
   it("honors plugin control-plane disablement for policy checks", () => {
     for (const plugins of [
@@ -527,7 +473,7 @@ describe("registerBundledHealthChecks", () => {
     ]) {
       vi.clearAllMocks();
 
-      registerBundledHealthChecks({ cfg: { plugins }, cwd: workspaceDir });
+      register({ plugins });
 
       expect(mocks.registerPolicyDoctorChecks).not.toHaveBeenCalled();
     }

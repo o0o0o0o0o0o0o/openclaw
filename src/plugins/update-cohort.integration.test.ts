@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { writeJsonFile } from "../../test/helpers/temp-repo.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import { withServer } from "../plugin-sdk/test-helpers/http-test-server.js";
@@ -11,6 +12,38 @@ import { loadInstalledPluginIndex } from "./installed-plugin-index.js";
 import { createInstalledPluginOwnershipResolver } from "./installed-plugin-package-ownership.js";
 import { createPluginCache, withPluginCache } from "./plugin-cache.js";
 import { convergePluginReleaseCohort } from "./update-cohort.js";
+
+const emptyModule = "module.exports = {};\n";
+function writePackage(directory: string, id: string, entries = ["index"], source = emptyModule) {
+  writeJsonFile(path.join(directory, "package.json"), {
+    name: `@example/${id}`,
+    version: "1.0.0",
+    openclaw: { extensions: entries.map((entry) => `./${entry}.js`) },
+  });
+  writeJsonFile(path.join(directory, "openclaw.plugin.json"), {
+    id,
+    configSchema: { type: "object" },
+  });
+  for (const entry of entries) {
+    fs.writeFileSync(path.join(directory, `${entry}.js`), source);
+  }
+}
+
+function fixtureEnv(root: string, registry?: string) {
+  return {
+    HOME: root,
+    OPENCLAW_STATE_DIR: path.join(root, "state"),
+    OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(root, "bundled"),
+    ...(registry
+      ? {
+          NPM_CONFIG_REGISTRY: registry,
+          npm_config_registry: registry,
+          NPM_CONFIG_CACHE: path.join(root, "npm-cache"),
+          NPM_CONFIG_USERCONFIG: path.join(root, "empty.npmrc"),
+        }
+      : {}),
+  };
+}
 
 describe("plugin release cohort real synchronization", () => {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -31,20 +64,7 @@ describe("plugin release cohort real synchronization", () => {
       const bundledPath = path.join(bundledRoot, "llm-task");
       const linkedPath = path.join(root, "linked-task");
       for (const directory of [bundledPath, linkedPath]) {
-        fs.mkdirSync(directory, { recursive: true });
-        fs.writeFileSync(
-          path.join(directory, "package.json"),
-          JSON.stringify({
-            name: "@example/llm-task",
-            version: "1.0.0",
-            openclaw: { extensions: ["./index.js"] },
-          }),
-        );
-        fs.writeFileSync(
-          path.join(directory, "openclaw.plugin.json"),
-          JSON.stringify({ id: "llm-task", configSchema: { type: "object" } }),
-        );
-        fs.writeFileSync(path.join(directory, "index.js"), "module.exports = {};\n");
+        writePackage(directory, "llm-task");
       }
       const record: PluginInstallRecord = {
         source: source === "none" ? "npm" : source,
@@ -63,23 +83,17 @@ describe("plugin release cohort real synchronization", () => {
           entries: { "llm-task": { enabled: true } },
         },
       };
-      const env = {
-        HOME: root,
-        OPENCLAW_STATE_DIR: path.join(root, "state"),
-        OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
-      };
+      const env = fixtureEnv(root);
       await withEnvAsync(env, async () => {
-        const converge = () =>
-          withPluginCache(createPluginCache(), () =>
-            convergePluginReleaseCohort({
-              config,
-              channel,
-              coreVersion: "2026.9.4",
-              timeoutMs: 60_000,
-              env,
-            }),
-          );
-        const result = await converge();
+        const result = await withPluginCache(createPluginCache(), () =>
+          convergePluginReleaseCohort({
+            config,
+            channel,
+            coreVersion: "2026.9.4",
+            timeoutMs: 60_000,
+            env,
+          }),
+        );
         expect(result.sync.summary.errors).toEqual([]);
         expect(result.remainingMissingPayloads).toEqual([]);
         expect(result.config.plugins?.installs?.["llm-task"]).toEqual(
@@ -151,22 +165,7 @@ describe("plugin release cohort real synchronization", () => {
     const managedPath = path.join(root, "managed-pack");
     const localPath = path.join(root, "local-pack");
     for (const directory of [managedPath, localPath]) {
-      fs.mkdirSync(directory, { recursive: true });
-      fs.writeFileSync(
-        path.join(directory, "package.json"),
-        JSON.stringify({
-          name: "@example/pack",
-          version: "1.0.0",
-          openclaw: { extensions: ["./one.js", "./two.js"] },
-        }),
-      );
-      fs.writeFileSync(
-        path.join(directory, "openclaw.plugin.json"),
-        JSON.stringify({ id: "pack", configSchema: { type: "object" } }),
-      );
-      for (const entry of ["one", "two"]) {
-        fs.writeFileSync(path.join(directory, `${entry}.js`), "module.exports = {};\n");
-      }
+      writePackage(directory, "pack", ["one", "two"]);
     }
     const records = {
       pack: { source: "npm", spec: "@example/pack", installPath: managedPath },
@@ -182,15 +181,7 @@ describe("plugin release cohort real synchronization", () => {
         response.end("No package replacement is available");
       },
       async (registry) => {
-        const env = {
-          HOME: root,
-          OPENCLAW_STATE_DIR: path.join(root, "state"),
-          OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(root, "bundled"),
-          NPM_CONFIG_REGISTRY: registry,
-          npm_config_registry: registry,
-          NPM_CONFIG_CACHE: path.join(root, "npm-cache"),
-          NPM_CONFIG_USERCONFIG: path.join(root, "empty.npmrc"),
-        };
+        const env = fixtureEnv(root, registry);
         await withEnvAsync(env, async () => {
           const result = await withPluginCache(createPluginCache(), () =>
             convergePluginReleaseCohort({ config, channel: "stable", timeoutMs: 10_000, env }),
@@ -227,45 +218,12 @@ describe("plugin release cohort real synchronization", () => {
     async (sibling) => {
       const hasSibling = sibling !== "none";
       const root = fs.realpathSync(tempDirs.make("openclaw-cohort-dev"));
-      const bundledRoot = path.join(root, "bundled");
-      const bundledPath = path.join(bundledRoot, "cohort");
+      const bundledPath = path.join(root, "bundled", "cohort");
       const oldPath = path.join(root, "removed-npm-package");
       const siblingPath = path.join(root, "sibling-package");
-      fs.mkdirSync(bundledPath, { recursive: true });
-      fs.writeFileSync(
-        path.join(bundledPath, "package.json"),
-        JSON.stringify({
-          name: "@example/cohort",
-          version: "1.0.0",
-          openclaw: { extensions: ["./index.js"] },
-        }),
-      );
-      fs.writeFileSync(
-        path.join(bundledPath, "openclaw.plugin.json"),
-        JSON.stringify({
-          id: "cohort",
-          configSchema: { type: "object" },
-        }),
-      );
-      fs.writeFileSync(path.join(bundledPath, "index.js"), "module.exports = {};\n");
+      writePackage(bundledPath, "cohort");
       if (sibling === "installed") {
-        fs.mkdirSync(siblingPath);
-        fs.writeFileSync(
-          path.join(siblingPath, "package.json"),
-          JSON.stringify({
-            name: "@example/broken",
-            version: "1.0.0",
-            openclaw: { extensions: ["./index.js"] },
-          }),
-        );
-        fs.writeFileSync(
-          path.join(siblingPath, "openclaw.plugin.json"),
-          JSON.stringify({ id: "broken", configSchema: { type: "object" } }),
-        );
-        fs.writeFileSync(
-          path.join(siblingPath, "index.js"),
-          "module.exports = { previous: true };\n",
-        );
+        writePackage(siblingPath, "broken", ["index"], "module.exports = { previous: true };\n");
       }
       const records: Record<string, PluginInstallRecord> = {
         ...(hasSibling
@@ -297,15 +255,7 @@ describe("plugin release cohort real synchronization", () => {
           response.end("Fixture package is unavailable");
         },
         async (registry) => {
-          const env = {
-            HOME: root,
-            OPENCLAW_STATE_DIR: path.join(root, "state"),
-            OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
-            NPM_CONFIG_REGISTRY: registry,
-            npm_config_registry: registry,
-            NPM_CONFIG_CACHE: path.join(root, "npm-cache"),
-            NPM_CONFIG_USERCONFIG: path.join(root, "empty.npmrc"),
-          };
+          const env = fixtureEnv(root, registry);
           await withEnvAsync(env, async () => {
             const result = await withPluginCache(createPluginCache(), () =>
               convergePluginReleaseCohort({

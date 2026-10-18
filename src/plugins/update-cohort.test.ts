@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { writeJsonFile } from "../../test/helpers/temp-repo.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
 import * as bundledSources from "./bundled-sources.js";
@@ -31,18 +32,36 @@ vi.mock("./payload-verification.js", () => ({
 
 const { convergePluginReleaseCohort } = await import("./update-cohort.js");
 
-function pluginRecord(params: {
-  pluginId: string;
-  installOwner: string;
-  rootDir: string;
-}): InstalledPluginIndexRecord {
+const summary = {
+  switchedToBundled: [],
+  switchedToClawHub: [],
+  switchedToNpm: [],
+  warnings: [],
+  errors: [],
+};
+const npmRecord = (spec: string, installPath: string): PluginInstallRecord => ({
+  source: "npm",
+  spec,
+  installPath,
+});
+function converge(
+  params: Omit<Parameters<typeof convergePluginReleaseCohort>[0], "channel" | "timeoutMs">,
+) {
+  return convergePluginReleaseCohort({ channel: "stable", timeoutMs: 60_000, ...params });
+}
+
+function pluginRecord(
+  pluginId: string,
+  installOwner: string,
+  rootDir: string,
+): InstalledPluginIndexRecord {
   return recordInstalledPluginIndexInstallOwner(
     {
-      pluginId: params.pluginId,
-      manifestPath: `${params.rootDir}/openclaw.plugin.json`,
-      manifestHash: params.pluginId,
-      source: `${params.rootDir}/index.js`,
-      rootDir: params.rootDir,
+      pluginId,
+      manifestPath: `${rootDir}/openclaw.plugin.json`,
+      manifestHash: pluginId,
+      source: `${rootDir}/index.js`,
+      rootDir,
       origin: "global",
       enabled: true,
       startup: { sidecar: false, memory: false, agentHarnesses: [] },
@@ -59,14 +78,14 @@ function pluginRecord(params: {
       },
       compat: [],
     },
-    params.installOwner,
+    installOwner,
   );
 }
 
-function installedIndex(params: {
-  records: Record<string, PluginInstallRecord>;
-  plugin?: InstalledPluginIndexRecord;
-}): InstalledPluginIndex {
+function installedIndex(
+  records: Record<string, PluginInstallRecord>,
+  plugin?: InstalledPluginIndexRecord,
+): InstalledPluginIndex {
   return {
     version: 1,
     hostContractVersion: "test",
@@ -74,11 +93,17 @@ function installedIndex(params: {
     migrationVersion: 1,
     policyHash: "test",
     generatedAtMs: 1,
-    installRecords: params.records,
-    plugins: params.plugin ? [params.plugin] : [],
+    installRecords: records,
+    plugins: plugin ? [plugin] : [],
     diagnostics: [],
   };
 }
+
+const updateResult = (config: OpenClawConfig, changed = true) => ({
+  config,
+  changed,
+  outcomes: [],
+});
 
 describe("plugin release cohort package reconciliation", () => {
   const tempDirs: string[] = [];
@@ -90,13 +115,7 @@ describe("plugin release cohort package reconciliation", () => {
     syncPluginsForUpdateChannelMock.mockImplementation(async ({ config }) => ({
       config,
       changed: false,
-      summary: {
-        switchedToBundled: [],
-        switchedToClawHub: [],
-        switchedToNpm: [],
-        warnings: [],
-        errors: [],
-      },
+      summary,
     }));
   });
 
@@ -104,32 +123,20 @@ describe("plugin release cohort package reconciliation", () => {
     const sourceDiscovery = vi.spyOn(bundledSources, "resolveSourceCheckoutBundledPluginIds");
     const config = { plugins: { entries: { unrelated: { enabled: false } } } };
     const records = {
-      introduced: {
-        source: "npm",
-        spec: "@example/introduced",
-        installPath: "/plugins/introduced",
-      },
+      introduced: npmRecord("@example/introduced", "/plugins/introduced"),
     } satisfies Record<string, PluginInstallRecord>;
     const updatedConfig = { plugins: { ...config.plugins, installs: records } };
     const remaining = [
       { pluginId: "introduced", installPath: "/plugins/introduced", reason: "missing-package-dir" },
     ];
     // A valid empty index makes the old path fail on unwanted discovery, not a mock error.
-    loadInstalledPluginIndexMock.mockReturnValue(installedIndex({ records: {} }));
-    updateNpmInstalledPluginsMock.mockResolvedValue({
-      config: updatedConfig,
-      changed: true,
-      outcomes: [],
-    });
+    loadInstalledPluginIndexMock.mockReturnValue(installedIndex({}));
+    updateNpmInstalledPluginsMock.mockResolvedValue(updateResult(updatedConfig));
     collectMissingPluginInstallPayloadsMock
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce(remaining);
 
-    const result = await convergePluginReleaseCohort({
-      config,
-      channel: "stable",
-      timeoutMs: 60_000,
-    });
+    const result = await converge({ config });
 
     expect(syncPluginsForUpdateChannelMock).toHaveBeenCalledOnce();
     expect(updateNpmInstalledPluginsMock).toHaveBeenCalledOnce();
@@ -154,10 +161,10 @@ describe("plugin release cohort package reconciliation", () => {
     async (kind) => {
       const rootDir = "/plugins/ownerless";
       const records = {
-        ownerless: { source: "npm", spec: "@example/ownerless", installPath: rootDir },
+        ownerless: npmRecord("@example/ownerless", rootDir),
       } satisfies Record<string, PluginInstallRecord>;
       const plugin = {
-        ...pluginRecord({ pluginId: "ownerless", installOwner: "ownerless", rootDir }),
+        ...pluginRecord("ownerless", "ownerless", rootDir),
         installOwner: undefined,
         origin: kind === "global" ? ("global" as const) : ("config" as const),
       };
@@ -170,8 +177,8 @@ describe("plugin release cohort package reconciliation", () => {
           ...(kind === "ambiguous-config" ? { load: { paths: [rootDir] } } : {}),
         },
       };
-      loadInstalledPluginIndexMock.mockReturnValue(installedIndex({ records, plugin }));
-      const result = convergePluginReleaseCohort({ config, channel: "stable", timeoutMs: 60_000 });
+      loadInstalledPluginIndexMock.mockReturnValue(installedIndex(records, plugin));
+      const result = converge({ config });
 
       await expect(result).rejects.toThrow(
         kind === "global"
@@ -199,19 +206,15 @@ describe("plugin release cohort package reconciliation", () => {
         OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(root, "bundled"),
       };
       const writePayload = (pluginId: string) => {
-        fs.mkdirSync(installPath, { recursive: true });
-        fs.writeFileSync(
-          path.join(installPath, "package.json"),
-          JSON.stringify({
-            name: "@example/cohort",
-            version: "1.0.0",
-            openclaw: { extensions: ["./index.js"] },
-          }),
-        );
-        fs.writeFileSync(
-          path.join(installPath, "openclaw.plugin.json"),
-          JSON.stringify({ id: pluginId, configSchema: { type: "object" } }),
-        );
+        writeJsonFile(path.join(installPath, "package.json"), {
+          name: "@example/cohort",
+          version: "1.0.0",
+          openclaw: { extensions: ["./index.js"] },
+        });
+        writeJsonFile(path.join(installPath, "openclaw.plugin.json"), {
+          id: pluginId,
+          configSchema: { type: "object" },
+        });
         fs.writeFileSync(path.join(installPath, "index.js"), "module.exports = {};\n");
       };
       if (state !== "missing") {
@@ -233,30 +236,20 @@ describe("plugin release cohort package reconciliation", () => {
       }
       updateNpmInstalledPluginsMock.mockImplementation(async ({ config: current }) => {
         writePayload("current-child");
-        return {
-          config: {
-            ...current,
-            plugins: {
-              ...current.plugins,
-              installs: { cohort: { ...records.cohort, version: "1.0.0" } },
-            },
+        return updateResult({
+          ...current,
+          plugins: {
+            ...current.plugins,
+            installs: { cohort: { ...records.cohort, version: "1.0.0" } },
           },
-          changed: true,
-          outcomes: [],
-        };
+        });
       });
 
       if (state === "replaced after sync introduces its owner") {
         syncPluginsForUpdateChannelMock.mockResolvedValueOnce({
           config,
           changed: true,
-          summary: {
-            switchedToBundled: [],
-            switchedToClawHub: [],
-            switchedToNpm: [],
-            warnings: [],
-            errors: [],
-          },
+          summary,
         });
       }
       const inputConfig =
@@ -264,12 +257,7 @@ describe("plugin release cohort package reconciliation", () => {
           ? { ...config, plugins: { ...config.plugins, installs: {} } }
           : config;
       const result = await withPluginCache(createPluginCache(), () =>
-        convergePluginReleaseCohort({
-          config: inputConfig,
-          channel: "stable",
-          timeoutMs: 60_000,
-          env,
-        }),
+        converge({ config: inputConfig, env }),
       );
 
       expect(result.config.plugins?.entries?.unrelated).toEqual({ enabled: false });
@@ -284,29 +272,13 @@ describe("plugin release cohort package reconciliation", () => {
     const legacyRoot = "/plugins/qqbot-legacy";
     const canonicalRoot = "/plugins/openclaw-qqbot";
     const legacyRecords = {
-      unrelated: {
-        source: "npm",
-        spec: "@example/unrelated",
-        installPath: "/plugins/unrelated",
-      },
-      qqbot: {
-        source: "npm",
-        spec: "@openclaw/qqbot@1.9.0",
-        installPath: legacyRoot,
-      },
-      "openclaw-qqbot": {
-        source: "npm",
-        spec: "@tencent-connect/openclaw-qqbot@2.0.1",
-        installPath: canonicalRoot,
-      },
+      unrelated: npmRecord("@example/unrelated", "/plugins/unrelated"),
+      qqbot: npmRecord("@openclaw/qqbot@1.9.0", legacyRoot),
+      "openclaw-qqbot": npmRecord("@tencent-connect/openclaw-qqbot@2.0.1", canonicalRoot),
     } satisfies Record<string, PluginInstallRecord>;
     const canonicalRecords = {
       unrelated: legacyRecords.unrelated,
-      "openclaw-qqbot": {
-        source: "npm",
-        spec: "@tencent-connect/openclaw-qqbot@2.0.3",
-        installPath: canonicalRoot,
-      },
+      "openclaw-qqbot": npmRecord("@tencent-connect/openclaw-qqbot@2.0.3", canonicalRoot),
     } satisfies Record<string, PluginInstallRecord>;
     const config = {
       channels: { qqbot: { enabled: true, appId: "app", clientSecret: "secret" } },
@@ -319,51 +291,29 @@ describe("plugin release cohort package reconciliation", () => {
       ...config,
       plugins: { ...config.plugins, installs: canonicalRecords },
     } satisfies OpenClawConfig;
+    const legacyIndex = installedIndex(legacyRecords, pluginRecord("qqbot", "qqbot", legacyRoot));
     loadInstalledPluginIndexMock
+      .mockReturnValueOnce(legacyIndex)
+      .mockReturnValueOnce(legacyIndex)
       .mockReturnValueOnce(
-        installedIndex({
-          records: legacyRecords,
-          plugin: pluginRecord({ pluginId: "qqbot", installOwner: "qqbot", rootDir: legacyRoot }),
-        }),
-      )
-      .mockReturnValueOnce(
-        installedIndex({
-          records: legacyRecords,
-          plugin: pluginRecord({ pluginId: "qqbot", installOwner: "qqbot", rootDir: legacyRoot }),
-        }),
-      )
-      .mockReturnValueOnce(
-        installedIndex({
-          records: canonicalRecords,
-          plugin: pluginRecord({
-            pluginId: "openclaw-qqbot",
-            installOwner: "openclaw-qqbot",
-            rootDir: canonicalRoot,
-          }),
-        }),
+        installedIndex(
+          canonicalRecords,
+          pluginRecord("openclaw-qqbot", "openclaw-qqbot", canonicalRoot),
+        ),
       );
     if (phase === "repair") {
       collectMissingPluginInstallPayloadsMock.mockResolvedValueOnce([
         { pluginId: "qqbot", installPath: legacyRoot, reason: "missing-package-json" },
       ]);
     }
-    updateNpmInstalledPluginsMock.mockImplementation(async ({ config: current }) => ({
-      config: current,
-      changed: false,
-      outcomes: [],
-    }));
+    updateNpmInstalledPluginsMock.mockImplementation(async ({ config: current }) =>
+      updateResult(current, false),
+    );
     updateNpmInstalledPluginsMock.mockResolvedValueOnce(
-      attachPluginInstallOwnerMigrations(
-        { config: updatedConfig, changed: true, outcomes: [] },
-        { qqbot: "openclaw-qqbot" },
-      ),
+      attachPluginInstallOwnerMigrations(updateResult(updatedConfig), { qqbot: "openclaw-qqbot" }),
     );
 
-    const result = await convergePluginReleaseCohort({
-      config,
-      channel: "stable",
-      timeoutMs: 60_000,
-    });
+    const result = await converge({ config });
 
     if (phase === "repair") {
       const ordinaryUpdateRequest = updateNpmInstalledPluginsMock.mock.lastCall?.[0];
@@ -378,25 +328,17 @@ describe("plugin release cohort package reconciliation", () => {
 
   it("rejects a repair owner migration when caller authority is revoked before the cohort resumes", async () => {
     const records = {
-      legacy: { source: "npm", spec: "@example/legacy", installPath: "/plugins/legacy" },
+      legacy: npmRecord("@example/legacy", "/plugins/legacy"),
     } satisfies Record<string, PluginInstallRecord>;
     const config = { plugins: { installs: records } };
     const repair = attachPluginInstallOwnerMigrations(
-      {
-        config: {
-          plugins: {
-            installs: {
-              canonical: {
-                source: "npm",
-                spec: "@example/canonical",
-                installPath: "/plugins/canonical",
-              },
-            },
+      updateResult({
+        plugins: {
+          installs: {
+            canonical: npmRecord("@example/canonical", "/plugins/canonical"),
           },
-        } satisfies OpenClawConfig,
-        changed: true,
-        outcomes: [],
-      },
+        },
+      }),
       { legacy: "canonical" },
     );
     const failure = new Error("original update authority revoked");
@@ -406,7 +348,7 @@ describe("plugin release cohort package reconciliation", () => {
         throw failure;
       }
     };
-    loadInstalledPluginIndexMock.mockReturnValue(installedIndex({ records }));
+    loadInstalledPluginIndexMock.mockReturnValue(installedIndex(records));
     collectMissingPluginInstallPayloadsMock.mockResolvedValueOnce([
       { pluginId: "legacy", installPath: "/plugins/legacy", reason: "missing-package-json" },
     ]);
@@ -419,10 +361,8 @@ describe("plugin release cohort package reconciliation", () => {
     });
 
     await expect(
-      convergePluginReleaseCohort({
+      converge({
         config,
-        channel: "stable",
-        timeoutMs: 60_000,
         beforePersistentEffect: assertCurrent,
       }),
     ).rejects.toBe(failure);

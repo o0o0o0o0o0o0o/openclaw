@@ -34,6 +34,7 @@ export type PanelTabStripProps<T extends SolidPanelTabStripTab> = {
   activeId: string | null;
   ariaControls: string | ((tab: T) => string);
   onSelect: (id: string) => void;
+  onFocusActiveReady?: (focus: ((options?: FocusOptions) => void) | null) => void;
   onClose: (id: string) => void | Promise<void>;
   onNew: () => void;
   newLabel: string;
@@ -136,6 +137,9 @@ function TabGroupView<T extends SolidPanelTabStripTab>(props: PanelTabStripProps
     () => props.tabs.map((tab) => ({ value: tab.id })),
     () => group,
   );
+  const onFocusActiveReady = props.onFocusActiveReady;
+  onFocusActiveReady?.((options) => tabs.element(props.activeId)?.focus(options));
+  onCleanup(() => onFocusActiveReady?.(null));
   let scheduleMeasurement = () => {};
   const controlsFor = (tab: T) =>
     typeof props.ariaControls === "string" ? props.ariaControls : props.ariaControls(tab);

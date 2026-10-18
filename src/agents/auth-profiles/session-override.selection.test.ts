@@ -7,14 +7,18 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { createApiKeyCredential } from "./credential-fixtures.test-support.js";
+import {
+  createApiKeyCredential,
+  createOAuthRefreshCredential,
+} from "./credential-fixtures.test-support.js";
 import {
   authStoreMocks,
   createAuthStoreWithProfiles,
+  createAutomaticSessionEntry,
   resolveSession,
   resolveSessionAuthSelection,
-  TEST_PRIMARY_PROFILE_ID,
-  TEST_SECONDARY_PROFILE_ID,
+  TEST_PRIMARY_PROFILE_ID as PRIMARY,
+  TEST_SECONDARY_PROFILE_ID as SECONDARY,
   withAuthState,
 } from "./session-override.test-support.js";
 
@@ -26,18 +30,12 @@ function configureProfiles(): void {
   authStoreMocks.state.hasSource = true;
   authStoreMocks.state.store = createAuthStoreWithProfiles({
     profiles: {
-      [TEST_PRIMARY_PROFILE_ID]: createApiKeyCredential("openai", "sk-primary"),
-      [TEST_SECONDARY_PROFILE_ID]: createApiKeyCredential("openai", "sk-secondary"),
-      [OAUTH_PROFILE_ID]: {
-        type: "oauth",
-        provider: "openai",
-        access: "test-access",
-        refresh: "test-refresh",
-        expires: Date.now() + 60_000,
-      },
+      [PRIMARY]: createApiKeyCredential("openai", "sk-primary"),
+      [SECONDARY]: createApiKeyCredential("openai", "sk-secondary"),
+      [OAUTH_PROFILE_ID]: createOAuthRefreshCredential(),
       [MISMATCHED_PROFILE_ID]: createApiKeyCredential("anthropic", "sk-mismatched"),
     },
-    order: { openai: [TEST_PRIMARY_PROFILE_ID, TEST_SECONDARY_PROFILE_ID, OAUTH_PROFILE_ID] },
+    order: { openai: [PRIMARY, SECONDARY, OAUTH_PROFILE_ID] },
   });
 }
 
@@ -50,13 +48,11 @@ async function select(params: {
   agentId?: string;
 }) {
   return await resolveSessionAuthSelection({
+    ...params,
     cfg: params.cfg ?? {},
     agentId: params.agentId ?? "main",
     provider: "openai",
     modelId: params.modelId ?? "gpt-5.6-sol",
-    ...(params.configuredProfileId ? { configuredProfileId: params.configuredProfileId } : {}),
-    agentDir: params.agentDir,
-    sessionEntry: params.sessionEntry,
     sessionStore: { [SESSION_KEY]: params.sessionEntry },
     sessionKey: SESSION_KEY,
     isNewSession: false,
@@ -64,75 +60,60 @@ async function select(params: {
 }
 
 describe("session auth selection prepared facts", () => {
-  it("selects the configured profile after model activation", async () => {
-    await withAuthState(async (state) => {
+  it("selects the configured profile after model activation", () =>
+    withAuthState(async (state) => {
       configureProfiles();
-      const sessionEntry: SessionEntry = {
-        sessionId: "existing-session",
-        updatedAt: 1,
+      const sessionEntry = createAutomaticSessionEntry({
         compactionCount: 0,
-        authProfileOverride: TEST_PRIMARY_PROFILE_ID,
-        authProfileOverrideSource: "auto",
         authProfileOverrideCompactionCount: 0,
-      };
+      });
       await expect(
         select({
           agentDir: state.agentDir(),
           agentId: "main",
           cfg: {
             agents: {
-              entries: { main: { model: `openai/gpt-4.1@${TEST_SECONDARY_PROFILE_ID}` } },
+              entries: { main: { model: `openai/gpt-4.1@${SECONDARY}` } },
             },
           },
           modelId: "gpt-4.1",
           sessionEntry,
         }),
       ).resolves.toMatchObject({
-        profileId: TEST_SECONDARY_PROFILE_ID,
+        profileId: SECONDARY,
         source: "user",
       });
-    });
-  });
+    }));
 
-  it("retains a removed explicit pin that also names the configured default", async () => {
-    await withAuthState(async (state) => {
+  it("retains a removed explicit pin that also names the configured default", () =>
+    withAuthState(async (state) => {
       configureProfiles();
-      const sessionEntry: SessionEntry = {
-        sessionId: "s1",
-        updatedAt: 1,
-        authProfileOverride: TEST_PRIMARY_PROFILE_ID,
-        authProfileOverrideSource: "user",
-      };
+      const sessionEntry = createAutomaticSessionEntry({ authProfileOverrideSource: "user" });
       const params = {
         agentDir: state.agentDir(),
         sessionEntry,
-        configuredProfileId: TEST_PRIMARY_PROFILE_ID,
+        configuredProfileId: PRIMARY,
       };
       await expect(select(params)).resolves.toMatchObject({
-        profileId: TEST_PRIMARY_PROFILE_ID,
+        profileId: PRIMARY,
         source: "user",
       });
-      delete authStoreMocks.state.store.profiles[TEST_PRIMARY_PROFILE_ID];
+      delete authStoreMocks.state.store.profiles[PRIMARY];
 
       await expect(select(params)).resolves.toMatchObject({
-        profileId: TEST_PRIMARY_PROFILE_ID,
+        profileId: PRIMARY,
         source: "user",
       });
-      expect(sessionEntry.authProfileOverride).toBe(TEST_PRIMARY_PROFILE_ID);
-    });
-  });
+      expect(sessionEntry.authProfileOverride).toBe(PRIMARY);
+    }));
 
-  it("uses only explicit configured-profile precedence", async () => {
-    await withAuthState(async (state) => {
+  it("uses only explicit configured-profile precedence", () =>
+    withAuthState(async (state) => {
       configureProfiles();
-      const sessionEntry: SessionEntry = {
-        sessionId: "s1",
-        updatedAt: 1,
+      const sessionEntry = createAutomaticSessionEntry({
         compactionCount: 0,
-        authProfileOverride: TEST_PRIMARY_PROFILE_ID,
-        authProfileOverrideSource: "auto",
         authProfileOverrideCompactionCount: 0,
-      };
+      });
 
       await expect(
         select({
@@ -140,7 +121,7 @@ describe("session auth selection prepared facts", () => {
           sessionEntry,
           modelId: `gpt-5.6-sol@${OAUTH_PROFILE_ID}`,
         }),
-      ).resolves.toMatchObject({ profileId: TEST_PRIMARY_PROFILE_ID, source: "auto" });
+      ).resolves.toMatchObject({ profileId: PRIMARY, source: "auto" });
       await expect(
         select({
           agentDir: state.agentDir(),
@@ -152,11 +133,10 @@ describe("session auth selection prepared facts", () => {
         source: "user",
         routeRequirement: "subscription",
       });
-    });
-  });
+    }));
 
-  it("retains typed recovery for an explicitly selected profile removed from the store", async () => {
-    await withAuthState(async (state) => {
+  it("retains typed recovery for an explicitly selected profile removed from the store", () =>
+    withAuthState(async (state) => {
       configureProfiles();
       await expect(
         select({
@@ -168,11 +148,10 @@ describe("session auth selection prepared facts", () => {
         code: "selected_auth_profile_unavailable",
         profileId: "openai:removed",
       });
-    });
-  });
+    }));
 
-  it("keeps provider incompatibility for a config-only aws-sdk profile", async () => {
-    await withAuthState(async (state) => {
+  it("keeps provider incompatibility for a config-only aws-sdk profile", () =>
+    withAuthState(async (state) => {
       configureProfiles();
       await expect(
         select({
@@ -191,18 +170,15 @@ describe("session auth selection prepared facts", () => {
         name: "Error",
         message: 'Auth profile "amazon-bedrock:default" is not configured for openai.',
       });
-    });
-  });
-  it("still rotates a legacy source-less automatic pin on a new session", async () => {
-    await withAuthState(async (state) => {
+    }));
+  it("still rotates a legacy source-less automatic pin on a new session", () =>
+    withAuthState(async (state) => {
       configureProfiles();
-      const sessionEntry: SessionEntry = {
-        sessionId: "s1",
-        updatedAt: 1,
+      const sessionEntry = createAutomaticSessionEntry({
         compactionCount: 0,
-        authProfileOverride: TEST_PRIMARY_PROFILE_ID,
+        authProfileOverrideSource: undefined,
         authProfileOverrideCompactionCount: 0,
-      };
+      });
 
       const resolved = await resolveSession({
         agentDir: state.agentDir(),
@@ -211,11 +187,12 @@ describe("session auth selection prepared facts", () => {
         isNewSession: true,
       });
 
-      expect(resolved).toBe(TEST_SECONDARY_PROFILE_ID);
-      expect(sessionEntry.authProfileOverride).toBe(TEST_SECONDARY_PROFILE_ID);
-      expect(sessionEntry.authProfileOverrideSource).toBe("auto");
-    });
-  });
+      expect(resolved).toBe(SECONDARY);
+      expect(sessionEntry).toMatchObject({
+        authProfileOverride: SECONDARY,
+        authProfileOverrideSource: "auto",
+      });
+    }));
 });
 
 it("clears an incompatible global pin only in the selected agent store", async () => {

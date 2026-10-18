@@ -13,7 +13,7 @@ import {
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
 import { noteCommittedSharedAuthStoreOwnership } from "./path-resolve.js";
-import { hasAnyAuthProfileStoreSourceAsync } from "./source-check.js";
+import { hasAnyAuthProfileStoreSourceAsync as hasSource } from "./source-check.js";
 import { writeAuthProfileJsonCell } from "./sqlite-json-write.js";
 import { SHARED_AUTH_STORE_STATE_KEY } from "./sqlite-json.js";
 import * as readers from "./sqlite-read.js";
@@ -36,6 +36,20 @@ async function prepareSourceCohort(state: OpenClawTestState) {
   return { database, claim: databaseClaim, reader: databaseClaim.reader };
 }
 
+async function expectSource(
+  agentDir: string,
+  expected: boolean,
+  reader?: Parameters<typeof hasSource>[1],
+) {
+  const sql = observeMainThreadSql();
+  try {
+    expect(await hasSource(agentDir, reader)).toBe(expected);
+    sql.expectIdle();
+  } finally {
+    sql.restore();
+  }
+}
+
 it("retains the read failure classification when reader cleanup also fails", async () => {
   await withOpenClawTestState({ label: "auth-source-cleanup" }, async (state) => {
     const failure = new SqliteWorkerError("source read closed", "closed");
@@ -51,9 +65,7 @@ it("retains the read failure classification when reader cleanup also fails", asy
       },
     });
     try {
-      await expect(
-        hasAnyAuthProfileStoreSourceAsync(state.agentDir("source")),
-      ).rejects.toMatchObject({
+      await expect(hasSource(state.agentDir("source"))).rejects.toMatchObject({
         code: "closed",
         cause: failure,
       });
@@ -76,7 +88,7 @@ it("detects an existing auth source without caller-thread SQLite", async () => {
     const sql = observeMainThreadSql();
     try {
       sql.calibrate();
-      expect(await hasAnyAuthProfileStoreSourceAsync(agentDir)).toBe(true);
+      expect(await hasSource(agentDir)).toBe(true);
       sql.expectIdle();
     } finally {
       sql.restore();
@@ -113,15 +125,7 @@ it("reads source presence through the selected cohort and refreshes foreign abse
             .prepare("INSERT INTO auth_profile_state VALUES ('primary', ?, 1)")
             .run(fixture.state);
         }
-        const sql = observeMainThreadSql();
-        try {
-          expect(await hasAnyAuthProfileStoreSourceAsync(state.agentDir(), reader)).toBe(
-            fixture.expected,
-          );
-          sql.expectIdle();
-        } finally {
-          sql.restore();
-        }
+        await expectSource(state.agentDir(), fixture.expected, reader);
       }
       expect(
         standalone.mock.calls.filter(([input]) => input.databasePath === database.path),
@@ -147,7 +151,7 @@ it("keeps mismatched cohort paths, agent owners, and state roots on the original
         { env: { ...reader.database.env, OPENCLAW_STATE_DIR: state.path("another-state-root") } },
       ]) {
         const mismatched = { ...reader, database: { ...reader.database, ...changed } };
-        expect(await hasAnyAuthProfileStoreSourceAsync(state.agentDir(), mismatched)).toBe(true);
+        expect(await hasSource(state.agentDir(), mismatched)).toBe(true);
       }
       expect(readCohort).not.toHaveBeenCalled();
       expect(
@@ -205,15 +209,7 @@ it("preserves absent, table-missing, state-only, and unreadable source routing",
       } else if (fixture.bytes) {
         fs.writeFileSync(databasePath, fixture.bytes);
       }
-      const sql = observeMainThreadSql();
-      try {
-        expect(await hasAnyAuthProfileStoreSourceAsync(agentDir), fixture.name).toBe(
-          fixture.expected,
-        );
-        sql.expectIdle();
-      } finally {
-        sql.restore();
-      }
+      await expectSource(agentDir, fixture.expected);
     }
     expect(fs.existsSync(resolveAuthProfileDatabasePath(state.agentDir("absent")))).toBe(false);
   });
@@ -239,12 +235,9 @@ it("keeps inherited shared reads on the captured root after a local read yields"
           },
         };
       });
-    const sql = observeMainThreadSql();
     try {
-      expect(await hasAnyAuthProfileStoreSourceAsync(state.agentDir("absent"))).toBe(true);
-      sql.expectIdle();
+      await expectSource(state.agentDir("absent"), true);
     } finally {
-      sql.restore();
       prepare.mockRestore();
       vi.unstubAllEnvs();
     }

@@ -11,6 +11,7 @@ import {
   type OpenClawTestState,
   withOpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
+import { createApiKeyCredential } from "./credential-fixtures.test-support.js";
 import type { AuthProfileStore } from "./types.js";
 
 export const TEST_PRIMARY_PROFILE_ID = "openai:primary@example.test";
@@ -28,11 +29,11 @@ const authStoreMocks = vi.hoisted(() => {
   };
   const ensureAuthProfileStoreAsync = vi.fn(async () => state.store);
   const hasAnyAuthProfileStoreSourceAsync = vi.fn(() => state.hasSource);
-  const isProfileInCooldown = vi.fn((_store: AuthProfileStore, _profileId: string) => false);
-  const resolveProviderModelRoutes = vi.fn(
-    ({ provider, modelId }: { provider: string; modelId?: string }) =>
-      state.routeResolutions.get(`${provider}\0${modelId ?? ""}`) ?? null,
-  );
+  const available = (_store: AuthProfileStore, _profileId: string) => false;
+  const routes = ({ provider, modelId }: { provider: string; modelId?: string }) =>
+    state.routeResolutions.get(`${provider}\0${modelId ?? ""}`) ?? null;
+  const isProfileInCooldown = vi.fn(available);
+  const resolveProviderModelRoutes = vi.fn(routes);
   return {
     state,
     ensureAuthProfileStoreAsync,
@@ -45,15 +46,8 @@ const authStoreMocks = vi.hoisted(() => {
       state.store = { version: 1, profiles: {} };
       ensureAuthProfileStoreAsync.mockReset().mockImplementation(async () => state.store);
       hasAnyAuthProfileStoreSourceAsync.mockReset().mockImplementation(() => state.hasSource);
-      isProfileInCooldown
-        .mockReset()
-        .mockImplementation((_store: AuthProfileStore, _profileId: string) => false);
-      resolveProviderModelRoutes
-        .mockReset()
-        .mockImplementation(
-          ({ provider, modelId }: { provider: string; modelId?: string }) =>
-            state.routeResolutions.get(`${provider}\0${modelId ?? ""}`) ?? null,
-        );
+      isProfileInCooldown.mockReset().mockImplementation(available);
+      resolveProviderModelRoutes.mockReset().mockImplementation(routes);
     },
   };
 });
@@ -95,24 +89,14 @@ afterEach(() => {
 });
 
 export async function withAuthState<T>(run: (state: OpenClawTestState) => Promise<T>): Promise<T> {
-  return await withOpenClawTestState(
-    {
-      layout: "state-only",
-      prefix: "openclaw-auth-",
-    },
-    run,
-  );
+  return await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-auth-" }, run);
 }
 
 export function createAuthStoreWithProfiles(params: {
   profiles: AuthProfileStore["profiles"];
   order?: Record<string, string[]>;
 }): AuthProfileStore {
-  return {
-    version: 1,
-    profiles: params.profiles,
-    ...(params.order ? { order: params.order } : {}),
-  };
+  return { version: 1, ...params };
 }
 
 export function configureProviderRoutes(params: {
@@ -150,10 +134,7 @@ export async function prepareCooldownAuthState(
   authStoreMocks.state.store = {
     ...createAuthStoreWithProfiles({
       profiles: Object.fromEntries(
-        profileIds.map((profileId) => [
-          profileId,
-          { type: "api_key" as const, provider: "openai", key: "sk-test" },
-        ]),
+        profileIds.map((profileId) => [profileId, createApiKeyCredential("openai", "sk-test")]),
       ),
       order: { openai: profileIds },
     }),
@@ -166,7 +147,7 @@ export async function prepareCooldownAuthState(
 export async function resolveSession(params: {
   agentDir: string;
   sessionEntry: SessionEntry;
-  sessionStore: Record<string, SessionEntry>;
+  sessionStore?: Record<string, SessionEntry>;
   cfg?: OpenClawConfig;
   provider?: string;
   sessionKey?: string;
@@ -175,15 +156,15 @@ export async function resolveSession(params: {
 }): Promise<string | undefined> {
   return (
     await resolveSessionAuthSelection({
+      ...params,
+      sessionStore: params.sessionStore ?? {
+        [params.sessionKey ?? "agent:main:main"]: params.sessionEntry,
+      },
       agentId: "main",
-      cfg: params.cfg ?? ({} as OpenClawConfig),
+      cfg: params.cfg ?? {},
       provider: params.provider ?? "openai",
       modelId: params.sessionEntry.model ?? "model-x",
-      agentDir: params.agentDir,
-      sessionEntry: params.sessionEntry,
-      sessionStore: params.sessionStore,
       sessionKey: params.sessionKey ?? "agent:main:main",
-      storePath: params.storePath,
       isNewSession: params.isNewSession ?? false,
     })
   )?.profileId;

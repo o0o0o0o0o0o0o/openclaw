@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { OpenClawConfig } from "../config/config.js";
-import type { ModelDefinitionConfig } from "../config/types.models.js";
+import { modelConfig } from "./context-config.test-support.js";
 import {
   evaluateContextWindowGuard,
   formatContextWindowBlockMessage,
@@ -9,28 +8,6 @@ import {
 } from "./context-window-guard.js";
 
 describe("context-window-guard", () => {
-  function modelConfig(
-    params: { contextWindow: number; contextTokens?: number },
-    provider = "openrouter",
-    id = "tiny",
-  ) {
-    const model: ModelDefinitionConfig = {
-      id,
-      name: id,
-      reasoning: false,
-      input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      ...params,
-      maxTokens: 256,
-    };
-    return {
-      models: {
-        providers: {
-          [provider]: { baseUrl: "http://localhost", apiKey: "x", models: [model] },
-        },
-      },
-    } satisfies OpenClawConfig;
-  }
   const guardFor = (tokens: number, source: "model" | "modelsConfig" = "model") =>
     evaluateContextWindowGuard({ info: { tokens, source } });
   const blockMessage = (
@@ -66,7 +43,7 @@ describe("context-window-guard", () => {
     (_case, provider, modelId, contextWindow, contextTokens, expected) => {
       expect(
         resolveContextWindowInfo({
-          cfg: modelConfig({ contextWindow, contextTokens }, provider, modelId),
+          cfg: modelConfig(provider, modelId, { contextWindow, contextTokens }),
           provider,
           modelId,
           modelContextTokens: 8_000,
@@ -79,7 +56,7 @@ describe("context-window-guard", () => {
 
   it("matches bare provider model config ids against provider-scoped runtime model ids", () => {
     const info = resolveContextWindowInfo({
-      cfg: modelConfig({ contextWindow: 1_000_000, contextTokens: 936_000 }),
+      cfg: modelConfig("openrouter", "tiny", { contextWindow: 1_000_000, contextTokens: 936_000 }),
       provider: "openrouter",
       modelId: "openrouter/tiny",
       modelContextWindow: 128_000,

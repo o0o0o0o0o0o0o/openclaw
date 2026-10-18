@@ -23,6 +23,7 @@ import * as ingressRuntime from "./ingress.js";
 import type { DiscordIngressLifecycle } from "./ingress.js";
 const createDiscordIngressMonitor = ingressRuntime.createDiscordIngressMonitor;
 import { createDiscordMessageHandler } from "./message-handler.js";
+import { createDiscordMessage } from "./message-handler.preflight.test-helpers.js";
 import type { DiscordMessagePreflightParams } from "./message-handler.preflight.types.js";
 import { createBaseDiscordMessageContext } from "./message-handler.test-harness.js";
 import {
@@ -40,28 +41,37 @@ type DiscordIngressPayload = {
 type DiscordQueue = ChannelIngressQueue<DiscordIngressPayload>;
 
 function rawMessage(id: string, channelId = "lane-a", timestamp = 0): APIMessage {
-  return {
+  return createDiscordMessage({
     id,
-    channel_id: channelId,
+    channelId,
     content: "hello",
-    author: {
-      id: "user-1",
-      username: "alice",
-      discriminator: "0",
-      avatar: null,
-    },
-    attachments: [],
-    embeds: [],
-    mentions: [],
-    mention_roles: [],
-    mention_everyone: false,
+    author: { id: "user-1", username: "alice", bot: false },
     timestamp: new Date(timestamp).toISOString(),
-    edited_timestamp: null,
     components: [],
-    pinned: false,
-    type: 0,
-    tts: false,
-  } as unknown as APIMessage;
+  }).rawData;
+}
+
+const payload = (id: string, receivedAt = 1): DiscordIngressPayload => ({
+  version: 1,
+  receivedAt,
+  rawMessage: rawMessage(id),
+});
+
+function attachQueue(queue: DiscordQueue) {
+  vi.spyOn(ingressRuntime, "createDiscordIngressMonitor").mockImplementation((params) =>
+    createDiscordIngressMonitor({ ...params, queue }),
+  );
+  return createDiscordMessageHandler({ ...createDiscordHandlerParams(), client: {} as never });
+}
+
+function prepareQueuedContext() {
+  preflightDiscordMessageMock.mockImplementation((async (
+    params: DiscordMessagePreflightParams,
+  ) => ({
+    ...createDiscordQueuePreflightContextForMessage(params.data),
+    abortSignal: params.abortSignal,
+    turnAdoptionLifecycle: params.turnAdoptionLifecycle,
+  })) as never);
 }
 
 async function withQueue(
@@ -87,11 +97,10 @@ async function seedPendingFailure(params: {
   attempts: number;
   laneKey?: string;
 }): Promise<void> {
-  await params.queue.enqueue(
-    params.id,
-    { version: 1, receivedAt: 1, rawMessage: rawMessage(params.id) },
-    { laneKey: params.laneKey ?? "channel:lane-a", receivedAt: 1 },
-  );
+  await params.queue.enqueue(params.id, payload(params.id), {
+    laneKey: params.laneKey ?? "channel:lane-a",
+    receivedAt: 1,
+  });
   for (let attempt = 1; attempt <= params.attempts; attempt += 1) {
     const claim = await params.queue.claim(params.id, { ownerId: `seed-${attempt}` });
     if (!claim) {
@@ -179,11 +188,10 @@ describe("Discord durable ingress replacement recovery", () => {
         id: "poison",
         attempts: DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS - 1,
       });
-      await queue.enqueue(
-        "follower",
-        { version: 1, receivedAt: 2, rawMessage: rawMessage("follower") },
-        { laneKey: "channel:lane-a", receivedAt: 2 },
-      );
+      await queue.enqueue("follower", payload("follower", 2), {
+        laneKey: "channel:lane-a",
+        receivedAt: 2,
+      });
       const expectedFacts = await retryFacts(queue, "poison");
 
       const dispatchEntered = createDeferred<void>();
@@ -311,35 +319,19 @@ describe("Discord durable ingress settlement", () => {
           id: "processing-poison",
           attempts: DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS - 1,
         });
-        await queue.enqueue(
-          "processing-follower",
-          {
-            version: 1,
-            receivedAt: 2,
-            rawMessage: rawMessage("processing-follower"),
-          },
-          { laneKey: "channel:lane-a", receivedAt: 2 },
-        );
+        await queue.enqueue("processing-follower", payload("processing-follower", 2), {
+          laneKey: "channel:lane-a",
+          receivedAt: 2,
+        });
         const processed: string[] = [];
-        preflightDiscordMessageMock.mockImplementation((async (
-          preflightParams: DiscordMessagePreflightParams,
-        ) => ({
-          ...createDiscordQueuePreflightContextForMessage(preflightParams.data),
-          turnAdoptionLifecycle: preflightParams.turnAdoptionLifecycle,
-        })) as never);
+        prepareQueuedContext();
         processDiscordMessageMock.mockImplementation(async (ctx) => {
           processed.push(ctx.message.id);
           if (ctx.message.id === "processing-poison") {
             throw new Error("deterministic queued processing failure");
           }
         });
-        vi.spyOn(ingressRuntime, "createDiscordIngressMonitor").mockImplementation(
-          (monitorParams) => createDiscordIngressMonitor({ ...monitorParams, queue }),
-        );
-        const handler = createDiscordMessageHandler({
-          ...createDiscordHandlerParams(),
-          client: {} as never,
-        });
+        const handler = attachQueue(queue);
         try {
           await vi.advanceTimersByTimeAsync(1_000);
           await vi.waitFor(() => expect(processed).toHaveLength(2));
@@ -372,24 +364,9 @@ describe("Discord durable ingress settlement", () => {
             throw new Error("processing stopped after cancellation");
           }
         });
-        const params = createDiscordHandlerParams();
-        preflightDiscordMessageMock.mockImplementation((async (preflightParams: {
-          abortSignal?: AbortSignal;
-          data: DiscordMessagePreflightParams["data"];
-          turnAdoptionLifecycle?: DiscordIngressLifecycle;
-        }) => ({
-          ...createDiscordQueuePreflightContextForMessage(preflightParams.data),
-          abortSignal: preflightParams.abortSignal,
-          turnAdoptionLifecycle: preflightParams.turnAdoptionLifecycle,
-        })) as never);
+        prepareQueuedContext();
         processDiscordMessageMock.mockImplementation(processDiscordMessage as never);
-        vi.spyOn(ingressRuntime, "createDiscordIngressMonitor").mockImplementation(
-          (monitorParams) => createDiscordIngressMonitor({ ...monitorParams, queue }),
-        );
-        const handler = createDiscordMessageHandler({
-          ...params,
-          client: {} as never,
-        });
+        const handler = attachQueue(queue);
 
         await processingStarted.promise;
         const deactivation = handler.deactivate();

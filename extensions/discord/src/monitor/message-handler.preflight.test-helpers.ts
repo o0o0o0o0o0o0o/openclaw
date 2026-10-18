@@ -1,36 +1,32 @@
 import type { APIAttachment, APIMessage } from "discord-api-types/v10";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { registerSessionBindingAdapter } from "openclaw/plugin-sdk/conversation-runtime";
+import type { SessionBindingRecord } from "openclaw/plugin-sdk/conversation-runtime";
 import { onTestFinished } from "vitest";
 import { ChannelType, Message, MessageType } from "../internal/discord.js";
 import { createInternalTestClient } from "../internal/test-builders.test-support.js";
 import type { preflightDiscordMessage } from "./message-handler.preflight.js";
-import { createNoopThreadBindingManager } from "./thread-bindings.js";
+import { createNoopThreadBindingManager, type ThreadBindingManager } from "./thread-bindings.js";
 
 export type DiscordConfig = NonNullable<OpenClawConfig["channels"]>["discord"];
 export type DiscordMessageEvent = import("./listeners.js").DiscordMessageEvent;
 export type DiscordClient = import("../internal/discord.js").Client;
 
-export const DEFAULT_PREFLIGHT_CFG = {
-  session: {
-    mainKey: "main",
-    scope: "per-sender",
-  },
-} as OpenClawConfig;
+export const DEFAULT_PREFLIGHT_CFG: OpenClawConfig = {
+  session: { mainKey: "main", scope: "per-sender" },
+};
+
+function channelClient(channels: Record<string, object>): DiscordClient {
+  const byId = new Map(Object.entries(channels));
+  return {
+    fetchChannel: async (id: string) => (byId.has(id) ? { ...byId.get(id) } : null),
+  } as unknown as DiscordClient;
+}
 
 export function createGuildTextClient(channelId: string): DiscordClient {
-  return {
-    fetchChannel: async (id: string) => {
-      if (id === channelId) {
-        return {
-          id: channelId,
-          type: ChannelType.GuildText,
-          name: "general",
-        };
-      }
-      return null;
-    },
-  } as unknown as DiscordClient;
+  return channelClient({
+    [channelId]: { id: channelId, type: ChannelType.GuildText, name: "general" },
+  });
 }
 
 export function createThreadClient(params: {
@@ -38,34 +34,23 @@ export function createThreadClient(params: {
   parentId: string;
   ownerId?: string;
 }): DiscordClient {
-  return {
-    fetchChannel: async (channelId: string) => {
-      if (channelId === params.threadId) {
-        return {
-          id: params.threadId,
-          type: ChannelType.PublicThread,
-          name: "focus",
-          parentId: params.parentId,
-          ownerId: params.ownerId ?? "owner-1",
-        };
-      }
-      if (channelId === params.parentId) {
-        return {
-          id: params.parentId,
-          type: ChannelType.GuildText,
-          name: "general",
-        };
-      }
-      return null;
+  return channelClient({
+    [params.parentId]: { id: params.parentId, type: ChannelType.GuildText, name: "general" },
+    [params.threadId]: {
+      id: params.threadId,
+      type: ChannelType.PublicThread,
+      name: "focus",
+      parentId: params.parentId,
+      ownerId: params.ownerId ?? "owner-1",
     },
-  } as unknown as DiscordClient;
+  });
 }
 
 export function createGuildEvent(params: {
   channelId: string;
   guildId: string;
-  author: import("../internal/discord.js").Message["author"];
-  message: import("../internal/discord.js").Message;
+  author: Message["author"];
+  message: Message;
   includeGuildObject?: boolean;
 }): DiscordMessageEvent {
   return {
@@ -73,39 +58,37 @@ export function createGuildEvent(params: {
     guild_id: params.guildId,
     ...(params.includeGuildObject === false
       ? {}
-      : {
-          guild: {
-            id: params.guildId,
-            name: "Guild One",
-          },
-        }),
+      : { guild: { id: params.guildId, name: "Guild One" } }),
     author: params.author,
     message: params.message,
   } as unknown as DiscordMessageEvent;
 }
 
-export function createDiscordMessage(params: {
-  id: string;
-  channelId: string;
-  content: string;
-  author: {
+export function createDiscordMessage(
+  params: {
     id: string;
-    bot: boolean;
-    username?: string;
-  };
-  mentionedUsers?: Array<{ id: string; username?: string }>;
-  mentionedEveryone?: boolean;
-  messageReference?: import("../internal/discord.js").Message["messageReference"];
-  referencedMessage?: import("../internal/discord.js").Message;
-  attachments?: Array<Pick<APIAttachment, "id" | "filename" | "url"> & Partial<APIAttachment>>;
-  webhookId?: string;
-  type?: import("../internal/discord.js").MessageType;
-  timestamp?: string;
-  embeds?: APIMessage["embeds"];
-  components?: APIMessage["components"];
-  stickers?: APIMessage["sticker_items"];
-}): Message {
-  return new Message(createInternalTestClient(), {
+    channelId: string;
+    content: string;
+    author: {
+      id: string;
+      bot: boolean;
+      username?: string;
+    };
+    mentionedUsers?: Array<{ id: string; username?: string }>;
+    mentionedEveryone?: boolean;
+    messageReference?: Message["messageReference"];
+    referencedMessage?: Message;
+    attachments?: Array<Pick<APIAttachment, "id" | "filename" | "url"> & Partial<APIAttachment>>;
+    webhookId?: string;
+    type?: MessageType;
+    timestamp?: string;
+    embeds?: APIMessage["embeds"];
+    components?: APIMessage["components"];
+    stickers?: APIMessage["sticker_items"];
+  },
+  client: DiscordClient = createInternalTestClient(),
+): Message {
+  return new Message(client, {
     id: params.id,
     type: params.type ?? MessageType.Default,
     content: params.content,
@@ -157,8 +140,7 @@ export function createDiscordPreflightArgs(params: {
     onTestFinished(() => threadBindings.stop());
   }
   return {
-    cfg: params.cfg,
-    discordConfig: params.discordConfig,
+    ...params,
     accountId: "default",
     token: "token",
     runtime: {} as import("openclaw/plugin-sdk/runtime-env").RuntimeEnv,
@@ -174,14 +156,10 @@ export function createDiscordPreflightArgs(params: {
     ackReactionScope: "direct",
     groupPolicy: "open",
     threadBindings,
-    data: params.data,
-    client: params.client,
   };
 }
 
-export function createThreadBinding(
-  overrides?: Partial<import("openclaw/plugin-sdk/conversation-runtime").SessionBindingRecord>,
-) {
+export function createThreadBinding(overrides?: Partial<SessionBindingRecord>) {
   return {
     bindingId: "default:thread-1",
     targetSessionKey: "agent:main:subagent:child-1",
@@ -201,14 +179,14 @@ export function createThreadBinding(
       webhookToken: "tok-1",
     },
     ...overrides,
-  } satisfies import("openclaw/plugin-sdk/conversation-runtime").SessionBindingRecord;
+  } satisfies SessionBindingRecord;
 }
 
 export async function runThreadBoundPreflight(params: {
   threadId: string;
   parentId: string;
-  message: import("../internal/discord.js").Message;
-  threadBinding: import("openclaw/plugin-sdk/conversation-runtime").SessionBindingRecord;
+  message: Message;
+  threadBinding: SessionBindingRecord;
   discordConfig: DiscordConfig;
   threadBindings: ReturnType<typeof createNoopThreadBindingManager>;
   registerBindingAdapter?: boolean;
@@ -223,11 +201,6 @@ export async function runThreadBoundPreflight(params: {
     });
   }
 
-  const client = createThreadClient({
-    threadId: params.threadId,
-    parentId: params.parentId,
-  });
-
   const { preflightDiscordMessage } = await import("./message-handler.preflight.js");
   return preflightDiscordMessage({
     ...createDiscordPreflightArgs({
@@ -240,10 +213,10 @@ export async function runThreadBoundPreflight(params: {
         author: params.message.author,
         message: params.message,
       }),
-      client,
+      client: createThreadClient(params),
     }),
     threadBindings: {
       getByThreadId: (id: string) => (id === params.threadId ? params.threadBinding : undefined),
-    } as import("./thread-bindings.js").ThreadBindingManager,
+    } as ThreadBindingManager,
   });
 }

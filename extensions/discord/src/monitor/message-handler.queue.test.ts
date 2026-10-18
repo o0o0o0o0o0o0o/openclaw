@@ -3,7 +3,6 @@ import { installDiscordIngressTestRuntime } from "../test-support/ingress-runtim
 installDiscordIngressTestRuntime();
 import fs from "node:fs/promises";
 import path from "node:path";
-import { MessageType } from "discord-api-types/v10";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import {
@@ -11,7 +10,6 @@ import {
   setRuntimeConfigSnapshot,
 } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { Message } from "../internal/discord.js";
 import { createInternalTestClient } from "../internal/test-builders.test-support.js";
 import type { DiscordIngressLifecycle } from "./ingress.js";
 import { createDiscordMessageDispatcher } from "./message-dispatcher.js";
@@ -54,6 +52,20 @@ function createTextMessageData(messageId: string, channelId = "ch-1") {
   const data = createMessageData(messageId, channelId);
   data.message.attachments = [];
   return data;
+}
+
+function dispatch(
+  handler: ReturnType<typeof createDiscordMessageHandler>,
+  id: string,
+  turnAdoptionLifecycle?: DiscordIngressLifecycle,
+) {
+  return handler(createTextMessageData(id) as never, {} as never, { turnAdoptionLifecycle });
+}
+
+function debouncedHandler(debounceMs: number) {
+  const params = createDiscordHandlerParams();
+  params.cfg.messages = { inbound: { debounceMs } };
+  return createDiscordMessageHandler(params);
 }
 
 describe("createDiscordMessageHandler queue behavior", () => {
@@ -118,8 +130,6 @@ describe("createDiscordMessageHandler queue behavior", () => {
   });
 
   it("settles every merged ingress claim when preflight admits the batch", async () => {
-    const params = createDiscordHandlerParams();
-    params.cfg.messages = { inbound: { debounceMs: 20 } };
     preflightDiscordMessageMock.mockImplementation(
       async (preflightParams: {
         data: { channel_id: string };
@@ -134,15 +144,13 @@ describe("createDiscordMessageHandler queue behavior", () => {
         await ctx.turnAdoptionLifecycle?.onAdopted();
       },
     );
-    const handler = createDiscordMessageHandler(params);
+    const handler = debouncedHandler(20);
     const first = createIngressLifecycle();
     const second = createIngressLifecycle();
     for (const [index, lifecycle] of [first, second].entries()) {
-      await expect(
-        handler(createTextMessageData(`m-fanout-${index}`) as never, {} as never, {
-          turnAdoptionLifecycle: lifecycle,
-        }),
-      ).resolves.toEqual({ kind: "deferred" });
+      await expect(dispatch(handler, `m-fanout-${index}`, lifecycle)).resolves.toEqual({
+        kind: "deferred",
+      });
     }
     await vi.waitFor(() => expect(processDiscordMessageMock).toHaveBeenCalledTimes(1));
     expect(first.onAdopted).toHaveBeenCalledTimes(1);
@@ -154,11 +162,7 @@ describe("createDiscordMessageHandler queue behavior", () => {
     await handler.deactivate();
     const lifecycle = createIngressLifecycle();
 
-    // Completing here would tombstone a message that never dispatched; the
-    // claim must release so a restarted drain replays it.
-    const result = await handler(createTextMessageData("m-after-stop") as never, {} as never, {
-      turnAdoptionLifecycle: lifecycle,
-    });
+    const result = await dispatch(handler, "m-after-stop", lifecycle);
 
     expect(result).toMatchObject({ kind: "deferred" });
     expect(lifecycle.onCancelled).toHaveBeenCalledTimes(1);
@@ -171,11 +175,7 @@ describe("createDiscordMessageHandler queue behavior", () => {
     const handler = createDiscordMessageHandler(createDiscordHandlerParams());
     const lifecycle = createIngressLifecycle();
 
-    await expect(
-      handler(createTextMessageData("m-failed") as never, {} as never, {
-        turnAdoptionLifecycle: lifecycle,
-      }),
-    ).resolves.toEqual({ kind: "deferred" });
+    await expect(dispatch(handler, "m-failed", lifecycle)).resolves.toEqual({ kind: "deferred" });
 
     expect(lifecycle.onFailed).toHaveBeenCalledExactlyOnceWith(failure);
     expect(lifecycle.onCancelled).not.toHaveBeenCalled();
@@ -183,19 +183,13 @@ describe("createDiscordMessageHandler queue behavior", () => {
   });
 
   it("settles every buffered claim when cancellation fan-in includes a legacy lifecycle", async () => {
-    const params = createDiscordHandlerParams();
-    params.cfg.messages = { inbound: { debounceMs: 60_000 } };
-    const handler = createDiscordMessageHandler(params);
+    const handler = debouncedHandler(60_000);
     const cancellable = createIngressLifecycle();
     const legacy = createIngressLifecycle();
     delete (legacy as Partial<typeof legacy>).onCancelled;
 
-    await handler(createTextMessageData("m-cancel-modern") as never, {} as never, {
-      turnAdoptionLifecycle: cancellable,
-    });
-    await handler(createTextMessageData("m-cancel-legacy") as never, {} as never, {
-      turnAdoptionLifecycle: legacy,
-    });
+    await dispatch(handler, "m-cancel-modern", cancellable);
+    await dispatch(handler, "m-cancel-legacy", legacy);
     await handler.deactivate();
 
     expect(preflightDiscordMessageMock).not.toHaveBeenCalled();
@@ -214,9 +208,7 @@ describe("createDiscordMessageHandler queue behavior", () => {
     });
     const handler = createDiscordMessageHandler(createDiscordHandlerParams());
     const lifecycle = createIngressLifecycle();
-    const handling = handler(createTextMessageData("m-active-stop") as never, {} as never, {
-      turnAdoptionLifecycle: lifecycle,
-    });
+    const handling = dispatch(handler, "m-active-stop", lifecycle);
     await vi.waitFor(() => expect(preflightDiscordMessageMock).toHaveBeenCalledTimes(1));
 
     let deactivated = false;
@@ -339,36 +331,22 @@ describe("createDiscordMessageHandler queue behavior", () => {
       dispatched.push([...precedingMessages, data.message].map((message) => message.id));
       return null;
     });
-    const handler = createDiscordMessageDispatcher({
-      ...params,
-    });
+    const handler = createDiscordMessageDispatcher(params);
     const publish = (inbound: NonNullable<OpenClawConfig["messages"]>["inbound"]) => {
       const cfg = { ...params.cfg, messages: { inbound } };
       setRuntimeConfigSnapshot(cfg, cfg);
     };
     const enqueue = (text: string) => {
-      const message = new Message(client, {
-        id: text,
-        channel_id: "c1",
-        content: text,
-        author: {
-          id: "U1",
-          username: "alice",
-          global_name: null,
-          discriminator: "0",
-          avatar: null,
+      const message = createDiscordMessage(
+        {
+          id: text,
+          channelId: "c1",
+          content: text,
+          author: { id: "U1", username: "alice", bot: false },
+          timestamp: "2026-09-04T00:00:00.000Z",
         },
-        attachments: [],
-        embeds: [],
-        mentions: [],
-        mention_roles: [],
-        mention_everyone: false,
-        timestamp: "2026-09-04T00:00:00.000Z",
-        edited_timestamp: null,
-        type: MessageType.Default,
-        tts: false,
-        pinned: false,
-      });
+        client,
+      );
       return handler({ message, author: message.author, channel_id: message.channelId }, client);
     };
     vi.useFakeTimers();

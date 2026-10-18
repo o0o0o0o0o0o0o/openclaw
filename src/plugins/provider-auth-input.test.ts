@@ -34,17 +34,10 @@ vi.mock("../agents/model-auth-env.js", () => ({
   resolveEnvApiKey,
 }));
 
-function createPrompter(params?: {
-  confirm?: WizardPrompter["confirm"];
-  note?: WizardPrompter["note"];
-  select?: WizardPrompter["select"];
-  text?: WizardPrompter["text"];
-}): WizardPrompter {
+function createPrompter(params: Partial<WizardPrompter> = {}): WizardPrompter {
   return {
-    confirm: params?.confirm ?? (vi.fn(async () => true) as WizardPrompter["confirm"]),
-    note: params?.note ?? (vi.fn(async () => undefined) as WizardPrompter["note"]),
-    ...(params?.select ? { select: params.select } : {}),
-    text: params?.text ?? (vi.fn(async () => "prompt-key") as WizardPrompter["text"]),
+    ...createPromptSpies(),
+    ...params,
   } as unknown as WizardPrompter;
 }
 
@@ -52,14 +45,7 @@ function createPromptSpies(params?: { confirmResult?: boolean; textResult?: stri
   const confirm = vi.fn(async () => params?.confirmResult ?? true);
   const note = vi.fn(async () => undefined);
   const text = vi.fn(async () => params?.textResult ?? "prompt-key");
-  return { confirm, note, text };
-}
-
-function createPromptAndCredentialSpies(params?: { confirmResult?: boolean; textResult?: string }) {
-  return {
-    ...createPromptSpies(params),
-    setCredential: vi.fn(async () => undefined),
-  };
+  return { confirm, note, text, setCredential: vi.fn(async () => undefined) };
 }
 
 function setMinimaxEnv(params: { apiKey?: string; oauthToken?: string } = {}) {
@@ -74,67 +60,43 @@ function currentMinimaxTestEnv(): NodeJS.ProcessEnv {
   };
 }
 
-async function ensureMinimaxApiKey(params: {
-  config?: OpenClawConfig;
-  env?: NodeJS.ProcessEnv;
-  workspaceDir?: string;
-  confirm?: WizardPrompter["confirm"];
-  note?: WizardPrompter["note"];
-  select?: WizardPrompter["select"];
-  text: WizardPrompter["text"];
-  setCredential: Parameters<typeof ensureApiKeyFromEnvOrPrompt>[0]["setCredential"];
-  secretInputMode?: Parameters<typeof ensureApiKeyFromEnvOrPrompt>[0]["secretInputMode"];
-}) {
-  return await ensureApiKeyFromEnvOrPrompt({
-    config: params.config ?? {},
-    env: params.env ?? currentMinimaxTestEnv(),
-    workspaceDir: params.workspaceDir,
+type KeyParams = Parameters<typeof ensureApiKeyFromEnvOrPrompt>[0];
+function keyParams(params: Partial<KeyParams> & Pick<KeyParams, "setCredential">): KeyParams {
+  return {
+    config: {},
+    env: currentMinimaxTestEnv(),
     provider: "minimax",
     envLabel: "MINIMAX_API_KEY",
     promptMessage: "Enter key",
     normalize: (value) => value.trim(),
     validate: acceptAnyApiKeyInput,
-    prompter: createPrompter(params),
-    secretInputMode: params.secretInputMode,
-    setCredential: params.setCredential,
-  });
+    prompter: createPrompter(),
+    ...params,
+  };
 }
 
-function expectMinimaxEnvRefCredentialStored(setCredential: ReturnType<typeof vi.fn>) {
-  expect(setCredential).toHaveBeenCalledWith(
-    { source: "env", provider: "default", id: "MINIMAX_API_KEY" },
-    "ref",
-  );
+function ensureMinimaxApiKey(
+  params: Partial<KeyParams> & Partial<WizardPrompter> & Pick<KeyParams, "setCredential">,
+) {
+  return ensureApiKeyFromEnvOrPrompt(keyParams({ ...params, prompter: createPrompter(params) }));
 }
 
-async function ensureWithOptionEnvOrPrompt(params: {
-  token: string;
-  tokenProvider: string;
-  expectedProviders: string[];
-  provider: string;
-  envLabel: string;
-  confirm: WizardPrompter["confirm"];
-  note: WizardPrompter["note"];
-  noteMessage: string;
-  noteTitle: string;
-  setCredential: Parameters<typeof ensureApiKeyFromOptionEnvOrPrompt>[0]["setCredential"];
-  text: WizardPrompter["text"];
-}) {
-  return await ensureApiKeyFromOptionEnvOrPrompt({
-    token: params.token,
-    tokenProvider: params.tokenProvider,
-    config: {},
-    env: currentMinimaxTestEnv(),
-    expectedProviders: params.expectedProviders,
-    provider: params.provider,
-    envLabel: params.envLabel,
-    promptMessage: "Enter key",
-    normalize: (value) => value.trim(),
-    validate: () => undefined,
-    prompter: createPrompter({ confirm: params.confirm, note: params.note, text: params.text }),
-    setCredential: params.setCredential,
-    noteMessage: params.noteMessage,
-    noteTitle: params.noteTitle,
+function ensureWithOptionEnvOrPrompt(
+  params: Partial<KeyParams> &
+    Partial<WizardPrompter> &
+    Pick<
+      Parameters<typeof ensureApiKeyFromOptionEnvOrPrompt>[0],
+      | "setCredential"
+      | "token"
+      | "tokenProvider"
+      | "expectedProviders"
+      | "noteMessage"
+      | "noteTitle"
+    >,
+) {
+  return ensureApiKeyFromOptionEnvOrPrompt({
+    ...keyParams({ ...params, prompter: createPrompter(params) }),
+    ...params,
   });
 }
 
@@ -202,7 +164,7 @@ describe("validateApiKeyInput", () => {
 describe("ensureApiKeyFromEnvOrPrompt", () => {
   it("falls back to prompt when env is declined", async () => {
     setMinimaxEnv({ apiKey: "env-key" });
-    const { confirm, text, setCredential } = createPromptAndCredentialSpies({
+    const { confirm, text, setCredential } = createPromptSpies({
       confirmResult: false,
       textResult: "  prompted-key  ",
     });
@@ -221,10 +183,7 @@ describe("ensureApiKeyFromEnvOrPrompt", () => {
   it("fails ref mode without select when fallback env var is missing", async () => {
     setMinimaxEnv();
 
-    const { confirm, text, setCredential } = createPromptAndCredentialSpies({
-      confirmResult: true,
-      textResult: "prompt-key",
-    });
+    const { confirm, text, setCredential } = createPromptSpies();
 
     await expect(
       ensureMinimaxApiKey({
@@ -271,7 +230,10 @@ describe("ensureApiKeyFromEnvOrPrompt", () => {
     });
 
     expect(result).toBe("env-key");
-    expectMinimaxEnvRefCredentialStored(setCredential);
+    expect(setCredential).toHaveBeenCalledWith(
+      { source: "env", provider: "default", id: "MINIMAX_API_KEY" },
+      "ref",
+    );
     const noteMessages = note.mock.calls.map((call) => call.at(0) ?? "").join("\n");
     expect(noteMessages).not.toContain("env-key");
     expect(note).toHaveBeenCalledWith(
@@ -299,10 +261,7 @@ describe("ensureApiKeyFromEnvOrPrompt", () => {
 
 describe("ensureApiKeyFromOptionEnvOrPrompt", () => {
   it("uses opts token and skips note/env/prompt", async () => {
-    const { confirm, note, text, setCredential } = createPromptAndCredentialSpies({
-      confirmResult: true,
-      textResult: "prompt-key",
-    });
+    const { confirm, note, text, setCredential } = createPromptSpies();
 
     const result = await ensureWithOptionEnvOrPrompt({
       token: "  opts-key  ",
@@ -328,10 +287,7 @@ describe("ensureApiKeyFromOptionEnvOrPrompt", () => {
   it("falls back to env flow and shows note when opts provider does not match", async () => {
     setMinimaxEnv({ apiKey: "env-key" });
 
-    const { confirm, note, text, setCredential } = createPromptAndCredentialSpies({
-      confirmResult: true,
-      textResult: "prompt-key",
-    });
+    const { confirm, note, text, setCredential } = createPromptSpies();
 
     const result = await ensureWithOptionEnvOrPrompt({
       token: "opts-key",

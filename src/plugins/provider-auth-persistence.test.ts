@@ -41,6 +41,40 @@ describe("provider auth protected persistence", () => {
     secretStorage: { kind: "store" as const, namePrefix: "OPENAI_TOKEN" },
   });
 
+  function persistenceFixture(label: string) {
+    const rootDir = tempDirs.make(label);
+    const stateDir = path.join(rootDir, "state");
+    const agentDir = path.join(stateDir, "agents", "main", "agent");
+    const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+    return { rootDir, stateDir, agentDir, env, config: {} };
+  }
+
+  async function rejection(promise: Promise<unknown>): Promise<unknown> {
+    try {
+      await promise;
+    } catch (error) {
+      return error;
+    }
+    throw new Error("Expected rejection");
+  }
+
+  function expectPersistenceFailure(
+    failure: unknown,
+    persistenceError: unknown,
+    cleanupErrors: unknown[],
+    message = "Provider auth persistence failed and staged state could not be fully released.",
+  ) {
+    assert(failure instanceof ProviderAuthPersistenceError);
+    const cleanupError: unknown = failure.errors[1];
+    assert(cleanupError instanceof AggregateError);
+    expect(failure.errors).toEqual([persistenceError, cleanupError]);
+    expect(failure.persistenceError).toBe(persistenceError);
+    expect(failure.cleanupError).toBe(cleanupError);
+    expect(failure.message).toBe(message);
+    expect(failure.cause).toBe(cleanupError);
+    expect(cleanupError.errors).toEqual(cleanupErrors);
+  }
+
   async function resolvePersistedToken(params: {
     agentDir: string;
     env: NodeJS.ProcessEnv;
@@ -65,20 +99,15 @@ describe("provider auth protected persistence", () => {
   }
 
   it.each([1, 2])("rejects revoked login authority at write boundary %s", async (revokeAt) => {
-    const rootDir = tempDirs.make("openclaw-login-revocation-");
-    const stateDir = path.join(rootDir, "state");
-    const agentDir = path.join(stateDir, "agents", "main", "agent");
-    const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+    const fixture = persistenceFixture("openclaw-login-revocation-");
+    const { stateDir, agentDir, env } = fixture;
     let writes = 0;
     const revoked = new Error("Login owner revoked");
     await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
       await expect(
         persistProviderAuthProfileBatch({
           profiles: [protectedTokenProfile("openai:revoked", "synthetic-revoked-token")],
-          config: {},
-          env,
-          stateDir,
-          agentDir,
+          ...fixture,
           beforeWrite: () => {
             if (++writes === revokeAt) {
               throw revoked;
@@ -101,9 +130,8 @@ describe("provider auth protected persistence", () => {
   });
 
   it("stores a provider-minted token behind a resolvable ref without an audit finding", async () => {
-    const rootDir = tempDirs.make("openclaw-provider-auth-store-");
-    const stateDir = path.join(rootDir, "state");
-    const agentDir = path.join(stateDir, "agents", "main", "agent");
+    const fixture = persistenceFixture("openclaw-provider-auth-store-");
+    const { rootDir, stateDir, agentDir } = fixture;
     const configPath = path.join(rootDir, "openclaw.json");
     await fs.writeFile(configPath, "{}\n", "utf8");
     const env = {
@@ -130,10 +158,8 @@ describe("provider auth protected persistence", () => {
               },
             },
           ],
-          config: {},
+          ...fixture,
           env,
-          stateDir,
-          agentDir,
         });
 
         const profile = ensureAuthProfileStore(agentDir, {
@@ -175,10 +201,8 @@ describe("provider auth protected persistence", () => {
   });
 
   it("retains protected material when rollback cannot restore a consumed OAuth generation", async () => {
-    const rootDir = tempDirs.make("openclaw-provider-auth-rollback-");
-    const stateDir = path.join(rootDir, "state");
-    const agentDir = path.join(stateDir, "agents", "main", "agent");
-    const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+    const fixture = persistenceFixture("openclaw-provider-auth-rollback-");
+    const { agentDir } = fixture;
     const profileId = "openai:default";
     const previous = {
       type: "oauth",
@@ -190,31 +214,12 @@ describe("provider auth protected persistence", () => {
     saveAuthProfileStore({ version: 1, profiles: { [profileId]: previous } }, agentDir);
 
     const persisted = await stageProviderAuthProfileBatch({
-      profiles: [
-        {
-          profileId,
-          credential: {
-            type: "token",
-            provider: "openai",
-            token: "replacement-token",
-          },
-          secretStorage: {
-            kind: "store",
-            namePrefix: "OPENAI_TOKEN",
-          },
-        },
-      ],
-      config: {},
-      env,
-      stateDir,
-      agentDir,
+      profiles: [protectedTokenProfile(profileId, "replacement-token")],
+      ...fixture,
     });
     await persisted.rollback();
 
-    const profile = ensureAuthProfileStore(agentDir, {
-      readOnly: true,
-      syncExternalCli: false,
-    }).profiles[profileId];
+    const { profile, token } = await resolvePersistedToken({ ...fixture, profileId });
     expect(profile).toMatchObject({
       type: "token",
       provider: "openai",
@@ -224,31 +229,17 @@ describe("provider auth protected persistence", () => {
         id: expect.stringMatching(/^OPENAI_TOKEN_[A-F0-9]{24}$/),
       },
     });
-    if (!profile || profile.type !== "token" || !profile.tokenRef) {
-      throw new Error("Expected retained tokenRef");
-    }
-    expect(
-      await readSecretStoreValue({
-        scope: { kind: "team" },
-        name: profile.tokenRef.id,
-        database: { env },
-      }),
-    ).toEqual({ ok: true, value: "replacement-token" });
+    expect(token).toBe("replacement-token");
   });
 
   it("serializes protected and inline same-profile stages before restoring baseline C", async () => {
-    const rootDir = tempDirs.make("openclaw-provider-auth-serialized-rollback-");
-    const stateDir = path.join(rootDir, "state");
-    const agentDir = path.join(stateDir, "agents", "main", "agent");
-    const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+    const fixture = persistenceFixture("openclaw-provider-auth-serialized-rollback-");
+    const { stateDir, agentDir, env } = fixture;
     const profileId = "openai:default";
     const persist = (token: string) =>
       persistProviderAuthProfileBatch({
         profiles: [protectedTokenProfile(profileId, token)],
-        config: {},
-        env,
-        stateDir,
-        agentDir,
+        ...fixture,
       });
     const stage = (token: string, protect = true) =>
       stageProviderAuthProfileBatch({
@@ -260,10 +251,7 @@ describe("provider auth protected persistence", () => {
                 credential: { type: "token", provider: "openai", token },
               },
         ],
-        config: {},
-        env,
-        stateDir,
-        agentDir,
+        ...fixture,
       });
 
     await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
@@ -290,27 +278,19 @@ describe("provider auth protected persistence", () => {
   });
 
   it("keeps committed A after a later B stage rolls back", async () => {
-    const rootDir = tempDirs.make("openclaw-provider-auth-serialized-commit-");
-    const stateDir = path.join(rootDir, "state");
-    const agentDir = path.join(stateDir, "agents", "main", "agent");
-    const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+    const fixture = persistenceFixture("openclaw-provider-auth-serialized-commit-");
+    const { stateDir, agentDir, env } = fixture;
     const profileId = "openai:default";
     const stage = (token: string) =>
       stageProviderAuthProfileBatch({
         profiles: [protectedTokenProfile(profileId, token)],
-        config: {},
-        env,
-        stateDir,
-        agentDir,
+        ...fixture,
       });
 
     await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
       await persistProviderAuthProfileBatch({
         profiles: [protectedTokenProfile(profileId, "baseline-c")],
-        config: {},
-        env,
-        stateDir,
-        agentDir,
+        ...fixture,
       });
       const a = await stage("candidate-a");
       await a.commit();
@@ -325,27 +305,19 @@ describe("provider auth protected persistence", () => {
   });
 
   it("reports unconfirmed protected rollback after a policy-only owner change", async () => {
-    const rootDir = tempDirs.make("openclaw-provider-auth-policy-rollback-");
-    const stateDir = path.join(rootDir, "state");
-    const agentDir = path.join(stateDir, "agents", "main", "agent");
-    const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+    const fixture = persistenceFixture("openclaw-provider-auth-policy-rollback-");
+    const { stateDir, env } = fixture;
     const profileId = "openai:default";
     const database = { env };
 
     await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
       await persistProviderAuthProfileBatch({
         profiles: [protectedTokenProfile(profileId, "baseline-c")],
-        config: {},
-        env,
-        stateDir,
-        agentDir,
+        ...fixture,
       });
       const staged = await stageProviderAuthProfileBatch({
         profiles: [protectedTokenProfile(profileId, "candidate-a")],
-        config: {},
-        env,
-        stateDir,
-        agentDir,
+        ...fixture,
       });
       const credential = staged.profiles[0]?.credential;
       if (credential?.type !== "token" || !credential.tokenRef) {
@@ -359,12 +331,7 @@ describe("provider auth protected persistence", () => {
         database,
       });
 
-      let rollbackError: unknown;
-      try {
-        await staged.rollback();
-      } catch (error) {
-        rollbackError = error;
-      }
+      const rollbackError = await rejection(staged.rollback());
       expect(rollbackError).toBeInstanceOf(AggregateError);
       await expect(staged.rollback()).rejects.toBe(rollbackError);
       await expect(staged.commit()).rejects.toBe(rollbackError);
@@ -383,10 +350,7 @@ describe("provider auth protected persistence", () => {
 
       const successor = await stageProviderAuthProfileBatch({
         profiles: [protectedTokenProfile(profileId, "candidate-b")],
-        config: {},
-        env,
-        stateDir,
-        agentDir,
+        ...fixture,
       });
       await successor.commit();
       expect(
@@ -400,10 +364,8 @@ describe("provider auth protected persistence", () => {
   });
 
   it("preserves the persistence failure and protected rollback diagnostics", async () => {
-    const rootDir = tempDirs.make("openclaw-provider-auth-dual-failure-");
-    const stateDir = path.join(rootDir, "state");
-    const agentDir = path.join(stateDir, "agents", "main", "agent");
-    const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+    const fixture = persistenceFixture("openclaw-provider-auth-dual-failure-");
+    const { env } = fixture;
     const database = { env };
     const persistenceError = new Error("profile persistence failed");
 
@@ -422,30 +384,14 @@ describe("provider auth protected persistence", () => {
       throw persistenceError;
     });
 
-    let failure: unknown;
-    try {
-      await stageProviderAuthProfileBatch({
+    const failure = await rejection(
+      stageProviderAuthProfileBatch({
         profiles: [protectedTokenProfile("openai:default", "candidate-a")],
-        config: {},
-        env,
-        stateDir,
-        agentDir,
-      });
-    } catch (error) {
-      failure = error;
-    }
-
-    assert(failure instanceof ProviderAuthPersistenceError);
-    const cleanupError: unknown = failure.errors[1];
-    assert(cleanupError instanceof AggregateError);
-    expect(failure.errors).toEqual([persistenceError, cleanupError]);
-    expect(failure.persistenceError).toBe(persistenceError);
-    expect(failure.cleanupError).toBe(cleanupError);
-    expect(failure.message).toBe(
-      "Provider auth persistence failed and staged state could not be fully released.",
+        ...fixture,
+      }),
     );
-    expect(failure.cause).toBe(cleanupError);
-    expect(cleanupError.errors).toEqual([
+
+    expectPersistenceFailure(failure, persistenceError, [
       new Error('Protected credential rollback lost ownership for profile "openai:default".'),
     ]);
   });
@@ -465,35 +411,28 @@ describe("provider auth protected persistence", () => {
         throw persistenceError;
       });
 
-    let failure: unknown;
-    try {
-      await stageProviderAuthProfileBatch({
+    const failure = await rejection(
+      stageProviderAuthProfileBatch({
         profiles: [
           protectedTokenProfile("openai:first", "candidate-a"),
           protectedTokenProfile("openai:second", "candidate-b"),
         ],
         config: {},
         stateDir,
-      });
-    } catch (error) {
-      failure = error;
-    }
+      }),
+    );
     write.mockRestore();
 
     assert(failure instanceof ProviderAuthPersistenceError);
     const materializationError: unknown = failure.errors[0];
     assert(materializationError instanceof Error);
     expect(materializationError.cause).toBe(persistenceError);
-    const cleanupError: unknown = failure.errors[1];
-    assert(cleanupError instanceof AggregateError);
-    expect(failure.errors).toEqual([materializationError, cleanupError]);
-    expect(failure.persistenceError).toBe(materializationError);
-    expect(failure.cleanupError).toBe(cleanupError);
-    expect(failure.message).toBe(
+    expectPersistenceFailure(
+      failure,
+      materializationError,
+      [rollbackError],
       "Provider credential persistence failed and protected-store rollback could not be confirmed.",
     );
-    expect(cleanupError.errors).toEqual([rollbackError]);
-    expect(failure.cause).toBe(cleanupError);
     expect(rollback).toHaveBeenCalledOnce();
   });
 
@@ -513,38 +452,23 @@ describe("provider auth protected persistence", () => {
       };
     });
 
-    let failure: unknown;
-    try {
-      await stageProviderAuthProfileBatch({
+    const failure = await rejection(
+      stageProviderAuthProfileBatch({
         profiles: [protectedTokenProfile("openai:default", "candidate-a")],
         config: {},
         stateDir,
         beforeWrite: () => {
           throw persistenceError;
         },
-      });
-    } catch (error) {
-      failure = error;
-    }
-
-    assert(failure instanceof ProviderAuthPersistenceError);
-    const cleanupError: unknown = failure.errors[1];
-    assert(cleanupError instanceof AggregateError);
-    expect(failure.errors).toEqual([persistenceError, cleanupError]);
-    expect(failure.persistenceError).toBe(persistenceError);
-    expect(failure.cleanupError).toBe(cleanupError);
-    expect(failure.message).toBe(
-      "Provider auth persistence failed and staged state could not be fully released.",
+      }),
     );
-    expect(cleanupError.errors).toEqual([releaseError]);
-    expect(failure.cause).toBe(cleanupError);
+
+    expectPersistenceFailure(failure, persistenceError, [releaseError]);
   });
 
   it("clears completed-login failure state in the immediate-commit path", async () => {
-    const rootDir = tempDirs.make("openclaw-provider-auth-login-reset-");
-    const stateDir = path.join(rootDir, "state");
-    const agentDir = path.join(stateDir, "agents", "main", "agent");
-    const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+    const fixture = persistenceFixture("openclaw-provider-auth-login-reset-");
+    const { agentDir } = fixture;
     const profileId = "openai:default";
     const lastUsed = Date.now() - 10_000;
     saveAuthProfileStore(
@@ -572,10 +496,7 @@ describe("provider auth protected persistence", () => {
           credential: { type: "token", provider: "openai", token: "fresh-token" },
         },
       ],
-      config: {},
-      env,
-      stateDir,
-      agentDir,
+      ...fixture,
     });
 
     expect(

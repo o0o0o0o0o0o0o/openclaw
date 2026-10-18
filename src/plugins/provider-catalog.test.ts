@@ -83,21 +83,6 @@ function createCatalogContext(params: {
   };
 }
 
-function expectCatalogTemplateMatch(params: {
-  entries: Parameters<typeof findCatalogTemplate>[0]["entries"];
-  providerId: string;
-  templateIds: readonly string[];
-  expected: ReturnType<typeof findCatalogTemplate>;
-}) {
-  expect(
-    findCatalogTemplate({
-      entries: params.entries,
-      providerId: params.providerId,
-      templateIds: params.templateIds,
-    }),
-  ).toEqual(params.expected);
-}
-
 describe("findCatalogTemplate", () => {
   it("keeps template priority and the first matching catalog entry", () => {
     const fallback = { provider: "demo", id: "fallback" };
@@ -130,32 +115,6 @@ describe("findCatalogTemplate", () => {
   });
 });
 
-function createSingleCatalogProvider(overrides: Partial<ModelProviderConfig> & { apiKey: string }) {
-  return {
-    provider: {
-      ...createProviderConfig(overrides),
-      apiKey: overrides.apiKey,
-    },
-  };
-}
-
-async function expectSingleCatalogResult(params: {
-  ctx: ProviderCatalogContext;
-  providerId?: string;
-  allowExplicitBaseUrl?: boolean;
-  buildProvider?: () => ModelProviderConfig;
-  expected: Awaited<ReturnType<typeof buildSingleProviderApiKeyCatalog>>;
-}) {
-  const result = await buildSingleProviderApiKeyCatalog({
-    ctx: params.ctx,
-    providerId: params.providerId ?? "test-provider",
-    buildProvider: params.buildProvider ?? (() => createProviderConfig()),
-    allowExplicitBaseUrl: params.allowExplicitBaseUrl,
-  });
-
-  expect(result).toEqual(params.expected);
-}
-
 describe("buildSingleProviderApiKeyCatalog", () => {
   it.each([
     {
@@ -179,82 +138,43 @@ describe("buildSingleProviderApiKeyCatalog", () => {
       expected: undefined,
     },
   ] as const)("$name", ({ entries, providerId, templateIds, expected }) => {
-    expectCatalogTemplateMatch({
-      entries,
-      providerId,
-      templateIds,
-      expected,
-    });
+    expect(findCatalogTemplate({ entries, providerId, templateIds })).toEqual(expected);
   });
   it.each([
-    {
-      name: "returns null when api key is missing",
-      ctx: createCatalogContext({}),
-      expected: null,
-    },
-    {
-      name: "adds api key to the built provider",
-      ctx: createCatalogContext({
-        apiKeys: { "test-provider": "secret-key" },
-      }),
-      expected: createSingleCatalogProvider({
-        apiKey: "secret-key",
-      }),
-    },
-    {
-      name: "prefers explicit base url when allowed",
-      ctx: createCatalogContext({
-        apiKeys: { "test-provider": "secret-key" },
-        config: {
-          models: {
-            providers: {
-              "test-provider": {
-                baseUrl: " https://override.example/v1/ ",
-                models: [],
-              },
-            },
-          },
-        },
-      }),
-      allowExplicitBaseUrl: true,
-      expected: createSingleCatalogProvider({
-        baseUrl: "https://override.example/v1/",
-        apiKey: "secret-key",
-      }),
-    },
-    {
-      name: "matches explicit base url config for exact provider ids",
-      ctx: createCatalogContext({
-        apiKeys: { "z.ai": "secret-key" },
-        config: {
-          models: {
-            providers: {
-              "z.ai": {
-                baseUrl: " https://api.z.ai/custom ",
-                models: [],
-              },
-            },
-          },
-        },
-      }),
-      allowExplicitBaseUrl: true,
-      expected: createSingleCatalogProvider({
-        baseUrl: "https://api.z.ai/custom",
-        apiKey: "secret-key",
-      }),
-      providerId: "z.ai",
-      buildProvider: () => createProviderConfig({ baseUrl: "https://default.example/zai" }),
-    },
-  ] as const)(
-    "$name",
-    async ({ ctx, allowExplicitBaseUrl, expected, providerId, buildProvider }) => {
-      await expectSingleCatalogResult({
-        ctx,
-        ...(providerId ? { providerId } : {}),
-        allowExplicitBaseUrl,
-        ...(buildProvider ? { buildProvider } : {}),
-        expected,
-      });
-    },
-  );
+    ["missing key", "test-provider", undefined, undefined, undefined],
+    ["key injection", "test-provider", "secret-key", undefined, "https://default.example/v1"],
+    [
+      "explicit URL",
+      "test-provider",
+      "secret-key",
+      " https://override.example/v1/ ",
+      "https://override.example/v1/",
+    ],
+    [
+      "exact provider ID",
+      "z.ai",
+      "secret-key",
+      " https://api.z.ai/custom ",
+      "https://api.z.ai/custom",
+    ],
+  ] as const)("%s", async (_name, providerId, apiKey, explicitUrl, expectedUrl) => {
+    const ctx = createCatalogContext({
+      apiKeys: { [providerId]: apiKey },
+      config: explicitUrl
+        ? { models: { providers: { [providerId]: { baseUrl: explicitUrl, models: [] } } } }
+        : {},
+    });
+    const result = await buildSingleProviderApiKeyCatalog({
+      ctx,
+      providerId,
+      allowExplicitBaseUrl: explicitUrl ? true : undefined,
+      buildProvider: () =>
+        createProviderConfig(
+          providerId === "z.ai" ? { baseUrl: "https://default.example/zai" } : {},
+        ),
+    });
+    expect(result).toEqual(
+      apiKey ? { provider: createProviderConfig({ baseUrl: expectedUrl, apiKey }) } : null,
+    );
+  });
 });

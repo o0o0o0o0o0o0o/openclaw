@@ -36,45 +36,26 @@ function account(role: string): MatrixAccountConfig {
   };
 }
 
+const namedAccounts = { ops: account("ops") };
+const namedDefault = { ...account("default"), defaultAccount: "ops", accounts: namedAccounts };
+function selection(
+  name: string,
+  approvalKind: "plugin" | "exec" | "system-agent",
+  accountId: string | null | undefined,
+  matrix: NonNullable<CoreConfig["channels"]>["matrix"],
+  role = "ops",
+) {
+  return { name, approvalKind, accountId, matrix, role };
+}
 const selectionCases = [
-  {
-    name: "explicit named",
-    approvalKind: "plugin" as const,
-    accountId: "OPS",
-    role: "ops",
-    matrix: { ...account("default"), accounts: { ops: account("ops") } },
-  },
-  {
-    name: "named default",
-    approvalKind: "exec" as const,
-    accountId: undefined,
-    role: "ops",
-    matrix: { ...account("default"), defaultAccount: "ops", accounts: { ops: account("ops") } },
-  },
-  {
-    name: "null default",
-    approvalKind: "system-agent" as const,
-    accountId: null,
-    role: "ops",
-    matrix: { ...account("default"), defaultAccount: "ops", accounts: { ops: account("ops") } },
-  },
-  {
-    name: "sole named",
-    approvalKind: "plugin" as const,
-    accountId: undefined,
-    role: "ops",
-    matrix: { accounts: { ops: account("ops") } },
-  },
-  {
-    name: "explicit empty",
-    approvalKind: "exec" as const,
-    accountId: "",
-    role: "default",
-    matrix: { ...account("default"), defaultAccount: "ops", accounts: { ops: account("ops") } },
-  },
+  selection("explicit named", "plugin", "OPS", { ...account("default"), accounts: namedAccounts }),
+  selection("named default", "exec", undefined, namedDefault),
+  selection("null default", "system-agent", null, namedDefault),
+  selection("sole named", "plugin", undefined, { accounts: namedAccounts }),
+  selection("explicit empty", "exec", "", namedDefault, "default"),
 ];
 
-async function expectNoHostSql(stateDir: string, run: () => void | Promise<void>) {
+async function expectNoHostSql(run: () => void | Promise<void>) {
   await closeOpenClawStateDatabaseAsync();
   const observation = observeHostDataSql();
   const sql = observation.calls;
@@ -142,31 +123,24 @@ describe("Matrix approval config boundaries", () => {
       if (!capability?.authorizeActorActionAsync || !capability.getActionAvailabilityState) {
         throw new Error("Matrix approval capability is not registered");
       }
-      await expectNoHostSql(stateDir, async () => {
+      await expectNoHostSql(async () => {
         const context = { cfg, accountId, action: "approve" as const, approvalKind };
         expect(capability.getActionAvailabilityState?.(context)).toEqual({ kind: "enabled" });
+        const authorize = (senderId: string) =>
+          capability.authorizeActorActionAsync!({ ...context, senderId });
         const expectedRole = approvalKind === "plugin" ? "owner" : "exec";
         const excludedRole = approvalKind === "plugin" ? "exec" : "owner";
-        expect(
-          await capability.authorizeActorActionAsync?.({
-            ...context,
-            senderId: `@${role}-${expectedRole}:example.org`,
-          }),
-        ).toEqual({ authorized: true });
+        expect(await authorize(`@${role}-${expectedRole}:example.org`)).toEqual({
+          authorized: true,
+        });
         for (const senderId of [
           `@${role}-${excludedRole}:example.org`,
           "@intruder:example.org",
           "@k:example.org",
         ]) {
-          expect(
-            await capability.authorizeActorActionAsync?.({ ...context, senderId }),
-          ).toMatchObject({
-            authorized: false,
-          });
+          expect(await authorize(senderId)).toMatchObject({ authorized: false });
         }
-        expect(
-          await capability.authorizeActorActionAsync?.({ ...context, senderId: "@K:example.org" }),
-        ).toEqual({ authorized: true });
+        expect(await authorize("@K:example.org")).toEqual({ authorized: true });
       });
     },
   );
@@ -184,7 +158,7 @@ describe("Matrix approval config boundaries", () => {
         },
       };
       installMatrixTestRuntime({ stateDir, cfg });
-      await expectNoHostSql(stateDir, async () => {
+      await expectNoHostSql(async () => {
         for (const approvalKind of ["plugin", "exec", "system-agent"] as const) {
           expect(
             await matrixPlugin.approvalCapability?.authorizeActorActionAsync?.({
@@ -253,7 +227,7 @@ describe("Matrix approval config boundaries", () => {
           isDirectMessage: false,
           logVerboseMessage: () => {},
         });
-      await expectNoHostSql(stateDir, async () => {
+      await expectNoHostSql(async () => {
         await react("@intruder:example.org");
         expect(gateway.resolve).not.toHaveBeenCalled();
         expect(await store.lookup(key)).toEqual(record);

@@ -9,6 +9,16 @@ import type { MatrixSetupInput } from "./setup-config.js";
 import { installMatrixTestRuntime } from "./test-runtime.js";
 import type { CoreConfig } from "./types.js";
 
+function config(matrix: NonNullable<CoreConfig["channels"]>["matrix"]): CoreConfig {
+  return { channels: { matrix } };
+}
+function warnings(cfg: CoreConfig, accountId = "default") {
+  return matrixPlugin.security?.collectWarnings?.({
+    cfg,
+    account: resolveMatrixAccount({ cfg, accountId }),
+  });
+}
+
 describe("matrix target classification", () => {
   it("distinguishes users from rooms", () => {
     expect(matrixPlugin.messaging?.inferTargetChatType?.({ to: "@owner:example.org" })).toBe(
@@ -25,10 +35,7 @@ function requireMatrixDirectory() {
   if (!directory?.listPeers || !directory.listGroups) {
     throw new Error("expected Matrix directory listPeers/listGroups");
   }
-  return {
-    listPeers: directory.listPeers,
-    listGroups: directory.listGroups,
-  };
+  return { listPeers: directory.listPeers, listGroups: directory.listGroups };
 }
 
 function requireMatrixReplyToModeResolver() {
@@ -59,28 +66,18 @@ describe("matrix directory", () => {
   });
 
   it("lists peers and groups from config", async () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          dm: { allowFrom: ["matrix:@alice:example.org", "bob"] },
-          groupAllowFrom: ["@dana:example.org"],
-          groups: {
-            "!room1:example.org": { users: ["@carol:example.org"] },
-            "#alias:example.org": { users: [] },
-          },
-        },
+    const cfg = config({
+      dm: { allowFrom: ["matrix:@alice:example.org", "bob"] },
+      groupAllowFrom: ["@dana:example.org"],
+      groups: {
+        "!room1:example.org": { users: ["@carol:example.org"] },
+        "#alias:example.org": { users: [] },
       },
-    } as unknown as CoreConfig;
+    });
 
     const directory = requireMatrixDirectory();
 
-    const peers = await directory.listPeers({
-      cfg,
-      accountId: undefined,
-      query: undefined,
-      limit: undefined,
-      runtime: runtimeEnv,
-    });
+    const peers = await directory.listPeers({ cfg, runtime: runtimeEnv });
     expect(requireDirectoryEntry(peers, "user", "user:@alice:example.org").name).toBeUndefined();
     expect(requireDirectoryEntry(peers, "user", "bob").name).toBe(
       "incomplete id; expected @user:server",
@@ -88,56 +85,29 @@ describe("matrix directory", () => {
     expect(requireDirectoryEntry(peers, "user", "user:@carol:example.org").name).toBeUndefined();
     expect(requireDirectoryEntry(peers, "user", "user:@dana:example.org").name).toBeUndefined();
 
-    const groups = await directory.listGroups({
-      cfg,
-      accountId: undefined,
-      query: undefined,
-      limit: undefined,
-      runtime: runtimeEnv,
-    });
+    const groups = await directory.listGroups({ cfg, runtime: runtimeEnv });
     expect(requireDirectoryEntry(groups, "group", "room:!room1:example.org").name).toBeUndefined();
     expect(requireDirectoryEntry(groups, "group", "#alias:example.org").name).toBeUndefined();
   });
 
   it("resolves replyToMode from account config", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          replyToMode: "off",
-          accounts: {
-            Assistant: {
-              replyToMode: "all",
-            },
-          },
-        },
+    const cfg = config({
+      replyToMode: "off",
+      accounts: {
+        Assistant: { replyToMode: "all" },
       },
-    } as unknown as CoreConfig;
+    });
 
     const resolveReplyToMode = requireMatrixReplyToModeResolver();
-    expect(
-      resolveReplyToMode({
-        cfg,
-        accountId: "assistant",
-        chatType: "direct",
-      }),
-    ).toBe("all");
-    expect(
-      resolveReplyToMode({
-        cfg,
-        accountId: "default",
-        chatType: "direct",
-      }),
-    ).toBe("off");
+    expect(resolveReplyToMode({ cfg, accountId: "assistant", chatType: "direct" })).toBe("all");
+    expect(resolveReplyToMode({ cfg, accountId: "default", chatType: "direct" })).toBe("off");
   });
 
   it("only exposes real Matrix thread ids in tool context", () => {
     expect(
       matrixPlugin.threading?.buildToolContext?.({
         cfg: {} as CoreConfig,
-        context: {
-          To: "room:!room:example.org",
-          ReplyToId: "$reply",
-        },
+        context: { To: "room:!room:example.org", ReplyToId: "$reply" },
         hasRepliedRef: { value: false },
       }),
     ).toEqual({
@@ -149,11 +119,7 @@ describe("matrix directory", () => {
     expect(
       matrixPlugin.threading?.buildToolContext?.({
         cfg: {} as CoreConfig,
-        context: {
-          To: "room:!room:example.org",
-          ReplyToId: "$reply",
-          MessageThreadId: "$thread",
-        },
+        context: { To: "room:!room:example.org", ReplyToId: "$reply", MessageThreadId: "$thread" },
         hasRepliedRef: { value: true },
       }),
     ).toEqual({
@@ -184,22 +150,18 @@ describe("matrix directory", () => {
   });
 
   it("resolves group mention policy from account config", () => {
-    const cfg = {
-      channels: {
-        matrix: {
+    const cfg = config({
+      groups: {
+        "!room:example.org": { requireMention: true },
+      },
+      accounts: {
+        Assistant: {
           groups: {
-            "!room:example.org": { requireMention: true },
-          },
-          accounts: {
-            Assistant: {
-              groups: {
-                "!room:example.org": { requireMention: false },
-              },
-            },
+            "!room:example.org": { requireMention: false },
           },
         },
       },
-    } as unknown as CoreConfig;
+    });
 
     expect(matrixPlugin.groups!.resolveRequireMention!({ cfg, groupId: "!room:example.org" })).toBe(
       true,
@@ -222,15 +184,11 @@ describe("matrix directory", () => {
   });
 
   it("does not trust prefixed Matrix aliases in group context", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          groups: {
-            "#ops:example.org": { requireMention: false },
-          },
-        },
+    const cfg = config({
+      groups: {
+        "#ops:example.org": { requireMention: false },
       },
-    } as unknown as CoreConfig;
+    });
 
     expect(
       matrixPlugin.groups!.resolveRequireMention!({
@@ -242,27 +200,7 @@ describe("matrix directory", () => {
   });
 
   it("reports room access warnings against the active Matrix config path", () => {
-    expect(
-      matrixPlugin.security?.collectWarnings?.({
-        cfg: {
-          channels: {
-            matrix: {
-              groupPolicy: "open",
-            },
-          },
-        } as CoreConfig,
-        account: resolveMatrixAccount({
-          cfg: {
-            channels: {
-              matrix: {
-                groupPolicy: "open",
-              },
-            },
-          } as CoreConfig,
-          accountId: "default",
-        }),
-      }),
-    ).toEqual([
+    expect(warnings(config({ groupPolicy: "open" }), "default")).toEqual([
       {
         checkId: "channels.matrix.groups.open",
         severity: "warn",
@@ -273,35 +211,15 @@ describe("matrix directory", () => {
     ]);
 
     expect(
-      matrixPlugin.security?.collectWarnings?.({
-        cfg: {
-          channels: {
-            matrix: {
-              defaultAccount: "assistant",
-              accounts: {
-                assistant: {
-                  groupPolicy: "open",
-                },
-              },
-            },
+      warnings(
+        config({
+          defaultAccount: "assistant",
+          accounts: {
+            assistant: { groupPolicy: "open" },
           },
-        } as CoreConfig,
-        account: resolveMatrixAccount({
-          cfg: {
-            channels: {
-              matrix: {
-                defaultAccount: "assistant",
-                accounts: {
-                  assistant: {
-                    groupPolicy: "open",
-                  },
-                },
-              },
-            },
-          } as CoreConfig,
-          accountId: "assistant",
         }),
-      }),
+        "assistant",
+      ),
     ).toEqual([
       {
         checkId: "channels.matrix.groups.open",
@@ -314,49 +232,23 @@ describe("matrix directory", () => {
   });
 
   it("reports invite auto-join warnings only when explicitly enabled", () => {
-    expect(
-      matrixPlugin.security?.collectWarnings?.({
-        cfg: {
-          channels: {
-            matrix: {
-              groupPolicy: "allowlist",
-              autoJoin: "always",
-            },
-          },
-        } as CoreConfig,
-        account: resolveMatrixAccount({
-          cfg: {
-            channels: {
-              matrix: {
-                groupPolicy: "allowlist",
-                autoJoin: "always",
-              },
-            },
-          } as CoreConfig,
-          accountId: "default",
-        }),
-      }),
-    ).toEqual([
+    expect(warnings(config({ groupPolicy: "allowlist", autoJoin: "always" }), "default")).toEqual([
       '- Matrix invites: autoJoin="always" joins any invited room before message policy applies. Set channels.matrix.autoJoin="allowlist" + channels.matrix.autoJoinAllowlist (or channels.matrix.autoJoin="off") to restrict joins.',
     ]);
   });
 
   it("writes matrix non-default account credentials under channels.matrix.accounts", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://default.example.org",
-          accessToken: "default-token",
-          deviceId: "DEFAULTDEVICE",
-          avatarUrl: "mxc://server/avatar",
-          encryption: true,
-          threadReplies: "inbound",
-          groups: {
-            "!room:example.org": { requireMention: true },
-          },
-        },
+    const cfg = config({
+      homeserver: "https://default.example.org",
+      accessToken: "default-token",
+      deviceId: "DEFAULTDEVICE",
+      avatarUrl: "mxc://server/avatar",
+      encryption: true,
+      threadReplies: "inbound",
+      groups: {
+        "!room:example.org": { requireMention: true },
       },
-    } as unknown as CoreConfig;
+    });
 
     const updated = matrixPlugin.setupContract!.applyAccountConfig({
       cfg,
@@ -394,14 +286,10 @@ describe("matrix directory", () => {
   });
 
   it("writes default matrix account credentials under channels.matrix.accounts.default", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          homeserver: "https://legacy.example.org",
-          accessToken: "legacy-token",
-        },
-      },
-    } as unknown as CoreConfig;
+    const cfg = config({
+      homeserver: "https://legacy.example.org",
+      accessToken: "legacy-token",
+    });
 
     const updated = matrixPlugin.setupContract!.applyAccountConfig({
       cfg,
@@ -468,32 +356,25 @@ describe("matrix directory", () => {
         MATRIX_OPS_DEVICE_NAME: "Ops Env Device",
       },
       () => {
-        const cfg = {
-          channels: {
-            matrix: {
-              accounts: {
-                ops: {
-                  homeserver: "https://ops.inline.example.org",
-                  proxy: "http://127.0.0.1:7890",
-                  userId: "@ops:inline.example.org",
-                  accessToken: "ops-inline-token",
-                  password: "ops-inline-password", // pragma: allowlist secret
-                  deviceId: "OPSINLINEDEVICE",
-                  deviceName: "Ops Inline Device",
-                  encryption: true,
-                },
-              },
+        const cfg = config({
+          accounts: {
+            ops: {
+              homeserver: "https://ops.inline.example.org",
+              proxy: "http://127.0.0.1:7890",
+              userId: "@ops:inline.example.org",
+              accessToken: "ops-inline-token",
+              password: "ops-inline-password", // pragma: allowlist secret
+              deviceId: "OPSINLINEDEVICE",
+              deviceName: "Ops Inline Device",
+              encryption: true,
             },
           },
-        } as unknown as CoreConfig;
+        });
 
         const updated = matrixPlugin.setupContract!.applyAccountConfig({
           cfg,
           accountId: "ops",
-          input: {
-            useEnv: true,
-            name: "Ops",
-          },
+          input: { useEnv: true, name: "Ops" },
         }) as CoreConfig;
 
         const opsAccount = updated.channels?.["matrix"]?.accounts?.ops;
@@ -517,18 +398,14 @@ describe("matrix directory", () => {
   });
 
   it("clears stale access token when switching an account to password auth", () => {
-    const cfg = {
-      channels: {
-        matrix: {
-          accounts: {
-            default: {
-              homeserver: "https://matrix.example.org",
-              accessToken: "old-token",
-            },
-          },
+    const cfg = config({
+      accounts: {
+        default: {
+          homeserver: "https://matrix.example.org",
+          accessToken: "old-token",
         },
       },
-    } as unknown as CoreConfig;
+    });
 
     const updated = matrixPlugin.setupContract!.applyAccountConfig({
       cfg,

@@ -128,6 +128,34 @@ function waitForFixtureReady(child: childProcess.ChildProcess): Promise<void> {
   });
 }
 
+function observeFixtureSpawn(fixture: { root: string }, waitForReady = true) {
+  const spawn = childProcess.spawn;
+  const observed: {
+    child?: childProcess.ChildProcess;
+    ready?: Promise<void>;
+    closed?: Promise<unknown>;
+  } = {};
+  const spy = vi.spyOn(childProcess, "spawn").mockImplementation((...args) => {
+    const spawned = spawn(...args);
+    if (
+      Array.isArray(args[1]) &&
+      args[1].includes(path.join(fixture.root, "startup-failure.mjs"))
+    ) {
+      observed.child = spawned;
+      observed.ready = waitForReady ? waitForFixtureReady(spawned) : undefined;
+      observed.closed = once(spawned, "close");
+    }
+    return spawned;
+  });
+  return Object.assign(observed, { restore: () => spy.mockRestore() });
+}
+function clientOptions(fixture: { root: string; pluginConfig: CodexPluginConfig }) {
+  return {
+    startOptions: resolveCodexAppServerRuntimeOptions({ pluginConfig: fixture.pluginConfig }).start,
+    agentDir: path.join(fixture.root, "agent"),
+  };
+}
+
 describe("Codex app-server startup retry", () => {
   beforeEach(async () => {
     const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-startup-state-"));
@@ -162,31 +190,18 @@ describe("Codex app-server startup retry", () => {
           maxEntries: 512,
           overflowPolicy: "reject-new",
         });
-        const spawn = childProcess.spawn;
         const readSnapshot = processSnapshot.readCodexAppServerProcessSnapshot;
         const readCommand = processSnapshot.readCodexAppServerProcessCommand;
-        let child: childProcess.ChildProcess | undefined;
-        let ready: Promise<void> | undefined;
-        const spawnSpy = vi.spyOn(childProcess, "spawn").mockImplementation((...args) => {
-          const spawned = spawn(...args);
-          if (
-            Array.isArray(args[1]) &&
-            args[1].includes(path.join(fixture.root, "startup-failure.mjs"))
-          ) {
-            child = spawned;
-            ready = waitForFixtureReady(spawned);
-          }
-          return spawned;
-        });
+        const observed = observeFixtureSpawn(fixture);
         const snapshotSpy = vi
           .spyOn(processSnapshot, "readCodexAppServerProcessSnapshot")
           .mockImplementation(async (...args) => {
-            if (!child) {
+            if (!observed.child) {
               return readSnapshot(...args);
             }
-            await ready;
-            expect(child.exitCode).toBeNull();
-            expect(child.signalCode).toBeNull();
+            await observed.ready;
+            expect(observed.child.exitCode).toBeNull();
+            expect(observed.child.signalCode).toBeNull();
             return failure === "snapshot"
               ? readSnapshot(performance.now() - 1)
               : readSnapshot(...args);
@@ -216,18 +231,22 @@ describe("Codex app-server startup retry", () => {
           expect((error as Error).message).toContain("startup diagnostic: inspection probe");
           expect(await fs.readFile(fixture.spawnCountPath, "utf8")).toBe("1");
           await expect(fs.access(fixture.requestLogPath)).rejects.toMatchObject({ code: "ENOENT" });
-          expect(child?.exitCode).toBe(0);
-          expect(child?.signalCode).toBeNull();
-          expect(child?.stdout?.destroyed).toBe(true);
-          expect(child?.stderr?.destroyed).toBe(true);
+          expect(observed.child?.exitCode).toBe(0);
+          expect(observed.child?.signalCode).toBeNull();
+          expect(observed.child?.stdout?.destroyed).toBe(true);
+          expect(observed.child?.stderr?.destroyed).toBe(true);
         } finally {
-          spawnSpy.mockRestore();
+          observed.restore();
           snapshotSpy.mockRestore();
           commandSpy.mockRestore();
           store.clear();
-          if (child && child.exitCode === null && child.signalCode === null) {
-            const exited = once(child, "exit");
-            child.kill("SIGKILL");
+          if (
+            observed.child &&
+            observed.child.exitCode === null &&
+            observed.child.signalCode === null
+          ) {
+            const exited = once(observed.child, "exit");
+            observed.child.kill("SIGKILL");
             await exited;
           }
         }
@@ -243,30 +262,15 @@ describe("Codex app-server startup retry", () => {
       );
       const refusal = new Error("startup owner revoked");
       let current = true;
-      const spawn = childProcess.spawn;
-      let child: childProcess.ChildProcess | undefined;
-      let ready: Promise<void> | undefined;
-      let closed: Promise<unknown> | undefined;
-      const spawnSpy = vi.spyOn(childProcess, "spawn").mockImplementation((...args) => {
-        const spawned = spawn(...args);
-        if (
-          Array.isArray(args[1]) &&
-          args[1].includes(path.join(fixture.root, "startup-failure.mjs"))
-        ) {
-          child = spawned;
-          ready = mode === "live child" ? waitForFixtureReady(spawned) : undefined;
-          closed = once(spawned, "close");
-        }
-        return spawned;
-      });
+      const observed = observeFixtureSpawn(fixture, mode === "live child");
       const readSnapshot = processSnapshot.readCodexAppServerProcessSnapshot;
       const snapshotSpy = vi
         .spyOn(processSnapshot, "readCodexAppServerProcessSnapshot")
         .mockImplementation(async (...args) => {
           if (mode === "natural exit") {
-            await closed;
+            await observed.closed;
           } else {
-            await ready;
+            await observed.ready;
           }
           const rows = await readSnapshot(...args);
           current = false;
@@ -283,11 +287,11 @@ describe("Codex app-server startup retry", () => {
             },
           ),
         ).rejects.toBe(refusal);
-        expect(child?.exitCode).toBe(mode === "natural exit" ? 1 : 0);
-        expect(child?.signalCode).toBeNull();
+        expect(observed.child?.exitCode).toBe(mode === "natural exit" ? 1 : 0);
+        expect(observed.child?.signalCode).toBeNull();
         await expect(fs.access(fixture.requestLogPath)).rejects.toMatchObject({ code: "ENOENT" });
       } finally {
-        spawnSpy.mockRestore();
+        observed.restore();
         snapshotSpy.mockRestore();
       }
     },
@@ -299,36 +303,19 @@ describe("Codex app-server startup retry", () => {
   ] as const)("preserves cancellation during %s registration", async (mode, factory) => {
     const fixture = await createStartupFailureFixture("refusal");
     const controller = new AbortController();
-    const spawn = childProcess.spawn;
     const readCommand = processSnapshot.readCodexAppServerProcessCommand;
-    let child: childProcess.ChildProcess | undefined;
-    let ready: Promise<void> | undefined;
-    let closed: Promise<unknown> | undefined;
-    const spawnSpy = vi.spyOn(childProcess, "spawn").mockImplementation((...args) => {
-      const spawned = spawn(...args);
-      if (
-        Array.isArray(args[1]) &&
-        args[1].includes(path.join(fixture.root, "startup-failure.mjs"))
-      ) {
-        child = spawned;
-        ready = waitForFixtureReady(spawned);
-        closed = once(spawned, "close");
-      }
-      return spawned;
-    });
+    const observed = observeFixtureSpawn(fixture);
     const commandSpy = vi
       .spyOn(processSnapshot, "readCodexAppServerProcessCommand")
       .mockImplementation(async (...args) => {
-        await ready;
+        await observed.ready;
         const command = await readCommand(...args);
         controller.abort();
         return command;
       });
     try {
       const options = {
-        startOptions: resolveCodexAppServerRuntimeOptions({ pluginConfig: fixture.pluginConfig })
-          .start,
-        agentDir: path.join(fixture.root, "agent"),
+        ...clientOptions(fixture),
         authProfileStore: { version: 1 as const, profiles: {} },
       };
       await expect(factory({ ...options, abandonSignal: controller.signal })).rejects.toMatchObject(
@@ -336,20 +323,20 @@ describe("Codex app-server startup retry", () => {
       );
       if (mode === "shared") {
         const client = await getLeasedSharedCodexAppServerClient(options);
-        expect(child?.exitCode).toBeNull();
+        expect(observed.child?.exitCode).toBeNull();
         expect(await fs.readFile(fixture.requestLogPath, "utf8")).toContain("initialize\n");
         releaseLeasedSharedCodexAppServerClient(client);
         await clearSharedCodexAppServerClientAndWait();
       }
-      await closed;
-      expect(child?.exitCode).toBe(0);
-      expect(child?.signalCode).toBeNull();
+      await observed.closed;
+      expect(observed.child?.exitCode).toBe(0);
+      expect(observed.child?.signalCode).toBeNull();
       expect(await fs.readFile(fixture.spawnCountPath, "utf8")).toBe("1");
       if (mode === "isolated") {
         await expect(fs.access(fixture.requestLogPath)).rejects.toMatchObject({ code: "ENOENT" });
       }
     } finally {
-      spawnSpy.mockRestore();
+      observed.restore();
       commandSpy.mockRestore();
     }
   });
@@ -426,11 +413,7 @@ describe("Codex app-server startup retry", () => {
       sibling.releaseSharedClientLease();
       expect(sibling.client.getCloseError()).toBeUndefined();
 
-      const reacquired = await getLeasedSharedCodexAppServerClient({
-        startOptions: resolveCodexAppServerRuntimeOptions({ pluginConfig: fixture.pluginConfig })
-          .start,
-        agentDir: path.join(fixture.root, "agent"),
-      });
+      const reacquired = await getLeasedSharedCodexAppServerClient(clientOptions(fixture));
       try {
         expect(reacquired).toBe(sibling.client);
         expect(reacquired.getCloseError()).toBeUndefined();

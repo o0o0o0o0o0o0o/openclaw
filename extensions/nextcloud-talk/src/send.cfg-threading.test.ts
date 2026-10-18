@@ -1,11 +1,8 @@
-import {
-  createSendCfgThreadingRuntime,
-  expectProvidedCfgSkipsRuntimeLoad,
-} from "openclaw/plugin-sdk/channel-test-helpers";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const hoisted = vi.hoisted(() => ({
-  loadConfig: vi.fn(),
+  currentConfig: vi.fn(() => ({})),
   resolveMarkdownTableMode: vi.fn(() => "preserve"),
   convertMarkdownTables: vi.fn((text: string) => text),
   record: vi.fn(),
@@ -23,7 +20,11 @@ vi.mock("./send.runtime.js", () => {
     convertMarkdownTables: hoisted.convertMarkdownTables,
     fetchWithSsrFGuard: hoisted.mockFetchGuard,
     generateNextcloudTalkSignature: hoisted.generateNextcloudTalkSignature,
-    getOptionalNextcloudTalkRuntime: () => createSendCfgThreadingRuntime(hoisted),
+    getOptionalNextcloudTalkRuntime: () =>
+      createPluginRuntimeMock({
+        config: { current: hoisted.currentConfig },
+        channel: { activity: { record: hoisted.record } },
+      }),
     requireRuntimeConfig: (cfg: unknown, context: string) => {
       if (cfg) {
         return cfg;
@@ -62,7 +63,7 @@ describe("nextcloud-talk send cfg threading", () => {
       const response = await globalThis.fetch(p.url, p.init);
       return { response, release: async () => {}, finalUrl: p.url };
     });
-    hoisted.loadConfig.mockReset();
+    hoisted.currentConfig.mockReset();
     hoisted.resolveMarkdownTableMode.mockClear();
     hoisted.convertMarkdownTables.mockClear();
     hoisted.record.mockReset();
@@ -154,9 +155,8 @@ describe("nextcloud-talk send cfg threading", () => {
       accountId: "work",
     });
 
-    expectProvidedCfgSkipsRuntimeLoad({
-      loadConfig: hoisted.loadConfig,
-      resolveAccount: hoisted.resolveNextcloudTalkAccount,
+    expect(hoisted.currentConfig).not.toHaveBeenCalled();
+    expect(hoisted.resolveNextcloudTalkAccount).toHaveBeenCalledWith({
       cfg,
       accountId: "work",
     });

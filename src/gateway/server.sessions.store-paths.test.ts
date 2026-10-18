@@ -35,6 +35,7 @@ import { releaseGatewaySessionStoreFixture } from "./test/server-sessions-resour
 import {
   directSessionReq,
   getGatewayConfigModule,
+  sessionStoreEntry,
   setupGatewaySessionsTestHarness,
 } from "./test/server-sessions.test-helpers.js";
 
@@ -108,10 +109,10 @@ test.each([false, true])(
       // Seed a fresh key after interception so its receipt cannot bypass the held read.
       await writeSessionStore({
         entries: {
-          [`agent:main:nested-state-reader-${disposalFails}`]: {
-            sessionId: `nested-state-reader-${disposalFails}`,
-            updatedAt: 1,
-          },
+          [`agent:main:nested-state-reader-${disposalFails}`]: sessionStoreEntry(
+            `nested-state-reader-${disposalFails}`,
+            { updatedAt: 1 },
+          ),
         },
       });
       sessionChanges.emit({ all: true, scope: { storePath }, factsInvalidated: true });
@@ -212,13 +213,8 @@ test("sessions.list reads completed models from each physical agent store", asyn
         projection.snapshot({ agentId: "main", key: "agent:main:main" }).row?.activeModel,
       ).toBe("claude-sonnet-4-6"),
     );
-    const listed = await directSessionReq<SessionsListResult>(
-      "sessions.list",
-      {},
-      {
-        context: bindSessionRowProjection({}, () => projection),
-      },
-    );
+    const context = bindSessionRowProjection({}, () => projection);
+    const listed = await directSessionReq<SessionsListResult>("sessions.list", {}, { context });
     expect(listed).toMatchObject({ ok: true, payload: { path: "(multiple)" } });
     expect(listed.payload?.sessions.find((row) => row.key === "agent:main:main")).toMatchObject({
       activeModelProvider: "anthropic",
@@ -249,7 +245,7 @@ test.runIf(process.platform !== "win32")(
       await writeSessionStore({
         agentId: "main",
         entries: {
-          "agent:main:main": { sessionId: "alias-main", updatedAt: 10 },
+          "agent:main:main": sessionStoreEntry("alias-main", { updatedAt: 10 }),
         },
         storePath: realStore,
       });
@@ -332,10 +328,7 @@ test("resolves and patches main alias to default agent main key", async () => {
     agentId: "ops",
     mainKey: "work",
     entries: {
-      main: {
-        sessionId: "sess-ops-main",
-        updatedAt: Date.now(),
-      },
+      main: sessionStoreEntry("sess-ops-main"),
     },
   });
 

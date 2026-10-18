@@ -1,13 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
 import path from "node:path";
 import { json } from "node:stream/consumers";
 import { expect, it, vi } from "vitest";
 import { createOpenAiResponsesModelConfig } from "../../test/helpers/openai-responses-model-fixture.js";
-import {
-  writeOpenAiResponsesSse,
-  writeOpenAiResponsesText,
-} from "../../test/helpers/openai-responses-sse.js";
+import { writeOpenAiResponsesText } from "../../test/helpers/openai-responses-sse.js";
 import { withinTest } from "../../test/helpers/promise.js";
 import { runQaGatewayFixture } from "../../test/helpers/qa-gateway-cleanup.js";
 import { resetSubagentRegistryForTests } from "../agents/subagents/registry/subagent-registry.test-helpers.js";
@@ -26,6 +22,7 @@ import {
   resetGatewayTestState,
   setupGatewayTempHome,
 } from "./gateway.test-support.js";
+import { startProofProvider, writeProofToolCall } from "./server.provider-proof.test-support.js";
 import type { SessionsListResult } from "./session-utils.types.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "./test-helpers.e2e.js";
 
@@ -42,8 +39,8 @@ async function startProvider() {
   let notice = createDeferredCore<ProviderRequest>();
   let spawn: Receipt | undefined;
   let spawnRequested = false;
-  const server = createServer((request, response) => {
-    void (async () => {
+  const server = await startProofProvider(async (request, response) => {
+    try {
       const body = (await json(request)) as ProviderRequest;
       requests.push(body);
       const input = JSON.stringify(body.input);
@@ -73,25 +70,7 @@ async function startProvider() {
             expectsCompletionMessage: false,
           }),
         };
-        writeOpenAiResponsesSse(response, [
-          { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
-          {
-            type: "response.function_call_arguments.delta",
-            item_id: item.id,
-            output_index: 0,
-            delta: item.arguments,
-          },
-          { type: "response.output_item.done", output_index: 0, item },
-          {
-            type: "response.completed",
-            response: {
-              id: "resp_spawn",
-              status: "completed",
-              output: [item],
-              usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-            },
-          },
-        ]);
+        writeProofToolCall(response, item, "resp_spawn", "delta");
       } else {
         writeOpenAiResponsesText(response, {
           text: title ? "Store lifecycle proof" : isNotice ? "NOTICE-RECEIVED" : "CHILD-DONE",
@@ -102,24 +81,16 @@ async function startProvider() {
       if (isNotice) {
         notice.resolve(body);
       }
-    })().catch((error: unknown) => {
+    } catch (error) {
       errors.push(error);
       if (!response.headersSent) {
         response.writeHead(500);
       }
       response.end();
-    });
+    }
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Provider did not bind");
-  }
   return {
-    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    baseUrl: server.baseUrl,
     requests,
     errors,
     armNoticeObservation() {
@@ -129,12 +100,7 @@ async function startProvider() {
     get spawn() {
       return spawn;
     },
-    async stop() {
-      server.closeAllConnections();
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
-      });
-    },
+    stop: server.close,
   };
 }
 
@@ -164,7 +130,7 @@ it.for(["different store", "same-store replacement"] as const)(
         const oldStore = path.join(home.tempHome, "old-store", "sessions.json");
         const newStore = path.join(home.tempHome, "new-store", "sessions.json");
         const { models } = createOpenAiResponsesModelConfig({
-          baseUrl: provider.baseUrl.slice(0, -3),
+          baseUrl: provider.baseUrl,
           providerId: "proof",
           modelId: "primary",
           reasoning: false,

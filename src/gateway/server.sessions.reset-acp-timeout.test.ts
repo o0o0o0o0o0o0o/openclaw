@@ -39,16 +39,6 @@ afterEach(closeOpenClawStateDatabaseForTest);
 const sessionKey = "agent:main:main";
 const readSession = (storePath: string) => loadSessionEntry({ storePath, sessionKey });
 const readAcp = () => readAcpSessionEntry({ sessionKey })?.acp;
-const acpSettings = {
-  backend: "acpx",
-  agent: "codex",
-  runtimeSessionName: "runtime:reset",
-  mode: "persistent",
-  runtimeOptions: { runtimeMode: "auto", timeoutSeconds: 30 },
-  cwd: "/tmp/acp-session",
-  state: "idle",
-} satisfies Partial<SessionAcpMeta>;
-
 const ownerRepairError = () =>
   new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "owner repair required", {
     detailCode: "SESSION_OWNER_MIGRATION_REQUIRED",
@@ -69,8 +59,13 @@ async function resetSession(options: Partial<ResetOptions> = {}) {
 
 function resolvedAcpMeta(): SessionAcpMeta {
   return {
-    ...acpSettings,
-    runtimeOptions: { ...acpSettings.runtimeOptions },
+    backend: "acpx",
+    agent: "codex",
+    runtimeSessionName: "runtime:reset",
+    mode: "persistent",
+    runtimeOptions: { runtimeMode: "auto", timeoutSeconds: 30 },
+    cwd: "/tmp/acp-session",
+    state: "idle",
     identity: {
       state: "resolved",
       acpxRecordId: sessionKey,
@@ -121,7 +116,7 @@ async function seedAcpSession() {
 }
 
 test.each(["source-and-acp", "acp", "committed-callback"])(
-  "settles committed reset actions after %s failure",
+  "settles reset actions after %s failure",
   async (failure) => {
     const { prepareFreshSession, storePath } = await seedAcpSession();
     const childKey = "agent:main:subagent:watched";
@@ -133,6 +128,12 @@ test.each(["source-and-acp", "acp", "committed-callback"])(
     const committedCallbackFailure = new Error("committed callback failed");
     const postCommitFailure = ownerRepairError();
     const events: string[] = [];
+    const step = (name: string, error?: Error) => {
+      events.push(name);
+      if (error) {
+        throw error;
+      }
+    };
     const notified = vi.fn();
     const unsubscribeReset = onGatewaySessionReset(notified);
     const rollback = vi.fn(async () => {});
@@ -153,34 +154,24 @@ test.each(["source-and-acp", "acp", "committed-callback"])(
       { targetSessionKey: childKey, watcherStorePath: drained[0]?.sessionStorePath ?? null },
     ]);
     prepareFreshSession.mockImplementation(async () => {
-      events.push("runtime-preparation");
-      if (postCommitFails) {
-        throw postCommitFailure;
-      }
+      step("runtime-preparation", postCommitFails ? postCommitFailure : undefined);
     });
     beforeResetHookState.hasBeforeResetHook = true;
     if (!postCommitFails) {
       beforeResetHookMocks.runBeforeReset.mockImplementationOnce(async () => {
-        events.push("before-reset");
+        step("before-reset");
       });
     }
     const reset = resetSession({
-      onCommitted: () => {
-        events.push("committed");
-        if (committedCallbackFails) {
-          throw committedCallbackFailure;
-        }
-      },
+      onCommitted: () =>
+        step("committed", committedCallbackFails ? committedCallbackFailure : undefined),
       prepareLifecycle: async () => ({
         ok: true,
         value: {
           rollback,
           withCommit: async (run) => {
             const result = await run(() => {});
-            events.push("source-closed");
-            if (sourceFails) {
-              throw sourceFailure;
-            }
+            step("source-closed", sourceFails ? sourceFailure : undefined);
             return result;
           },
         },
@@ -226,7 +217,7 @@ test.each(["source-and-acp", "acp", "committed-callback"])(
 );
 
 test.each(["cancelSession", "closeSession"] as const)(
-  "sessions.reset force-discards ACP ownership after %s timeout",
+  "discards ACP ownership after %s timeout",
   async (step) => {
     const { prepareFreshSession, storePath } = await seedAcpSession();
     const stalled = createDeferredCore();
@@ -260,27 +251,24 @@ test.each(["cancelSession", "closeSession"] as const)(
   },
 );
 
-test.each([true, false])(
-  "reset binds legacy ACP metadata to the committed canonical row (existing=%s)",
-  async (existing) => {
-    const { storePath } = await createSessionStoreDir();
-    await writeSessionStore({
-      entries: existing ? { main: sessionStoreEntry("legacy-main") } : {},
-    });
-    const { identity: _identity, ...legacyMeta } = resolvedAcpMeta();
-    seedCanonicalAcpSessionMeta({ sessionKey, meta: legacyMeta });
-    const reset = await directSessionReq("sessions.reset", { key: "main" });
-    expect(reset.ok).toBe(true);
-    const entry = readSession(storePath);
-    expect(entry?.lifecycleRevision).toEqual(expect.any(String));
-    const meta = readAcpSessionEntry({ sessionKey, agentId: "main" })?.acp;
-    expect(meta).toMatchObject({ backend: "acpx", agent: "codex", identity: { state: "pending" } });
-    expect(loadSessionEntry({ storePath, sessionKey: "main" })?.sessionId).toBe(entry?.sessionId);
-  },
-);
+test.each([true, false])("binds legacy ACP to canonical row (existing=%s)", async (existing) => {
+  const { storePath } = await createSessionStoreDir();
+  await writeSessionStore({
+    entries: existing ? { main: sessionStoreEntry("legacy-main") } : {},
+  });
+  const { identity: _identity, ...legacyMeta } = resolvedAcpMeta();
+  seedCanonicalAcpSessionMeta({ sessionKey, meta: legacyMeta });
+  const reset = await directSessionReq("sessions.reset", { key: "main" });
+  expect(reset.ok).toBe(true);
+  const entry = readSession(storePath);
+  expect(entry?.lifecycleRevision).toEqual(expect.any(String));
+  const meta = readAcpSessionEntry({ sessionKey, agentId: "main" })?.acp;
+  expect(meta).toMatchObject({ backend: "acpx", agent: "codex", identity: { state: "pending" } });
+  expect(loadSessionEntry({ storePath, sessionKey: "main" })?.sessionId).toBe(entry?.sessionId);
+});
 
 test.each(["global", "agent:work:main"])(
-  "reset of %s preserves the other agent's ACP owner",
+  "%s reset preserves other agent's ACP owner",
   async (key) => {
     const stores = await createConfiguredGlobalAgentSessionStore({ writePrimeStore: true });
     try {
@@ -311,7 +299,7 @@ test.each(["global", "agent:work:main"])(
 );
 
 test.each(["owner-repair", "discard-error"] as const)(
-  "reset does not commit when cleanup fails with %s",
+  "does not commit after %s cleanup failure",
   async (failure) => {
     const { storePath } = await seedAcpSession();
     const before = readSession(storePath);

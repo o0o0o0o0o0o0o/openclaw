@@ -50,6 +50,18 @@ const pendingDevices = async (loaded: Identity) =>
   (await listDevicePairing()).pending.filter(
     (entry) => entry.deviceId === loaded.identity.deviceId,
   );
+const requestPairing = (
+  loaded: Identity,
+  role: "node" | "operator",
+  options: { silent?: boolean } = {},
+) =>
+  requestDevicePairing({
+    deviceId: loaded.identity.deviceId,
+    publicKey: loaded.publicKey,
+    role,
+    scopes: [],
+    ...options,
+  });
 const setLocalApproval = (autoApproveLocal: boolean) =>
   writeConfigFile({ gateway: { nodes: { pairing: { autoApproveLocal } } } });
 const remoteBoundaryConfig = {
@@ -128,12 +140,7 @@ test.each([
 
 async function seedSilentNode(name: string) {
   const loaded = loadDeviceIdentity(name);
-  const pairing = await requestDevicePairing({
-    deviceId: loaded.identity.deviceId,
-    publicKey: loaded.publicKey,
-    role: "node",
-    scopes: [],
-  });
+  const pairing = await requestPairing(loaded, "node");
   await approveDevicePairing(pairing.request.requestId, {
     callerScopes: [],
     approvedVia: "silent",
@@ -212,10 +219,9 @@ test("keeps later native capability surface upgrades pending", async () => {
     ...MAC_SURFACE,
     commands: [...MAC_SURFACE.commands, "system.which"],
   });
-  const paired = await pairedDevice(loaded);
-  expect(paired?.nodeSurface?.commands).not.toContain("system.which");
-  expect(paired?.pendingNodeSurface).toMatchObject({
-    commands: expect.arrayContaining(["system.which"]),
+  expect(await pairedDevice(loaded)).toMatchObject({
+    nodeSurface: { commands: expect.not.arrayContaining(["system.which"]) },
+    pendingNodeSurface: { commands: expect.arrayContaining(["system.which"]) },
   });
 });
 
@@ -238,11 +244,9 @@ test("keeps a concurrent initial approval from silently widening the surface", a
     });
   try {
     await connectSurface(loaded);
-    const paired = await pairedDevice(loaded);
-    expect(paired?.nodeSurface?.commands).toEqual(["screen.snapshot"]);
-    expect(paired?.pendingNodeSurface).toMatchObject({
-      commands: expect.arrayContaining(["computer.act"]),
-      silent: false,
+    expect(await pairedDevice(loaded)).toMatchObject({
+      nodeSurface: { commands: ["screen.snapshot"] },
+      pendingNodeSurface: { commands: expect.arrayContaining(["computer.act"]), silent: false },
     });
   } finally {
     snapshot.mockRestore();
@@ -284,12 +288,12 @@ test("keeps an explicitly revoked native node token pending", async () => {
     await revokeDeviceToken({ deviceId: loaded.identity.deviceId, role: "node" }),
   ).toMatchObject({ ok: true });
 
-  const response = await connect(loaded, "node");
-  const pending = await pendingDevices(loaded);
-  expect(response).toMatchObject({ ok: false, error: { details: { reason: "role-upgrade" } } });
-  expect(pending).toMatchObject([{ isRepair: true, silent: false }]);
-  const after = await pairedDevice(loaded);
-  expect(after?.tokens).toMatchObject({
+  expect(await connect(loaded, "node")).toMatchObject({
+    ok: false,
+    error: { details: { reason: "role-upgrade" } },
+  });
+  expect(await pendingDevices(loaded)).toMatchObject([{ isRepair: true, silent: false }]);
+  expect((await pairedDevice(loaded))?.tokens).toMatchObject({
     node: { revokedAtMs: expect.any(Number), token: before?.tokens?.node?.token },
     operator: { token: before?.tokens?.operator?.token },
   });
@@ -300,15 +304,15 @@ test("silently resolves an existing role-upgrade repair when local approval is e
   const before = await connectOperator(loaded);
   await setLocalApproval(false);
   expect(await connect(loaded, "node")).toMatchObject({ ok: false });
-  const pending = await pendingDevices(loaded);
-  expect(pending).toMatchObject([{ role: "node", isRepair: true, silent: false }]);
+  expect(await pendingDevices(loaded)).toMatchObject([
+    { role: "node", isRepair: true, silent: false },
+  ]);
 
   await setLocalApproval(true);
-  const response = await connect(loaded, "node");
-  expect(response.ok).toBe(true);
+  expect(await connect(loaded, "node")).toMatchObject({ ok: true });
   expect(await pendingDevices(loaded)).toEqual([]);
   const after = await pairedDevice(loaded);
-  expect(after?.tokens?.operator?.token === before?.tokens?.operator?.token).toBe(true);
+  expect(after?.tokens?.operator?.token).toBe(before?.tokens?.operator?.token);
 });
 
 test.each<{ name: string; headers?: Record<string, string>; client?: ConnectParams["client"] }>([
@@ -336,17 +340,12 @@ test.each<{ name: string; headers?: Record<string, string>; client?: ConnectPara
 test("does not approve a merged operator request during node repair", async () => {
   const loaded = loadDeviceIdentity("local-native-merged-repair");
   const before = await connectOperator(loaded);
-  await requestDevicePairing({
-    deviceId: loaded.identity.deviceId,
-    publicKey: loaded.publicKey,
-    role: "operator",
-    scopes: [],
-    silent: false,
-  });
-  const response = await connect(loaded, "node");
-  expect(response.ok).toBe(false);
+  await requestPairing(loaded, "operator", { silent: false });
+  expect(await connect(loaded, "node")).toMatchObject({ ok: false });
   const after = await pairedDevice(loaded);
   expect(after?.tokens?.node).toBeUndefined();
-  expect(after?.tokens?.operator?.token === before?.tokens?.operator?.token).toBe(true);
-  expect(after?.approvedScopes).toEqual(before?.approvedScopes);
+  expect(after).toMatchObject({
+    tokens: { operator: { token: before?.tokens?.operator?.token } },
+    approvedScopes: before?.approvedScopes,
+  });
 });

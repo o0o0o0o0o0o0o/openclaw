@@ -2,26 +2,24 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GatewayClientCloseInfo, GatewayClientOptions } from "../gateway/client.js";
 import { createNodeHostGatewayCandidateConnection } from "./gateway-candidate-connection.js";
 
-const mocks = vi.hoisted(() => ({
-  options: [] as GatewayClientOptions[],
-  clients: [] as Array<{
-    request: ReturnType<typeof vi.fn>;
-    start: ReturnType<typeof vi.fn>;
-    stop: ReturnType<typeof vi.fn>;
-    stopAndWait: ReturnType<typeof vi.fn<() => Promise<void>>>;
-    updateNodeManifest: ReturnType<typeof vi.fn>;
-  }>,
-}));
+const mocks = vi.hoisted(() => {
+  const createClient = (options: GatewayClientOptions) => ({
+    request: vi.fn(async () => ({ url: options.url })),
+    start: vi.fn(),
+    stop: vi.fn(),
+    stopAndWait: vi.fn(async () => {}),
+    updateNodeManifest: vi.fn(),
+  });
+  return {
+    createClient,
+    options: [] as GatewayClientOptions[],
+    clients: [] as ReturnType<typeof createClient>[],
+  };
+});
 
 vi.mock("../gateway/client.js", () => ({
   GatewayClient: function GatewayClient(options: GatewayClientOptions) {
-    const client = {
-      request: vi.fn(async () => ({ url: options.url })),
-      start: vi.fn(),
-      stop: vi.fn(),
-      stopAndWait: vi.fn(async () => {}),
-      updateNodeManifest: vi.fn(),
-    };
+    const client = mocks.createClient(options);
     mocks.options.push(options);
     mocks.clients.push(client);
     return client;
@@ -88,10 +86,11 @@ describe("gateway candidate connection", () => {
     expect(mocks.clients[0]?.start).toHaveBeenCalledOnce();
     closeCandidate();
     await vi.waitFor(() => expect(mocks.clients).toHaveLength(2));
+    const [first, winner] = mocks.clients;
 
-    expect(mocks.clients[0]?.stop).toHaveBeenCalledOnce();
+    expect(first?.stop).toHaveBeenCalledOnce();
     expect(mocks.options[1]?.url).toBe("wss://gateway.tailnet.example:443");
-    expect(mocks.clients[1]?.start).toHaveBeenCalledOnce();
+    expect(winner?.start).toHaveBeenCalledOnce();
 
     mocks.options[0]?.onEvent?.({ type: "event", event: "stale" });
     mocks.options[0]?.onHelloOk?.({} as never);
@@ -111,13 +110,9 @@ describe("gateway candidate connection", () => {
 
     await connection.request("node.test", { active: true }, undefined);
     connection.updateNodeManifest(manifest);
-    expect(mocks.clients[0]?.request).not.toHaveBeenCalled();
-    expect(mocks.clients[1]?.request).toHaveBeenCalledWith(
-      "node.test",
-      { active: true },
-      undefined,
-    );
-    expect(mocks.clients[1]?.updateNodeManifest).toHaveBeenCalledWith(manifest);
+    expect(first?.request).not.toHaveBeenCalled();
+    expect(winner?.request).toHaveBeenCalledWith("node.test", { active: true }, undefined);
+    expect(winner?.updateNodeManifest).toHaveBeenCalledWith(manifest);
   });
 
   it("does not rotate after the connect request was sent", async () => {

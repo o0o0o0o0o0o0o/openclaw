@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { afterEach, beforeEach } from "vitest";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "../state/openclaw-agent-db-contract.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "../state/openclaw-state-db-contract.js";
 
@@ -29,4 +30,31 @@ export async function writeNodeUpdateCandidate(
       "dist/entry.js",
     ].map((file) => fs.writeFile(path.join(root, file), "export {};\n")),
   );
+}
+
+export function useNodeUpdateRuntime(runtime?: "bun" | "node", platform?: NodeJS.Platform) {
+  const bun = Object.getOwnPropertyDescriptor(process.versions, "bun");
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const select = (selected: "bun" | "node", selectedPlatform = platform) => {
+    if (selected === "bun") {
+      Object.defineProperty(process.versions, "bun", { value: "1.4.3", configurable: true });
+    } else {
+      Reflect.deleteProperty(process.versions, "bun");
+    }
+    if (selectedPlatform) {
+      Object.defineProperty(process, "platform", { value: selectedPlatform, configurable: true });
+    }
+  };
+  if (runtime) {
+    beforeEach(() => select(runtime));
+  }
+  afterEach(() => {
+    if (bun) {
+      Object.defineProperty(process.versions, "bun", bun);
+    } else {
+      Reflect.deleteProperty(process.versions, "bun");
+    }
+    Object.defineProperty(process, "platform", originalPlatform);
+  });
+  return select;
 }

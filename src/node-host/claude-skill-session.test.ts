@@ -22,23 +22,25 @@ import { prepareNodeClaudeSkillSession } from "./claude-skill-session.js";
 
 const temps = useAutoCleanupTempDirTracker(afterEach);
 const workshopFixture = { description: "Fixture", inputSchema: {} };
-type SessionIo = Parameters<typeof prepareNodeClaudeSkillSession>[0];
+const workshopCall = { name: "skill_workshop", arguments: {} };
+const mcpIdentity = { name: "workshop-fixture", version: "1" };
+const textContent = (text: string | number) => ({ content: [{ type: "text", text }] });
 
 function prepareSession(
   init: Omit<NodeClaudeSkillInit, "type">,
   options: {
     signal?: AbortSignal;
-    send?: NonNullable<SessionIo["frames"]>["send"];
     unsubscribe?: () => void;
   } = {},
 ) {
+  const sent = createDeferredCore<Uint8Array>();
   let receive: ((bytes: Uint8Array) => void | Promise<void>) | undefined;
   const session = prepareNodeClaudeSkillSession({
     signal: options.signal ?? new AbortController().signal,
     emitChunk: vi.fn(),
     onInput: vi.fn(),
     frames: {
-      send: options.send ?? vi.fn(),
+      send: async (bytes) => sent.resolve(bytes),
       onMessage: (listener) => {
         receive = listener;
         void listener(Buffer.from(JSON.stringify({ type: "init", ...init })));
@@ -48,6 +50,7 @@ function prepareSession(
   });
   return {
     session,
+    sent: sent.promise,
     dispatch: (bytes: Uint8Array) => {
       assert(receive);
       return receive(bytes);
@@ -55,27 +58,15 @@ function prepareSession(
   };
 }
 
-async function connectWorkshop(
-  sdk: string,
-  session: Awaited<ReturnType<typeof prepareNodeClaudeSkillSession>>,
-) {
+async function prepareWorkshop(sdk: string) {
+  const prepared = prepareSession({ workshop: workshopFixture });
+  const session = await prepared.session;
   const client =
     sdk === "v1"
-      ? new Client({ name: "workshop-fixture", version: "1" })
-      : new V2Client(
-          { name: "workshop-fixture", version: "1" },
-          { versionNegotiation: { mode: "legacy" } },
-        );
+      ? new Client(mcpIdentity)
+      : new V2Client(mcpIdentity, { versionNegotiation: { mode: "legacy" } });
   onTestFinished(async () => {
-    try {
-      await client.close();
-    } finally {
-      try {
-        await session.close();
-      } finally {
-        await session.cleanup();
-      }
-    }
+    await client.close().finally(() => session.close().finally(() => session.cleanup()));
   });
   const configPath = session.argv[session.argv.indexOf("--mcp-config") + 1];
   assert(configPath);
@@ -85,6 +76,8 @@ async function connectWorkshop(
   assert(isRecord(endpoint) && typeof endpoint.url === "string");
   const url = new URL(endpoint.url);
   return {
+    ...prepared,
+    session,
     client,
     url,
     connect: () =>
@@ -116,39 +109,31 @@ function captureWarnings() {
   const previousConsole = loggingState.rawConsole;
   setLoggerOverride({ level: "silent", consoleLevel: "warn" });
   loggingState.rawConsole = { log: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
-  return {
-    warn,
-    restore: () => {
-      loggingState.rawConsole = previousConsole;
-      setLoggerOverride(null);
-      resetLogger();
-    },
-  };
+  onTestFinished(() => {
+    loggingState.rawConsole = previousConsole;
+    setLoggerOverride(null);
+    resetLogger();
+  });
+  return warn;
 }
 
 describe("node Claude Workshop result settlement", () => {
   it.each(["v1", "v2"].flatMap((sdk) => [false, true].map((malformed) => ({ sdk, malformed }))))(
     "$sdk settles the real MCP request (malformed result: $malformed)",
     async ({ sdk, malformed }) => {
-      const sent = createDeferredCore<Uint8Array>();
-      const prepared = prepareSession(
-        { workshop: workshopFixture },
-        { send: async (bytes) => sent.resolve(bytes) },
-      );
-      const { client, connect } = await connectWorkshop(sdk, await prepared.session);
+      const { client, connect, sent, dispatch } = await prepareWorkshop(sdk);
       await connect();
-      const result = client.callTool({ name: "skill_workshop", arguments: {} });
+      const result = client.callTool(workshopCall);
       void result.catch(() => {});
-      const request: unknown = JSON.parse(Buffer.from(await sent.promise).toString("utf8"));
+      const request: unknown = JSON.parse(Buffer.from(await sent).toString("utf8"));
       assert(isRecord(request) && request.type === "workshop" && typeof request.id === "string");
       const response = Buffer.from(
         JSON.stringify({
           type: "result",
           id: request.id,
-          result: { content: [{ type: "text", text: malformed ? 42 : "Workshop result" }] },
+          result: textContent(malformed ? 42 : "Workshop result"),
         }),
       );
-      const { dispatch } = prepared;
       if (malformed) {
         await expect(Promise.resolve().then(() => dispatch(response))).rejects.toMatchObject({
           name: "ZodError",
@@ -156,9 +141,7 @@ describe("node Claude Workshop result settlement", () => {
         await expect(result).rejects.toMatchObject({ code: ErrorCode.InternalError });
       } else {
         await dispatch(response);
-        await expect(result).resolves.toMatchObject({
-          content: [{ type: "text", text: "Workshop result" }],
-        });
+        await expect(result).resolves.toMatchObject(textContent("Workshop result"));
       }
     },
   );
@@ -166,24 +149,18 @@ describe("node Claude Workshop result settlement", () => {
   it.each(["v1", "v2"])(
     "%s preserves route authority and tears down pending HTTP calls",
     async (sdk) => {
-      const sent = createDeferredCore();
-      const session = await prepareSession(
-        { workshop: workshopFixture },
-        { send: async () => sent.resolve() },
-      ).session;
-      const { client, url, connect } = await connectWorkshop(sdk, session);
-      expect((await fetch(new URL("/mcp/wrong-invocation", url), { method: "POST" })).status).toBe(
-        404,
-      );
-      expect(
-        (await fetch(url, { method: "POST", headers: { Origin: "https://unrelated.example" } }))
-          .status,
-      ).toBe(404);
-      expect((await fetch(url)).status).toBe(404);
+      const { session, client, url, connect, sent } = await prepareWorkshop(sdk);
+      for (const [target, options] of [
+        [new URL("/mcp/wrong-invocation", url), { method: "POST" }],
+        [url, { method: "POST", headers: { Origin: "https://unrelated.example" } }],
+        [url, undefined],
+      ] satisfies [URL, RequestInit | undefined][]) {
+        expect((await fetch(target, options)).status).toBe(404);
+      }
       await connect();
-      const call = client.callTool({ name: "skill_workshop", arguments: {} });
+      const call = client.callTool(workshopCall);
       const rejected = expect(call).rejects.toBeInstanceOf(Error);
-      await sent.promise;
+      await sent;
       await session.close();
       await rejected;
       await expect(session.writeStdout("late response")).rejects.toThrow("invocation closed");
@@ -209,7 +186,7 @@ describe("node Claude skill artifact cleanup", () => {
       const configPath = workshop
         ? session.argv[session.argv.indexOf("--mcp-config") + 1]!
         : undefined;
-      const { warn, restore } = captureWarnings();
+      const warn = captureWarnings();
       try {
         expect(session.argv.filter((arg) => arg === "--add-dir")).toHaveLength(1);
         expect(path.dirname(path.dirname(skillPath))).toBe(artifactRoot);
@@ -233,7 +210,6 @@ describe("node Claude skill artifact cleanup", () => {
         await session.close();
         await fs.chmod(path.dirname(skillPath), 0o700);
         await session.cleanup();
-        restore();
       }
     },
   );
@@ -269,7 +245,7 @@ describe("node Claude skill artifact cleanup", () => {
       }
       return originalRm(target, options);
     });
-    const { warn, restore } = captureWarnings();
+    const warn = captureWarnings();
     const unsubscribe = vi.fn();
     try {
       const result = await prepareSession(
@@ -292,7 +268,6 @@ describe("node Claude skill artifact cleanup", () => {
     } finally {
       writeFile.mockRestore();
       rm.mockRestore();
-      restore();
       if (directory) {
         await fs.rm(directory, { recursive: true, force: true });
       }

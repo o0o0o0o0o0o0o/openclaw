@@ -15,7 +15,7 @@ import {
 } from "../../test-utils/channel-plugins.js";
 import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
 import type { CronCreatorAuthorityGrant } from "../cron-creator-authority-grant.types.js";
-import type { GatewayClient, GatewayRequestContext, RespondFn } from "./types.js";
+import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
 type MutationOptions = {
   commitGuard?: () => void;
@@ -265,25 +265,29 @@ export function createCronTestInvoker(
   handlers: typeof import("./cron.js").cronHandlers,
   getRuntimeConfig: () => OpenClawConfig,
 ) {
+  type CronMethod = keyof typeof handlers;
+
   return async function invokeCron(
-    method: keyof typeof handlers,
+    method: CronMethod,
     params: Record<string, unknown>,
     options: {
       currentJob?: CronJob;
       context?: ReturnType<typeof createCronTestContext>;
       client?: GatewayClient;
-      respond?: ReturnType<typeof vi.fn<RespondFn>>;
+      respond?: ReturnType<typeof vi.fn>;
       sessionMutationCommitGuard?: () => void;
       hasCurrentClientAuthority?: () => boolean;
     } = {},
   ) {
     const context = options.context ?? createCronTestContext(options.currentJob, getRuntimeConfig);
-    const respond = options.respond ?? vi.fn<RespondFn>();
-    const handler = expectDefined(handlers[method], "cron handler");
-    await handler({
+    const respond = options.respond ?? vi.fn();
+    await expectDefined(
+      handlers[method],
+      "cronHandlers[method] test invariant",
+    )({
       req: {} as never,
-      params,
-      respond,
+      params: params as never,
+      respond: respond as never,
       context: context as never,
       client: options.client ?? null,
       sessionMutationCommitGuard: options.sessionMutationCommitGuard,

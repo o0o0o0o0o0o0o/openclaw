@@ -1,4 +1,3 @@
-// Covers provider catalog entries derived from plugin metadata.
 import { normalizeModelCatalogProviderRows } from "@openclaw/model-catalog-core/model-catalog-normalize";
 import type { ModelCatalogProvider } from "@openclaw/model-catalog-core/model-catalog-types";
 import { describe, expect, it } from "vitest";
@@ -21,7 +20,6 @@ describe("manifest model size projection", () => {
     models: [
       {
         id: "compact-chat",
-        name: "Compact Chat",
         contextWindow: 32_768,
         maxTokens: 8192,
         parameterCount: 4_000_000_000,
@@ -75,11 +73,9 @@ function createCatalogContext(params: {
     resolveProviderApiKey: (providerId) => ({
       apiKey: providerId ? params.apiKeys?.[providerId] : undefined,
     }),
-    resolveProviderAuth: (providerId) => ({
-      apiKey: providerId ? params.apiKeys?.[providerId] : undefined,
-      mode: providerId && params.apiKeys?.[providerId] ? "api_key" : "none",
-      source: providerId && params.apiKeys?.[providerId] ? "env" : "none",
-    }),
+    resolveProviderAuth: () => {
+      throw new Error("Catalog must use API-key resolution");
+    },
   };
 }
 
@@ -117,28 +113,20 @@ describe("findCatalogTemplate", () => {
 
 describe("buildSingleProviderApiKeyCatalog", () => {
   it.each([
-    {
-      name: "matches provider templates case-insensitively",
-      entries: [
-        { provider: "Demo Provider", id: "demo-model" },
-        { provider: "other", id: "fallback" },
-      ],
-      providerId: "demo provider",
-      templateIds: ["missing", "DEMO-MODEL"],
-      expected: { provider: "Demo Provider", id: "demo-model" },
-    },
-    {
-      name: "does not match provider templates across provider id variants",
-      entries: [
-        { provider: "z.ai", id: "glm-4.7" },
-        { provider: "other", id: "fallback" },
-      ],
-      providerId: "z-ai",
-      templateIds: ["GLM-4.7"],
-      expected: undefined,
-    },
-  ] as const)("$name", ({ entries, providerId, templateIds, expected }) => {
-    expect(findCatalogTemplate({ entries, providerId, templateIds })).toEqual(expected);
+    [
+      "case-insensitive match",
+      "Demo Provider",
+      "demo-model",
+      "demo provider",
+      ["missing", "DEMO-MODEL"],
+      true,
+    ],
+    ["no provider-ID aliasing", "z.ai", "glm-4.7", "z-ai", ["GLM-4.7"], false],
+  ] as const)("%s", (_name, provider, id, providerId, templateIds, matches) => {
+    const entry = { provider, id };
+    expect(findCatalogTemplate({ entries: [entry], providerId, templateIds })).toEqual(
+      matches ? entry : undefined,
+    );
   });
   it.each([
     ["missing key", "test-provider", undefined, undefined, undefined],

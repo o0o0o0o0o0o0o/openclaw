@@ -1,31 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { clearInternalHooks, registerInternalHook } from "../hooks/internal-hooks.js";
 import { createHookRunnerWithRegistry } from "../plugins/hooks.test-fixtures.js";
 import type { PluginHookSessionContext } from "../plugins/session-end-transcript.js";
 
-type SessionEndHookEvent = {
-  reason?: string;
-  sessionId?: string;
-  sessionKey?: string;
-};
-
-const runSessionEndMock = vi.fn(async (_eventValue: SessionEndHookEvent) => undefined);
-const hasHooksMock = vi.fn((name: string) => name === "session_end");
+const sessionEnd = vi.fn(async (_event: { sessionId?: string }) => undefined);
+const hasHooks = vi.fn((name: string) => name === "session_end");
 const createMockHookRunner = () => ({
-  hasHooks: hasHooksMock,
-  runSessionEnd: runSessionEndMock,
-  runSessionStart: vi.fn(async () => undefined),
+  hasHooks,
+  runSessionEnd: sessionEnd,
 });
 type TestHookRunner =
   | ReturnType<typeof createMockHookRunner>
   | ReturnType<typeof createHookRunnerWithRegistry>["runner"];
-const getGlobalHookRunnerMock = vi.fn<() => TestHookRunner>(() => createMockHookRunner());
-const closedTranscriptReadMock = vi.fn();
+const hookRunner = vi.fn<() => TestHookRunner>(() => createMockHookRunner());
+const readTranscript = vi.fn();
 
 vi.mock("../plugins/hook-runner-global.js", () => ({
-  getGlobalHookRunner: getGlobalHookRunnerMock,
+  getGlobalHookRunner: hookRunner,
 }));
 
 vi.mock("./session-transcript-files.fs.js", () => ({
@@ -42,74 +34,73 @@ vi.mock("./session-end-transcript-reader.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./session-end-transcript-reader.js")>()),
   createClosedSessionTranscriptSource: vi.fn(() => ({
     available: true as const,
-    readTail: closedTranscriptReadMock,
+    readTail: readTranscript,
   })),
 }));
 
-const { emitGatewaySessionEndPluginHook, emitGatewaySessionStartPluginHook } =
+const { emitGatewaySessionEndPluginHook: emitEnd, emitGatewaySessionStartPluginHook: emitStart } =
   await import("./session-reset-service.js");
 const { drainActiveSessionsForShutdown } = await import("./active-sessions-shutdown-drain.js");
-const { forgetActiveSessionForShutdown, listActiveSessionsForShutdown } =
+const { forgetActiveSessionForShutdown: forget, listActiveSessionsForShutdown: activeSessions } =
   await import("./active-sessions-shutdown-tracker.js");
 
-const cfg: OpenClawConfig = {};
-
-const session = (sessionId: string, sessionKey = "agent:main:main") => ({
-  cfg,
-  sessionKey,
-  sessionId,
+const baseSession = {
+  cfg: {},
+  sessionKey: "agent:main:main",
   storePath: "/tmp/store.json",
   agentId: "main",
+};
+const session = (sessionId: string, sessionKey = baseSession.sessionKey) => ({
+  ...baseSession,
+  sessionId,
+  sessionKey,
 });
-const trackSessionForShutdown = (sessionId: string, sessionKey?: string) =>
-  emitGatewaySessionStartPluginHook(session(sessionId, sessionKey));
+const track = (sessionId: string, sessionKey?: string) => emitStart(session(sessionId, sessionKey));
 const drain = (totalTimeoutMs?: number) =>
   drainActiveSessionsForShutdown({ reason: "shutdown", totalTimeoutMs });
 
-function clearTrackedSessions(): void {
-  for (const entry of listActiveSessionsForShutdown()) {
-    forgetActiveSessionForShutdown(entry.sessionId);
+function cleanup(): void {
+  for (const entry of activeSessions()) {
+    forget(entry.sessionId);
   }
+  clearInternalHooks();
 }
 
 beforeEach(() => {
-  clearTrackedSessions();
-  clearInternalHooks();
-  runSessionEndMock.mockClear();
-  closedTranscriptReadMock.mockReset();
-  hasHooksMock.mockClear();
-  hasHooksMock.mockImplementation((name: string) => name === "session_end");
-  getGlobalHookRunnerMock.mockReset();
-  getGlobalHookRunnerMock.mockImplementation(() => createMockHookRunner());
+  cleanup();
+  sessionEnd.mockClear();
+  readTranscript.mockReset();
+  hasHooks.mockClear().mockImplementation((name: string) => name === "session_end");
+  hookRunner.mockReset().mockImplementation(() => createMockHookRunner());
 });
 
-afterEach(() => {
-  clearTrackedSessions();
-  clearInternalHooks();
-});
+afterEach(cleanup);
 
 describe("drainActiveSessionsForShutdown", () => {
-  it("does not double-fire for a session already finalized by reset/delete/compaction", async () => {
-    trackSessionForShutdown("sess-A");
-    trackSessionForShutdown("sess-B", "agent:main:other");
-    emitGatewaySessionEndPluginHook({
-      ...session("sess-A"),
-      reason: "reset",
-    });
-    runSessionEndMock.mockClear();
-
-    await drain();
-
-    expect(runSessionEndMock).toHaveBeenCalledTimes(1);
-    expect(runSessionEndMock.mock.calls[0]?.[0].sessionId).toBe("sess-B");
+  it.each([
+    ["reset", true],
+    ["deleted", false],
+  ] as const)("forgets finalized sessions (%s, plugins: %s)", async (reason, plugins) => {
+    hasHooks.mockImplementation((name) => plugins && name === "session_end");
+    track("sess-A");
+    if (plugins) {
+      track("sess-B", "agent:main:other");
+    }
+    emitEnd({ ...session("sess-A"), reason });
+    sessionEnd.mockClear();
+    if (!plugins) {
+      expect(activeSessions()).toEqual([]);
+    }
+    const expected = plugins ? ["sess-B"] : [];
+    expect((await drain()).emittedSessionIds).toEqual(expected);
+    expect(sessionEnd.mock.calls.map(([event]) => event.sessionId)).toEqual(expected);
   });
-
   it("awaits each session_end handler so the bounded timeout actually races real plugin work", async () => {
     const { promise: handlerLatch, resolve: resolveHandler } = createDeferred();
-    runSessionEndMock.mockImplementationOnce(async () => {
+    sessionEnd.mockImplementationOnce(async () => {
       await handlerLatch;
     });
-    trackSessionForShutdown("sess-A");
+    track("sess-A");
 
     let drainSettled = false;
     const drainPromise = drain().then((value) => {
@@ -121,7 +112,7 @@ describe("drainActiveSessionsForShutdown", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(drainSettled).toBe(false);
-    expect(runSessionEndMock).toHaveBeenCalledTimes(1);
+    expect(sessionEnd).toHaveBeenCalledTimes(1);
 
     resolveHandler?.();
     const result = await drainPromise;
@@ -129,23 +120,17 @@ describe("drainActiveSessionsForShutdown", () => {
   });
 
   it("returns timedOut=true while still starting later emissions when one handler hangs", async () => {
-    runSessionEndMock.mockImplementation(async (event: SessionEndHookEvent) => {
-      if (event.sessionId === "sess-A") {
-        await new Promise<void>(() => {});
-      }
-    });
-    trackSessionForShutdown("sess-A");
-    trackSessionForShutdown("sess-B", "agent:main:other");
+    sessionEnd.mockImplementationOnce(() => new Promise<never>(() => {}));
+    track("sess-A");
+    track("sess-B", "agent:main:other");
 
     const result = await drain(120);
 
-    expect(result.timedOut).toBe(true);
-    expect(result.emittedSessionIds.toSorted()).toEqual(["sess-A", "sess-B"]);
-    expect(runSessionEndMock).toHaveBeenCalledTimes(2);
-    expect(runSessionEndMock.mock.calls.map(([event]) => event.sessionId)).toEqual([
-      "sess-A",
-      "sess-B",
-    ]);
+    expect({ ...result, emittedSessionIds: result.emittedSessionIds.toSorted() }).toEqual({
+      timedOut: true,
+      emittedSessionIds: ["sess-A", "sess-B"],
+    });
+    expect(sessionEnd.mock.calls.map(([event]) => event.sessionId)).toEqual(["sess-A", "sess-B"]);
   });
 
   it("revokes shutdown transcript reads when the aggregate drain expires", async () => {
@@ -156,7 +141,7 @@ describe("drainActiveSessionsForShutdown", () => {
       truncated: boolean;
     }>();
     const readStarted = createDeferred();
-    closedTranscriptReadMock.mockImplementationOnce(() => {
+    readTranscript.mockImplementationOnce(() => {
       readStarted.resolve();
       return sourceRead.promise;
     });
@@ -177,8 +162,8 @@ describe("drainActiveSessionsForShutdown", () => {
         },
       },
     ]);
-    getGlobalHookRunnerMock.mockReturnValue(runner);
-    trackSessionForShutdown("sess-A");
+    hookRunner.mockReturnValue(runner);
+    track("sess-A");
 
     const drainPromise = drain(100);
     await readStarted.promise;
@@ -191,40 +176,26 @@ describe("drainActiveSessionsForShutdown", () => {
     await expect(retainedReader.readTail({ maxMessages: 1, maxBytes: 1_024 })).rejects.toThrow(
       "no longer active",
     );
-    expect(closedTranscriptReadMock).toHaveBeenCalledOnce();
+    expect(readTranscript).toHaveBeenCalledOnce();
 
     sourceRead.resolve({ messages: [], totalMessages: 0, truncated: false });
     await expect(inFlightRead).rejects.toThrow("no longer active");
     vi.useRealTimers();
   });
 
-  it("still records the session as forgotten when no `session_end` plugins are registered", async () => {
-    hasHooksMock.mockImplementation(() => false);
-    trackSessionForShutdown("sess-A");
-    emitGatewaySessionEndPluginHook({
-      ...session("sess-A"),
-      reason: "deleted",
-    });
-
-    expect(listActiveSessionsForShutdown()).toEqual([]);
-    const result = await drain();
-
-    expect(result.emittedSessionIds).toEqual([]);
-  });
-
   it("emits session:auto-reset for idle rollover without a session_end plugin", async () => {
-    hasHooksMock.mockImplementation(() => false);
+    hasHooks.mockImplementation(() => false);
     const listener = vi.fn();
     registerInternalHook("session:auto-reset", listener);
 
-    emitGatewaySessionEndPluginHook({
+    emitEnd({
       ...session("sess-A"),
       reason: "idle",
       nextSessionId: "sess-B",
     });
 
     await vi.waitFor(() => expect(listener).toHaveBeenCalledTimes(1));
-    expect(runSessionEndMock).not.toHaveBeenCalled();
+    expect(sessionEnd).not.toHaveBeenCalled();
     expect(listener.mock.calls[0]?.[0]).toMatchObject({
       type: "session",
       action: "auto-reset",

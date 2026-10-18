@@ -30,6 +30,17 @@ const stateArgs = (patch: Record<string, number>) => [
   expect.any(String),
 ];
 const fixture = () => createCronStreamWatcherFixture({ minIntervalMs: 1 });
+function blockedBatch(result: "busy" | "fired") {
+  const gate = createDeferred();
+  const fireBatch = vi
+    .fn()
+    .mockImplementationOnce(async () => {
+      await gate.promise;
+      return result;
+    })
+    .mockResolvedValue("fired");
+  return { fireBatch, releaseFirst: gate.resolve };
+}
 async function flush(ms = 100) {
   await settle();
   await vi.advanceTimersByTimeAsync(ms);
@@ -143,14 +154,7 @@ describe("cron stream output", () => {
 
   it("keeps one bounded pending batch while a payload is busy and honors minimum spacing", async () => {
     vi.setSystemTime(1_000);
-    const { promise: first, resolve: releaseFirst } = createDeferred();
-    const fireBatch = vi
-      .fn()
-      .mockImplementationOnce(async () => {
-        await first;
-        return "fired" as const;
-      })
-      .mockResolvedValue("fired" as const);
+    const { fireBatch, releaseFirst } = blockedBatch("fired");
     const { fake, updateState, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 100,
       fireBatch,
@@ -175,14 +179,7 @@ describe("cron stream output", () => {
 
   it("prepends a busy retry ahead of batches that arrived while it was in flight", async () => {
     vi.setSystemTime(1_000);
-    const { promise: first, resolve: releaseFirst } = createDeferred();
-    const fireBatch = vi
-      .fn()
-      .mockImplementationOnce(async () => {
-        await first;
-        return "busy" as const;
-      })
-      .mockResolvedValue("fired" as const);
+    const { fireBatch, releaseFirst } = blockedBatch("busy");
     const { fake, watchers } = createCronStreamWatcherFixture({
       minIntervalMs: 1,
       fireBatch,

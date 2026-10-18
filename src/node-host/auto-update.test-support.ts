@@ -35,6 +35,8 @@ export async function writeNodeUpdateCandidate(
 export function useNodeUpdateRuntime(runtime?: "bun" | "node", platform?: NodeJS.Platform) {
   const bun = Object.getOwnPropertyDescriptor(process.versions, "bun");
   const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const originalVersions = Object.getOwnPropertyDescriptor(process, "versions")!;
+  const originalExecPath = Object.getOwnPropertyDescriptor(process, "execPath")!;
   const select = (selected: "bun" | "node", selectedPlatform = platform) => {
     if (selected === "bun") {
       Object.defineProperty(process.versions, "bun", { value: "1.4.3", configurable: true });
@@ -49,6 +51,8 @@ export function useNodeUpdateRuntime(runtime?: "bun" | "node", platform?: NodeJS
     beforeEach(() => select(runtime));
   }
   afterEach(() => {
+    Object.defineProperty(process, "versions", originalVersions);
+    Object.defineProperty(process, "execPath", originalExecPath);
     if (bun) {
       Object.defineProperty(process.versions, "bun", bun);
     } else {

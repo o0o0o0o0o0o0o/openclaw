@@ -66,20 +66,7 @@ it.each([
   "preserves declared launch names or the published 2026.9.6 vocabulary ($declared)",
   ({ declared, expected }) => {
     const declaration = parseNodeRunnerInventoryDeclaration(
-      workerDeclaration({
-        environmentSession: 1,
-        capturedExecPolicy: true,
-        ...(declared
-          ? {
-              bundlePrewarm: 1,
-              bundleRetention: 1,
-              bundleStatus: 1,
-              portalStream: 1,
-              preparedWorkspace: 1,
-              launchToolNames: declared,
-            }
-          : {}),
-      }),
+      workerDeclaration(declared ? { launchToolNames: declared } : {}),
     );
     if (!declaration || !("workerHost" in declaration)) {
       throw new Error("Expected the supervisor declaration to parse");

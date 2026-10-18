@@ -25,18 +25,17 @@ const workshopFixture = { description: "Fixture", inputSchema: {} };
 const workshopCall = { name: "skill_workshop", arguments: {} };
 const mcpIdentity = { name: "workshop-fixture", version: "1" };
 const textContent = (text: string | number) => ({ content: [{ type: "text", text }] });
+const markdown = "---\ndescription: Guide\n---\n# Guide\n";
 
 function prepareSession(
   init: Omit<NodeClaudeSkillInit, "type">,
-  options: {
-    signal?: AbortSignal;
-    unsubscribe?: () => void;
-  } = {},
+  signal = new AbortController().signal,
+  unsubscribe: () => void = vi.fn(),
 ) {
   const sent = createDeferredCore<Uint8Array>();
   let receive: ((bytes: Uint8Array) => void | Promise<void>) | undefined;
   const session = prepareNodeClaudeSkillSession({
-    signal: options.signal ?? new AbortController().signal,
+    signal,
     emitChunk: vi.fn(),
     onInput: vi.fn(),
     frames: {
@@ -44,7 +43,7 @@ function prepareSession(
       onMessage: (listener) => {
         receive = listener;
         void listener(Buffer.from(JSON.stringify({ type: "init", ...init })));
-        return options.unsubscribe ?? vi.fn();
+        return unsubscribe;
       },
     },
   });
@@ -87,9 +86,9 @@ async function prepareWorkshop(sdk: string) {
   };
 }
 
-async function skillResources(name: string, markdown: string, reference?: string) {
+async function skillResources(reference?: string) {
   const workspace = temps.make("node-skill-session-");
-  const skillDir = path.join(workspace, "skills", name);
+  const skillDir = path.join(workspace, "skills", "guide");
   await fs.mkdir(skillDir, { recursive: true });
   await fs.writeFile(path.join(skillDir, "SKILL.md"), markdown);
   if (reference) {
@@ -173,10 +172,7 @@ describe("node Claude skill artifact cleanup", () => {
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0).each([false, true])(
     "grants only the artifact root and cleans independent inputs after close (Workshop: %s)",
     async (workshop) => {
-      const { skillDir, resources } = await skillResources(
-        "guide",
-        "---\ndescription: Guide\n---\n# Guide\n",
-      );
+      const { skillDir, resources } = await skillResources();
       const session = await prepareSession({
         resources,
         ...(workshop ? { workshop: workshopFixture } : {}),
@@ -215,8 +211,7 @@ describe("node Claude skill artifact cleanup", () => {
   );
 
   it("preserves the exact frozen setup error when partial skill cleanup fails", async () => {
-    const markdown = "---\ndescription: Partial materialization proof\n---\n# Instructions\n";
-    const { resources } = await skillResources("partial", markdown, "supporting resource");
+    const { resources } = await skillResources("supporting resource");
     const primary = new Error("Node skill setup cancelled");
     primary.name = "AbortError";
     Object.freeze(primary);
@@ -250,7 +245,8 @@ describe("node Claude skill artifact cleanup", () => {
     try {
       const result = await prepareSession(
         { resources },
-        { signal: controller.signal, unsubscribe },
+        controller.signal,
+        unsubscribe,
       ).session.catch((error: unknown) => error);
       expect.soft(result).toBe(primary);
       expect(unsubscribe).toHaveBeenCalledOnce();

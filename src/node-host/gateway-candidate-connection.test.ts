@@ -31,6 +31,14 @@ const candidates = [
   { host: "gateway.tailnet.example", port: 443, tls: true },
 ];
 const manifest = { caps: ["mcp"], commands: ["mcp.tools.call.v1"] };
+const callbacks = {
+  onEvent: vi.fn(),
+  onHelloOk: vi.fn(),
+  onConnectError: vi.fn(),
+  onReconnectPaused: vi.fn(),
+  onClose: vi.fn(),
+  onWinningCandidate: vi.fn(),
+};
 
 function closeCandidate(
   overrides: Partial<GatewayClientCloseInfo> = {},
@@ -52,23 +60,12 @@ function createConnection(
     typeof createNodeHostGatewayCandidateConnection
   >[0]["cloudflareAccessByCandidate"],
 ) {
-  const callbacks = {
-    onEvent: vi.fn(),
-    onHelloOk: vi.fn(),
-    onConnectError: vi.fn(),
-    onReconnectPaused: vi.fn(),
-    onClose: vi.fn(),
-    onWinningCandidate: vi.fn(),
-  };
-  return {
-    callbacks,
-    connection: createNodeHostGatewayCandidateConnection({
-      candidates,
-      clientOptions: {},
-      cloudflareAccessByCandidate,
-      ...callbacks,
-    }),
-  };
+  return createNodeHostGatewayCandidateConnection({
+    candidates,
+    clientOptions: {},
+    cloudflareAccessByCandidate,
+    ...callbacks,
+  });
 }
 
 describe("gateway candidate connection", () => {
@@ -79,7 +76,7 @@ describe("gateway candidate connection", () => {
   });
 
   it("rotates only before hello, fences stale callbacks, and forwards through the winner", async () => {
-    const { callbacks, connection } = createConnection();
+    const connection = createConnection();
     connection.start();
 
     expect(mocks.options[0]?.url).toBe("ws://192.168.1.20:18789/openclaw-gw");
@@ -129,7 +126,7 @@ describe("gateway candidate connection", () => {
   });
 
   it("promotes a candidate after hello instead of replaying setup auth on another endpoint", async () => {
-    const { callbacks } = createConnection();
+    createConnection();
 
     mocks.options[0]?.onHelloOk?.({} as never);
     closeCandidate({}, "later reconnect transport failure");
@@ -140,7 +137,7 @@ describe("gateway candidate connection", () => {
   });
 
   it("carries a pre-hello manifest update into the next candidate", async () => {
-    const { connection } = createConnection();
+    const connection = createConnection();
 
     connection.updateNodeManifest(manifest);
     closeCandidate();
@@ -149,27 +146,20 @@ describe("gateway candidate connection", () => {
     expect(mocks.clients[1]?.updateNodeManifest).toHaveBeenCalledWith(manifest);
   });
 
-  it("does not create the queued candidate after stop", async () => {
-    const { connection } = createConnection();
-
-    closeCandidate();
-    await connection.stop();
-    await Promise.resolve();
-
-    expect(mocks.clients).toHaveLength(1);
-  });
-
-  it("does not start a connection when readiness completes after stop", async () => {
-    const { connection } = createConnection();
-
+  it.each([false, true])("cannot start candidates after stop (queued=%s)", async (queued) => {
+    const connection = createConnection();
+    if (queued) {
+      closeCandidate();
+    }
     await connection.stop();
     connection.start();
-
+    await Promise.resolve();
+    expect(mocks.clients).toHaveLength(1);
     expect(mocks.clients[0]?.start).not.toHaveBeenCalled();
   });
 
   it("preserves a retired candidate's drain failure during shutdown", async () => {
-    const { connection } = createConnection();
+    const connection = createConnection();
     closeCandidate();
     await vi.waitFor(() => expect(mocks.clients).toHaveLength(2));
     const retiredFailure = new Error("retired candidate storage failed");

@@ -8,7 +8,7 @@ import type { prepareGitCandidateNodeRuntime } from "../infra/update-runner-git-
 import { snapshotPreflightSourceManifest } from "../state/openclaw-database-preflight.test-support.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { assertNodeRuntimeUpdateCompatible } from "./auto-update-compatibility.js";
-import { writeNodeUpdateCandidate } from "./auto-update.test-support.js";
+import { useNodeUpdateRuntime, writeNodeUpdateCandidate } from "./auto-update.test-support.js";
 
 const mocks = vi.hoisted(() => ({
   command: vi.fn(),
@@ -27,6 +27,11 @@ vi.mock("../state/openclaw-database-preflight.js", () => ({
 }));
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+useNodeUpdateRuntime();
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
 let fixture: Awaited<ReturnType<typeof createCompatibilityFixture>>;
 beforeEach(async () => {
   vi.clearAllMocks();
@@ -67,52 +72,43 @@ describe("candidate node runtime compatibility", () => {
     { runtime: "Node", accepted: false },
     { runtime: "Bun", accepted: true },
   ])("checks the candidate against its $runtime host", async ({ runtime, accepted }) => {
-    const originalExecPath = process.execPath;
-    const originalVersions = process.versions;
     const system =
       runtime === "renamed Node"
         ? vi.spyOn(runtimePaths, "resolveSystemNodeInfo").mockResolvedValue(null)
         : undefined;
     Object.defineProperty(process, "versions", {
       value: {
-        ...originalVersions,
-        node: runtime === "renamed Node" ? "26.7.0" : originalVersions.node,
+        ...process.versions,
+        node: runtime === "renamed Node" ? "26.7.0" : process.versions.node,
         bun: runtime === "Bun" ? "1.4.3" : undefined,
       },
     });
-    try {
-      if (runtime === "renamed Node") {
-        const { prepareGitCandidateNodeRuntime: prepareRuntime } = await vi.importActual<
-          typeof import("../infra/update-runner-git-node-preflight.js")
-        >("../infra/update-runner-git-node-preflight.js");
-        mocks.nodeRuntime.mockImplementation(prepareRuntime);
-        vi.stubEnv("PATH", "");
-        Object.defineProperty(process, "execPath", { value: path.resolve("fixture", "node26") });
-      } else {
-        mocks.nodeRuntime.mockResolvedValue({
-          step: {
-            name: "preflight-node-runtime",
-            command: "check Node",
-            cwd: "/fixture",
-            durationMs: 0,
-            exitCode: 1,
-            stderrTail: "No system Node was found.",
-          },
-        });
-      }
-      await fs.rm(fixture.statePath);
-      const compatible = assertNodeRuntimeUpdateCompatible(fixture);
-      await (accepted
-        ? expect(compatible).resolves.toBeUndefined()
-        : expect(compatible).rejects.toThrow("No system Node was found."));
-      if (runtime === "renamed Node") {
-        expect(system).not.toHaveBeenCalled();
-      }
-    } finally {
-      Object.defineProperty(process, "execPath", { value: originalExecPath });
-      Object.defineProperty(process, "versions", { value: originalVersions });
-      vi.unstubAllEnvs();
-      system?.mockRestore();
+    if (runtime === "renamed Node") {
+      const { prepareGitCandidateNodeRuntime: prepareRuntime } = await vi.importActual<
+        typeof import("../infra/update-runner-git-node-preflight.js")
+      >("../infra/update-runner-git-node-preflight.js");
+      mocks.nodeRuntime.mockImplementation(prepareRuntime);
+      vi.stubEnv("PATH", "");
+      Object.defineProperty(process, "execPath", { value: path.resolve("fixture", "node26") });
+    } else {
+      mocks.nodeRuntime.mockResolvedValue({
+        step: {
+          name: "preflight-node-runtime",
+          command: "check Node",
+          cwd: "/fixture",
+          durationMs: 0,
+          exitCode: 1,
+          stderrTail: "No system Node was found.",
+        },
+      });
+    }
+    await fs.rm(fixture.statePath);
+    const compatible = assertNodeRuntimeUpdateCompatible(fixture);
+    await (accepted
+      ? expect(compatible).resolves.toBeUndefined()
+      : expect(compatible).rejects.toThrow("No system Node was found."));
+    if (runtime === "renamed Node") {
+      expect(system).not.toHaveBeenCalled();
     }
   });
 });

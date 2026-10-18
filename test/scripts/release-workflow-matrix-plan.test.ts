@@ -71,42 +71,33 @@ function requiredJob(definition: WorkflowDocument, name: string): WorkflowJob {
   return expectDefined(definition.jobs[name], `release workflow job ${name}`);
 }
 
+function requiredStep(job: WorkflowJob, name: string): WorkflowStep {
+  return expectDefined(
+    job.steps.find((step) => step.name === name),
+    name,
+  );
+}
+
+function bashRun(command: string, env: NodeJS.ProcessEnv) {
+  return spawnSync("bash", ["--noprofile", "--norc", "-c", command], { encoding: "utf8", env });
+}
+
 // Direct dispatches build from the selected ref. Only trusted workflow callers
 // may provide the complete immutable package artifact tuple.
-const WORKFLOW_CALL_ONLY_INPUTS = new Set([
-  "runner_group",
-  "package_sha256",
-  "prepublish_plugin_registry_manifest_sha256",
-  "shared_image_archive_sha256",
-  "published_upgrade_survivor_baseline_scope",
-  "prepare_only",
-  "emit_candidate_evidence",
-  "release_soak",
-  "package_published",
-  "package_artifact_name",
-  "prepared_npm_bundle_json",
-  "package_artifact_id",
-  "package_artifact_digest",
-  "package_artifact_run_id",
-  "package_artifact_run_attempt",
-  "package_file_name",
-  "package_source_sha",
-  "package_sha256",
-  "package_version",
-  "enable_prepublish_plugin_registry",
-  "prepublish_plugin_registry_artifact_name",
-  "prepublish_plugin_registry_artifact_id",
-  "prepublish_plugin_registry_artifact_digest",
-  "prepublish_plugin_registry_artifact_run_id",
-  "prepublish_plugin_registry_artifact_run_attempt",
-  "prepublish_plugin_registry_manifest_sha256",
-  "shared_image_artifact_name",
-  "shared_image_artifact_id",
-  "shared_image_artifact_digest",
-  "shared_image_artifact_run_id",
-  "shared_image_artifact_run_attempt",
-  "shared_image_archive_sha256",
-]);
+const WORKFLOW_CALL_ONLY_INPUTS = new Set(
+  `runner_group package_sha256
+prepublish_plugin_registry_manifest_sha256 shared_image_archive_sha256
+published_upgrade_survivor_baseline_scope prepare_only emit_candidate_evidence release_soak
+package_published package_artifact_name prepared_npm_bundle_json package_artifact_id
+package_artifact_digest package_artifact_run_id package_artifact_run_attempt package_file_name
+package_source_sha package_version enable_prepublish_plugin_registry
+prepublish_plugin_registry_artifact_name prepublish_plugin_registry_artifact_id
+prepublish_plugin_registry_artifact_digest prepublish_plugin_registry_artifact_run_id
+prepublish_plugin_registry_artifact_run_attempt shared_image_artifact_name shared_image_artifact_id
+shared_image_artifact_digest shared_image_artifact_run_id shared_image_artifact_run_attempt`.split(
+    /\s+/u,
+  ),
+);
 
 const PACKAGE_UPDATE_CHUNKS = [
   "package-update-openai",
@@ -308,23 +299,14 @@ describe("scripts/plan-release-workflow-matrix.mjs", () => {
     ],
   ])("propagates harness results from %s to the release gate", (stepName, args) => {
     const job = requiredJob(workflow(), "validate_release_live_cache");
-    const step = expectDefined(
-      job.steps.find((entry) => entry.name === stepName),
-      "prompt-prefix step",
-    );
+    const step = requiredStep(job, stepName);
     for (const code of [0, 23]) {
-      const result = spawnSync(
-        "bash",
-        [
-          "--noprofile",
-          "--norc",
-          "-c",
-          `timeout() { while [[ "$1" == --* ]]; do shift; done; shift; "$@"; }
+      const result = bashRun(
+        `timeout() { while [[ "$1" == --* ]]; do shift; done; shift; "$@"; }
 node() { printf '%s\\n' "$*"; return "$HARNESS_EXIT"; }
 pnpm() { node "$@"; }
 ${expectDefined(step.run, "prompt-prefix command")}`,
-        ],
-        { encoding: "utf8", env: { PATH: process.env.PATH, HARNESS_EXIT: String(code) } },
+        { PATH: process.env.PATH, HARNESS_EXIT: String(code) },
       );
       expect(result.stdout.trim()).toBe(args);
       expect(result.status, result.stderr).toBe(code);
@@ -337,14 +319,8 @@ ${expectDefined(step.run, "prompt-prefix command")}`,
     ["validate_docker_lanes", "Run targeted Docker E2E lanes"],
   ])("drains diagnostics after credential failure in %s", (jobName, runStepName) => {
     const job = requiredJob(workflow(), jobName);
-    const credentials = expectDefined(
-      job.steps.find((step) => step.name === "Validate Docker E2E credentials"),
-      "credential validation step",
-    );
-    const run = expectDefined(
-      job.steps.find((step) => step.name === runStepName),
-      "Docker execution step",
-    );
+    const credentials = requiredStep(job, "Validate Docker E2E credentials");
+    const run = requiredStep(job, runStepName);
     // Credential validation must be reached only after every setup/binding step
     // succeeds; nothing fallible may intervene before diagnostic continuation.
     expect(job.steps.indexOf(run)).toBe(job.steps.indexOf(credentials) + 1);
@@ -367,14 +343,11 @@ ${expectDefined(step.run, "prompt-prefix command")}`,
       },
     ]) {
       for (const authenticated of [false, true]) {
-        const result = spawnSync("bash", ["--noprofile", "--norc", "-c", preflight], {
-          encoding: "utf8",
-          env: {
-            PATH: process.env.PATH,
-            CREDENTIALS: credential,
-            ...alternatives,
-            ...(authenticated ? { [key]: "synthetic-api-key" } : {}),
-          },
+        const result = bashRun(preflight, {
+          PATH: process.env.PATH,
+          CREDENTIALS: credential,
+          ...alternatives,
+          ...(authenticated ? { [key]: "synthetic-api-key" } : {}),
         });
         expect(result.status, result.stderr).toBe(authenticated ? 0 : 1);
         if (!authenticated) {
@@ -384,57 +357,37 @@ ${expectDefined(step.run, "prompt-prefix command")}`,
       }
     }
 
-    for (const state of [
-      { label: "success", success: true, cancelled: false, outcome: "success", selected: true },
-      {
-        label: "credential failure",
-        success: false,
-        cancelled: false,
-        outcome: "failure",
-        selected: true,
-      },
-      {
-        label: "setup failure",
-        success: false,
-        cancelled: false,
-        outcome: "skipped",
-        selected: true,
-      },
-      { label: "cancelled", success: false, cancelled: true, outcome: "failure", selected: true },
-      {
-        label: "unselected profile",
-        success: true,
-        cancelled: false,
-        outcome: "skipped",
-        selected: false,
-      },
-    ]) {
+    for (const [label, success, cancelled, outcome, selected] of [
+      ["success", true, false, "success", true],
+      ["credential failure", false, false, "failure", true],
+      ["setup failure", false, false, "skipped", true],
+      ["cancelled", false, true, "failure", true],
+      ["unselected profile", true, false, "skipped", false],
+    ] as const) {
       const evaluate = (step: WorkflowStep) => {
         const expression = (step.if ?? "success()").replace(/^\$\{\{\s*([\s\S]*?)\s*\}\}$/u, "$1");
         // GitHub implicitly adds success() unless a status function is present.
         const implicitSuccess = /\b(?:always|cancelled|failure|success)\s*\(/u.test(expression)
           ? true
-          : state.success;
+          : success;
         return (
           implicitSuccess &&
           runInNewContext(expression, {
             always: () => true,
-            cancelled: () => state.cancelled,
-            failure: () => !state.success && !state.cancelled,
-            success: () => state.success,
+            cancelled: () => cancelled,
+            failure: () => !success && !cancelled,
+            success: () => success,
             contains: (value: string, item: string) => value.includes(item),
             inputs: { release_test_profile: "full" },
-            matrix: { profiles: state.selected ? "stable full" : "beta" },
-            steps: { [credentials.id ?? ""]: { outcome: state.outcome } },
+            matrix: { profiles: selected ? "stable full" : "beta" },
+            steps: { [credentials.id ?? ""]: { outcome } },
           })
         );
       };
-      const profileSelected = jobName === "validate_docker_lanes" || state.selected;
-      expect(evaluate(credentials), `${state.label}: preflight`).toBe(
-        state.success && profileSelected,
-      );
-      expect(evaluate(run), `${state.label}: diagnostics`).toBe(
-        !state.cancelled && profileSelected && (state.success || state.outcome === "failure"),
+      const profileSelected = jobName === "validate_docker_lanes" || selected;
+      expect(evaluate(credentials), `${label}: preflight`).toBe(success && profileSelected);
+      expect(evaluate(run), `${label}: diagnostics`).toBe(
+        !cancelled && profileSelected && (success || outcome === "failure"),
       );
     }
   });
@@ -459,19 +412,14 @@ ${expectDefined(step.run, "prompt-prefix command")}`,
       SELECTED_SHA: "a".repeat(40),
       SHARED_IMAGE_POLICY: "no-push-artifact",
     };
-    const steps = requiredJob(definition, "plan_release_workflow_matrices").steps;
-    const setup = expectDefined(
-      steps.find((entry) => entry.name === "Setup admission Node.js"),
-      "matrix planner Node setup",
-    );
+    const plannerJob = requiredJob(definition, "plan_release_workflow_matrices");
+    const { steps } = plannerJob;
+    const setup = requiredStep(plannerJob, "Setup admission Node.js");
     expect(setup.if).toBeUndefined();
     expect(setup.env).toMatchObject({ REQUESTED_NODE_VERSION: "24.x" });
     expect(setup.run).toContain("source .github/actions/setup-pnpm-store-cache/ensure-node.sh");
     expect(setup.run).toContain('openclaw_ensure_node "$REQUESTED_NODE_VERSION"');
-    const planner = expectDefined(
-      steps.find((entry) => entry.name === "Plan shared live image plugins"),
-      "live image planner step",
-    );
+    const planner = requiredStep(plannerJob, "Plan shared live image plugins");
     expect(steps.indexOf(setup)).toBeLessThan(steps.indexOf(planner));
     const planned = spawnSync(bash, ["-c", expectDefined(planner.run, "planner command")], {
       cwd: outputDir,
@@ -480,18 +428,13 @@ ${expectDefined(step.run, "prompt-prefix command")}`,
     });
     expect(planned.status, planned.stderr).toBe(0);
     const selected = readFileSync(outputPath, "utf8").trim().split("=")[1];
-    const step = expectDefined(
-      requiredJob(definition, "prepare_live_test_image").steps.find(
-        (entry) => entry.name === "Resolve shared live-test image tag",
-      ),
-      "live image selection step",
+    const step = requiredStep(
+      requiredJob(definition, "prepare_live_test_image"),
+      "Resolve shared live-test image tag",
     );
     const result = spawnSync(bash, ["-c", expectDefined(step.run, "selection command")], {
       encoding: "utf8",
-      env: {
-        ...env,
-        LIVE_IMAGE_EXTENSIONS: selected,
-      },
+      env: { ...env, LIVE_IMAGE_EXTENSIONS: selected },
     });
     expect(result.status, result.stderr).toBe(0);
     const outputs = Object.fromEntries(
@@ -570,10 +513,10 @@ ${expectDefined(step.run, "prompt-prefix command")}`,
     expect(definition.env.OPENCLAW_DOCKER_E2E_ALLOW_UNRELEASED_CHANGELOG).toBe(
       "${{ inputs.allow_unreleased_changelog }}",
     );
-    const packageStep = requiredJob(definition, "prepare_docker_e2e_image").steps.find(
-      (step: WorkflowStep) => step.name === "Pack OpenClaw package for Docker E2E",
+    const requiredPackageStep = requiredStep(
+      requiredJob(definition, "prepare_docker_e2e_image"),
+      "Pack OpenClaw package for Docker E2E",
     );
-    const requiredPackageStep = expectDefined(packageStep, "Docker E2E package step");
     expect(requiredPackageStep.env?.ALLOW_UNRELEASED_CHANGELOG).toBe(
       "${{ inputs.allow_unreleased_changelog }}",
     );
@@ -697,10 +640,7 @@ ${expectDefined(step.run, "prompt-prefix command")}`,
           expectDefined(expressions[expression], `release-core fixture expression ${expression}`),
         );
       for (const stepName of ["Plan Docker E2E chunk", "Run Docker E2E chunk"]) {
-        const step = expectDefined(
-          job.steps.find((entry) => entry.name === stepName),
-          stepName,
-        );
+        const step = requiredStep(job, stepName);
         // Preserve every scheduler selector from the real workflow. PLAN_JSON
         // only substitutes scheduling for execution; it does not change lanes.
         const selectors = Object.fromEntries(

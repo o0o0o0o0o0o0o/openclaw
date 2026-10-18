@@ -42,12 +42,7 @@ const releases: Record<
       job: "plan",
       step: "Validate trusted workflow and target",
     },
-    env: {
-      EVENT_SHA: sha,
-      SOURCE_REF: sha,
-      WORKFLOW_REF: "refs/heads/main",
-      WORKFLOW_SHA: sha,
-    },
+    env: { EVENT_SHA: sha, SOURCE_REF: sha, WORKFLOW_REF: "refs/heads/main", WORKFLOW_SHA: sha },
   },
 };
 
@@ -65,6 +60,23 @@ function releaseRun(signal: AbortSignal, mode: ReleaseMode, options: RunOptions 
 
 function gitCommands(report: Awaited<ReturnType<typeof releaseRun>>) {
   return report.commands.filter(({ tool }) => tool === "git").map(({ args }) => args);
+}
+
+function expectBlocked(
+  report: Awaited<ReturnType<typeof releaseRun>>,
+  code?: number,
+  operation?: string,
+) {
+  if (code === undefined) {
+    expect(report.code, report.output).not.toBe(0);
+  } else {
+    expect(report.code, report.output).toBe(code);
+  }
+  if (operation) {
+    expect(gitCommands(report).at(-1)?.[0]).toBe(operation);
+  }
+  expect(report.githubOutput).toBe("");
+  expect(report.commands.some(({ tool }) => tool === "pnpm")).toBe(false);
 }
 
 posixIt.for([releaseTag, `${releaseTag}-2`])(
@@ -148,10 +160,7 @@ posixIt.for(
   { timeout: 55_000 },
   async ({ failure, mode }, { signal }) => {
     const report = await releaseRun(signal, mode, { fetchResults: [failure] });
-    expect(report.code, report.output).toBe(failure === "hang" ? 124 : failure);
-    expect(gitCommands(report).at(-1)?.[0]).toBe("fetch");
-    expect(report.githubOutput).toBe("");
-    expect(report.commands.some(({ tool }) => tool === "pnpm")).toBe(false);
+    expectBlocked(report, failure === "hang" ? 124 : failure, "fetch");
   },
 );
 
@@ -163,13 +172,8 @@ posixIt.for(
   "$mode ordinary rev-parse status $code remains terminal",
   { timeout: 55_000 },
   async ({ code, mode }, { signal }) => {
-    const report = await releaseRun(signal, mode, {
-      gitFault: { match: "^rev-parse ", code },
-    });
-    expect(report.code, report.output).toBe(code);
-    expect(gitCommands(report).at(-1)?.[0]).toBe("rev-parse");
-    expect(report.githubOutput).toBe("");
-    expect(report.commands.some(({ tool }) => tool === "pnpm")).toBe(false);
+    const report = await releaseRun(signal, mode, { gitFault: { match: "^rev-parse ", code } });
+    expectBlocked(report, code, "rev-parse");
   },
 );
 
@@ -179,37 +183,33 @@ posixIt(
     const report = await releaseRun(signal, "macos", {
       env: { PUBLIC_RELEASE_BRANCH: "feature/not-a-release" },
     });
-    expect(report.code, report.output).toBe(1);
+    expectBlocked(report, 1);
     expect(report.output).toContain(
       "public_release_branch must be main or release/YYYY.M.PATCH, got feature/not-a-release.",
     );
     expect(gitCommands(report)).toEqual([]);
-    expect(report.commands.some(({ tool }) => tool === "pnpm")).toBe(false);
   },
   55_000,
 );
 
-const terminalOperations = [
-  { mode: "linux" as const, match: "^fetch ", operation: "fetch" },
-  { mode: "linux" as const, match: "^rev-parse ", operation: "rev-parse" },
-  { mode: "linux" as const, match: "^merge-base ", operation: "merge-base" },
-  { mode: "macos" as const, match: "^rev-parse ", operation: "rev-parse" },
-  { mode: "macos" as const, match: "^fetch ", operation: "fetch" },
-  { mode: "placeholder" as const, match: "^rev-parse ", operation: "rev-parse" },
-  { mode: "placeholder" as const, match: "^fetch ", operation: "fetch" },
-  {
-    mode: "placeholder" as const,
-    match: "^merge-base ",
-    occurrence: 1,
-    operation: "merge-base",
-  },
-  {
-    mode: "placeholder" as const,
-    match: "^merge-base ",
-    occurrence: 2,
-    operation: "merge-base",
-  },
-];
+const terminalOperations = (
+  [
+    ["linux", "fetch"],
+    ["linux", "rev-parse"],
+    ["linux", "merge-base"],
+    ["macos", "rev-parse"],
+    ["macos", "fetch"],
+    ["placeholder", "rev-parse"],
+    ["placeholder", "fetch"],
+    ["placeholder", "merge-base", 1],
+    ["placeholder", "merge-base", 2],
+  ] as const
+).map(([mode, operation, occurrence]) => ({
+  mode,
+  operation,
+  occurrence,
+  match: `^${operation} `,
+}));
 
 posixIt.for(
   terminalOperations.flatMap((entry) =>
@@ -224,10 +224,7 @@ posixIt.for(
     const report = await releaseRun(signal, mode, {
       gitFault: { match, occurrence, code: failure },
     });
-    expect(report.code, report.output).toBe(failure === "cancel" ? 143 : 125);
-    expect(gitCommands(report).at(-1)?.[0]).toBe(operation);
-    expect(report.githubOutput).toBe("");
-    expect(report.commands.some(({ tool }) => tool === "pnpm")).toBe(false);
+    expectBlocked(report, failure === "cancel" ? 143 : 125, operation);
     expect(report.output).not.toMatch(/not reachable|requires ref to equal/u);
   },
 );
@@ -236,12 +233,8 @@ posixIt.for([23, 125])(
   "Linux ordinary merge-base status %s is terminal without trying another branch",
   { timeout: 55_000 },
   async (code, { signal }) => {
-    const report = await releaseRun(signal, "linux", {
-      gitFault: { match: "^merge-base ", code },
-    });
-    expect(report.code, report.output).toBe(code);
-    expect(gitCommands(report).at(-1)?.[0]).toBe("merge-base");
-    expect(report.githubOutput).toBe("");
+    const report = await releaseRun(signal, "linux", { gitFault: { match: "^merge-base ", code } });
+    expectBlocked(report, code, "merge-base");
   },
 );
 
@@ -254,11 +247,10 @@ posixIt(
         [`merge-base --is-ancestor ${sha} refs/remotes/origin/release/2026.8.1`]: { code: 1 },
       },
     });
-    expect(report.code, report.output).toBe(1);
+    expectBlocked(report, 1);
     expect(report.output).toContain(
       `Tag ${releaseTag} (${sha}) is not reachable from main or release/2026.8.1.`,
     );
-    expect(report.githubOutput).toBe("");
   },
   55_000,
 );
@@ -269,10 +261,9 @@ posixIt(
     const report = await releaseRun(signal, "linux", {
       commandResults: { [`merge-base --is-ancestor ${otherSha} origin/main`]: { code: 1 } },
     });
-    expect(report.code, report.output).toBe(1);
+    expectBlocked(report, 1);
     expect(report.output).toContain("Linux release tooling must be reachable from current main.");
     expect(gitCommands(report).some(([operation]) => operation === "rev-parse")).toBe(false);
-    expect(report.githubOutput).toBe("");
   },
   55_000,
 );
@@ -285,11 +276,11 @@ posixIt.for([128, "cleanup-failure", "cancel"] as const)(
       commandResults: { [`merge-base --is-ancestor ${sha} origin/main`]: { code: 1 } },
       gitFault: { match: "^fetch ", occurrence: 2, code: failure },
     });
-    expect(report.code, report.output).toBe(
+    expectBlocked(
+      report,
       failure === "cancel" ? 143 : failure === "cleanup-failure" ? 125 : failure,
+      "fetch",
     );
-    expect(gitCommands(report).at(-1)?.[0]).toBe("fetch");
-    expect(report.githubOutput).toBe("");
   },
 );
 
@@ -303,12 +294,11 @@ posixIt.for([
     const report = await releaseRun(signal, "placeholder", {
       gitFault: { match: "^merge-base ", occurrence, code: 23 },
     });
-    expect(report.code, report.output).toBe(1);
+    expectBlocked(report, 1);
     expect(report.output).toContain(message);
     expect(gitCommands(report).filter(([operation]) => operation === "merge-base")).toHaveLength(
       occurrence,
     );
-    expect(report.githubOutput).toBe("");
   },
 );
 
@@ -319,12 +309,11 @@ posixIt.for([23, 125])(
     const report = await releaseRun(signal, "placeholder", {
       gitFault: { match: "^rev-parse ", code },
     });
-    expect(report.code, report.output).toBe(1);
+    expectBlocked(report, 1);
     expect(report.output).toContain(
       "NPM placeholder publication requires ref to equal the exact main workflow SHA.",
     );
     expect(gitCommands(report)).toHaveLength(1);
-    expect(report.githubOutput).toBe("");
   },
 );
 
@@ -336,10 +325,7 @@ const placeholderIdentityMismatches: Array<{
     env: { WORKFLOW_REF: "refs/heads/release/2026.8.1" },
     message: "must run from the trusted main workflow",
   },
-  {
-    env: { EVENT_SHA: otherSha },
-    message: "requires ref to equal the exact main workflow SHA",
-  },
+  { env: { EVENT_SHA: otherSha }, message: "requires ref to equal the exact main workflow SHA" },
 ];
 
 posixIt.for(placeholderIdentityMismatches)(
@@ -347,10 +333,9 @@ posixIt.for(placeholderIdentityMismatches)(
   { timeout: 55_000 },
   async ({ env, message }, { signal }) => {
     const report = await releaseRun(signal, "placeholder", { env });
-    expect(report.code, report.output).toBe(1);
+    expectBlocked(report, 1);
     expect(report.output).toContain(message);
     expect(gitCommands(report)).toEqual([]);
-    expect(report.githubOutput).toBe("");
   },
 );
 
@@ -360,12 +345,11 @@ posixIt(
     const report = await releaseRun(signal, "placeholder", {
       commandResults: { "rev-parse HEAD": { code: 0, output: `${otherSha}\n` } },
     });
-    expect(report.code, report.output).toBe(1);
+    expectBlocked(report, 1);
     expect(report.output).toContain(
       "NPM placeholder publication requires ref to equal the exact main workflow SHA.",
     );
     expect(gitCommands(report)).toEqual([["rev-parse", "HEAD"]]);
-    expect(report.githubOutput).toBe("");
   },
   55_000,
 );
@@ -379,8 +363,6 @@ posixIt.for(
   { timeout: 55_000 },
   async ({ mode, setupFailure }, { signal }) => {
     const report = await releaseRun(signal, mode, { setupFailure });
-    expect(report.code, report.output).not.toBe(0);
-    expect(report.githubOutput).toBe("");
-    expect(report.commands.some(({ tool }) => tool === "pnpm")).toBe(false);
+    expectBlocked(report);
   },
 );

@@ -1,5 +1,6 @@
 /* @vitest-environment jsdom */
 
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it, vi } from "vitest";
 import { mountSolid } from "../../test-helpers/mount-solid.ts";
 import { Security } from "./security.tsx";
@@ -12,10 +13,7 @@ function expectButtonByText(container: Element, text: string): SecurityControl {
   const button = Array.from(
     container.querySelectorAll<SecurityControl>("button, label.settings-segmented__btn"),
   ).find((candidate) => candidate.textContent?.trim() === text);
-  if (!(button instanceof HTMLElement)) {
-    throw new Error(`Expected button labelled ${text}`);
-  }
-  return button;
+  return expectDefined(button, `button labelled ${text}`);
 }
 
 function selectRadio(control: SecurityControl) {
@@ -28,10 +26,7 @@ function expectRowByTitle(container: Element, text: string): HTMLElement {
   const row = Array.from(container.querySelectorAll<HTMLElement>(".settings-row")).find(
     (candidate) => candidate.querySelector(".settings-row__title")?.textContent?.trim() === text,
   );
-  if (!(row instanceof HTMLElement)) {
-    throw new Error(`Expected security row "${text}"`);
-  }
-  return row;
+  return expectDefined(row, `security row "${text}"`);
 }
 
 function renderSecurity(
@@ -70,10 +65,7 @@ describe("Security", () => {
     const browserInput = browserRow.querySelector<HTMLInputElement>(".settings-toggle__input");
     expect(browserInput).toBeInstanceOf(HTMLInputElement);
     expect(browserInput?.checked).toBe(false);
-    if (!browserInput) {
-      throw new Error("Expected browser switch");
-    }
-    browserInput.click();
+    browserInput?.click();
     expect(onBrowserEnabledToggle).toHaveBeenCalledWith(true);
 
     selectRadio(expectButtonByText(container, "Full"));
@@ -83,12 +75,7 @@ describe("Security", () => {
   });
 
   it("shows gateway auth as a dot status, not a pill", () => {
-    const { container } = renderSecurity({
-      gatewayAuth: "none",
-      browserEnabledOverridden: false,
-      toolProfile: "",
-      toolProfileOverridden: false,
-    });
+    const { container } = renderSecurity({ gatewayAuth: "none" });
 
     const authRow = expectRowByTitle(container, "Gateway auth");
     const authStatus = authRow.querySelector(".settings-status");

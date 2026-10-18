@@ -14,10 +14,8 @@ import { flush, waitForSolid } from "../../test-helpers/solid-settle.ts";
 import { SessionStorageSettings } from "./session-storage.tsx";
 
 const configs: RuntimeConfigCapability[] = [];
-function inventory(
-  count: number,
-  maintenance: Partial<SessionsStorageStatusResult["maintenance"]> = {},
-): SessionsStorageStatusResult {
+type Maintenance = Partial<SessionsStorageStatusResult["maintenance"]>;
+function inventory(count: number, maintenance: Maintenance = {}): SessionsStorageStatusResult {
   return {
     agents: [
       {
@@ -65,9 +63,8 @@ async function mount() {
   configs.push(runtimeConfig);
   await runtimeConfig.ensureLoaded();
   const context = { gateway, runtimeConfig } as unknown as ApplicationContext;
-  const provider = createSolidApplicationContextProvider(context);
   const { container: page, unmount } = mountSolid(() => <SessionStorageSettings />, {
-    wrapper: provider.wrapper,
+    wrapper: createSolidApplicationContextProvider(context).wrapper,
   });
   await waitText(page, "7 uncompressed");
   return { page, context, runtimeConfig, request, client, respond, reply, publish, unmount };
@@ -82,82 +79,73 @@ function click(page: HTMLElement, label: string) {
   flush();
 }
 
-function waitText(page: HTMLElement, text: string) {
-  return waitForSolid(() => expect(page.textContent).toContain(text));
-}
-
-function waitRunning(page: HTMLElement) {
+function waitText(page: HTMLElement, text: string, selector?: string) {
   return waitForSolid(() =>
-    expect(page.querySelector(".settings-status")?.textContent).toContain("Running"),
+    expect((selector ? page.querySelector(selector) : page)?.textContent).toContain(text),
   );
+}
+async function expectIdle(request: ReturnType<typeof vi.fn>) {
+  const calls = request.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(request.mock.calls).toHaveLength(calls);
+}
+function draft(page: HTMLElement, value: string) {
+  const input = page.querySelector<HTMLInputElement>('input[type="number"]')!;
+  input.value = value;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  return input;
 }
 afterEach(() => {
   cleanupSolid();
-  for (const config of configs.splice(0)) {
-    config.dispose();
-  }
+  configs.splice(0).forEach((config) => config.dispose());
   vi.restoreAllMocks();
 });
 
-it.each(["client", "handshake", "reconnect"])(
-  "rejects a delayed inventory after the Gateway %s changes",
-  async (change) => {
-    const { page, context, request, client, reply, publish } = await mount();
-    const previous = createDeferred<SessionsStorageStatusResult>();
-    request.mockImplementation(reply("sessions.storage.status", () => previous.promise));
-    click(page, "Refresh");
-    await waitForSolid(() =>
-      expect(
-        request.mock.calls.filter(([method]) => method === "sessions.storage.status"),
-      ).toHaveLength(2),
-    );
-    expect(page.textContent).toContain("7 uncompressed");
-    const currentRequest = vi.fn(reply("sessions.storage.status", async () => inventory(42)));
-    if (change === "client") {
-      publish(true, { request: currentRequest } as unknown as GatewayBrowserClient);
-    } else {
-      request.mockImplementation(currentRequest);
-      if (change === "reconnect") {
-        const hello = context.gateway.snapshot.hello;
-        publish(false, client, hello);
-        publish(true, client, hello);
-      } else {
-        publish(true, client);
-      }
-    }
-    await waitText(page, "42 uncompressed");
-    previous.resolve(inventory(700));
-    await previous.promise;
-    flush();
-    expect(page.textContent).toContain("42 uncompressed");
-    expect(page.textContent).not.toContain("700 uncompressed");
-  },
-);
-
-it("does not publish an old Gateway's completed run after a new connection", async () => {
-  const { page, request, reply, publish } = await mount();
+it.each([
+  ["status", "client"],
+  ["status", "handshake"],
+  ["status", "reconnect"],
+  ["run", "client"],
+])("rejects a delayed %s response after the Gateway %s changes", async (kind, change) => {
+  const { page, context, request, client, reply, publish } = await mount();
+  const method = `sessions.storage.${kind}`;
   const previous = createDeferred<SessionsStorageStatusResult>();
-  request.mockImplementation(reply("sessions.storage.run", () => previous.promise));
-  click(page, "Run now");
+  request.mockImplementation(reply(method, () => previous.promise));
+  click(page, kind === "status" ? "Refresh" : "Run now");
   await waitForSolid(() =>
-    expect(request.mock.calls.some(([method]) => method === "sessions.storage.run")).toBe(true),
+    expect(request.mock.calls.filter(([called]) => called === method)).toHaveLength(
+      kind === "status" ? 2 : 1,
+    ),
   );
+  expect(page.textContent).toContain("7 uncompressed");
   const currentRequest = vi.fn(reply("sessions.storage.status", async () => inventory(42)));
-  publish(true, { request: currentRequest } as unknown as GatewayBrowserClient);
+  if (change === "client") {
+    publish(true, { request: currentRequest } as unknown as GatewayBrowserClient);
+  } else {
+    request.mockImplementation(currentRequest);
+    if (change === "reconnect") {
+      const hello = context.gateway.snapshot.hello;
+      publish(false, client, hello);
+      publish(true, client, hello);
+    } else {
+      publish(true, client);
+    }
+  }
   await waitText(page, "42 uncompressed");
   previous.resolve(inventory(700, { archivedTranscripts: 693 }));
   await previous.promise;
   flush();
-  expect(page.textContent).not.toContain("Batch completed");
+  expect(page.textContent).toContain("42 uncompressed");
   expect(page.textContent).not.toContain("700 uncompressed");
-  expect(button(page, "Run now").disabled).toBe(false);
+  if (kind === "run") {
+    expect(page.textContent).not.toContain("Batch completed");
+    expect(button(page, "Run now").disabled).toBe(false);
+  }
 });
 
 it("keeps a days draft and inventory through reconnect and retires them on client replacement", async () => {
   const { page, runtimeConfig, request, respond, reply, publish, client } = await mount();
-  const input = page.querySelector<HTMLInputElement>('input[type="number"]')!;
-  input.value = "14";
-  input.dispatchEvent(new Event("input", { bubbles: true }));
+  const input = draft(page, "14");
   request.mockImplementation(reply("sessions.storage.status", async () => inventory(42)));
   click(page, "Refresh");
   await waitText(page, "42 uncompressed");
@@ -166,9 +154,8 @@ it("keeps a days draft and inventory through reconnect and retires them on clien
 
   publish(false, client, null);
   flush();
-  expect(input.value).toBe("14");
+  expect(input).toMatchObject({ value: "14", disabled: true });
   expect(page.textContent).toContain("42 uncompressed");
-  expect(input.disabled).toBe(true);
   const reconnect = createDeferred<SessionsStorageStatusResult>();
   request.mockImplementation(reply("sessions.storage.status", () => reconnect.promise));
   publish(true, client);
@@ -179,28 +166,23 @@ it("keeps a days draft and inventory through reconnect and retires them on clien
   await waitText(page, "21 uncompressed");
   expect(input.value).toBe("14");
 
-  input.value = "";
-  input.dispatchEvent(new Event("input", { bubbles: true }));
+  draft(page, "");
   input.dispatchEvent(new Event("change", { bubbles: true }));
   expect(runtimeConfig.state.configFormDirty).toBe(false);
   expect(request.mock.calls.some(([method]) => method === "config.set")).toBe(false);
 
-  const currentRequest = vi.fn(respond);
-  publish(true, { request: currentRequest } as unknown as GatewayBrowserClient);
+  publish(true, { request: vi.fn(respond) } as unknown as GatewayBrowserClient);
   await waitText(page, "7 uncompressed");
   expect(input.value).toBe("30");
 });
 
 it("retires the days draft and inventory when a fresh hello removes access", async () => {
   const { page, context, client, publish } = await mount();
-  const input = page.querySelector<HTMLInputElement>('input[type="number"]')!;
-  input.value = "14";
-  input.dispatchEvent(new Event("input", { bubbles: true }));
+  const input = draft(page, "14");
   const hello = context.gateway.snapshot.hello!;
   publish(true, client, { ...hello, auth: { ...hello.auth, scopes: [] } });
   flush();
-  expect(input.value).toBe("30");
-  expect(input.disabled).toBe(true);
+  expect(input).toMatchObject({ value: "30", disabled: true });
   expect(page.textContent).not.toContain("7 uncompressed");
 });
 
@@ -208,74 +190,59 @@ async function startBackgroundRun() {
   const mounted = await mount();
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   const running = inventory(7, { running: true, lastStartedAt: 100 });
-  let nextStatus: () => Promise<SessionsStorageStatusResult> = async () => running;
+  const nextStatus = vi.fn<() => Promise<SessionsStorageStatusResult>>().mockResolvedValue(running);
+  const readStatus = mounted.reply("sessions.storage.status", nextStatus);
   mounted.request.mockImplementation((method) =>
-    method === "sessions.storage.run"
-      ? Promise.resolve(running)
-      : method === "sessions.storage.status"
-        ? nextStatus()
-        : mounted.respond(method),
+    method === "sessions.storage.run" ? Promise.resolve(running) : readStatus(method),
   );
   click(mounted.page, "Run now");
   await waitForSolid(() => expect(mounted.page.textContent).toContain("Background batch started."));
-  await waitRunning(mounted.page);
-  return {
-    ...mounted,
-    running,
-    setStatus: (read: typeof nextStatus) => {
-      nextStatus = read;
-    },
-  };
+  await waitText(mounted.page, "Running", ".settings-status");
+  return { ...mounted, running, nextStatus };
 }
 
-it("tracks an accepted job until completion and stops polling while idle", async () => {
-  const { page, request, setStatus } = await startBackgroundRun();
+it.each([false, true])("follows run completion (reconnect=%s)", async (reconnect) => {
+  const { page, request, nextStatus, client, publish } = await startBackgroundRun();
   const reads = () =>
     request.mock.calls.filter(([method]) => method === "sessions.storage.status").length;
   const acceptedReads = reads();
   expect(page.textContent).not.toContain("Batch completed");
-  await vi.advanceTimersByTimeAsync(2_000);
-  expect(reads()).toBe(acceptedReads + 1);
-  setStatus(async () =>
+  if (reconnect) {
+    publish(false, client, null);
+    flush();
+    expect(page.textContent).toContain("Background batch started.");
+  } else {
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(reads()).toBe(acceptedReads + 1);
+  }
+  nextStatus.mockResolvedValue(
     inventory(5, {
       lastCompletedAt: 200,
       archivedTranscripts: 2,
       externalizedTranscripts: 3,
     }),
   );
-  await vi.advanceTimersByTimeAsync(2_000);
+  if (reconnect) {
+    publish(true, client);
+  } else {
+    await vi.advanceTimersByTimeAsync(2_000);
+  }
   await waitText(page, "Batch completed. 2 transcripts archived.");
   expect(page.textContent).toContain("3 compressed archives moved from the database to files.");
-  const finishedReads = reads();
-  await vi.advanceTimersByTimeAsync(10_000);
-  expect(reads()).toBe(finishedReads);
-});
-
-it("observes a followed run completing while the same client reconnects", async () => {
-  const { page, client, publish, setStatus } = await startBackgroundRun();
-  publish(false, client, null);
-  flush();
-  expect(page.textContent).toContain("Background batch started.");
-  setStatus(async () => inventory(5, { lastCompletedAt: 200, archivedTranscripts: 2 }));
-  publish(true, client);
-  await waitText(page, "Batch completed. 2 transcripts archived.");
+  await expectIdle(request);
 });
 
 it("stops polling after a status failure and resumes only after an explicit refresh", async () => {
-  const { page, request, running, setStatus } = await startBackgroundRun();
-  setStatus(async () => {
-    throw new Error("Worker status unavailable");
-  });
+  const { page, request, running, nextStatus } = await startBackgroundRun();
+  nextStatus.mockRejectedValue(new Error("Worker status unavailable"));
   await vi.advanceTimersByTimeAsync(2_000);
   await waitText(page, "Worker status unavailable");
   expect(page.textContent).toContain("Refresh to check the current maintenance state.");
-  const failedReads = request.mock.calls.length;
-  await vi.advanceTimersByTimeAsync(10_000);
-  expect(request.mock.calls).toHaveLength(failedReads);
-  setStatus(async () => running);
+  await expectIdle(request);
+  nextStatus.mockResolvedValue(running);
   click(page, "Refresh");
-  await waitRunning(page);
-  setStatus(async () =>
+  await waitText(page, "Running", ".settings-status");
+  nextStatus.mockResolvedValue(
     inventory(7, {
       lastCompletedAt: 200,
       lastError: "Archive publication failed",
@@ -284,9 +251,7 @@ it("stops polling after a status failure and resumes only after an explicit refr
   await vi.advanceTimersByTimeAsync(2_000);
   await waitText(page, "Archive publication failed");
   expect(page.textContent).not.toContain("Batch completed");
-  const terminalReads = request.mock.calls.length;
-  await vi.advanceTimersByTimeAsync(10_000);
-  expect(request.mock.calls).toHaveLength(terminalReads);
+  await expectIdle(request);
 });
 
 it.each(["detach", "disconnect", "replace"])("retires background polling on %s", async (change) => {
@@ -299,9 +264,7 @@ it.each(["detach", "disconnect", "replace"])("retires background polling on %s",
     publish(true, { request: vi.fn(respond) } as unknown as GatewayBrowserClient);
   }
   flush();
-  const previousCalls = request.mock.calls.length;
-  await vi.advanceTimersByTimeAsync(10_000);
-  expect(request.mock.calls).toHaveLength(previousCalls);
+  await expectIdle(request);
   if (change === "replace") {
     expect(page.textContent).not.toContain("Background batch started.");
   } else if (change === "disconnect") {

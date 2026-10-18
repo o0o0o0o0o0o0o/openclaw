@@ -15,8 +15,14 @@ import { pages } from "./route.ts";
 type RouteModule = Awaited<ReturnType<(typeof pages)[number]["component"]>>;
 type Page = PageDefinition<RouteId, ApplicationContext, RouteModule>;
 
-const removedGeneralPage = pages.find((page) => page.id === "config") as Page;
-const updatesPage = pages.find((page) => page.id === "updates") as Page;
+const page = (id: RouteId) => pages.find((candidate) => candidate.id === id) as Page;
+const component = async () => ({ header: true, renderSolid: () => null });
+const routerFor = (...routes: Page[]) =>
+  createRouter<RouteId, ApplicationContext, RouteModule>({ routes });
+const runtimeConfig = () => ({
+  ensureLoaded: vi.fn(() => Promise.resolve()),
+  ensureSchemaLoaded: vi.fn(() => Promise.resolve()),
+});
 
 function memoryHistory(origin: RouteLocation) {
   const entries = [origin];
@@ -61,151 +67,120 @@ function loaderOptions(location: RouteLocation): RouteLoaderOptions {
   };
 }
 
-function targetPage(id: RouteId) {
-  return definePage({
-    ...routePageSpec(id),
-    component: async () => ({ header: true, renderSolid: () => null }),
-  }) as Page;
-}
+const targetPage = (id: RouteId) => definePage({ ...routePageSpec(id), component }) as Page;
 
-describe("removed General route", () => {
-  it.each([
-    [
-      "/ui/settings/general?section=env#config-section-env",
-      "/ui/settings/appearance?section=__appearance__#settings-language",
-    ],
-    ["/config#settings-general-model", "/settings/model-providers#settings-model-behavior"],
-  ])("performs at most one replace for %s and never oscillates", async (sourceUrl, targetUrl) => {
-    const { history, replace, push } = memoryHistory(locationFromUrl(sourceUrl));
-    const router = createRouter<RouteId, ApplicationContext, RouteModule>({
-      routes: [removedGeneralPage, targetPage("appearance"), targetPage("model-providers")],
-    });
-    const basePath = sourceUrl.startsWith("/ui/") ? "/ui" : "";
-    const context = { basePath } as ApplicationContext;
+it.each([
+  [
+    "/ui/settings/general?section=env#config-section-env",
+    "/ui/settings/appearance?section=__appearance__#settings-language",
+  ],
+  ["/config#settings-general-model", "/settings/model-providers#settings-model-behavior"],
+])("performs at most one replace for %s and never oscillates", async (sourceUrl, targetUrl) => {
+  const { history, replace, push } = memoryHistory(locationFromUrl(sourceUrl));
+  const router = routerFor(page("config"), targetPage("appearance"), targetPage("model-providers"));
+  const basePath = sourceUrl.startsWith("/ui/") ? "/ui" : "";
+  const context = { basePath } as ApplicationContext;
 
-    try {
-      await router.start(history, basePath, context);
-      for (let cycle = 0; cycle < 3; cycle += 1) {
-        await router.navigateLocation({ ...history.location() }, context);
-      }
-
-      expect(replace).toHaveBeenCalledOnce();
-      expect(push).not.toHaveBeenCalled();
-      expect(history.location()).toEqual(locationFromUrl(targetUrl));
-      expect(router.getState().resolvedLocation).toEqual(locationFromUrl(targetUrl));
-    } finally {
-      router.stop();
+  try {
+    await router.start(history, basePath, context);
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      await router.navigateLocation({ ...history.location() }, context);
     }
-  });
+
+    expect(replace).toHaveBeenCalledOnce();
+    expect(push).not.toHaveBeenCalled();
+    expect(history.location()).toEqual(locationFromUrl(targetUrl));
+    expect(router.getState().resolvedLocation).toEqual(locationFromUrl(targetUrl));
+  } finally {
+    router.stop();
+  }
 });
+it("loads readable config without requesting the admin-only schema", async () => {
+  const config = runtimeConfig();
+  const context = { runtimeConfig: config } as unknown as ApplicationContext;
+  const location = locationFromUrl("/settings/updates");
 
-describe("Updates route", () => {
-  it("loads readable config without requesting the admin-only schema", async () => {
-    const ensureLoaded = vi.fn(() => Promise.resolve());
-    const ensureSchemaLoaded = vi.fn(() => Promise.resolve());
-    const context = {
-      runtimeConfig: { ensureLoaded, ensureSchemaLoaded },
-    } as unknown as ApplicationContext;
-    const location = locationFromUrl("/settings/updates");
+  await page("updates").loader?.(context, loaderOptions(location));
+  await Promise.resolve();
 
-    await updatesPage.loader?.(context, loaderOptions(location));
-    await Promise.resolve();
-
-    expect(ensureLoaded).toHaveBeenCalledOnce();
-    expect(ensureSchemaLoaded).not.toHaveBeenCalled();
-  });
+  expect(config.ensureLoaded).toHaveBeenCalledOnce();
+  expect(config.ensureSchemaLoaded).not.toHaveBeenCalled();
 });
+it("captures intent before config loading and changes the cache key for a newer choice", async () => {
+  const memoryPage = page("memory");
+  const selection = { intentRevision: 3 };
+  const context = {
+    settingsAgentSelection: selection,
+    runtimeConfig: {
+      ...runtimeConfig(),
+      ensureLoaded: vi.fn(() => {
+        selection.intentRevision += 1;
+        return Promise.resolve();
+      }),
+    },
+  } as unknown as ApplicationContext;
+  const location = locationFromUrl("/settings/memory?agent=research");
+  const previousKey = memoryPage.loaderDeps?.(context, location);
+  const data = await memoryPage.loader?.(context, loaderOptions(location));
 
-describe("Memory route selection intent", () => {
-  it("captures intent before config loading and changes the cache key for a newer choice", async () => {
-    const memoryPage = pages.find((page) => page.id === "memory")!;
-    const selection = { intentRevision: 3 };
-    const context = {
-      settingsAgentSelection: selection,
-      runtimeConfig: {
-        ensureLoaded: vi.fn(() => {
-          selection.intentRevision += 1;
-          return Promise.resolve();
-        }),
-        ensureSchemaLoaded: vi.fn(() => Promise.resolve()),
-      },
-    } as unknown as ApplicationContext;
-    const location = locationFromUrl("/settings/memory?agent=research");
-    const previousKey = memoryPage.loaderDeps?.(context, location);
-    const data = await memoryPage.loader?.(context, loaderOptions(location));
-
-    expect(data).toMatchObject({ agentSelectionIntent: { owner: selection, revision: 3 } });
-    expect(memoryPage.loaderDeps?.(context, location)).not.toBe(previousKey);
-  });
+  expect(data).toMatchObject({ agentSelectionIntent: { owner: selection, revision: 3 } });
+  expect(memoryPage.loaderDeps?.(context, location)).not.toBe(previousKey);
 });
+const movedSections = [
+  ["communications", "__notifications__", "notifications", ""],
+  ["communications", "channels", "channels", ""],
+  ["communications", "broadcast", "advanced", "?section=broadcast"],
+  ["communications", "talk", "talk", "?section=talk"],
+  ["appearance", "wizard", "advanced", "?section=wizard"],
+  ["advanced", "transcripts", "communications", "?section=transcripts&advanced=1"],
+  ["automation", "approvals", "security", "?section=approvals"],
+  ["automation", "plugins", "plugin-settings", "?tab=advanced"],
+  ["ai-agents", "memory", "memory", "?section=memory"],
+  ["ai-agents", "models", "model-providers", ""],
+] as const;
 
-describe("moved Settings sections", () => {
-  const movedSections = [
-    ["communications", "__notifications__", "notifications", ""],
-    ["communications", "channels", "channels", ""],
-    ["communications", "broadcast", "advanced", "?section=broadcast"],
-    ["communications", "talk", "talk", "?section=talk"],
-    ["appearance", "wizard", "advanced", "?section=wizard"],
-    ["advanced", "transcripts", "communications", "?section=transcripts&advanced=1"],
-    ["automation", "approvals", "security", "?section=approvals"],
-    ["automation", "plugins", "plugin-settings", "?tab=advanced"],
-    ["ai-agents", "memory", "memory", "?section=memory"],
-    ["ai-agents", "models", "model-providers", ""],
-  ] as const;
+describe.each(["", "/ui"])("moved Settings sections with base path %j", (basePath) => {
+  it.each(movedSections)(
+    "replaces %s section %s and preserves Back/Forward",
+    async (sourceId, section, targetId, search) => {
+      const hash = `#config-section-${section}`;
+      const origin = locationFromUrl(`${basePath}/settings/updates`);
+      const destination = { pathname: pathForRoute(targetId, basePath), search, hash };
+      const { entries, history, replace, pop } = memoryHistory(origin);
+      const config = runtimeConfig();
+      const context = { basePath, runtimeConfig: config } as unknown as ApplicationContext;
+      const router = routerFor(
+        { ...page(sourceId), component },
+        targetPage("updates"),
+        targetPage(targetId),
+      );
+      try {
+        await router.start(history, basePath, context);
+        await router.navigate(
+          sourceId,
+          context,
+          { history: "push" },
+          {
+            pathname: pathForRoute(sourceId, basePath),
+            search: `?section=${section}`,
+            hash,
+          },
+        );
+        expect(entries).toEqual([origin, destination]);
+        expect(replace).toHaveBeenCalledOnce();
+        expect(config.ensureLoaded).not.toHaveBeenCalled();
+        expect(config.ensureSchemaLoaded).not.toHaveBeenCalled();
+        expect(router.getState().resolvedLocation).toEqual(destination);
 
-  describe.each(["", "/ui"])("with base path %j", (basePath) => {
-    it.each(movedSections)(
-      "replaces %s section %s and preserves Back/Forward",
-      async (sourceId, section, targetId, search) => {
-        const sourcePage = pages.find((page) => page.id === sourceId)!;
-        const hash = `#config-section-${section}`;
-        const origin = locationFromUrl(`${basePath}/settings/updates`);
-        const destination = { pathname: pathForRoute(targetId, basePath), search, hash };
-        const { entries, history, replace, pop } = memoryHistory(origin);
-        const ensureLoaded = vi.fn(() => Promise.resolve());
-        const ensureSchemaLoaded = vi.fn(() => Promise.resolve());
-        const context = {
-          basePath,
-          runtimeConfig: { ensureLoaded, ensureSchemaLoaded },
-        } as unknown as ApplicationContext;
-        const router = createRouter<RouteId, ApplicationContext, RouteModule>({
-          routes: [
-            {
-              ...sourcePage,
-              component: async () => ({ header: true, renderSolid: () => null }),
-            },
-            targetPage("updates"),
-            targetPage(targetId),
-          ],
-        });
-        try {
-          await router.start(history, basePath, context);
-          await router.navigate(
-            sourceId,
-            context,
-            { history: "push" },
-            {
-              pathname: pathForRoute(sourceId, basePath),
-              search: `?section=${section}`,
-              hash,
-            },
-          );
-          expect(entries).toEqual([origin, destination]);
-          expect(replace).toHaveBeenCalledOnce();
-          expect(ensureLoaded).not.toHaveBeenCalled();
-          expect(ensureSchemaLoaded).not.toHaveBeenCalled();
-          expect(router.getState().resolvedLocation).toEqual(destination);
-
-          pop(-1);
-          await expect.poll(() => router.getState().resolvedLocation).toEqual(origin);
-          pop(1);
-          await expect.poll(() => router.getState().resolvedLocation).toEqual(destination);
-          expect(entries).toEqual([origin, destination]);
-          expect(replace).toHaveBeenCalledOnce();
-        } finally {
-          router.stop();
-        }
-      },
-    );
-  });
+        pop(-1);
+        await expect.poll(() => router.getState().resolvedLocation).toEqual(origin);
+        pop(1);
+        await expect.poll(() => router.getState().resolvedLocation).toEqual(destination);
+        expect(entries).toEqual([origin, destination]);
+        expect(replace).toHaveBeenCalledOnce();
+      } finally {
+        router.stop();
+      }
+    },
+  );
 });

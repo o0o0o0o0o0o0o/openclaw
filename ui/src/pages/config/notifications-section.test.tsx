@@ -70,26 +70,17 @@ describe("native notification test outcome", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("renders an actionable error without replacing granted permission", () => {
-    const { container } = renderSection({
-      nativeNotifications: {
-        permission: "granted",
-        test: { state: "error", message: "Open System Settings and try again." },
-      },
-    });
-
+  it.each([
+    { state: "error", message: "Open System Settings and try again." },
+    { state: "sent", message: "Test notification queued" },
+  ] as const)("renders $state independently from permission", ({ state, message }) => {
+    const test = state === "sent" ? { state } : { state, message };
+    const { container } = renderSection({ nativeNotifications: { permission: "granted", test } });
     expect(container.textContent).toContain("Granted");
-    expect(container.textContent).toContain("Open System Settings and try again.");
-    expect(container.querySelector(".settings-status--danger")).not.toBeNull();
-  });
-
-  it("renders queued success independently from permission", () => {
-    const { container } = renderSection({
-      nativeNotifications: { permission: "granted", test: { state: "sent" } },
-    });
-
-    expect(container.textContent).toContain("Granted");
-    expect(container.textContent).toContain("Test notification queued");
+    expect(container.textContent).toContain(message);
+    if (state === "error") {
+      expect(container.querySelector(".settings-status--danger")).not.toBeNull();
+    }
   });
 });
 
@@ -129,43 +120,40 @@ describe("Web Push preference saves", () => {
   it("disables every preference control while a save is in flight", () => {
     const { container } = renderSection({ webPush: webPush(true) });
 
-    // Preference sections stack inside the page column; a nested .settings-page
-    // would reapply the 760px max-width and inset them from the card above.
     expect(container.querySelector(".settings-page .settings-page")).toBeNull();
-    const preferences = container.querySelector<HTMLElement>(".settings-page .settings-stack");
-    const preferenceGroup = expectDefined(preferences, "notification preferences group");
-    expect(preferenceGroup.querySelector("input, select")).not.toBeNull();
-    expect(preferenceGroup.hasAttribute("inert")).toBe(true);
+    const group = expectDefined(
+      container.querySelector(".settings-page .settings-stack"),
+      "preferences",
+    );
+    expect(group.querySelector("input, select")).not.toBeNull();
+    expect(group.hasAttribute("inert")).toBe(true);
   });
 });
 
-type DevicePreferencesListener = NonNullable<
-  Parameters<typeof NotificationsSection>[0]["onWebPushSetDevicePreferences"]
->;
+type DevicePreferencesListener = NonNullable<NotificationProps["onWebPushSetDevicePreferences"]>;
 
 describe("Web Push preference controls", () => {
   function renderPreferences(
     options: {
       onDevice?: DevicePreferencesListener;
-      onUser?: Parameters<typeof NotificationsSection>[0]["onWebPushSetUserPreferences"];
+      onUser?: NotificationProps["onWebPushSetUserPreferences"];
       timeZone?: string;
     } = {},
   ) {
     const [timeZone, setTimeZone] = createSignal(options.timeZone ?? "UTC");
-    const user = () => ({
-      ...userPreferences,
-      quietHours: {
-        ...userPreferences.quietHours,
-        enabled: true,
-        timeZone: timeZone(),
-      },
-    });
     const device = { enabled: true, label: "phone", agentIds: ["main"] };
     const mounted = renderSection({
       onWebPushSetDevicePreferences: options.onDevice,
       onWebPushSetUserPreferences: options.onUser,
       get webPush(): WebPushSnapshot {
-        return webPush(false, user(), device);
+        return webPush(
+          false,
+          {
+            ...userPreferences,
+            quietHours: { ...userPreferences.quietHours, enabled: true, timeZone: timeZone() },
+          },
+          device,
+        );
       },
     });
     return { ...mounted, setTimeZone };

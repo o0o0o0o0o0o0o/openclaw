@@ -1,10 +1,7 @@
-// Test support for status publishing in monitorWebSocket and monitorWebhook. These
-// tests exercise the status sink wiring used by the gateway health monitor.
-// See PROPOSAL.md for the incident background.
-
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FeishuStatusSink } from "./monitor.js";
 import { getGatewayPort } from "./monitor.webhook.test-helpers.js";
+import type { ResolvedFeishuAccount } from "./types.js";
 
 type StatusPatch = Parameters<FeishuStatusSink>[0];
 
@@ -22,42 +19,59 @@ async function loadTransportModule() {
   return await import("./monitor.transport.js");
 }
 
-describe("monitorWebSocket status publishing", () => {
-  let originalNow: () => number;
-  let nowValue: number;
+function account(
+  accountId: string,
+  config: ResolvedFeishuAccount["config"] = { connectionMode: "websocket" },
+): ResolvedFeishuAccount {
+  return {
+    accountId,
+    selectionSource: "explicit",
+    enabled: true,
+    configured: true,
+    appId: "app",
+    appSecret: "secret",
+    domain: "https://open.feishu.cn",
+    encryptKey: undefined,
+    verificationToken: undefined,
+    config,
+  };
+}
 
+async function startWebSocket(accountId: string) {
+  const recorder = createRecordingSink();
+  const abort = new AbortController();
+  const { monitorWebSocket } = await loadTransportModule();
+  const monitor = monitorWebSocket({
+    account: account(accountId),
+    accountId,
+    abortSignal: abort.signal,
+    eventDispatcher: { register: () => undefined } as never,
+    statusSink: recorder.sink,
+  });
+  return { ...recorder, abort, monitor };
+}
+
+function expectPatch(actual: StatusPatch | undefined, expected: StatusPatch) {
+  expect(actual).toMatchObject(expected);
+  expect(actual?.lastTransportActivityAt).toBeUndefined();
+}
+
+let nowValue: number;
+function installClock(initialNow: number) {
   beforeEach(() => {
-    nowValue = 1_700_000_000_000;
-    originalNow = Date.now;
-    Date.now = () => nowValue;
+    nowValue = initialNow;
+    vi.spyOn(Date, "now").mockImplementation(() => nowValue);
   });
+  afterEach(() => vi.restoreAllMocks());
+}
 
-  afterEach(() => {
-    Date.now = originalNow;
-    vi.restoreAllMocks();
-  });
-
+describe("monitorWebSocket status publishing", () => {
+  installClock(1_700_000_000_000);
   it("publishes connected state when the WS SDK reports ready or reconnected", async () => {
-    const recorder = createRecordingSink();
     const fakeWsClient = {
       start: vi.fn(async () => undefined),
       close: vi.fn(),
     };
-    const { monitorWebSocket } = await loadTransportModule();
-
-    const account = {
-      accountId: "acct-1",
-      appId: "app",
-      appSecret: "secret",
-      domain: "https://open.feishu.cn",
-      encryptKey: undefined,
-      verificationToken: undefined,
-      config: { connectionMode: "websocket" as const },
-    } as never;
-
-    const abortController = new AbortController();
-
-    // Start the monitor in background; it will call createFeishuWSClient.
     const wsClientModule = await import("./client.js");
     let callbacks:
       | {
@@ -73,95 +87,57 @@ describe("monitorWebSocket status publishing", () => {
       },
     );
 
-    const monitorPromise = monitorWebSocket({
-      account,
-      accountId: "acct-1",
-      abortSignal: abortController.signal,
-      eventDispatcher: { register: () => undefined } as never,
-      statusSink: recorder.sink,
-    });
-
-    // Let the WS handshake complete.
+    const recorder = await startWebSocket("acct-1");
     await new Promise<void>((resolve) => {
       setImmediate(() => resolve());
     });
     expect(recorder.calls).toEqual([]);
 
     callbacks?.onReady?.();
-    const first = recorder.calls[0];
-    expect(first?.connected).toBe(true);
-    expect(first?.lifecycle).toBe("ready");
-    expect(first?.terminalDisconnect).toBeUndefined();
-    expect(first?.lastConnectedAt).toBe(nowValue);
-    expect(first?.lastEventAt).toBe(nowValue);
-    expect(first?.lastTransportActivityAt).toBeUndefined();
-    expect(first?.lastError).toBeNull();
+    expectPatch(recorder.calls[0], {
+      connected: true,
+      lifecycle: "ready",
+      lastConnectedAt: nowValue,
+      lastEventAt: nowValue,
+      lastError: null,
+    });
+    expect(recorder.calls[0]?.terminalDisconnect).toBeUndefined();
 
     nowValue += 1_000;
     callbacks?.onReconnected?.();
-    const second = recorder.calls[1];
-    expect(second?.connected).toBe(true);
-    expect(second?.lifecycle).toBe("ready");
-    expect(second?.lastConnectedAt).toBe(nowValue);
-    expect(second?.lastEventAt).toBe(nowValue);
-    expect(second?.lastTransportActivityAt).toBeUndefined();
-    expect(second?.lastError).toBeNull();
+    expectPatch(recorder.calls[1], {
+      connected: true,
+      lifecycle: "ready",
+      lastConnectedAt: nowValue,
+      lastEventAt: nowValue,
+      lastError: null,
+    });
 
     nowValue += 1_000;
     callbacks?.onReconnecting?.();
-    const third = recorder.calls[2];
-    expect(third?.connected).toBe(false);
-    expect(third?.lifecycle).toBe("recovering");
-    expect(third?.lastEventAt).toBe(nowValue);
-    expect(third?.lastTransportActivityAt).toBeUndefined();
-
-    // Trigger abort to terminate the monitor cleanly.
-    abortController.abort();
-    await monitorPromise;
+    expectPatch(recorder.calls[2], {
+      connected: false,
+      lifecycle: "recovering",
+      lastEventAt: nowValue,
+    });
+    recorder.abort.abort();
+    await recorder.monitor;
   });
 
   it("publishes disconnected when WS handshake throws", async () => {
-    const recorder = createRecordingSink();
-    const { monitorWebSocket } = await loadTransportModule();
-
-    const account = {
-      accountId: "acct-2",
-      appId: "app",
-      appSecret: "secret",
-      domain: "https://open.feishu.cn",
-      encryptKey: undefined,
-      verificationToken: undefined,
-      config: { connectionMode: "websocket" as const },
-    } as never;
-
-    const abortController = new AbortController();
     const wsClientModule = await import("./client.js");
     vi.spyOn(wsClientModule, "createFeishuWSClient").mockRejectedValue(new Error("boom"));
 
-    // Pre-abort so the monitor exits after the first failed attempt.
-    setImmediate(() => abortController.abort());
-
-    const monitorPromise = monitorWebSocket({
-      account,
-      accountId: "acct-2",
-      abortSignal: abortController.signal,
-      eventDispatcher: { register: () => undefined } as never,
-      statusSink: recorder.sink,
-    });
-
-    await monitorPromise;
+    const recorder = await startWebSocket("acct-2");
+    setImmediate(() => recorder.abort.abort());
+    await recorder.monitor;
 
     const disconnected = recorder.calls.find((c) => c.connected === false);
     expect(disconnected).toBeDefined();
-    expect(disconnected?.lifecycle).toBe("recovering");
-    expect(disconnected?.lastEventAt).toBe(nowValue);
-    expect(disconnected?.lastTransportActivityAt).toBeUndefined();
+    expectPatch(disconnected, { lifecycle: "recovering", lastEventAt: nowValue });
   });
 
   it("publishes blocked for the SDK terminal WebSocket error", async () => {
-    const recorder = createRecordingSink();
-    const { monitorWebSocket } = await loadTransportModule();
-    const abortController = new AbortController();
     let onError: ((error: Error) => void) | undefined;
     const wsClientModule = await import("./client.js");
     vi.spyOn(wsClientModule, "createFeishuWSClient").mockImplementation(
@@ -171,19 +147,7 @@ describe("monitorWebSocket status publishing", () => {
       },
     );
 
-    const monitor = monitorWebSocket({
-      account: {
-        accountId: "acct-terminal",
-        appId: "app",
-        appSecret: "secret",
-        domain: "https://open.feishu.cn",
-        config: { connectionMode: "websocket" as const },
-      } as never,
-      accountId: "acct-terminal",
-      abortSignal: abortController.signal,
-      eventDispatcher: { register: () => undefined } as never,
-      statusSink: recorder.sink,
-    });
+    const recorder = await startWebSocket("acct-terminal");
 
     await vi.waitFor(() => expect(onError).toBeTypeOf("function"));
     onError?.(new Error("WebSocket reconnect exhausted after 3 attempts"));
@@ -196,48 +160,27 @@ describe("monitorWebSocket status publishing", () => {
         }),
       ),
     );
-    abortController.abort();
-    await monitor;
+    recorder.abort.abort();
+    await recorder.monitor;
   });
 });
 
 describe("monitorWebhook status publishing", () => {
-  let originalNow: () => number;
-  let nowValue: number;
-
-  beforeEach(() => {
-    nowValue = 1_700_000_001_000;
-    originalNow = Date.now;
-    Date.now = () => nowValue;
-  });
-
-  afterEach(() => {
-    Date.now = originalNow;
-    vi.restoreAllMocks();
-  });
+  installClock(1_700_000_001_000);
 
   it("publishes connected after Gateway route registration", async () => {
     await getGatewayPort();
     const recorder = createRecordingSink();
     const { monitorWebhook } = await loadTransportModule();
 
-    const account = {
-      accountId: "webhook-acct",
-      appId: "app",
-      appSecret: "secret",
-      domain: "https://open.feishu.cn",
-      encryptKey: "ek",
-      verificationToken: "vt",
-      config: {
-        connectionMode: "webhook" as const,
-        webhookPath: "/feishu/events",
-      },
-    } as never;
-
     const abortController = new AbortController();
 
     const monitorPromise = monitorWebhook({
-      account,
+      account: {
+        ...account("webhook-acct", { connectionMode: "webhook", webhookPath: "/feishu/events" }),
+        encryptKey: "ek",
+        verificationToken: "vt",
+      },
       accountId: "webhook-acct",
       abortSignal: abortController.signal,
       eventDispatcher: { register: () => undefined, invoke: vi.fn() } as never,
@@ -246,10 +189,11 @@ describe("monitorWebhook status publishing", () => {
 
     const connected = recorder.calls.find((c) => c.connected === true);
     expect(connected).toBeDefined();
-    expect(connected?.lifecycle).toBe("ready");
-    expect(connected?.lastConnectedAt).toBe(nowValue);
-    expect(connected?.lastEventAt).toBe(nowValue);
-    expect(connected?.lastTransportActivityAt).toBeUndefined();
+    expectPatch(connected, {
+      lifecycle: "ready",
+      lastConnectedAt: nowValue,
+      lastEventAt: nowValue,
+    });
 
     abortController.abort();
     await monitorPromise;

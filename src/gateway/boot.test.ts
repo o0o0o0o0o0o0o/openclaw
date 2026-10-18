@@ -101,28 +101,23 @@ describe("runBootOnce", () => {
       return resolvedPath;
     });
 
-    await expect(runBoot()).resolves.toEqual({
-      status: "skipped",
-      reason: "missing",
-    });
+    await expect(runBoot()).resolves.toEqual({ status: "skipped", reason: "missing" });
     expect(agentCommand).not.toHaveBeenCalled();
     await expect(fs.access(bootPath())).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("returns failed when BOOT.md exceeds the safe read size limit", async () => {
-    await writeBoot(Buffer.alloc(16 * 1024 * 1024 + 1, "x"));
+  it.each([
+    [
+      "oversized",
+      () => writeBoot(Buffer.alloc(16 * 1024 * 1024 + 1, "x")),
+      /File exceeds 16777216 bytes/,
+    ],
+    ["directory", () => fs.mkdir(bootPath()), /./s],
+  ] as const)("returns failed when BOOT.md is %s", async (_name, create, reason) => {
+    await create();
     await expect(runBoot()).resolves.toEqual({
       status: "failed",
-      reason: expect.stringContaining("File exceeds 16777216 bytes"),
-    });
-    expect(agentCommand).not.toHaveBeenCalled();
-  });
-
-  it("returns failed when BOOT.md is not a regular file", async () => {
-    await fs.mkdir(bootPath());
-    await expect(runBoot()).resolves.toEqual({
-      status: "failed",
-      reason: expect.stringMatching(/./s),
+      reason: expect.stringMatching(reason),
     });
     expect(agentCommand).not.toHaveBeenCalled();
   });
@@ -173,9 +168,11 @@ describe("runBootOnce", () => {
     const call = await runBootAndReturnCall({ cfg, agentId });
     const mainSessionKey = resolveAgentMainSessionKey({ cfg, agentId });
     expect(mainSessionKey).toBe("agent:ops:primary");
-    expect(call.sessionKey).toBe(`agent:ops:boot:${String(call.sessionId)}`);
-    expect(call.deliver).toBe(false);
-    expect(call.suppressPromptPersistence).toBe(true);
+    expect(call).toMatchObject({
+      sessionKey: `agent:ops:boot:${String(call.sessionId)}`,
+      deliver: false,
+      suppressPromptPersistence: true,
+    });
   });
 
   it("isolates boot execution and cleanup from an existing main session", async () => {
@@ -186,10 +183,7 @@ describe("runBootOnce", () => {
 
     await replaceSessionEntry(
       { storePath, sessionKey },
-      {
-        sessionId: existingSessionId,
-        updatedAt: Date.now() - 60_000,
-      },
+      { sessionId: existingSessionId, updatedAt: Date.now() - 60_000 },
     );
 
     agentCommand.mockImplementation(async (opts: { sessionId?: string; sessionKey?: string }) => {
@@ -202,9 +196,7 @@ describe("runBootOnce", () => {
         { sessionId: String(opts.sessionId), updatedAt: Date.now() },
       );
     });
-    await expect(runBoot(cfg)).resolves.toEqual({
-      status: "ran",
-    });
+    await expect(runBoot(cfg)).resolves.toEqual({ status: "ran" });
 
     const call = requireAgentCall();
     expect(call.sessionId).not.toBe(existingSessionId);
@@ -243,9 +235,7 @@ describe("runBootOnce", () => {
           }
         },
       );
-      await expect(runBoot(cfg)).resolves.toEqual({
-        status: "ran",
-      });
+      await expect(runBoot(cfg)).resolves.toEqual({ status: "ran" });
       const call = requireAgentCall();
       const replacementScope = {
         storePath,

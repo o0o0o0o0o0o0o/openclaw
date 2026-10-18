@@ -21,61 +21,55 @@ export function registerGatewayCallDispatchPreparationTests(
     close: (code: number, reason: string) => void;
   },
 ): void {
-  it.each([
-    [
-      { method: "secrets.resolve", requiredMethods: ["secrets.resolve"] },
-      /does not support required method "secrets\.resolve".*update or restart the active gateway/i,
-    ],
-    [
-      {
-        method: "gateway.restart.request",
-        requiredCapabilities: ["gateway-restart-target-safe-v1"],
-      },
-      /does not support required capability "gateway-restart-target-safe-v1".*update or restart the active gateway/i,
-    ],
-    [
-      { method: "agent", requiredCapabilities: [GATEWAY_SERVER_CAPS.AGENT_SESSION_ID_CREATE] },
-      /does not support required capability "agent-session-id-create-v1".*update or restart the active gateway/i,
-    ],
-  ] satisfies Array<[Parameters<typeof callGateway>[0], RegExp]>)(
-    "requires supported features before calling %j",
-    async (options, error) => {
-      const harness = setup();
-      harness.setFeatures(["health"], []);
-      await expect(harness.call(options)).rejects.toThrow(error);
-      expect(harness.request()).toBeNull();
-    },
-  );
+  function preparing(options: Partial<Parameters<typeof callGateway>[0]>) {
+    const harness = setup();
+    const entered = createDeferred();
+    const prepared = createDeferred();
+    const call = harness.call({
+      method: "agent",
+      onHelloOk: () => entered.resolve(),
+      prepareDispatchCurrent: () => prepared.promise,
+      ...options,
+    });
+    return { ...harness, entered, prepared, call };
+  }
 
   it.each([
-    {
-      method: "models.authSetApiKey",
-      capability: GATEWAY_SERVER_CAPS.MODELS_AUTH_SET_API_KEY_OWNER,
-      params: { provider: "fixture", apiKey: "synthetic-api-key", expectedOwnerId: "owner" },
-    },
-    {
-      method: "models.authLogin",
-      capability: GATEWAY_SERVER_CAPS.MODELS_AUTH_LOGIN_OWNER,
-      params: { authChoice: "fixture/device", sessionId: "login", expectedOwnerId: "owner" },
-    },
-  ])(
-    "does not send $method to a Gateway without owner-bound auth writes",
-    async ({ method, capability, params }) => {
-      const harness = setup();
-      harness.setFeatures([method], [GATEWAY_SERVER_CAPS.LOCAL_STATE_OWNER_ROUTING]);
-      await expect(
-        harness.call({
-          method,
-          params,
-          requiredMethods: [method],
-          requiredCapabilities: [capability],
-        }),
-      ).rejects.toThrow(
-        /does not support required capability.*update or restart the active gateway/i,
-      );
-      expect(harness.request()).toBeNull();
-    },
-  );
+    ["secrets.resolve", "method", "secrets.resolve", undefined],
+    ["gateway.restart.request", "capability", "gateway-restart-target-safe-v1", undefined],
+    ["agent", "capability", GATEWAY_SERVER_CAPS.AGENT_SESSION_ID_CREATE, undefined],
+    [
+      "models.authSetApiKey",
+      "capability",
+      GATEWAY_SERVER_CAPS.MODELS_AUTH_SET_API_KEY_OWNER,
+      { provider: "fixture", apiKey: "synthetic-api-key", expectedOwnerId: "owner" },
+    ],
+    [
+      "models.authLogin",
+      "capability",
+      GATEWAY_SERVER_CAPS.MODELS_AUTH_LOGIN_OWNER,
+      { authChoice: "fixture/device", sessionId: "login", expectedOwnerId: "owner" },
+    ],
+  ] as const)("requires %s support before dispatch", async (method, kind, feature, params) => {
+    const harness = setup();
+    harness.setFeatures(
+      params ? [method] : ["health"],
+      params ? [GATEWAY_SERVER_CAPS.LOCAL_STATE_OWNER_ROUTING] : [],
+    );
+    const error = new RegExp(
+      `does not support required ${kind} "${feature.replaceAll(".", "\\.")}".*update or restart the active gateway`,
+      "i",
+    );
+    await expect(
+      harness.call({
+        method,
+        params,
+        requiredMethods: kind === "method" || params ? [method] : undefined,
+        requiredCapabilities: kind === "capability" ? [feature] : undefined,
+      }),
+    ).rejects.toThrow(error);
+    expect(harness.request()).toBeNull();
+  });
 
   it("keeps the authenticated connection open for wizard follow-up requests", async () => {
     const harness = setup();
@@ -148,87 +142,63 @@ export function registerGatewayCallDispatchPreparationTests(
     expect(stop).toHaveBeenCalledOnce();
   });
 
-  it.each(["current", "revoked", "rejected"])(
-    "checks dispatch authority after preparation is %s",
-    async (outcome) => {
-      const harness = setup();
-      const entered = createDeferred();
-      const prepared = createDeferred();
+  it.each([
+    ["current", false, ""],
+    ["revoked", false, "dispatch owner revoked"],
+    ["rejected", false, "preparation failed"],
+    ["abort", true, "gateway request aborted"],
+    ["close", true, "gateway closed"],
+    ["timeout", true, "gateway timeout"],
+  ] as const)(
+    "checks dispatch authority and connection liveness after preparation: %s",
+    async (outcome, interrupted, error) => {
+      if (interrupted) {
+        vi.useFakeTimers();
+      }
+      const controller = new AbortController();
+      const onSignalAbort = vi.fn();
       let current = false;
       const assertDispatchCurrent = vi.fn(() => {
         if (!current) {
           throw new Error("dispatch owner revoked");
         }
       });
-      const call = harness.call({
-        method: "agent",
-        onHelloOk: () => entered.resolve(),
-        prepareDispatchCurrent: () => prepared.promise,
+      const { call, entered, prepared, request, close } = preparing({
         assertDispatchCurrent,
+        ...(interrupted ? { timeoutMs: 50, signal: controller.signal, onSignalAbort } : {}),
       });
       const result =
         outcome === "current"
           ? expect(call).resolves.toEqual({ ok: true })
-          : expect(call).rejects.toThrow(
-              outcome === "rejected" ? "preparation failed" : "dispatch owner revoked",
-            );
+          : expect(call).rejects.toThrow(error);
 
       await entered.promise;
-      expect(harness.request()).toBeNull();
+      expect(request()).toBeNull();
       expect(assertDispatchCurrent).not.toHaveBeenCalled();
       current = outcome === "current";
-      if (outcome === "rejected") {
+      if (outcome === "abort") {
+        controller.abort();
+      } else if (outcome === "close") {
+        close(1001, "connection retired");
+      } else if (outcome === "timeout") {
+        await vi.advanceTimersByTimeAsync(50);
+      } else if (outcome === "rejected") {
         prepared.reject(new Error("preparation failed"));
       } else {
         prepared.resolve();
       }
       await result;
-      expect(assertDispatchCurrent).toHaveBeenCalledTimes(outcome === "rejected" ? 0 : 1);
-      expect(harness.request()?.method).toBe(outcome === "current" ? "agent" : undefined);
-    },
-  );
-
-  it.each(["abort", "close", "timeout"])(
-    "does not dispatch after %s during preparation",
-    async (outcome) => {
-      vi.useFakeTimers();
-      const harness = setup();
-      const entered = createDeferred();
-      const prepared = createDeferred();
-      const controller = new AbortController();
-      const assertDispatchCurrent = vi.fn();
-      const onSignalAbort = vi.fn();
-      const call = harness.call({
-        method: "agent",
-        timeoutMs: 50,
-        signal: controller.signal,
-        onHelloOk: () => entered.resolve(),
-        prepareDispatchCurrent: () => prepared.promise,
-        assertDispatchCurrent,
-        onSignalAbort,
-      });
-      const result = expect(call).rejects.toThrow(
-        outcome === "abort"
-          ? "gateway request aborted"
-          : outcome === "close"
-            ? "gateway closed"
-            : "gateway timeout",
-      );
-      await entered.promise;
-      expect(harness.request()).toBeNull();
-      if (outcome === "abort") {
-        controller.abort();
-      } else if (outcome === "close") {
-        harness.close(1001, "connection retired");
+      if (interrupted) {
+        prepared.resolve();
+        await prepared.promise;
+        expect(request()).toBeNull();
+        expect(onSignalAbort).not.toHaveBeenCalled();
       } else {
-        await vi.advanceTimersByTimeAsync(50);
+        expect(request()?.method).toBe(outcome === "current" ? "agent" : undefined);
       }
-      await result;
-      prepared.resolve();
-      await prepared.promise;
-      expect(harness.request()).toBeNull();
-      expect(assertDispatchCurrent).not.toHaveBeenCalled();
-      expect(onSignalAbort).not.toHaveBeenCalled();
+      expect(assertDispatchCurrent).toHaveBeenCalledTimes(
+        interrupted || outcome === "rejected" ? 0 : 1,
+      );
     },
   );
 
@@ -247,17 +217,13 @@ export function registerGatewayCallDispatchPreparationTests(
         return response.promise;
       });
       harness.setRequest(request);
-      let preparationCount = 0;
       const call = harness.call({
         method: "agent",
         onHelloOk: () => entered.resolve(),
-        prepareDispatchCurrent: () => {
-          preparationCount += 1;
-          if (preparationCount === 1) {
-            return stalePreparation.promise;
-          }
-          return Promise.resolve();
-        },
+        prepareDispatchCurrent: vi
+          .fn<() => Promise<void>>()
+          .mockReturnValueOnce(stalePreparation.promise)
+          .mockResolvedValue(undefined),
       });
       await entered.promise;
       expect(request).not.toHaveBeenCalled();

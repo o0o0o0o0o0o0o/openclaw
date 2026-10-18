@@ -22,8 +22,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("./http-utils.js", () => ({
-  authorizeControlUiSessionOwnerReadRequestOrReply: (...args: unknown[]) =>
-    mocks.authorize(...args),
+  authorizeControlUiSessionOwnerReadRequestOrReply: mocks.authorize,
 }));
 
 // mock-isolation: avatar HTTP tests use request-local config without loading operator state.
@@ -33,15 +32,15 @@ vi.mock("../config/io.js", () => ({
 
 // mock-isolation: avatar authorization tests supply session ownership without a database worker.
 vi.mock("./session-utils-store-worker.js", () => ({
-  loadGatewaySessionEntryReadOnlyInWorker: (...args: unknown[]) => mocks.loadEntry(...args),
+  loadGatewaySessionEntryReadOnlyInWorker: mocks.loadEntry,
 }));
 
 vi.mock("../media/media-reference.js", () => ({
-  resolveInboundMediaReference: (...args: unknown[]) => mocks.resolveReference(...args),
+  resolveInboundMediaReference: mocks.resolveReference,
 }));
 
 vi.mock("../media/store.js", () => ({
-  readMediaBuffer: (...args: unknown[]) => mocks.readMedia(...args),
+  readMediaBuffer: mocks.readMedia,
 }));
 
 const { handleChannelAvatarHttpRequest } = await import("./channel-avatar-http.js");
@@ -118,18 +117,8 @@ describe("handleChannelAvatarHttpRequest", () => {
         ),
       );
     mocks.loadEntry.mockReset().mockResolvedValue({ entry: avatarEntry() });
-    mocks.resolveReference.mockReset().mockResolvedValue({
-      id: "channel-avatar.png",
-      normalizedSource: AVATAR_REFERENCE,
-      physicalPath: AVATAR_REFERENCE,
-      sourceType: "path",
-    });
-    mocks.readMedia.mockReset().mockResolvedValue({
-      id: "channel-avatar.png",
-      path: AVATAR_REFERENCE,
-      buffer: PNG_BYTES,
-      size: PNG_BYTES.byteLength,
-    });
+    mocks.resolveReference.mockReset().mockResolvedValue({ id: "channel-avatar.png" });
+    mocks.readMedia.mockReset().mockResolvedValue({ buffer: PNG_BYTES });
   });
 
   const avatarRoute = (sessionKey: string) =>
@@ -202,10 +191,12 @@ describe("handleChannelAvatarHttpRequest", () => {
       }),
     });
     const url = new URL(avatarRoute("agent:main:portrait-binding"));
-    url.searchParams.set("v", channelAvatarRevision(AVATAR_REFERENCE));
-    url.searchParams.set("provider", "telegram");
-    url.searchParams.set("account", "sample-bot");
-    url.searchParams.set("sender", "1000000001");
+    url.search = new URLSearchParams({
+      v: channelAvatarRevision(AVATAR_REFERENCE),
+      provider: "telegram",
+      account: "sample-bot",
+      sender: "1000000001",
+    }).toString();
     expect((await fetch(url)).status).toBe(200);
     const reads = mocks.readMedia.mock.calls.length;
     for (const [key, value] of [
@@ -311,28 +302,26 @@ describe("handleChannelAvatarHttpRequest", () => {
     expect(mocks.readMedia).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["missing", "failed", "invalid"])(
-    "retries an avatar after a %s load settles",
-    async (failure) => {
-      if (failure === "missing") {
-        mocks.resolveReference.mockResolvedValueOnce(null);
-      } else if (failure === "failed") {
-        mocks.readMedia.mockRejectedValueOnce(new Error("media unavailable"));
-      } else {
-        mocks.readMedia.mockResolvedValueOnce({ buffer: Buffer.from("not an image") });
-      }
-      const route = avatarRoute(`agent:main:recover:${failure}`);
-      const unavailable = await fetch(route);
-      await unavailable.arrayBuffer();
-      const recovered = await fetch(route);
+  it.each([
+    ["missing", () => mocks.resolveReference.mockResolvedValueOnce(null)],
+    ["failed", () => mocks.readMedia.mockRejectedValueOnce(new Error("media unavailable"))],
+    [
+      "invalid",
+      () => mocks.readMedia.mockResolvedValueOnce({ buffer: Buffer.from("not an image") }),
+    ],
+  ] as const)("retries an avatar after a %s load settles", async (failure, failLoad) => {
+    failLoad();
+    const route = avatarRoute(`agent:main:recover:${failure}`);
+    const unavailable = await fetch(route);
+    await unavailable.arrayBuffer();
+    const recovered = await fetch(route);
 
-      expect(unavailable.status).toBe(404);
-      expect(unavailable.headers.get("cache-control")).toBe("no-store");
-      expect(recovered.status).toBe(200);
-      expect(Buffer.from(await recovered.arrayBuffer())).toEqual(PNG_BYTES);
-      expect(mocks.resolveReference).toHaveBeenCalledTimes(2);
-    },
-  );
+    expect(unavailable.status).toBe(404);
+    expect(unavailable.headers.get("cache-control")).toBe("no-store");
+    expect(recovered.status).toBe(200);
+    expect(Buffer.from(await recovered.arrayBuffer())).toEqual(PNG_BYTES);
+    expect(mocks.resolveReference).toHaveBeenCalledTimes(2);
+  });
 
   it("releases superseded avatars without evicting another session's cached image", async () => {
     const stable = await fetch(avatarRoute("agent:main:stable-avatar"));
@@ -357,16 +346,21 @@ describe("handleChannelAvatarHttpRequest", () => {
   });
 
   it.each([
-    { label: "missing session", entry: undefined },
-    { label: "session without an avatar", entry: avatarEntry("") },
-  ])("returns an uncacheable 404 for a $label", async ({ entry }) => {
+    ["agent:main:missing", undefined, false],
+    ["agent:main:no-avatar", avatarEntry(""), false],
+    ["/__openclaw__/channel-avatar/", avatarEntry(), true],
+    ["/__openclaw__/channel-avatar/a/b", avatarEntry(), true],
+  ] as const)("returns an uncacheable 404 for %s", async (route, entry, malformed) => {
     mocks.loadEntry.mockReturnValue({ entry });
 
-    const response = await fetch(avatarRoute("agent:main:missing"));
+    const response = await fetch(malformed ? `${baseUrl}${route}` : avatarRoute(route));
 
     expect(response.status).toBe(404);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(mocks.resolveReference).not.toHaveBeenCalled();
+    if (malformed) {
+      expect(mocks.loadEntry).not.toHaveBeenCalled();
+    }
   });
 
   it("never reads session or media state when authentication or owner access is denied", async () => {
@@ -382,16 +376,6 @@ describe("handleChannelAvatarHttpRequest", () => {
       expect(mocks.resolveReference).not.toHaveBeenCalled();
     }
   });
-
-  it.each(["/__openclaw__/channel-avatar/", "/__openclaw__/channel-avatar/a/b"])(
-    "claims malformed route %s as a 404",
-    async (pathname) => {
-      const response = await fetch(`${baseUrl}${pathname}`);
-
-      expect(response.status).toBe(404);
-      expect(mocks.loadEntry).not.toHaveBeenCalled();
-    },
-  );
 
   it("rejects non-read methods and leaves unrelated paths unhandled", async () => {
     const rejected = await fetch(avatarRoute("agent:main:one"), { method: "POST" });

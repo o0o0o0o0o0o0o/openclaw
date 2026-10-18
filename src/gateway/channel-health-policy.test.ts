@@ -16,49 +16,21 @@ function evaluateHealth(
   account: Record<string, unknown>,
   opts: { now?: number; channelId?: string } = {},
 ) {
-  return evaluateChannelHealth(account, { ...policy, ...opts });
-}
-
-function runningAccount(overrides: Record<string, unknown> = {}) {
-  return {
-    running: true,
-    enabled: true,
-    configured: true,
-    ...overrides,
-  };
-}
-
-function connectedAccount(overrides: Record<string, unknown> = {}) {
-  return runningAccount({ connected: true, ...overrides });
-}
-
-function activeRunAccount(lastRunActivityAt: number, overrides: Record<string, unknown> = {}) {
-  return runningAccount({
-    connected: false,
-    activeRuns: 1,
-    lastRunActivityAt,
-    ...overrides,
-  });
-}
-
-function inheritedTransportAccount() {
-  return connectedAccount({
-    lastStartAt: 50_000,
-    lastTransportActivityAt: 10_000,
-  });
+  return evaluateChannelHealth(
+    { running: true, enabled: true, configured: true, ...account },
+    { ...policy, ...opts },
+  );
 }
 
 describe("evaluateChannelHealth", () => {
   it("treats explicitly unlinked accounts as healthy unmanaged", () => {
-    const evaluation = evaluateHealth(runningAccount({ running: false, linked: false }));
+    const evaluation = evaluateHealth({ running: false, linked: false });
     expect(evaluation).toEqual({ healthy: true, reason: "unmanaged" });
   });
 
   it("trusts a fresh recorded starting lifecycle inside connect grace", () => {
     expect(
-      evaluateHealth(
-        runningAccount({ connected: false, lifecycle: "starting", lastStartAt: 95_000 }),
-      ),
+      evaluateHealth({ connected: false, lifecycle: "starting", lastStartAt: 95_000 }),
     ).toEqual({ healthy: true, reason: "startup-connect-grace" });
   });
 
@@ -71,77 +43,64 @@ describe("evaluateChannelHealth", () => {
     ["ignores a disconnect dated after the current clock", 0, { at: 101_000 }, false],
   ] as const)("%s", (_name, lastStartAt, lastDisconnect, healthy) => {
     expect(
-      evaluateHealth(
-        runningAccount({
-          connected: false,
-          lifecycle: "recovering",
-          lastStartAt,
-          lastDisconnect,
-        }),
-      ),
+      evaluateHealth({
+        connected: false,
+        lifecycle: "recovering",
+        lastStartAt,
+        lastDisconnect,
+      }),
     ).toEqual({ healthy, reason: healthy ? "reconnect-grace" : "disconnected" });
   });
 
   it("maps recorded stopped lifecycle to the existing restartable verdict", () => {
-    expect(evaluateHealth(runningAccount({ lifecycle: "stopped" }))).toEqual({
+    expect(evaluateHealth({ lifecycle: "stopped" })).toEqual({
       healthy: false,
       reason: "not-running",
     });
   });
 
-  it("flags a hung run masking a disconnected transport as stuck despite a fresh heartbeat", () => {
-    const now = 30 * 60_000;
-    const evaluation = evaluateHealth(
-      activeRunAccount(now - 1_000, {
-        connected: false,
-        activeRunStartedAt: now - 26 * 60_000,
-      }),
-      { now },
-    );
-    expect(evaluation).toEqual({ healthy: false, reason: "stuck" });
-  });
-
-  it("keeps a connected run healthy past the threshold while its heartbeat stays fresh", () => {
-    const now = 30 * 60_000;
-    const evaluation = evaluateHealth(
-      activeRunAccount(now - 1_000, {
-        connected: true,
-        activeRunStartedAt: now - 26 * 60_000,
-      }),
-      { now },
-    );
-    expect(evaluation).toEqual({ healthy: true, reason: "busy" });
-  });
+  it.each([false, true])(
+    "evaluates an old run with a fresh heartbeat, connected=%s",
+    (connected) => {
+      const now = 30 * 60_000;
+      const evaluation = evaluateHealth(
+        {
+          connected,
+          activeRuns: 1,
+          lastRunActivityAt: now - 1_000,
+          activeRunStartedAt: now - 26 * 60_000,
+        },
+        { now },
+      );
+      expect(evaluation).toEqual({ healthy: connected, reason: connected ? "busy" : "stuck" });
+    },
+  );
 
   it("ignores inherited busy flags until current lifecycle reports run activity", () => {
     const now = 100_000;
     const evaluation = evaluateHealth(
-      runningAccount({
+      {
         connected: false,
         lastStartAt: now - 30_000,
         busy: true,
         activeRuns: 1,
         lastRunActivityAt: now - 31_000,
-      }),
+      },
       { now },
     );
     expect(evaluation).toEqual({ healthy: false, reason: "disconnected" });
   });
 
-  it("ignores inherited transport timestamps from a previous lifecycle", () => {
-    const evaluation = evaluateHealth(inheritedTransportAccount(), {
-      now: 75_000,
-      channelId: "slack",
-    });
-    expect(evaluation).toEqual({ healthy: true, reason: "healthy" });
-  });
-
-  it("flags inherited transport timestamps after the lifecycle exceeds the stale threshold", () => {
-    const evaluation = evaluateHealth(inheritedTransportAccount(), {
-      now: 140_000,
-      channelId: "slack",
-    });
-    expect(evaluation).toEqual({ healthy: false, reason: "stale-socket" });
+  it.each([
+    [75_000, true],
+    [140_000, false],
+  ] as const)("checks inherited transport at %s", (now, healthy) => {
+    expect(
+      evaluateHealth(
+        { connected: true, lastStartAt: 50_000, lastTransportActivityAt: 10_000 },
+        { now, channelId: "slack" },
+      ),
+    ).toEqual({ healthy, reason: healthy ? "healthy" : "stale-socket" });
   });
 
   it.each([
@@ -149,53 +108,50 @@ describe("evaluateChannelHealth", () => {
     [{ running: false, terminalDisconnect: false }, "not-running"],
     [{ running: true, connected: true, terminalDisconnect: true }, "healthy"],
   ] as const)("evaluates terminal state %j as %s", (snapshot, reason) => {
-    expect(
-      evaluateHealth({ enabled: true, configured: true, ...snapshot }, { channelId: "whatsapp" }),
-    ).toEqual({ healthy: reason === "healthy", reason });
-  });
-
-  describe("inbound ingress dimension", () => {
-    it("keeps the ingress reason for the stopped state a failed start lands in", () => {
-      // Failed ingress starts publish their cause after the start task stops.
-      const evaluation = evaluateHealth(
-        runningAccount({
-          running: false,
-          linked: false,
-          restartPending: true,
-          ingressUnavailable: true,
-        }),
-      );
-      expect(evaluation).toEqual({ healthy: false, reason: "ingress-unavailable" });
+    expect(evaluateHealth(snapshot, { channelId: "whatsapp" })).toEqual({
+      healthy: reason === "healthy",
+      reason,
     });
-
-    it.each([{ enabled: false }, { configured: false }])(
-      "keeps disabled or unconfigured accounts unmanaged (%j)",
-      (unmanaged) => {
-        const evaluation = evaluateHealth(
-          runningAccount({
-            running: false,
-            linked: false,
-            terminalDisconnect: true,
-            lifecycle: "blocked",
-            ingressUnavailable: true,
-            ...unmanaged,
-          }),
-        );
-        expect(evaluation).toEqual({ healthy: true, reason: "unmanaged" });
-      },
-    );
   });
+
+  it("keeps the ingress reason for the stopped state a failed start lands in", () => {
+    // Failed ingress starts publish their cause after the start task stops.
+    const evaluation = evaluateHealth({
+      running: false,
+      linked: false,
+      restartPending: true,
+      ingressUnavailable: true,
+    });
+    expect(evaluation).toEqual({ healthy: false, reason: "ingress-unavailable" });
+  });
+
+  it.each([{ enabled: false }, { configured: false }])(
+    "keeps disabled or unconfigured accounts unmanaged (%j)",
+    (unmanaged) => {
+      const evaluation = evaluateHealth({
+        running: false,
+        linked: false,
+        terminalDisconnect: true,
+        lifecycle: "blocked",
+        ingressUnavailable: true,
+        ...unmanaged,
+      });
+      expect(evaluation).toEqual({ healthy: true, reason: "unmanaged" });
+    },
+  );
 });
 
 describe("resolveChannelHealthState", () => {
   it("preserves authored terminal detail above the shared blocked projection", () => {
-    const snapshot = runningAccount({
+    const snapshot = {
+      enabled: true,
+      configured: true,
       running: false,
       connected: false,
       terminalDisconnect: true,
       lifecycle: "blocked",
       healthState: "conflict",
-    });
+    } satisfies Parameters<typeof resolveChannelHealthState>[0];
     const evaluation = evaluateHealth(snapshot);
 
     expect(evaluation).toEqual({ healthy: false, reason: "terminal-disconnect" });

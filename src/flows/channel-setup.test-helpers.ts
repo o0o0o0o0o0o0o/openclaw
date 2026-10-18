@@ -7,13 +7,13 @@ type ChannelPluginCatalogEntry = import("../channels/plugins/catalog.js").Channe
 type ChannelSetupPlugin = import("../channels/plugins/setup-wizard-types.js").ChannelSetupPlugin;
 type ChannelSetupWizardAdapter =
   import("../channels/plugins/setup-wizard-types.js").ChannelSetupWizardAdapter;
-type ResolveChannelSetupEntries =
-  typeof import("../commands/channel-setup/discovery.js").resolveChannelSetupEntries;
-type LoadChannelSetupPluginRegistrySnapshotForChannel =
-  typeof import("../commands/channel-setup/plugin-install.js").loadChannelSetupPluginRegistrySnapshotForChannel;
-type PluginRegistry = Awaited<ReturnType<LoadChannelSetupPluginRegistrySnapshotForChannel>>;
+type Discover = typeof import("../commands/channel-setup/discovery.js").resolveChannelSetupEntries;
+type LoadRegistryParams = Parameters<
+  typeof import("../commands/channel-setup/plugin-install.js").loadChannelSetupPluginRegistrySnapshotForChannel
+>[0];
+type PluginRegistry = ReturnType<typeof createEmptyPluginRegistry>;
 
-type ChannelSetupEntries = ReturnType<ResolveChannelSetupEntries>;
+type ChannelSetupEntries = ReturnType<Discover>;
 
 export function makeMeta(
   id: string,
@@ -21,7 +21,7 @@ export function makeMeta(
   overrides: Partial<ChannelMeta> = {},
 ): ChannelMeta {
   return {
-    id: id as ChannelMeta["id"],
+    id,
     label,
     selectionLabel: label,
     docsPath: `/channels/${id}`,
@@ -63,13 +63,10 @@ export function makeSetupPlugin(params: {
   setupWizard?: ChannelSetupPlugin["setupWizard"];
 }): ChannelSetupPlugin {
   return {
-    id: params.id as ChannelSetupPlugin["id"],
+    id: params.id,
     meta: makeMeta(params.id, params.label),
     capabilities: { chatTypes: [] },
-    config: {
-      listAccountIds: vi.fn(() => ["default"]),
-      resolveAccount: vi.fn(() => ({})),
-    } as unknown as ChannelSetupPlugin["config"],
+    config: { listAccountIds: () => ["default"], resolveAccount: () => ({}) },
     ...(params.setupWizard ? { setupWizard: params.setupWizard } : {}),
   };
 }
@@ -82,19 +79,13 @@ export function makeExternalChatSetupPlugin(
     label: "External Chat",
     setupWizard: {
       channel: "external-chat",
-      getStatus: vi.fn(async () => ({
-        channel: "external-chat",
-        configured: false,
-        statusLines: [],
-      })),
+      getStatus: async () => ({ channel: "external-chat", configured: false, statusLines: [] }),
       ...setupWizard,
     },
   });
 }
 
-export function externalChatSetupEntries(
-  overrides: Partial<ReturnType<ResolveChannelSetupEntries>> = {},
-) {
+export function externalChatSetupEntries(overrides: Partial<ReturnType<Discover>> = {}) {
   return makeChannelSetupEntries({
     entries: [{ id: "external-chat", meta: makeMeta("external-chat", "External Chat") }],
     ...overrides,
@@ -102,118 +93,100 @@ export function externalChatSetupEntries(
 }
 
 export function makePluginRegistry(overrides: Partial<PluginRegistry> = {}): PluginRegistry {
-  const registry = createEmptyPluginRegistry();
-  for (const key of Object.keys(overrides) as Array<keyof PluginRegistry>) {
-    const value = overrides[key];
-    if (value !== undefined) {
-      Object.assign(registry, { [key]: value });
-    }
-  }
-  return registry;
+  return { ...createEmptyPluginRegistry(), ...overrides };
 }
 
-type CollectChannelStatus = typeof import("./channel-setup.status.js").collectChannelStatus;
-type EnsureChannelSetupPluginInstalled =
+type CollectStatus = typeof import("./channel-setup.status.js").collectChannelStatus;
+type Install =
   typeof import("../commands/channel-setup/plugin-install.js").ensureChannelSetupPluginInstalled;
 
 export function createChannelSetupMocks() {
-  const mocks = {
+  const agentScope = {
     resolveAgentWorkspaceDir: vi.fn(
       (_cfg?: unknown, _agentId?: unknown) => "/tmp/openclaw-workspace",
     ),
     resolveDefaultAgentId: vi.fn((_cfg?: unknown) => "default"),
+  };
+  const setupRegistry = {
+    getChannelSetupPlugin: vi.fn((_channel?: unknown) => undefined),
+    listChannelSetupPlugins: vi.fn((): unknown[] => []),
+    listActiveChannelSetupPlugins: vi.fn((): unknown[] => []),
+  };
+  const trustedCatalog = {
     listTrustedChannelPluginCatalogEntries: vi.fn((_params?: unknown): unknown[] => [
       { id: "external-chat", pluginId: "@vendor/external-chat-plugin", origin: "bundled" },
     ]),
     getTrustedChannelPluginCatalogEntry: vi.fn(
       (_channelId: string, _params?: unknown): unknown => undefined,
     ),
-    getChannelSetupPlugin: vi.fn((_channel?: unknown) => undefined),
-    listChannelSetupPlugins: vi.fn((): unknown[] => []),
-    listActiveChannelSetupPlugins: vi.fn((): unknown[] => []),
-    loadChannelSetupPluginRegistrySnapshotForChannel: vi.fn(
-      (_params: Parameters<LoadChannelSetupPluginRegistrySnapshotForChannel>[0]) =>
-        makePluginRegistry(),
+  };
+  const pluginInstall = {
+    loadChannelSetupPluginRegistrySnapshotForChannel: vi.fn((_params: LoadRegistryParams) =>
+      makePluginRegistry(),
     ),
-    ensureChannelSetupPluginInstalled: vi.fn(
-      async ({ cfg, entry }: Parameters<EnsureChannelSetupPluginInstalled>[0]) => ({
-        cfg,
-        installed: true,
-        pluginId: entry?.pluginId,
-        status: "installed",
-      }),
+    ensureChannelSetupPluginInstalled: vi.fn(async ({ cfg, entry }: Parameters<Install>[0]) => ({
+      cfg,
+      installed: true,
+      pluginId: entry?.pluginId,
+      status: "installed",
+    })),
+  };
+  const discovery = {
+    resolveChannelSetupEntries: vi.fn((_params: Parameters<Discover>[0]) =>
+      makeChannelSetupEntries(),
     ),
-    resolveChannelSetupEntries: vi.fn(
-      (
-        _params: Parameters<ResolveChannelSetupEntries>[0],
-      ): ReturnType<ResolveChannelSetupEntries> => makeChannelSetupEntries(),
-    ),
-    collectChannelStatus: vi.fn<CollectChannelStatus>(async (_params) => ({
+  };
+  const configured = { isChannelConfigured: vi.fn((_cfg?: unknown, _channel?: unknown) => true) };
+  const status = {
+    collectChannelStatus: vi.fn<CollectStatus>(async (_params) => ({
       statusByChannel: new Map(),
       statusLines: [],
     })),
     resolveChannelSetupWorkspaceDir: vi.fn((_cfg?: unknown) => "/tmp/openclaw-workspace"),
-    isChannelConfigured: vi.fn((_cfg?: unknown, _channel?: unknown) => true),
+    findBundledSourceForCatalogChannel: vi.fn(() => undefined),
+    noteChannelPrimer: vi.fn(),
+    resolveCatalogChannelSelectionHint: vi.fn(() => "download from <npm>"),
+    resolveChannelSelectionNoteLines: vi.fn(() => []),
+    resolveChannelSetupSelectionOptions: vi.fn(() => []),
+    resolveQuickstartDefault: vi.fn(() => undefined),
   };
-  const factories = {
-    agentScope: () => ({
-      resolveAgentWorkspaceDir: mocks.resolveAgentWorkspaceDir,
-      resolveDefaultAgentId: mocks.resolveDefaultAgentId,
-    }),
-    setupRegistry: () => ({
-      getChannelSetupPlugin: mocks.getChannelSetupPlugin,
-      listActiveChannelSetupPlugins: mocks.listActiveChannelSetupPlugins,
-      listChannelSetupPlugins: mocks.listChannelSetupPlugins,
-    }),
-    channels: () => ({
-      getChatChannelMeta: (channelId: string) => ({ id: channelId, label: channelId }),
-      listChatChannels: () => [],
-      normalizeAnyChannelId: (channelId?: unknown) =>
-        typeof channelId === "string" ? channelId.trim().toLowerCase() || null : null,
-      normalizeChatChannelId: (channelId?: unknown) =>
-        typeof channelId === "string" ? channelId.trim().toLowerCase() || null : null,
-    }),
-    discovery: () => ({
-      resolveChannelSetupEntries: mocks.resolveChannelSetupEntries,
-      shouldShowChannelInSetup: () => true,
-    }),
-    pluginInstall: () => ({
-      ensureChannelSetupPluginInstalled: mocks.ensureChannelSetupPluginInstalled,
-      loadChannelSetupPluginRegistrySnapshotForChannel:
-        mocks.loadChannelSetupPluginRegistrySnapshotForChannel,
-    }),
-    registry: () => ({
-      resolveChannelSetupWizardAdapterForPlugin: (plugin?: { setupWizard?: unknown }) =>
-        plugin?.setupWizard,
-    }),
-    trustedCatalog: () => ({
-      listTrustedChannelPluginCatalogEntries: mocks.listTrustedChannelPluginCatalogEntries,
-      getTrustedChannelPluginCatalogEntry: mocks.getTrustedChannelPluginCatalogEntry,
-    }),
-    configured: () => ({
-      isChannelConfigured: mocks.isChannelConfigured,
-    }),
-    prompts: () => ({
-      maybeConfigureCommandOwner: vi.fn(async ({ cfg }: { cfg: OpenClawConfig }) => cfg),
-      maybeConfigureDmPolicies: vi.fn(async ({ cfg }: { cfg: OpenClawConfig }) => cfg),
-      promptConfiguredAction: vi.fn(),
-      promptRemovalAccountId: vi.fn(),
-      formatAccountLabel: vi.fn(),
-    }),
-    status: () => ({
-      collectChannelStatus: mocks.collectChannelStatus,
-      findBundledSourceForCatalogChannel: vi.fn(() => undefined),
-      noteChannelPrimer: vi.fn(),
-      resolveCatalogChannelSelectionHint: vi.fn(() => "download from <npm>"),
-      resolveChannelSelectionNoteLines: vi.fn(() => []),
-      resolveChannelSetupSelectionOptions: vi.fn(() => []),
-      resolveChannelSetupWorkspaceDir: mocks.resolveChannelSetupWorkspaceDir,
-      resolveQuickstartDefault: vi.fn(() => undefined),
-    }),
+  const mocks = {
+    ...agentScope,
+    ...setupRegistry,
+    ...trustedCatalog,
+    ...pluginInstall,
+    ...discovery,
+    ...configured,
+    ...status,
   };
   return {
     ...mocks,
-    factories,
+    factories: {
+      agentScope: () => agentScope,
+      setupRegistry: () => setupRegistry,
+      trustedCatalog: () => trustedCatalog,
+      pluginInstall: () => pluginInstall,
+      configured: () => configured,
+      status: () => status,
+      discovery: () => ({ ...discovery, shouldShowChannelInSetup: () => true }),
+      channels: () => ({
+        getChatChannelMeta: (channelId: string) => ({ id: channelId, label: channelId }),
+        listChatChannels: () => [],
+        normalizeAnyChannelId: normalizeChannel,
+        normalizeChatChannelId: normalizeChannel,
+      }),
+      registry: () => ({
+        resolveChannelSetupWizardAdapterForPlugin: (plugin?: { setupWizard?: unknown }) =>
+          plugin?.setupWizard,
+      }),
+      prompts: () => ({
+        maybeConfigureCommandOwner: vi.fn(async ({ cfg }: { cfg: OpenClawConfig }) => cfg),
+        maybeConfigureDmPolicies: vi.fn(async ({ cfg }: { cfg: OpenClawConfig }) => cfg),
+        promptConfiguredAction: vi.fn(),
+        promptRemovalAccountId: vi.fn(),
+        formatAccountLabel: vi.fn(),
+      }),
+    },
     reset() {
       vi.clearAllMocks();
       for (const mock of Object.values(mocks)) {
@@ -223,4 +196,8 @@ export function createChannelSetupMocks() {
       mocks.resolveChannelSetupEntries.mockReturnValue(makeChannelSetupEntries());
     },
   };
+}
+
+function normalizeChannel(channelId?: unknown) {
+  return typeof channelId === "string" ? channelId.trim().toLowerCase() || null : null;
 }

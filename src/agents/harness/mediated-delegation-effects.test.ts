@@ -321,6 +321,35 @@ function observeLaunches(trace: string[]) {
   return () => launches;
 }
 
+async function prepareEffect(route: Route, suffix: string, senderRestricted = false) {
+  const caller = await createCaller(route, config, "", senderRestricted);
+  const basename = route + suffix;
+  const target = path.join(state.workspaceDir, basename);
+  await fs.writeFile(target, "original");
+  return { caller, basename, target };
+}
+async function expectRejected(receipt: Receipt, target: string) {
+  expect(receipt.isError, receipt.text).toBe(true);
+  expect(receipt.text).toMatch(/authorization changed|authority is no longer active/);
+  expect(await fs.readFile(target, "utf8")).toBe("original");
+}
+async function revokeAtGate(
+  entered: Promise<void>,
+  running: Promise<Receipt>,
+  signal: AbortSignal,
+  message: string,
+  release: () => void,
+  trace: string[],
+) {
+  try {
+    await withinTest(awaitGateBeforeSettlement(entered, running, message), signal);
+    revoke();
+    trace.push("delegation:revoked");
+  } finally {
+    release();
+  }
+}
+
 // Promise gates delay real preparation/I/O only. All authority, tool construction,
 // approval policy, command launch, mutation, and caller receipts remain production-owned.
 describe.each(["cli-loopback", "plugin-harness"] as const)(
@@ -352,23 +381,11 @@ describe.each(["cli-loopback", "plugin-harness"] as const)(
       expect(read.isError, read.text).toBe(false);
       expect(read.text).toContain("write-effect");
       expect(await fs.readFile(target, "utf8")).toBe("write-effect");
-      console.log(
-        JSON.stringify({
-          route,
-          trace: caller.trace,
-          launches: launches(),
-          finalFile: "write-effect",
-          resumed: { exec: false, write: false, read: true },
-        }),
-      );
     });
 
     it("does not waive sender restrictions even with a persisted delegation exception", async () => {
-      const caller = await createCaller(route, config, "", true);
+      const { caller, basename, target } = await prepareEffect(route, "-sender-denied.txt", true);
       const launches = observeLaunches(caller.trace);
-      const basename = route + "-sender-denied.txt";
-      const target = path.join(state.workspaceDir, basename);
-      await fs.writeFile(target, "original");
       expect(caller.names).not.toContain("exec");
       expect(caller.names).not.toContain("write");
       for (const [name, args] of [
@@ -380,25 +397,13 @@ describe.each(["cli-loopback", "plugin-harness"] as const)(
       }
       expect(launches()).toBe(0);
       expect(await fs.readFile(target, "utf8")).toBe("original");
-      console.log(
-        JSON.stringify({
-          route,
-          stage: "sender-denied",
-          trace: caller.trace,
-          launches: launches(),
-          finalFile: "original",
-        }),
-      );
     });
 
     it("rejects revocation during awaited command preparation before process launch", async ({
       signal,
     }) => {
-      const caller = await createCaller(route);
+      const { caller, basename, target } = await prepareEffect(route, "-revoked-command.txt");
       const launches = observeLaunches(caller.trace);
-      const basename = route + "-revoked-command.txt";
-      const target = path.join(state.workspaceDir, basename);
-      await fs.writeFile(target, "original");
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
       const original = shellSnapshot.maybeWrapCommandWithShellSnapshot;
@@ -415,39 +420,23 @@ describe.each(["cli-loopback", "plugin-harness"] as const)(
         command: "printf forbidden > " + basename,
         yieldMs: 10_000,
       });
-      try {
-        await withinTest(
-          awaitGateBeforeSettlement(entered.promise, running, "command did not reach preparation"),
-          signal,
-        );
-        revoke();
-        caller.trace.push("delegation:revoked");
-      } finally {
-        release.resolve();
-      }
-      const receipt = await running;
-      expect(receipt.isError, receipt.text).toBe(true);
-      expect(receipt.text).toMatch(/authorization changed|authority is no longer active/);
-      expect(launches()).toBe(0);
-      expect(await fs.readFile(target, "utf8")).toBe("original");
-      console.log(
-        JSON.stringify({
-          route,
-          stage: "command-preparation",
-          trace: caller.trace,
-          launches: launches(),
-          finalFile: "original",
-          denied: receipt.text,
-        }),
+      await revokeAtGate(
+        entered.promise,
+        running,
+        signal,
+        "command did not reach preparation",
+        release.resolve,
+        caller.trace,
       );
+      const receipt = await running;
+      await expectRejected(receipt, target);
+      expect(launches()).toBe(0);
     });
 
     it("rejects revocation after the write descriptor opens but before mutation", async ({
       signal,
     }) => {
-      const caller = await createCaller(route);
-      const target = path.join(state.workspaceDir, route + "-revoked-write.txt");
-      await fs.writeFile(target, "original");
+      const { caller, target } = await prepareEffect(route, "-revoked-write.txt");
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
       const originalOpen = fs.open;
@@ -462,29 +451,16 @@ describe.each(["cli-loopback", "plugin-harness"] as const)(
         return handle;
       });
       const running = caller.call("write", { path: target, content: "forbidden" });
-      try {
-        await withinTest(
-          awaitGateBeforeSettlement(entered.promise, running, "write did not open its descriptor"),
-          signal,
-        );
-        revoke();
-        caller.trace.push("delegation:revoked");
-      } finally {
-        release.resolve();
-      }
-      const receipt = await running;
-      expect(receipt.isError, receipt.text).toBe(true);
-      expect(receipt.text).toMatch(/authorization changed|authority is no longer active/);
-      expect(await fs.readFile(target, "utf8")).toBe("original");
-      console.log(
-        JSON.stringify({
-          route,
-          stage: "file-open",
-          trace: caller.trace,
-          finalFile: "original",
-          denied: receipt.text,
-        }),
+      await revokeAtGate(
+        entered.promise,
+        running,
+        signal,
+        "write did not open its descriptor",
+        release.resolve,
+        caller.trace,
       );
+      const receipt = await running;
+      await expectRejected(receipt, target);
     });
   },
 );

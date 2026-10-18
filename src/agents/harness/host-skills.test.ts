@@ -7,8 +7,44 @@ import { createCanonicalFixtureSkill } from "../../skills/test-support/test-help
 import { readCodeModeSkill } from "../code-mode-skills.js";
 import { readInstalledSkill } from "../installed-skill-catalog.js";
 import { createSandboxTestContext } from "../sandbox/test-fixtures.js";
+import type { AnyAgentTool } from "../tools/common.js";
 import { createAdmittedHostCapabilityTestFixture } from "./host-capability.test-support.js";
 import { bindHostSkillCatalog } from "./host-skills.js";
+
+const config = { plugins: { enabled: false } };
+function fixtureSkill(name: string, filePath: string, description = name) {
+  return Object.assign(
+    createCanonicalFixtureSkill({
+      name,
+      description,
+      filePath,
+      baseDir: path.dirname(filePath),
+      source: "workspace",
+    }),
+    { readContent: "Cached instructions must not bypass the root" },
+  );
+}
+async function rootedSkills(prefix: string) {
+  const parent = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+  const root = path.join(parent, "workspace");
+  await fs.mkdir(root);
+  const inside = path.join(root, "SKILL.md");
+  const outside = path.join(parent, "outside.md");
+  await fs.writeFile(inside, "Inside instructions");
+  await fs.writeFile(outside, "Outside instructions");
+  return { parent, root, inside, outside };
+}
+const snapshot = (candidates: ReturnType<typeof fixtureSkill>[]) => ({
+  prompt: "",
+  skills: candidates.map(({ name }) => ({ name, skillKey: name })),
+  discoverySkills: candidates,
+});
+function findTool(tools: AnyAgentTool[], name: string) {
+  return expectDefined(
+    tools.find((tool) => tool.name === name),
+    name,
+  );
+}
 
 it("binds skill reads to a late sandbox and refuses reads after host closure", async () => {
   const sourcePath = "/host/skills/guide/SKILL.md";
@@ -32,7 +68,7 @@ it("binds skill reads to a late sandbox and refuses reads after host closure", a
   const host = await createAdmittedHostCapabilityTestFixture({
     runId: "late-sandbox-skills",
     workspaceDir: "/host",
-    config: { plugins: { enabled: false } },
+    config,
     skillsSnapshot: {
       prompt: "",
       skills: [
@@ -74,17 +110,11 @@ it("binds skill reads to a late sandbox and refuses reads after host closure", a
     );
     const tools = createToolSurface({
       workspaceDir: "/host",
-      config: { plugins: { enabled: false } },
+      config,
       sandbox,
     });
-    const read = expectDefined(
-      tools.find((tool) => tool.name === "skills_read"),
-      "installed skill read tool",
-    );
-    const search = expectDefined(
-      tools.find((tool) => tool.name === "skills_search"),
-      "installed skill search tool",
-    );
+    const read = findTool(tools, "skills_read");
+    const search = findTool(tools, "skills_search");
     expect((await search.execute("find-node", { query: "node-only" })).details).toEqual({
       skills: [],
       hasMore: false,
@@ -117,16 +147,8 @@ it("binds skill reads to a late sandbox and refuses reads after host closure", a
 });
 
 it("confines cached and retargeted skill instructions to the required root at read time", async () => {
-  const parent = await fs.realpath(
-    await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-rooted-skills-")),
-  );
-  const root = path.join(parent, "workspace");
-  await fs.mkdir(root);
-  const inside = path.join(root, "SKILL.md");
-  const outside = path.join(parent, "outside.md");
+  const { parent, root, inside, outside } = await rootedSkills("openclaw-rooted-skills-");
   const alias = path.join(root, "alias.md");
-  await fs.writeFile(inside, "Inside instructions");
-  await fs.writeFile(outside, "Outside instructions");
   await fs.writeFile(alias, "Inside instructions");
   const candidates = (
     [
@@ -134,18 +156,7 @@ it("confines cached and retargeted skill instructions to the required root at re
       ["outside", outside],
       ["alias", alias],
     ] as const
-  ).map(([name, filePath]) =>
-    Object.assign(
-      createCanonicalFixtureSkill({
-        name,
-        description: name,
-        filePath,
-        baseDir: path.dirname(filePath),
-        source: "workspace",
-      }),
-      { readContent: "Cached instructions must not bypass the root" },
-    ),
-  );
+  ).map(([name, filePath]) => fixtureSkill(name, filePath));
   let active = true;
   const assertCurrent = () => {
     if (!active) {
@@ -154,11 +165,7 @@ it("confines cached and retargeted skill instructions to the required root at re
   };
   try {
     const getSkills = bindHostSkillCatalog({
-      snapshot: {
-        prompt: "",
-        skills: candidates.map(({ name }) => ({ name, skillKey: name })),
-        discoverySkills: candidates,
-      },
+      snapshot: snapshot(candidates),
       workspaceDir: root,
       requiredRoot: root,
       readable: true,
@@ -191,26 +198,11 @@ it("confines cached and retargeted skill instructions to the required root at re
 });
 
 it("keeps the host-owned skill root when plugin options widen placement or replace the catalog", async () => {
-  const parent = await fs.realpath(
-    await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-host-skills-")),
-  );
-  const root = path.join(parent, "workspace");
-  await fs.mkdir(root);
-  const inside = path.join(root, "SKILL.md");
-  const outside = path.join(parent, "outside.md");
-  await fs.writeFile(inside, "Inside instructions");
-  await fs.writeFile(outside, "Outside instructions");
+  const { parent, root, inside, outside } = await rootedSkills("openclaw-host-skills-");
   const candidates = [inside, outside].map((filePath, index) =>
-    Object.assign(
-      createCanonicalFixtureSkill({
-        name: index === 0 ? "inside" : "outside",
-        description: "Instructions",
-        filePath,
-        baseDir: path.dirname(filePath),
-        source: "workspace",
-      }),
-      { readContent: "Cached outside instructions" },
-    ),
+    Object.assign(fixtureSkill(index === 0 ? "inside" : "outside", filePath, "Instructions"), {
+      readContent: "Cached outside instructions",
+    }),
   );
   const host = await createAdmittedHostCapabilityTestFixture({
     runId: "required-root-skills",
@@ -218,12 +210,8 @@ it("keeps the host-owned skill root when plugin options widen placement or repla
     cwd: root,
     sessionRoot: root,
     requireWorkspaceOnly: true,
-    config: { plugins: { enabled: false } },
-    skillsSnapshot: {
-      prompt: "",
-      skills: candidates.map(({ name }) => ({ name, skillKey: name })),
-      discoverySkills: candidates,
-    },
+    config,
+    skillsSnapshot: snapshot(candidates),
   });
   try {
     const createTools = expectDefined(host.hostCapabilities.createToolSurface, "host tools");
@@ -241,10 +229,7 @@ it("keeps the host-owned skill root when plugin options widen placement or repla
         },
       ],
     });
-    const read = expectDefined(
-      tools.find((tool) => tool.name === "skills_read"),
-      "skill reader",
-    );
+    const read = findTool(tools, "skills_read");
     expect((await read.execute("inside", { name: "inside" })).content).toEqual([
       {
         type: "text",

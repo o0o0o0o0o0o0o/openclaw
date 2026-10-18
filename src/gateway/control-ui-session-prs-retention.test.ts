@@ -3,7 +3,7 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runGitWorkerOperation } from "../infra/git-worker.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
-import { createControlUiSessionPullRequestSubscriptions } from "./control-ui-session-pr-subscriptions.js";
+import { createControlUiSessionPullRequestSubscriptions as createSubscriptions } from "./control-ui-session-pr-subscriptions.js";
 import {
   createSessionPullRequestsFixture,
   githubJson,
@@ -13,7 +13,7 @@ import {
 } from "./control-ui-session-prs.test-support.js";
 
 const fixture = createSessionPullRequestsFixture();
-const loadControlUiSessionPullRequests = fixture.load;
+const loadPrs = fixture.load;
 
 vi.mock("../infra/git-worker.js", () => ({ runGitWorkerOperation: vi.fn() }));
 
@@ -29,17 +29,11 @@ function localGitReads() {
     );
 }
 
-function mockCheckout({
-  revision,
-  branch,
-  facts = () => undefined,
-}: {
-  revision: () => string | null;
-  branch: (root: string) => string | null;
-  facts?: () =>
-    | { creatable: boolean; stats: { additions: number; deletions: number; changedFiles: number } }
-    | undefined;
-}) {
+function mockCheckout(
+  revision: () => string | null,
+  branch: (root: string) => string | null,
+  additions?: () => number,
+) {
   vi.mocked(runGitWorkerOperation).mockImplementation(async (operation) => {
     switch (operation.type) {
       case "pull-request.branch-comparison":
@@ -58,7 +52,9 @@ function mockCheckout({
           : null;
       }
       case "pull-request.branch-facts":
-        return facts();
+        return additions
+          ? { creatable: true, stats: { additions: additions(), deletions: 0, changedFiles: 1 } }
+          : undefined;
       default:
         throw new Error("Unexpected local Git operation");
     }
@@ -66,12 +62,9 @@ function mockCheckout({
 }
 
 function subscribe(
-  options: Pick<
-    Parameters<typeof createControlUiSessionPullRequestSubscriptions>[0],
-    "load" | "broadcastToConnIds"
-  >,
+  options: Pick<Parameters<typeof createSubscriptions>[0], "load" | "broadcastToConnIds">,
 ) {
-  return createControlUiSessionPullRequestSubscriptions({
+  return createSubscriptions({
     scheduler: createTestGatewayScheduler("fake-timers"),
     prepareRead: fixture.prepareRead,
     ...options,
@@ -102,16 +95,16 @@ describe("watched session PR retention", () => {
       { match: "/repos/openclaw/openclaw", response: () => githubJson({ fork: false }) },
     ]);
     vi.stubGlobal("fetch", fetchImpl);
-    mockCheckout({
-      revision: () => revision,
-      branch: () => "shared-feature",
-      facts: () => ({ creatable: true, stats: { additions, deletions: 0, changedFiles: 1 } }),
-    });
+    mockCheckout(
+      () => revision,
+      () => "shared-feature",
+      () => additions,
+    );
     const broadcastToConnIds = vi.fn();
     const subscriptions = subscribe({
       broadcastToConnIds,
       load: (params, cacheSignal) =>
-        loadControlUiSessionPullRequests(params, {
+        loadPrs(params, {
           cacheSignal,
           resolveGitRoot: async () => "/watched/shared-checkout",
         }),
@@ -183,32 +176,35 @@ describe("watched session PR retention", () => {
       },
     ]);
     vi.stubGlobal("fetch", fetchImpl);
-    const snapshots = new Map<
-      string,
-      { rateLimited: boolean; pullRequests: unknown[]; repository: unknown }
-    >();
+    const snapshots = new Map<string, unknown>();
+    const expectSnapshots = (rateLimited: boolean) => {
+      for (const snapshot of snapshots.values()) {
+        expect(snapshot).toEqual(
+          expect.objectContaining({
+            rateLimited,
+            pullRequests: [expect.anything()],
+            repository: { owner: "openclaw", repo: "openclaw" },
+          }),
+        );
+      }
+    };
     const subscriptions = subscribe({
       broadcastToConnIds: (_event, payload) => {
         if (!isRecord(payload) || !isRecord(payload.sessions)) {
           throw new Error("invalid subscription event");
         }
         for (const [key, snapshot] of Object.entries(payload.sessions)) {
-          if (
-            !isRecord(snapshot) ||
-            typeof snapshot.rateLimited !== "boolean" ||
-            !Array.isArray(snapshot.pullRequests)
-          ) {
-            throw new Error("invalid subscription snapshot");
-          }
-          snapshots.set(key, {
-            rateLimited: snapshot.rateLimited,
-            pullRequests: snapshot.pullRequests,
-            repository: snapshot.repository,
-          });
+          expect(snapshot).toEqual(
+            expect.objectContaining({
+              rateLimited: expect.any(Boolean),
+              pullRequests: expect.any(Array),
+            }),
+          );
+          snapshots.set(key, snapshot);
         }
       },
       load: (params, cacheSignal) =>
-        loadControlUiSessionPullRequests(params, {
+        loadPrs(params, {
           cacheSignal,
           resolveGitContext: async () => ({
             owner: "openclaw",
@@ -226,31 +222,16 @@ describe("watched session PR retention", () => {
       await subscriptions.pollNow();
       const callsAtBackoff = fetchImpl.mock.calls.length;
       expect(callsAtBackoff).toBeGreaterThan(101);
-      expect(
-        [...snapshots.values()].every(
-          (snapshot) => snapshot.rateLimited && snapshot.pullRequests.length === 1,
-        ),
-      ).toBe(true);
-      for (const snapshot of snapshots.values()) {
-        expect(snapshot.repository).toEqual({ owner: "openclaw", repo: "openclaw" });
-      }
+      expectSnapshots(true);
       vi.setSystemTime(Date.now() + 61_000);
       await subscriptions.replace("watcher", keys, new Set(keys));
       expect(fetchImpl.mock.calls).toHaveLength(callsAtBackoff);
-      expect(
-        [...snapshots.values()].every(
-          (snapshot) => snapshot.rateLimited && snapshot.pullRequests.length === 1,
-        ),
-      ).toBe(true);
+      expectSnapshots(true);
       limited = false;
       vi.setSystemTime(Date.now() + 240_001);
       await subscriptions.pollNow();
       expect(fetchImpl.mock.calls).toHaveLength(callsAtBackoff + 101);
-      expect(
-        [...snapshots.values()].every(
-          (snapshot) => !snapshot.rateLimited && snapshot.pullRequests.length === 1,
-        ),
-      ).toBe(true);
+      expectSnapshots(false);
     } finally {
       await subscriptions.stop();
     }
@@ -265,17 +246,17 @@ describe("watched session PR retention", () => {
     ]);
     vi.stubGlobal("fetch", fetchImpl);
     const signals = new Set<AbortSignal>();
-    mockCheckout({
-      revision: () => "unchanged",
-      branch: (root) => root.slice("/watched/".length),
-    });
+    mockCheckout(
+      () => "unchanged",
+      (root) => root.slice("/watched/".length),
+    );
     const subscriptions = subscribe({
       broadcastToConnIds: vi.fn(),
       load: (params, cacheSignal) => {
         if (cacheSignal) {
           signals.add(cacheSignal);
         }
-        return loadControlUiSessionPullRequests(params, {
+        return loadPrs(params, {
           cacheSignal,
           resolveGitRoot: async () => `/watched/${params.sessionKey}`,
         });
@@ -293,16 +274,12 @@ describe("watched session PR retention", () => {
       expect(fetchImpl.mock.calls).toHaveLength(300);
       expect(localGitReads()).toHaveLength(600);
 
-      vi.setSystemTime(Date.now() + 60_000);
-      await subscriptions.pollNow();
-
-      expect(fetchImpl.mock.calls).toHaveLength(300);
-      expect(localGitReads()).toHaveLength(600);
-
-      vi.setSystemTime(Date.now() + 15_001);
-      await subscriptions.pollNow();
-      expect(fetchImpl.mock.calls).toHaveLength(300);
-      expect(localGitReads()).toHaveLength(600);
+      for (const elapsed of [60_000, 15_001]) {
+        vi.setSystemTime(Date.now() + elapsed);
+        await subscriptions.pollNow();
+        expect(fetchImpl.mock.calls).toHaveLength(300);
+        expect(localGitReads()).toHaveLength(600);
+      }
       vi.setSystemTime(Date.now() + 225_000);
       await subscriptions.pollNow();
       expect(localGitReads()).toHaveLength(900);
@@ -334,9 +311,12 @@ describe("watched session PR retention", () => {
       { match: "/repos/openclaw/openclaw", response: () => githubJson({ fork: false }) },
     ]);
     vi.stubGlobal("fetch", fetchImpl);
-    mockCheckout({ revision: () => branch, branch: () => branch });
+    mockCheckout(
+      () => branch,
+      () => branch,
+    );
     const load = () =>
-      loadControlUiSessionPullRequests(
+      loadPrs(
         { sessionKey: "retained", refresh: true },
         {
           cacheSignal: cacheLifetime.signal,

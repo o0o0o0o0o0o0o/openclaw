@@ -15,13 +15,15 @@ import {
 } from "../test-utils/openclaw-test-state.js";
 import { resolveControlUiSessionPrTarget } from "./control-ui-session-pr-read.js";
 import { withControlUiSessionPrSource } from "./control-ui-session-pr-source.js";
-import { loadControlUiSessionPullRequests } from "./control-ui-session-prs.js";
+import { loadControlUiSessionPullRequests as loadPrs } from "./control-ui-session-prs.js";
 import { resolveRequestedSessionAgentId } from "./session-request-agent.js";
 import { prepareSessionMutationFacts } from "./session-sharing-preparation.js";
 import { resolveSessionStoreKey } from "./session-store-key.js";
-import { loadGatewaySessionEntryReadOnlyAsync } from "./session-utils-store.js";
+import { loadGatewaySessionEntryReadOnlyAsync as loadEntry } from "./session-utils-store.js";
 
 type GitContext = { owner: string; repo: string; branch: string };
+type PrRequest = Parameters<typeof loadPrs>[0];
+type PrDeps = Omit<Parameters<typeof loadPrs>[1], "read">;
 
 export function githubJson(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -31,13 +33,7 @@ export function githubJson(body: unknown, status = 200): Response {
 }
 
 export function requestUrl(input: RequestInfo | URL | undefined): string {
-  if (typeof input === "string") {
-    return input;
-  }
-  if (input instanceof URL) {
-    return input.href;
-  }
-  return input?.url ?? "";
+  return typeof input === "string" ? input : input instanceof URL ? input.href : (input?.url ?? "");
 }
 
 export function routedFetch(
@@ -75,9 +71,9 @@ export const testGitContext: GitContext = {
 
 /** Direct loader tests supply real target facts; registered callers use the row projection. */
 export async function loadTestSessionPullRequests(
-  params: Parameters<typeof loadControlUiSessionPullRequests>[0],
-  deps: Omit<Parameters<typeof loadControlUiSessionPullRequests>[1], "read"> = {},
-): ReturnType<typeof loadControlUiSessionPullRequests> {
+  params: PrRequest,
+  deps: PrDeps = {},
+): ReturnType<typeof loadPrs> {
   const requested = resolveRequestedSessionAgentId(
     getRuntimeConfig(),
     params.sessionKey,
@@ -86,8 +82,7 @@ export async function loadTestSessionPullRequests(
   if (!requested.ok) {
     throw new Error(requested.error.message);
   }
-  const readTarget = await prepareTestSessionPrTarget({ ...params, agentId: requested.agentId });
-  const target = await readTarget();
+  const target = await prepareTestSessionPrTarget({ ...params, agentId: requested.agentId });
   if (!target) {
     return { pullRequests: [], rateLimited: false };
   }
@@ -101,7 +96,7 @@ export async function loadTestSessionPullRequests(
     return await withControlUiSessionPrSource(
       target.readSource,
       (assertSourceCurrent, sourceIdentity) =>
-        loadControlUiSessionPullRequests(params, {
+        loadPrs(params, {
           ...deps,
           read: {
             target,
@@ -125,26 +120,21 @@ export async function loadTestSessionPullRequests(
 }
 
 async function prepareTestSessionPrTarget(params: { sessionKey: string; agentId?: string }) {
-  const initial = await loadGatewaySessionEntryReadOnlyAsync(params.sessionKey, {
-    agentId: params.agentId,
-  });
+  const read = () => loadEntry(params.sessionKey, { agentId: params.agentId });
+  const initial = await read();
   const prepared = initial.entry?.repositoryWorkspaceId
     ? await getSessionRepositoryWorkspaceStore().prepare(initial.entry.repositoryWorkspaceId)
     : undefined;
-  return async () => {
-    const selected = await loadGatewaySessionEntryReadOnlyAsync(params.sessionKey, {
-      agentId: params.agentId,
-    });
-    const repository = prepared?.current();
-    return resolveControlUiSessionPrTarget(
-      selected,
-      repository?.workspaceId === selected.entry?.repositoryWorkspaceId &&
-        repository?.agentId === selected.agentId &&
-        repository.sessionKey === selected.canonicalKey
-        ? repository
-        : null,
-    );
-  };
+  const selected = await read();
+  const repository = prepared?.current();
+  return resolveControlUiSessionPrTarget(
+    selected,
+    repository?.workspaceId === selected.entry?.repositoryWorkspaceId &&
+      repository?.agentId === selected.agentId &&
+      repository.sessionKey === selected.canonicalKey
+      ? repository
+      : null,
+  );
 }
 
 /** Git/network fixtures still select real sessions; each test owns its cache namespace. */
@@ -170,7 +160,7 @@ export function createSessionPullRequestsFixture() {
     await state?.cleanup();
     state = undefined;
   });
-  const seed = (params: Parameters<typeof loadControlUiSessionPullRequests>[0]) => {
+  const seed = (params: PrRequest) => {
     if (!state) {
       throw new Error("Session PR fixture is not active");
     }
@@ -198,12 +188,9 @@ export function createSessionPullRequestsFixture() {
   };
   return {
     load,
-    prepareRead: async (
-      _connId: string,
-      session: Parameters<typeof loadControlUiSessionPullRequests>[0],
-    ) => {
+    prepareRead: async (_connId: string, session: PrRequest) => {
       const params = seed(session);
-      return async () => (await prepareTestSessionPrTarget(params))();
+      return () => prepareTestSessionPrTarget(params);
     },
   };
 }

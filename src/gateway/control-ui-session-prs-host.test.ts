@@ -11,7 +11,6 @@ import { loadControlUiSessionPullRequests } from "./control-ui-session-prs.js";
 import { githubJson, pullListItem, requestUrl } from "./control-ui-session-prs.test-support.js";
 import { getSessionRowProjection } from "./session-row-projection-access.js";
 
-// Broadcasts send one shared pre-encoded buffer per frame; decode before matching text.
 function sentText(socket: { send: { mock: { calls: ReadonlyArray<readonly unknown[]> } } }) {
   return socket.send.mock.calls.map(([data]) => String(data)).join("\n");
 }
@@ -19,12 +18,23 @@ function sentText(socket: { send: { mock: { calls: ReadonlyArray<readonly unknow
 type Fixture = Awaited<ReturnType<typeof createFixture>>;
 async function withReader(run: (fixture: Fixture) => Promise<void>) {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    vi.stubEnv("GH_TOKEN", "");
+    vi.stubEnv("GITHUB_TOKEN", "");
     const f = await createFixture("operator.read", true);
     try {
       await run(f);
     } finally {
       await f.close();
     }
+  });
+}
+
+function publicationPull(host = "github.com", title = "Public change") {
+  return pullListItem({
+    state: "closed",
+    title,
+    html_url: `https://${host}/synthetic/publication/pull/103469`,
+    base: { repo: { name: "publication", owner: { login: "synthetic" } } },
   });
 }
 
@@ -66,10 +76,7 @@ afterEach(() => {
 it.each([false, true])(
   "keeps a coalesced branch refresh after its first reader retires (forced=%s)",
   async (forced) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async () => {
-      vi.stubEnv("GH_TOKEN", "");
-      vi.stubEnv("GITHUB_TOKEN", "");
-      const f = await createFixture("operator.read", true);
+    await withReader(async (f) => {
       const gate = createDeferredCore<Response>();
       const started = createDeferredCore();
       const fetchImpl = vi.fn<typeof fetch>(async () => {
@@ -78,14 +85,7 @@ it.each([false, true])(
       });
       vi.stubGlobal("fetch", fetchImpl);
       try {
-        const repository = await getSessionRepositoryWorkspaceStore().create({
-          agentId: "main",
-          sessionKey,
-          url: "https://github.com/synthetic/publication",
-          branch: "coalesced-readers",
-          assertCurrent: () => {},
-        });
-        await f.seed(sessionKey, f.profile.id, { repositoryWorkspaceId: repository.workspaceId });
+        await seedRepository(f, sessionKey, "github.com");
         const secondReader = f.addReader("second-publication-reader");
         const targets = await Promise.all(
           [f.client, secondReader.client].map(async (client) => {
@@ -125,21 +125,12 @@ it.each([false, true])(
         const second = load(targets[1]!, forced);
         await Promise.resolve();
         f.client.invalidated = true;
-        gate.resolve(
-          githubJson([
-            pullListItem({
-              state: "closed",
-              html_url: "https://github.com/synthetic/publication/pull/103469",
-              base: { repo: { name: "publication", owner: { login: "synthetic" } } },
-            }),
-          ]),
-        );
+        gate.resolve(githubJson([publicationPull()]));
         await rejected;
         expect((await second).pullRequests).toMatchObject([{ number: 103469 }]);
         expect(fetchImpl).toHaveBeenCalledTimes(forced ? 2 : 1);
       } finally {
         gate.resolve(githubJson([]));
-        await f.close();
       }
     });
   },
@@ -147,18 +138,17 @@ it.each([false, true])(
 
 it("keeps a public session reader outside a same-named private Enterprise repository", async () => {
   await withReader(async (f) => {
-    vi.stubEnv("GH_TOKEN", "");
-    vi.stubEnv("GITHUB_TOKEN", "");
     const provider = vi.fn<typeof fetch>(async (input) => {
       const url = new URL(requestUrl(input));
+      const isPublic = url.hostname === "api.github.com";
       return githubJson([
-        pullListItem({
-          state: "closed",
+        {
+          ...publicationPull(
+            isPublic ? "github.com" : "ghe.example.test",
+            isPublic ? "Public change" : "Private Enterprise secret",
+          ),
           head: {},
-          title: url.hostname === "api.github.com" ? "Public change" : "Private Enterprise secret",
-          html_url: `https://${url.hostname === "api.github.com" ? "github.com" : "ghe.example.test"}/synthetic/publication/pull/103469`,
-          base: { repo: { name: "publication", owner: { login: "synthetic" } } },
-        }),
+        },
       ]);
     });
     vi.stubGlobal("fetch", provider);

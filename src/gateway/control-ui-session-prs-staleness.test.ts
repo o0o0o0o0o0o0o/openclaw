@@ -12,19 +12,20 @@ import {
 } from "../state/openclaw-agent-db.js";
 import { getSessionRepositoryWorkspaceStore } from "../state/session-repository-workspaces.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
-import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../test-utils/openclaw-test-state.js";
 import {
   githubJson,
-  loadTestSessionPullRequests as loadControlUiSessionPullRequests,
+  loadTestSessionPullRequests as loadPullRequests,
   pullListItem,
   requestUrl,
-  routedFetch,
   testGitContext,
 } from "./control-ui-session-prs.test-support.js";
 import { loadGatewaySessionEntryReadOnlyAsync } from "./session-utils.js";
 
 beforeEach(() => {
-  vi.useFakeTimers();
   vi.stubEnv("GH_TOKEN", "");
   vi.stubEnv("GITHUB_TOKEN", "");
 });
@@ -34,62 +35,108 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it("marks retained PR data unavailable after a refresh fails, then recovers", async () => {
-  vi.useRealTimers();
-  await withOpenClawTestState({ scenario: "minimal" }, async () => {
-    await captureRuntimeConfigAsyncReader()();
-    const sessionKey = "agent:main:stale-preview";
-    await upsertSessionEntryCore(
-      { agentId: "main", sessionKey },
-      { sessionId: "stale-preview-session", updatedAt: 1 },
-    );
-    vi.useFakeTimers();
+let state: OpenClawTestState;
+const withState = (run: () => Promise<void>) =>
+  withOpenClawTestState({ scenario: "minimal" }, async (fixture) => {
+    state = fixture;
     try {
-      let failed = false;
-      const fetchImpl = routedFetch([
-        {
-          match: "/pulls?head=",
-          response: () =>
-            failed
-              ? githubJson({ message: "Unavailable" }, 503)
-              : githubJson([pullListItem({ state: "closed", merged_at: "2026-09-01T00:00:00Z" })]),
-        },
-      ]);
-      vi.stubGlobal("fetch", fetchImpl);
-      const load = () =>
-        loadControlUiSessionPullRequests(
-          { sessionKey },
-          {
-            resolveGitContext: async () => ({ ...testGitContext, branch: "stale-preview" }),
-          },
-        );
-      const fresh = await load();
-      expect(fresh.pullRequests[0]?.state).toBe("merged");
-      failed = true;
-      vi.advanceTimersByTime(91_000);
-      const stale = await load();
-      expect(stale.pullRequests).toEqual(fresh.pullRequests);
-      expect(stale.status).toBe("unavailable");
-      expect(stale.rateLimited).toBe(false);
-      const calls = fetchImpl.mock.calls.length;
-      expect(await load()).toEqual(stale);
-      expect(fetchImpl.mock.calls).toHaveLength(calls);
-      failed = false;
-      vi.advanceTimersByTime(31_000);
-      const recovered = await load();
-      expect(recovered.status).not.toBe("unavailable");
-      expect(recovered.pullRequests).toEqual(fresh.pullRequests);
+      await run();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+function seedSession(
+  sessionKey: string,
+  entry: Parameters<typeof upsertSessionEntryCore>[1] = {},
+  storePath?: string,
+) {
+  return upsertSessionEntryCore(
+    { agentId: "main", sessionKey, storePath },
+    {
+      sessionId: sessionKey,
+      updatedAt: 1,
+      spawnedCwd: state.workspaceDir,
+      ...entry,
+    },
+  );
+}
+
+function stubPulls(response: () => Response) {
+  const fetch = vi.fn<typeof globalThis.fetch>(async (input) => {
+    if (!requestUrl(input).includes("/pulls?head=")) {
+      throw new Error(`Unexpected request: ${requestUrl(input)}`);
+    }
+    return response();
+  });
+  vi.stubGlobal("fetch", fetch);
+  return fetch;
+}
+
+const readWithGit = (sessionKey: string, resolveGitContext: () => Promise<typeof testGitContext>) =>
+  loadPullRequests({ sessionKey }, { resolveGitContext });
+
+function gatedRead(sessionKey: string, branch = testGitContext.branch) {
+  const entered = createDeferred();
+  const release = createDeferred();
+  const load = () =>
+    readWithGit(sessionKey, async () => {
+      entered.resolve();
+      await release.promise;
+      return { ...testGitContext, branch };
+    });
+  const pending = load().then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  const ready = Promise.race([
+    entered.promise,
+    pending.then(() => {
+      throw new Error("PR read settled before the Git-context barrier");
+    }),
+  ]);
+  return { load, pending, ready, release };
+}
+
+it("marks retained PR data unavailable after a refresh fails, then recovers", async () => {
+  await withState(async () => {
+    await captureRuntimeConfigAsyncReader()();
+    const sessionKey = "agent:main:stale-preview";
+    await seedSession(sessionKey);
+    vi.useFakeTimers();
+    let failed = false;
+    const fetchImpl = stubPulls(() =>
+      failed
+        ? githubJson({ message: "Unavailable" }, 503)
+        : githubJson([pullListItem({ state: "closed", merged_at: "2026-09-01T00:00:00Z" })]),
+    );
+    const load = () =>
+      readWithGit(sessionKey, async () => ({ ...testGitContext, branch: "stale-preview" }));
+    const fresh = await load();
+    expect(fresh.pullRequests[0]?.state).toBe("merged");
+    failed = true;
+    vi.advanceTimersByTime(91_000);
+    const stale = await load();
+    expect(stale).toMatchObject({
+      pullRequests: fresh.pullRequests,
+      status: "unavailable",
+      rateLimited: false,
+    });
+    const calls = fetchImpl.mock.calls.length;
+    expect(await load()).toEqual(stale);
+    expect(fetchImpl.mock.calls).toHaveLength(calls);
+    failed = false;
+    vi.advanceTimersByTime(31_000);
+    const recovered = await load();
+    expect(recovered.status).not.toBe("unavailable");
+    expect(recovered.pullRequests).toEqual(fresh.pullRequests);
   });
 });
 
 it.each(["replacement", "metadata"] as const)(
   "keeps PR reads and warm caches bound to the session across %s updates",
   async (change) => {
-    vi.useRealTimers();
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    await withState(async () => {
       await captureRuntimeConfigAsyncReader()();
       const replaced = change === "replacement";
       const owner = replaced ? ensureProfileForEmail("original-pr-reader@example.test") : undefined;
@@ -98,53 +145,22 @@ it.each(["replacement", "metadata"] as const)(
         : undefined;
       const sessionKey = `agent:main:${change}-pr-snapshot`;
       const scope = { agentId: "main", sessionKey };
-      await upsertSessionEntryCore(scope, {
-        sessionId: "original-pr-session",
-        updatedAt: 1,
-        spawnedCwd: state.workspaceDir,
-        ...(owner
+      await seedSession(
+        sessionKey,
+        owner
           ? {
               visibility: "shared" as const,
               createdActor: { type: "human" as const, source: "profile" as const, id: owner.id },
             }
-          : {}),
-      });
-      const captured = createDeferred();
-      const release = createDeferred();
-      const gitContext = { ...testGitContext, branch: `${change}-pr-snapshot` };
-      let title = replaced ? "Retired session result" : "Current session result";
-      const fetchImpl = routedFetch([
-        {
-          match: "/pulls?head=",
-          response: () =>
-            githubJson([
-              pullListItem({ title, state: "closed", merged_at: "2026-09-01T00:00:00Z" }),
-            ]),
-        },
-      ]);
-      vi.stubGlobal("fetch", fetchImpl);
-      const load = () =>
-        loadControlUiSessionPullRequests(
-          { sessionKey },
-          {
-            resolveGitContext: async () => {
-              captured.resolve();
-              await release.promise;
-              return gitContext;
-            },
-          },
-        );
-      const pending = load().then(
-        (value) => ({ ok: true as const, value }),
-        (error: unknown) => ({ ok: false as const, error }),
+          : {},
       );
+      let title = replaced ? "Retired session result" : "Current session result";
+      const fetchImpl = stubPulls(() =>
+        githubJson([pullListItem({ title, state: "closed", merged_at: "2026-09-01T00:00:00Z" })]),
+      );
+      const { load, pending, ready, release } = gatedRead(sessionKey, `${change}-pr-snapshot`);
       try {
-        await Promise.race([
-          captured.promise,
-          pending.then(() => {
-            throw new Error("PR read settled before the Git-context barrier");
-          }),
-        ]);
+        await ready;
         if (replacementOwner) {
           const original = await loadGatewaySessionEntryReadOnlyAsync(sessionKey, {
             agentId: "main",
@@ -154,15 +170,14 @@ it.each(["replacement", "metadata"] as const)(
               agentId: "main",
               storePath: original.storePath,
               target: { canonicalKey: original.canonicalKey, storeKeys: original.storeKeys },
-              expectedSessionId: "original-pr-session",
+              expectedSessionId: sessionKey,
               archiveTranscript: false,
             }),
           ).resolves.toMatchObject({ deleted: true });
-          await upsertSessionEntryCore(scope, {
+          await seedSession(sessionKey, {
             sessionId: "replacement-pr-session",
             updatedAt: 2,
             visibility: "draft",
-            spawnedCwd: state.workspaceDir,
             createdActor: { type: "human", source: "profile", id: replacementOwner.id },
           });
         } else {
@@ -170,16 +185,10 @@ it.each(["replacement", "metadata"] as const)(
         }
         release.resolve();
         const result = await pending;
+        expect.soft(result.ok).toBe(!replaced);
         if (replaced) {
-          expect.soft(result.ok).toBe(false);
           expect.soft(fetchImpl).not.toHaveBeenCalled();
           title = "Replacement session result";
-        } else {
-          expect(result.ok).toBe(true);
-          if (!result.ok) {
-            throw result.error;
-          }
-          expect(result.value.pullRequests[0]?.title).toBe("Current session result");
         }
         const current = result.ok ? result.value : await load();
         expect(current.pullRequests[0]?.title).toBe(title);
@@ -195,8 +204,7 @@ it.each(["replacement", "metadata"] as const)(
 );
 
 it("retires a repository-only target without falling back to its local workspace", async () => {
-  vi.useRealTimers();
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+  await withState(async () => {
     await captureRuntimeConfigAsyncReader()();
     const sessionKey = "agent:main:repository-only";
     const repositories = getSessionRepositoryWorkspaceStore();
@@ -207,31 +215,11 @@ it("retires a repository-only target without falling back to its local workspace
       branch: "repository-only",
       assertCurrent: () => {},
     });
-    await upsertSessionEntryCore(
-      { agentId: "main", sessionKey },
-      {
-        sessionId: "repository-only-pr",
-        updatedAt: 1,
-        spawnedCwd: state.workspaceDir,
-        repositoryWorkspaceId: repository.workspaceId,
-      },
-    );
-    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
-      const url = new URL(requestUrl(input));
-      if (url.pathname.endsWith("/pulls")) {
-        return githubJson([
-          pullListItem({ state: "closed", head: {}, additions: 1, deletions: 0 }),
-        ]);
-      }
-      if (url.pathname.endsWith("/pulls/103469")) {
-        return githubJson({ additions: 1, deletions: 0 });
-      }
-      throw new Error(`Unexpected repository-only request: ${url.pathname}`);
-    });
-    vi.stubGlobal("fetch", fetchImpl);
+    await seedSession(sessionKey, { repositoryWorkspaceId: repository.workspaceId });
+    const fetchImpl = stubPulls(() => githubJson([pullListItem({ state: "closed", head: {} })]));
     const git = vi.spyOn(gitWorker, "runGitWorkerOperation");
     try {
-      const result = await loadControlUiSessionPullRequests({ sessionKey }, {});
+      const result = await loadPullRequests({ sessionKey });
       expect(result.pullRequests).toMatchObject([{ number: 103469, state: "closed" }]);
       expect(new URL(requestUrl(fetchImpl.mock.calls[0]?.[0])).searchParams.get("head")).toBe(
         "openclaw:repository-only",
@@ -239,7 +227,7 @@ it("retires a repository-only target without falling back to its local workspace
       expect(git).not.toHaveBeenCalled();
       const fetched = fetchImpl.mock.calls.length;
       await repositories.delete({ workspaceId: repository.workspaceId, assertCurrent: () => {} });
-      expect(await loadControlUiSessionPullRequests({ sessionKey }, {})).toEqual({
+      expect(await loadPullRequests({ sessionKey })).toEqual({
         pullRequests: [],
         rateLimited: false,
       });
@@ -252,16 +240,12 @@ it("retires a repository-only target without falling back to its local workspace
 });
 
 it("discards pending PR work after same-file reopen even when persisted rows are identical", async () => {
-  vi.useRealTimers();
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+  await withState(async () => {
     const sessionKey = "agent:main:physical-pr-source";
     const original = state.statePath("original", "sessions.sqlite");
     const aliasDirectory = state.statePath("selected");
     const alias = state.statePath("selected", "sessions.sqlite");
-    await upsertSessionEntryCore(
-      { agentId: "main", storePath: original, sessionKey },
-      { sessionId: "identical-pr-session", updatedAt: 1, spawnedCwd: state.workspaceDir },
-    );
+    await seedSession(sessionKey, {}, original);
     await closeOpenClawAgentDatabaseByPathAsync(original);
     fs.symlinkSync(state.statePath("original"), aliasDirectory, "junction");
     const cfg = {
@@ -270,34 +254,15 @@ it("discards pending PR work after same-file reopen even when persisted rows are
     };
     await state.writeConfig(cfg);
     setRuntimeConfigSnapshot(cfg);
-    const entered = createDeferred();
-    const release = createDeferred();
     const fetchImpl = vi.fn<typeof fetch>();
     vi.stubGlobal("fetch", fetchImpl);
-    const pending = loadControlUiSessionPullRequests(
-      { sessionKey },
-      {
-        resolveGitContext: async () => {
-          entered.resolve();
-          await release.promise;
-          return testGitContext;
-        },
-      },
-    ).then(
-      () => true,
-      () => false,
-    );
+    const { pending, ready, release } = gatedRead(sessionKey);
     try {
-      await Promise.race([
-        entered.promise,
-        pending.then(() => {
-          throw new Error("PR read settled before source capture");
-        }),
-      ]);
+      await ready;
       await closeOpenClawAgentDatabaseByPathAsync(original);
       openOpenClawAgentDatabase({ agentId: "main", path: original });
       release.resolve();
-      expect(await pending).toBe(false);
+      expect((await pending).ok).toBe(false);
       expect(fetchImpl).not.toHaveBeenCalled();
     } finally {
       release.resolve();

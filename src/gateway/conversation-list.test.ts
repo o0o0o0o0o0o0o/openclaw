@@ -5,6 +5,11 @@ import {
   emptySqliteCounts,
   observeParentSqlite,
 } from "../../test/helpers/sqlite-parent-observer.js";
+import type { ChannelDirectoryAdapter } from "../channels/plugins/types.adapters.js";
+import type {
+  ChannelDirectoryEntry,
+  ChannelDirectoryEntryKind,
+} from "../channels/plugins/types.core.js";
 import type { ConversationIdentity } from "../config/sessions/conversation-identity.js";
 import {
   listConversations,
@@ -31,15 +36,6 @@ import {
 } from "../test-utils/openclaw-test-state.js";
 import { runGatewayConversationList } from "./conversation-list.js";
 
-function directoryAccountConfig(accountIds = ["default"]) {
-  return {
-    listAccountIds: () => accountIds,
-    resolveAccount: () => ({ enabled: true, configured: true }),
-    isEnabled: () => true,
-    isConfigured: () => true,
-  };
-}
-
 function outboundRoute(
   channel: string,
   target: string,
@@ -54,6 +50,70 @@ function outboundRoute(
     chatType: kind,
     from: `${channel}:${target}`,
     to,
+  };
+}
+
+function directoryList(kind: ChannelDirectoryEntryKind, entries: Record<string, string>) {
+  return vi.fn(async () => Object.entries(entries).map(([id, name]) => ({ kind, id, name })));
+}
+
+function directoryFixture(
+  channel: string,
+  directory: ChannelDirectoryAdapter,
+  route: (input: { target: string }) => Promise<ReturnType<typeof outboundRoute>>,
+  registration: "none" | "capture" | "project" = "none",
+) {
+  let discovered: ConversationIdentity[] = [];
+  const deps = {
+    resolveOutboundChannelPlugin: vi.fn(() => ({
+      id: channel,
+      config: {
+        listAccountIds: () => ["default"],
+        resolveAccount: () => ({ enabled: true, configured: true }),
+        isEnabled: () => true,
+        isConfigured: () => true,
+      },
+      directory,
+    })),
+    resolveOutboundSessionRoute: vi.fn(route),
+    registerConversationAddresses: vi.fn(
+      (
+        _scope: unknown,
+        identities: readonly ConversationIdentity[],
+        _at: number,
+        isEligible: (identities: readonly ConversationIdentity[]) => readonly boolean[],
+      ) => {
+        if (registration === "none") {
+          return;
+        }
+        const eligible = isEligible(identities);
+        discovered = identities.filter((_, index) => eligible[index]);
+      },
+    ),
+    listConversations: vi.fn(() =>
+      (registration === "project" ? discovered : []).map((identity) => ({
+        conversationRef: identity.conversationRef,
+        channel: identity.channel,
+        accountId: identity.accountId,
+        kind: identity.kind,
+        peerId: identity.peerId,
+        target: identity.deliveryTarget,
+        label: identity.label,
+        firstSeenAt: 100,
+        lastSeenAt: 100,
+      })),
+    ),
+  };
+  return {
+    deps,
+    get discovered() {
+      return discovered;
+    },
+    run: (options: Partial<Parameters<typeof runGatewayConversationList>[0]> = {}) =>
+      runGatewayConversationList(
+        { config: {}, agentId: "main", channel, limit: 50, ...options },
+        deps as never,
+      ),
   };
 }
 
@@ -88,18 +148,11 @@ describe("runGatewayConversationList", () => {
       {
         config: {
           agents: { entries: { personal: {}, finance: {} } },
-          bindings: [
-            {
-              type: "route",
-              agentId: "personal",
-              match: { channel: "reef", accountId: "personal" },
-            },
-            {
-              type: "route",
-              agentId: "finance",
-              match: { channel: "reef", accountId: "finance" },
-            },
-          ],
+          bindings: ["personal", "finance"].map((agentId) => ({
+            type: "route" as const,
+            agentId,
+            match: { channel: "reef", accountId: agentId },
+          })),
         },
         agentId: "personal",
         limit: 1,
@@ -116,195 +169,109 @@ describe("runGatewayConversationList", () => {
       expect.objectContaining({ agentId: "personal" }),
       {},
     );
-    expect(result.conversations).toEqual([
-      expect.objectContaining({ accountId: "personal", target: "reef:personal-peer" }),
+    expect(result.conversations).toMatchObject([
+      { accountId: "personal", target: "reef:personal-peer" },
     ]);
   });
 
-  it("discovers a trusted directory peer without creating a session", async () => {
-    let discovered: ConversationIdentity[] = [];
-    const listPeers = vi.fn(async () => [
-      { kind: "user" as const, id: "peer-id-123", name: "Friendly Lobster", handle: "@molty" },
-    ]);
-    const resolveOutboundSessionRoute = vi.fn(async () =>
-      outboundRoute("reef", "canonical-peer", "direct", "reef:peer-id-123"),
-    );
-    const deps = {
-      resolveOutboundChannelPlugin: vi.fn(() => ({
-        id: "reef",
-        config: directoryAccountConfig(),
-        directory: { listPeers, listGroups: async () => [] },
-      })),
-      resolveOutboundSessionRoute,
-      registerConversationAddresses: vi.fn(
-        (_scope, identities: readonly ConversationIdentity[], _at, isEligible) => {
-          const eligible = isEligible(identities);
-          discovered = identities.filter((_, index) => eligible[index]);
-        },
-      ),
-      listConversations: vi.fn(() =>
-        discovered.map((identity) => ({
-          conversationRef: identity.conversationRef,
-          channel: identity.channel,
-          accountId: identity.accountId,
-          kind: identity.kind,
-          peerId: identity.peerId,
-          target: identity.deliveryTarget,
-          label: identity.label,
-          firstSeenAt: 100,
-          lastSeenAt: 100,
-        })),
-      ),
-    };
-
-    const result = await runGatewayConversationList(
-      { config: {}, agentId: "main", channel: "reef", query: "@molty", limit: 50 },
-      deps as never,
-    );
-
-    expect(listPeers).toHaveBeenCalledWith(
-      expect.objectContaining({ accountId: "default", query: "@molty", limit: 50 }),
-    );
-    expect(deps.listConversations).toHaveBeenCalledWith(
-      expect.objectContaining({ agentId: "main" }),
-      { channel: "reef" },
-    );
-    expect(resolveOutboundSessionRoute).toHaveBeenCalledWith(
-      expect.objectContaining({
-        channel: "reef",
-        agentId: "main",
-        accountId: "default",
-        target: "peer-id-123",
-        resolvedTarget: {
-          to: "peer-id-123",
-          kind: "user",
-          display: "Friendly Lobster",
-          source: "directory",
-          resolutionSource: "directory",
-        },
-      }),
-    );
-    expect(result.conversations).toEqual([
-      expect.objectContaining({
-        conversationRef: expect.stringMatching(/^conv_[a-f0-9]{32}$/u),
-        channel: "reef",
-        accountId: "default",
-        kind: "direct",
-        target: "reef:peer-id-123",
-        label: "Friendly Lobster",
-      }),
-    ]);
-    expect(result.conversations[0]).not.toHaveProperty("sessionId");
-    expect(discovered).toEqual([
-      expect.objectContaining({
-        peerId: "canonical-peer",
-        deliveryTarget: "reef:peer-id-123",
-        nativeDirectUserId: "canonical-peer",
-      }),
-    ]);
-  });
-
-  it("keeps a discovered group origin distinct from its channel delivery address", async () => {
-    let discovered: ConversationIdentity[] = [];
-    const channelId = "private-room-123";
-    const resolveOutboundSessionRoute = vi.fn(async () => ({
-      ...outboundRoute("reef", channelId, "group", `channel:${channelId}`),
-      from: `reef:group:${channelId}`,
-    }));
-    const deps = {
-      resolveOutboundChannelPlugin: vi.fn(() => ({
-        id: "reef",
-        config: directoryAccountConfig(),
-        directory: {
-          listPeers: async () => [],
-          listGroups: async () => [
-            { kind: "group" as const, id: `channel:${channelId}`, name: "Private room" },
-          ],
-        },
-      })),
-      resolveOutboundSessionRoute,
-      registerConversationAddresses: vi.fn(
-        (_scope, identities: readonly ConversationIdentity[], _at, isEligible) => {
-          const eligible = isEligible(identities);
-          discovered = identities.filter((_, index) => eligible[index]);
-        },
-      ),
-      listConversations: vi.fn(() => []),
-    };
-
-    await runGatewayConversationList(
-      { config: {}, agentId: "main", channel: "reef", limit: 50 },
-      deps as never,
-    );
-
-    expect(resolveOutboundSessionRoute).toHaveBeenCalledWith(
-      expect.objectContaining({
-        target: `channel:${channelId}`,
-        resolvedTarget: expect.objectContaining({
-          kind: "group",
-          to: `channel:${channelId}`,
+  it.each(["direct", "group"] as const)(
+    "discovers a trusted %s address preserving its native identity",
+    async (kind) => {
+      const direct = kind === "direct";
+      const peerId = direct ? "canonical-peer" : "private-room-123";
+      const target = direct ? "reef:peer-id-123" : `channel:${peerId}`;
+      const sourceId = direct ? "peer-id-123" : target;
+      const name = direct ? "Friendly Lobster" : "Private room";
+      const query = direct ? "@molty" : undefined;
+      const entryKind = direct ? "user" : "group";
+      const list = vi.fn(async (): Promise<ChannelDirectoryEntry[]> => [
+        { kind: entryKind, id: sourceId, name, ...(direct ? { handle: "@molty" } : {}) },
+      ]);
+      const fixture = directoryFixture(
+        "reef",
+        direct
+          ? { listPeers: list, listGroups: async () => [] }
+          : { listPeers: async () => [], listGroups: list },
+        async () => ({
+          ...outboundRoute("reef", peerId, kind, target),
+          from: direct ? `reef:${peerId}` : `reef:group:${peerId}`,
         }),
-      }),
-    );
-    expect(discovered).toEqual([
-      expect.objectContaining({
-        channel: "reef",
-        kind: "group",
-        peerId: channelId,
-        deliveryTarget: `channel:${channelId}`,
-        nativeChannelId: channelId,
-      }),
-    ]);
-  });
+        direct ? "project" : "capture",
+      );
+      const result = await fixture.run(direct ? { query } : {});
+      expect(list).toHaveBeenCalledWith(
+        expect.objectContaining({ accountId: "default", limit: 50, ...(query ? { query } : {}) }),
+      );
+      expect(fixture.deps.listConversations).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: "main" }),
+        { channel: "reef" },
+      );
+      expect(fixture.deps.resolveOutboundSessionRoute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel: "reef",
+          agentId: "main",
+          accountId: "default",
+          target: sourceId,
+          resolvedTarget: {
+            to: sourceId,
+            kind: entryKind,
+            display: name,
+            source: "directory",
+            resolutionSource: "directory",
+          },
+        }),
+      );
+      if (direct) {
+        expect(result.conversations).toMatchObject([
+          {
+            conversationRef: expect.stringMatching(/^conv_[a-f0-9]{32}$/u),
+            channel: "reef",
+            accountId: "default",
+            kind,
+            target,
+            label: name,
+          },
+        ]);
+        expect(result.conversations[0]).not.toHaveProperty("sessionId");
+      }
+      expect(fixture.discovered).toMatchObject([
+        {
+          channel: "reef",
+          kind,
+          peerId,
+          deliveryTarget: target,
+          ...(direct ? { nativeDirectUserId: peerId } : { nativeChannelId: peerId }),
+        },
+      ]);
+    },
+  );
 
   it("merges live directory adapters with config-backed entries", async () => {
-    const listPeers = vi.fn(async () => [
-      { kind: "user" as const, id: "stale-peer", name: "Stale Peer" },
-      { kind: "user" as const, id: "shared-peer", name: "Configured Shared Peer" },
-    ]);
-    const listPeersLive = vi.fn(async () => [
-      { kind: "user" as const, id: "live-peer", name: "Live Peer" },
-      { kind: "user" as const, id: "shared-peer", name: "Live Shared Peer" },
-    ]);
-    const listGroups = vi.fn(async () => [
-      { kind: "group" as const, id: "stale-group", name: "Stale Group" },
-    ]);
-    const listGroupsLive = vi.fn(async () => [
-      { kind: "group" as const, id: "live-group", name: "Live Group" },
-    ]);
-    const resolvedTargets: string[] = [];
-    const deps = {
-      resolveOutboundChannelPlugin: vi.fn(() => ({
-        id: "discord",
-        config: directoryAccountConfig(),
-        directory: { listPeers, listPeersLive, listGroups, listGroupsLive },
-      })),
-      resolveOutboundSessionRoute: vi.fn(async ({ target }: { target: string }) => {
-        resolvedTargets.push(target);
-        const direct = target.endsWith("-peer");
-        return outboundRoute("discord", target, direct ? "direct" : "channel");
-      }),
-      registerConversationAddresses: vi.fn(),
-      listConversations: vi.fn(() => []),
-    };
-
-    await runGatewayConversationList(
-      { config: {}, agentId: "main", channel: "discord", limit: 50 },
-      deps as never,
+    const listPeers = directoryList("user", {
+      "stale-peer": "Stale Peer",
+      "shared-peer": "Configured Shared Peer",
+    });
+    const listPeersLive = directoryList("user", {
+      "live-peer": "Live Peer",
+      "shared-peer": "Live Shared Peer",
+    });
+    const listGroups = directoryList("group", { "stale-group": "Stale Group" });
+    const listGroupsLive = directoryList("group", { "live-group": "Live Group" });
+    const fixture = directoryFixture(
+      "discord",
+      { listPeers, listPeersLive, listGroups, listGroupsLive },
+      async ({ target }) =>
+        outboundRoute("discord", target, target.endsWith("-peer") ? "direct" : "channel"),
     );
+    await fixture.run();
 
-    expect(listPeersLive).toHaveBeenCalledOnce();
-    expect(listGroupsLive).toHaveBeenCalledOnce();
-    expect(listPeers).toHaveBeenCalledOnce();
-    expect(listGroups).toHaveBeenCalledOnce();
-    expect(resolvedTargets).toEqual([
-      "stale-peer",
-      "shared-peer",
-      "live-peer",
-      "stale-group",
-      "live-group",
-    ]);
-    expect(deps.resolveOutboundSessionRoute).toHaveBeenCalledWith(
+    expect(
+      [listPeersLive, listGroupsLive, listPeers, listGroups].map((list) => list.mock.calls.length),
+    ).toEqual([1, 1, 1, 1]);
+    expect(
+      fixture.deps.resolveOutboundSessionRoute.mock.calls.map(([input]) => input.target),
+    ).toEqual(["stale-peer", "shared-peer", "live-peer", "stale-group", "live-group"]);
+    expect(fixture.deps.resolveOutboundSessionRoute).toHaveBeenCalledWith(
       expect.objectContaining({
         target: "shared-peer",
         resolvedTarget: expect.objectContaining({ display: "Live Shared Peer" }),
@@ -313,36 +280,16 @@ describe("runGatewayConversationList", () => {
   });
 
   it("retains configured peers when live discovery is empty or fails", async () => {
-    const listPeers = vi.fn(async () => [
-      { kind: "user" as const, id: "configured-peer", name: "Configured Peer" },
-    ]);
+    const listPeers = directoryList("user", { "configured-peer": "Configured Peer" });
     const listPeersLive = vi.fn(async ({ query }: { query?: string }) =>
       query ? [{ kind: "user" as const, id: "live-peer", name: "Live Peer" }] : [],
     );
     listPeersLive.mockRejectedValueOnce(new Error("directory unavailable"));
-    const resolvedTargets: string[] = [];
-    const deps = {
-      resolveOutboundChannelPlugin: vi.fn(() => ({
-        id: "discord",
-        config: directoryAccountConfig(),
-        directory: { listPeers, listPeersLive },
-      })),
-      resolveOutboundSessionRoute: vi.fn(async ({ target }: { target: string }) => {
-        resolvedTargets.push(target);
-        return outboundRoute("discord", target);
-      }),
-      registerConversationAddresses: vi.fn(),
-      listConversations: vi.fn(() => []),
-    };
-
-    await runGatewayConversationList(
-      { config: {}, agentId: "main", channel: "discord", limit: 50 },
-      deps as never,
+    const fixture = directoryFixture("discord", { listPeers, listPeersLive }, async ({ target }) =>
+      outboundRoute("discord", target),
     );
-    await runGatewayConversationList(
-      { config: {}, agentId: "main", channel: "discord", limit: 50 },
-      deps as never,
-    );
+    await fixture.run();
+    await fixture.run();
 
     expect(listPeers).toHaveBeenCalledTimes(2);
     expect(listPeersLive).toHaveBeenCalledTimes(2);
@@ -350,7 +297,9 @@ describe("runGatewayConversationList", () => {
       expect.not.objectContaining({ query: expect.anything() }),
       expect.not.objectContaining({ query: expect.anything() }),
     ]);
-    expect(resolvedTargets).toEqual(["configured-peer", "configured-peer"]);
+    expect(
+      fixture.deps.resolveOutboundSessionRoute.mock.calls.map(([input]) => input.target),
+    ).toEqual(["configured-peer", "configured-peer"]);
   });
 });
 
@@ -391,9 +340,7 @@ describe("worker conversation reads", () => {
         agentId: "main",
         limit: 10,
       });
-      expect(result.conversations).toEqual([
-        expect.objectContaining({ channel: "reef", target: "reef:room" }),
-      ]);
+      expect(result.conversations).toMatchObject([{ channel: "reef", target: "reef:room" }]);
       const ref = result.conversations[0]!.conversationRef;
       const exact = await readConversation(scope(), ref);
       expect(exact).toMatchObject({ conversationRef: ref, sessionId, sessionKey, role: "primary" });
@@ -518,9 +465,7 @@ describe("worker conversation reads", () => {
       config: { session: { store: memory.storePath } },
     });
     const rows = await listConversations(prepared);
-    expect(rows).toEqual([
-      expect.objectContaining({ sessionId: memory.sessionId, sessionKey: memory.sessionKey }),
-    ]);
+    expect(rows).toMatchObject([{ sessionId: memory.sessionId, sessionKey: memory.sessionKey }]);
     expect(await resolveCurrentSessionPrimaryConversation(memory)).toEqual(rows[0]);
     expect(worker).not.toHaveBeenCalled();
     await expect(fs.stat(memory.storePath)).rejects.toMatchObject({ code: "ENOENT" });

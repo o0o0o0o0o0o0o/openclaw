@@ -40,45 +40,34 @@ describe("resolveBranchLanding", () => {
   beforeEach(async () => {
     root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-prs-landing-")));
     await git("init", "--initial-branch=main", ".");
-    await fs.writeFile(path.join(root, "a.txt"), "one\n");
-    await git("add", "a.txt");
-    await git("commit", "-m", "base");
+    await commitFile("a.txt", "one\n", "base");
     await git("update-ref", "refs/remotes/origin/main", "HEAD");
   });
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  it.each([
-    { scenario: "an unrelated descendant ref", mergedHeads: [], descendantRef: true },
-    {
-      scenario: "a merge into another base without a propagation commit",
-      mergedHeads: [{ sha: "1".repeat(40), baseRef: "release" }],
-      descendantRef: false,
-    },
-    {
-      scenario: "an unavailable merged head",
-      mergedHeads: [{ sha: "1".repeat(40), baseRef: "main" }],
-      descendantRef: false,
-      expected: { complete: false, hasLandedPullRequest: true },
-    },
-  ])(
-    "resolves an unpublished branch with $scenario against captured revisions",
-    async ({
-      mergedHeads,
-      descendantRef,
-      expected = { complete: true, hasLandedPullRequest: false },
-    }) => {
+  it.each(["unrelated descendant", "other base", "unavailable merged head"])(
+    "resolves an unpublished branch with %s against captured revisions",
+    async (scenario) => {
       const base = await sha("HEAD");
-      await git("checkout", "-b", "feature");
-      await fs.appendFile(path.join(root, "a.txt"), "two\n");
-      await git("commit", "-am", "unpublished work");
-      if (descendantRef) {
+      await feature();
+      if (scenario === "unrelated descendant") {
         await git("update-ref", "refs/remotes/origin/feature/child", "HEAD");
       }
-      expect(await land(mergedHeads)).toEqual({ ...expectedLanding(base), ...expected });
+      const unavailable = scenario === "unavailable merged head";
+      const mergedHeads =
+        scenario === "unrelated descendant"
+          ? []
+          : [{ sha: "1".repeat(40), baseRef: unavailable ? "main" : "release" }];
+      expect(await land(mergedHeads)).toEqual({
+        ...expectedLanding(base),
+        complete: !unavailable,
+        hasLandedPullRequest: unavailable,
+      });
     },
   );
 
@@ -97,18 +86,14 @@ describe("resolveBranchLanding", () => {
       await git("config", "remote.origin.url", path.join(root, "missing-remote"));
       const tracePath = path.join(root, "git-trace.jsonl");
       vi.stubEnv("GIT_TRACE2_EVENT", tracePath);
-      try {
-        await expect(land()).resolves.toEqual({
-          ...expectedLanding(base),
-          pushedSha: missingSelectedObject ? missingObject : null,
-        });
-        const trace = await fs.readFile(tracePath, "utf8");
-        expect(trace.split("\n").filter((line) => line.includes('"event":"child_start"'))).toEqual(
-          [],
-        );
-      } finally {
-        vi.unstubAllEnvs();
-      }
+      await expect(land()).resolves.toEqual({
+        ...expectedLanding(base),
+        pushedSha: missingSelectedObject ? missingObject : null,
+      });
+      const trace = await fs.readFile(tracePath, "utf8");
+      expect(trace.split("\n").filter((line) => line.includes('"event":"child_start"'))).toEqual(
+        [],
+      );
     },
   );
 
@@ -129,15 +114,10 @@ describe("resolveBranchLanding", () => {
     await git("update-ref", "refs/remotes/origin/feature", "HEAD");
     const mergedHead = await sha("HEAD");
 
-    const landing = await land([{ sha: mergedHead, baseRef: "main" }]);
-
-    expect(landing).toEqual({
-      complete: true,
-      pushedSha: mergedHead,
-      defaultSha: await sha("refs/remotes/origin/main"),
+    expect(await land([{ sha: mergedHead, baseRef: "main" }])).toEqual({
+      ...expectedLanding(await sha("refs/remotes/origin/main"), mergedHead),
       statsBase: mergedHead,
       hasLandedPullRequest: true,
-      provenNewPushedWork: false,
     });
   });
 
@@ -151,19 +131,13 @@ describe("resolveBranchLanding", () => {
       await commitFile("a.txt", "two\n", "squash land", true);
       const mergeCommit = await sha("HEAD");
       // A reset of main can land the same head without incorporating the older merge.
-      const otherMerge =
-        scenario === "distinct"
-          ? (
-              await git(
-                "commit-tree",
-                (await git("write-tree")).stdout.trim(),
-                "-p",
-                base,
-                "-m",
-                "another landing",
-              )
-            ).stdout.trim()
-          : mergeCommit;
+      let otherMerge = mergeCommit;
+      if (scenario === "distinct") {
+        const tree = (await git("write-tree")).stdout.trim();
+        otherMerge = (
+          await git("commit-tree", tree, "-p", base, "-m", "another landing")
+        ).stdout.trim();
+      }
       await git("update-ref", "refs/remotes/origin/main", "HEAD");
       await git("checkout", "feature");
       await git("reset", "--hard", "refs/remotes/origin/main");
@@ -175,9 +149,11 @@ describe("resolveBranchLanding", () => {
 
       const landing = await land([landedHead, { ...landedHead, mergeCommitSha: otherMerge }]);
 
-      expect(landing.provenNewPushedWork).toBe(scenario !== "distinct");
       // The first squash remains the baseline even when another landing is missing.
-      expect(landing.statsBase).toBe(mergeCommit);
+      expect(landing).toMatchObject({
+        provenNewPushedWork: scenario !== "distinct",
+        statsBase: mergeCommit,
+      });
       expect(
         runGit.mock.calls.filter(
           ([, args]) =>
@@ -191,8 +167,7 @@ describe("resolveBranchLanding", () => {
   );
 
   it("selects the newest of three related baselines via the batched path", async () => {
-    // Linear chain: fork point (merge base) -> merged head 1 -> merged head 2
-    // -> HEAD; the maximal published baseline is merged head 2.
+    // Linear chain: merge base -> head1 -> head2 -> HEAD.
     const base = await sha("HEAD");
     await git("checkout", "-b", "feature");
     await commitFile("a.txt", "two\n", "pr1 work", true);
@@ -208,8 +183,7 @@ describe("resolveBranchLanding", () => {
       { sha: head2, baseRef: "main" },
     ]);
 
-    expect(landing.statsBase).toBe(head2);
-    expect(landing.hasLandedPullRequest).toBe(true);
+    expect(landing).toMatchObject({ statsBase: head2, hasLandedPullRequest: true });
     expect(runGit).not.toHaveBeenCalledWith(root, ["merge-base", "--is-ancestor", base, head2]);
   });
 });

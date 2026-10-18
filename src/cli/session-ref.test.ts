@@ -16,24 +16,6 @@ import {
 } from "./session-ref.js";
 import { resolveSessionTarget } from "./session-target.js";
 
-function gatewayTransportError(params: {
-  url: string;
-  message: string;
-  reason?: string;
-  kind?: "closed" | "timeout";
-}): GatewayTransportError {
-  return new GatewayTransportError({
-    kind: params.kind ?? "closed",
-    message: params.message,
-    reason: params.reason,
-    connectionDetails: {
-      url: params.url,
-      urlSource: "cli --url",
-      message: `Gateway target: ${params.url}`,
-    },
-  });
-}
-
 function errorText(run: () => unknown): string {
   try {
     run();
@@ -43,45 +25,41 @@ function errorText(run: () => unknown): string {
   throw new Error("Expected invocation to throw");
 }
 
-const remote = "gateway.example/main/a1166b81";
-const resolveRemote = () => resolveSessionTarget({ raw: remote });
-function requestError(message: string, code?: string) {
-  return new GatewayClientRequestError({
+const resolveRemote = () => resolveSessionTarget({ raw: "gateway.example/main/a1166b81" });
+const expectGatewayCall = (expected: object) =>
+  expect(callGatewayMock).toHaveBeenCalledWith(expect.objectContaining(expected));
+const requestError = (message: string, code?: string) =>
+  new GatewayClientRequestError({
     code: "INVALID_REQUEST",
     message,
     ...(code ? { details: { code } } : {}),
   });
-}
+
+beforeEach(() => {
+  callGatewayMock.mockReset();
+  delete process.env.OPENCLAW_ALLOW_INSECURE_PRIVATE_WS;
+});
 
 describe("session target parsing", () => {
-  beforeEach(() => {
-    callGatewayMock.mockReset();
-    delete process.env.OPENCLAW_ALLOW_INSECURE_PRIVATE_WS;
-  });
-
   it.each([
-    {
-      input: "wss://gateway.example/base/chat/ops/telegram/123?view=compact#messages",
-      expected: {
-        kind: "url",
-        origin: "wss://gateway.example",
-        basePath: "/base",
-        agentId: "ops",
-        ref: { kind: "literal", sessionKey: "agent:ops:telegram:123" },
-      },
-    },
-    {
-      input: "Gateway.Example/Ops/movies-A1166B81/",
-      expected: {
-        kind: "url",
-        origin: "wss://gateway.example",
-        basePath: "",
-        agentId: "ops",
-        ref: { kind: "short", shortId: "a1166b81", slugHint: "movies" },
-      },
-    },
-  ])("parses $input", ({ input, expected }) => {
-    expect(parseSessionTargetInput(input)).toEqual(expected);
+    [
+      "wss://gateway.example/base/chat/ops/telegram/123?view=compact#messages",
+      "/base",
+      { kind: "literal", sessionKey: "agent:ops:telegram:123" },
+    ],
+    [
+      "Gateway.Example/Ops/movies-A1166B81/",
+      "",
+      { kind: "short", shortId: "a1166b81", slugHint: "movies" },
+    ],
+  ])("parses %s", (input, basePath, ref) => {
+    expect(parseSessionTargetInput(input)).toEqual({
+      kind: "url",
+      origin: "wss://gateway.example",
+      agentId: "ops",
+      basePath,
+      ref,
+    });
   });
 
   it.each([
@@ -94,25 +72,14 @@ describe("session target parsing", () => {
     expect(() => parseSessionTargetInput(input)).toThrow("Accepted session targets:");
   });
 
-  it("rejects credentials without echoing them", () => {
-    const secret = "do-not-print-me";
-    const error = errorText(() =>
-      parseSessionTargetInput(
-        `https://user:${secret}@gateway.example/dashboard/main/movies-a1166b81`,
-      ),
-    );
+  it.each([
+    "https://user:do-not-print-me@gateway.example/dashboard/main/movies-a1166b81",
+    "https://gateway.example/dashboard/main/movies-a1166b81?token=do-not-print-me",
+    "https://gateway.example/dashboard/main/movies-a1166b81#password=do-not-print-me",
+  ])("rejects URL credentials without echoing them: %s", (target) => {
+    const error = errorText(() => parseSessionTargetInput(target));
     expect(error).toContain("must not contain credentials");
-    expect(error).not.toContain(secret);
-  });
-
-  it("rejects credential query and fragment parameters without echoing them", () => {
-    for (const suffix of ["?token=do-not-print-me", "#password=do-not-print-me"]) {
-      const error = errorText(() =>
-        parseSessionTargetInput(`https://gateway.example/dashboard/main/movies-a1166b81${suffix}`),
-      );
-      expect(error).toContain("must not contain credentials");
-      expect(error).not.toContain("do-not-print-me");
-    }
+    expect(error).not.toContain("do-not-print-me");
   });
 
   it("surfaces the canonical plaintext WebSocket security gate", () => {
@@ -124,18 +91,16 @@ describe("session target parsing", () => {
 
 describe("bare-root session URL options", () => {
   const target = "https://gateway.example/dashboard/main/movies-a1166b81";
+  const value = "https://example.com/article";
   const parse = (...args: string[]) => parseBareSessionInvocation(["node", "openclaw", ...args]);
 
-  it("parses --message before and after the URL, split or inline", () => {
-    const value = "https://example.com/article";
-    for (const args of [
-      ["--message", value, target],
-      [`--message=${value}`, target],
-      [target, "--message", value],
-      [target, `--message=${value}`],
-    ]) {
-      expect(parse(...args)).toEqual({ target, options: { message: value } });
-    }
+  it.each([
+    ["--message", value, target],
+    [`--message=${value}`, target],
+    [target, "--message", value],
+    [target, `--message=${value}`],
+  ])("parses --message around the URL, split or inline: %j", (...args) => {
+    expect(parse(...args)).toEqual({ target, options: { message: value } });
   });
 
   it("parses boolean options on either side and preserves root globals", () => {
@@ -156,13 +121,12 @@ describe("bare-root session URL options", () => {
     });
   });
 
-  it("does not claim host shorthand", () => {
-    expect(parse("gateway.example/main/a1166b81")).toBeNull();
-  });
-
-  it("leaves an explicit command's URL argument to its owner", () => {
-    expect(parse("unowned-command", target)).toBeNull();
-  });
+  it.each([["gateway.example/main/a1166b81"], ["unowned-command", target]])(
+    "leaves non-bare invocations to their owner: %j",
+    (...args) => {
+      expect(parse(...args)).toBeNull();
+    },
+  );
 
   it.each([
     ["split before", ["--token", target]],
@@ -189,10 +153,6 @@ describe("bare-root session URL options", () => {
 });
 
 describe("session target resolution", () => {
-  beforeEach(() => {
-    callGatewayMock.mockReset();
-  });
-
   it("resolves a stale-agent URL short reference without scoping UUID lookup", async () => {
     callGatewayMock.mockResolvedValue({ ok: true, key: "agent:research:thread:full-key" });
 
@@ -202,46 +162,37 @@ describe("session target resolution", () => {
     });
 
     expect(result.sessionKey).toBe("agent:research:thread:full-key");
-    expect(callGatewayMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: "wss://gateway.example/base",
-        token: "explicit-token",
-        method: "sessions.resolve",
-        params: { shortId: "a1166b81", slugHint: "movies" },
-        useStoredDeviceAuth: true,
-        requiredStoredDeviceAuthScopes: ["operator.read"],
-      }),
-    );
+    expectGatewayCall({
+      url: "wss://gateway.example/base",
+      token: "explicit-token",
+      method: "sessions.resolve",
+      params: { shortId: "a1166b81", slugHint: "movies" },
+      useStoredDeviceAuth: true,
+      requiredStoredDeviceAuthScopes: ["operator.read"],
+    });
   });
 
   it("uses gateway-advertised routing for URL main sessions without requiring an existing row", async () => {
-    callGatewayMock.mockResolvedValue({
-      defaultId: "main",
-      mainKey: "workspace",
-      scope: "per-sender",
-      agents: [],
-    });
+    callGatewayMock.mockResolvedValue({ mainKey: "workspace", scope: "per-sender" });
 
     const result = await resolveSessionTarget({
       raw: "https://gateway.example/dashboard/ops",
     });
 
     expect(result.sessionKey).toBe("agent:ops:workspace");
-    expect(callGatewayMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: "wss://gateway.example",
-        method: "agents.list",
-        params: {},
-        requiredStoredDeviceAuthScopes: ["operator.read"],
-      }),
-    );
+    expectGatewayCall({
+      url: "wss://gateway.example",
+      method: "agents.list",
+      params: {},
+      requiredStoredDeviceAuthScopes: ["operator.read"],
+    });
   });
 
   it.each([
-    { key: "agent:ops:main", agentId: "other" },
-    { key: "global", agentId: undefined },
-  ])("rejects inconsistent resolved ownership $key/$agentId", async (result) => {
-    callGatewayMock.mockResolvedValue({ ok: true, ...result });
+    ["agent:ops:main", "other"],
+    ["global", undefined],
+  ])("rejects inconsistent resolved ownership %s/%s", async (key, agentId) => {
+    callGatewayMock.mockResolvedValue({ ok: true, key, agentId });
 
     await expect(resolveSessionTarget({ raw: "agent:ops:main" })).rejects.toThrow(
       "Gateway returned a session without a consistent agent identity",
@@ -271,15 +222,9 @@ describe("session target resolution", () => {
     callGatewayMock.mockResolvedValue({
       ok: false,
       candidates: [
-        {
-          key: "agent:main:thread:12345678-0aaa-4000-8000-000000000001",
-          displayName: "Alpha",
-        },
-        {
-          key: "agent:main:thread:12345678-0bbb-4000-8000-000000000002",
-          displayName: "Beta",
-        },
-      ],
+        ["agent:main:thread:12345678-0aaa-4000-8000-000000000001", "Alpha"],
+        ["agent:main:thread:12345678-0bbb-4000-8000-000000000002", "Beta"],
+      ].map(([key, displayName]) => ({ key, displayName })),
     });
 
     await expect(resolveSessionTarget({ raw: "12345678" })).rejects.toThrow(
@@ -307,51 +252,37 @@ describe("session target resolution", () => {
   it("sends remote not-found recovery to the target Control UI, not the local session store", async () => {
     callGatewayMock.mockRejectedValue(requestError("No session found: a1166b81"));
 
-    let error: unknown;
-    try {
-      await resolveRemote();
-    } catch (caught) {
-      error = caught;
-    }
-    expect(String(error)).toContain("that gateway's Control UI (https://gateway.example)");
-    expect(String(error)).not.toContain("sessions list --url");
+    const error = await resolveRemote().catch(String);
+    expect(error).toContain("that gateway's Control UI (https://gateway.example)");
+    expect(error).not.toContain("sessions list --url");
   });
 
-  it("turns structured pairing and revoked-token failures into actions", async () => {
-    callGatewayMock.mockRejectedValueOnce(requestError("connect failed", "PAIRING_REQUIRED"));
-    await expect(resolveRemote()).rejects.toThrow("openclaw devices approve --latest");
-
-    callGatewayMock.mockRejectedValueOnce(
+  it.each([
+    [requestError("connect failed", "PAIRING_REQUIRED"), "openclaw devices approve --latest"],
+    [
       requestError("connect failed", "AUTH_DEVICE_TOKEN_MISMATCH"),
-    );
-    await expect(resolveRemote()).rejects.toThrow(
       "openclaw devices rotate --device <deviceId> --role operator",
-    );
-  });
-
-  it("explains how to bootstrap auth when no origin token exists", async () => {
-    callGatewayMock.mockRejectedValue(
+    ],
+    [
       new GatewayStoredDeviceAuthUnavailableError("No stored device auth"),
-    );
-
-    await expect(resolveRemote()).rejects.toThrow("Pass --token or --password once");
-  });
-
-  it("names unreachable origins for ENOTFOUND", async () => {
-    callGatewayMock.mockRejectedValue(
+      "Pass --token or --password once",
+    ],
+    [
       Object.assign(new Error("connect ENOTFOUND"), { code: "ENOTFOUND" }),
-    );
-    await expect(resolveRemote()).rejects.toThrow(
       /Could not reach gateway wss:\/\/gateway\.example[\s\S]*tailnet or SSH tunnel/u,
-    );
+    ],
+  ])("provides recovery guidance for %s", async (error, expected) => {
+    callGatewayMock.mockRejectedValue(error);
+    await expect(resolveRemote()).rejects.toThrow(expected);
   });
 
   it("uses transport connection details for configured-remote bare refs", async () => {
+    const url = "wss://claw.example.ts.net/base";
     callGatewayMock.mockRejectedValue(
-      gatewayTransportError({
+      new GatewayTransportError({
         kind: "timeout",
-        url: "wss://claw.example.ts.net/base",
         message: "gateway timeout after 10000ms",
+        connectionDetails: { url, urlSource: "cli --url", message: `Gateway target: ${url}` },
       }),
     );
 
@@ -360,7 +291,7 @@ describe("session target resolution", () => {
         raw: "a1166b81",
         gateway: {
           config: {
-            gateway: { mode: "remote", remote: { url: "wss://claw.example.ts.net/base" } },
+            gateway: { mode: "remote", remote: { url } },
           },
         },
       }),
@@ -370,10 +301,12 @@ describe("session target resolution", () => {
   });
 
   it("does not mask TLS fingerprint mismatch errors", async () => {
-    const mismatch = gatewayTransportError({
-      url: "wss://gateway.example",
+    const url = "wss://gateway.example";
+    const mismatch = new GatewayTransportError({
+      kind: "closed",
       message: "gateway tls fingerprint mismatch",
       reason: "gateway tls fingerprint mismatch",
+      connectionDetails: { url, urlSource: "cli --url", message: `Gateway target: ${url}` },
     });
     callGatewayMock.mockRejectedValue(mismatch);
 

@@ -60,22 +60,6 @@ function run(...args: string[]) {
   return program.parseAsync(["security", "audit", ...args], { from: "user" });
 }
 
-function primeDeepAuditConfig(sourceConfig = { gateway: { mode: "local" } }) {
-  loadConfig.mockReturnValue(sourceConfig);
-  resolveCommandSecretRefsViaGateway.mockResolvedValue({
-    resolvedConfig: sourceConfig,
-    diagnostics: [],
-    targetStatesByPath: {},
-    hadUnresolvedTargets: false,
-  });
-  runSecurityAuditCore.mockResolvedValue({
-    ts: 0,
-    summary: { critical: 0, warn: 0, info: 0 },
-    findings: [],
-  });
-  return sourceConfig;
-}
-
 function lastSecretResolverOptions(): Record<string, unknown> | undefined {
   return resolveCommandSecretRefsViaGateway.mock.lastCall?.[0];
 }
@@ -93,6 +77,19 @@ describe("security CLI", () => {
     resolveCommandSecretRefsViaGateway.mockReset();
     getSecurityAuditCommandSecretTargetIds.mockClear();
     fixSecurityFootguns.mockResolvedValue({ changes: [], actions: [], errors: [] });
+    const config = { gateway: { mode: "local" } };
+    loadConfig.mockReturnValue(config);
+    resolveCommandSecretRefsViaGateway.mockResolvedValue({
+      resolvedConfig: config,
+      diagnostics: [],
+      targetStatesByPath: {},
+      hadUnresolvedTargets: false,
+    });
+    runSecurityAuditCore.mockResolvedValue({
+      ts: 0,
+      summary: { critical: 0, warn: 0, info: 0 },
+      findings: [],
+    });
   });
 
   it("runs audit with read-only SecretRef resolution and prints JSON diagnostics", async () => {
@@ -103,7 +100,6 @@ describe("security CLI", () => {
           token: { source: "env", provider: "default", id: "OPENCLAW_GATEWAY_TOKEN" },
         },
       },
-      secrets: { providers: { default: { source: "env" } } },
     };
     const resolvedConfig = {
       ...sourceConfig,
@@ -111,7 +107,6 @@ describe("security CLI", () => {
     };
     const diagnostic =
       "security audit: gateway secrets.resolve unavailable (gateway closed); resolved command secrets locally.";
-    primeDeepAuditConfig();
     loadConfig.mockReturnValue(sourceConfig);
     resolveCommandSecretRefsViaGateway.mockResolvedValue({
       resolvedConfig,
@@ -142,7 +137,6 @@ describe("security CLI", () => {
   });
 
   it("reports an unexpected fixer failure instead of emitting a successful JSON audit", async () => {
-    primeDeepAuditConfig();
     const failure = new Error("Fixture repair failed");
     fixSecurityFootguns.mockRejectedValueOnce(failure);
 
@@ -166,15 +160,11 @@ describe("security CLI", () => {
   ] as const)(
     "forwards deep probe auth for %j without changing resolver mode",
     async (argv, deepProbeAuth, auditGatewayAuthOverride) => {
-      primeDeepAuditConfig();
-
       await run("--deep", ...argv, "--json");
 
       expect(lastSecretResolverOptions()?.mode).toBe("read_only_status");
-      expect(lastSecurityAuditOptions()?.deep).toBe(true);
-      expect(lastSecurityAuditOptions()?.deepProbeAuth).toEqual(deepProbeAuth);
-      expect(lastSecurityAuditOptions()?.auditGatewayAuthOverride).toEqual(
-        auditGatewayAuthOverride,
+      expect(lastSecurityAuditOptions()).toEqual(
+        expect.objectContaining({ deep: true, deepProbeAuth, auditGatewayAuthOverride }),
       );
     },
   );
@@ -185,8 +175,6 @@ describe("security CLI", () => {
   ] as const)(
     "rejects shared-secret auth override without the matching secret",
     async (mode, message) => {
-      primeDeepAuditConfig();
-
       await expect(run("--auth", mode, "--json")).rejects.toThrow(message);
       expect(runSecurityAuditCore).not.toHaveBeenCalled();
     },

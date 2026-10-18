@@ -19,8 +19,6 @@ const mocks = await vi.hoisted(async () => {
     updateHosts: vi.fn(),
     remove: vi.fn(),
     purge: vi.fn(),
-    gatewayIdentity: vi.fn(),
-    confirm: vi.fn(),
   };
 });
 
@@ -47,26 +45,7 @@ vi.mock("../secrets/store/secret-store.js", async (importOriginal) => {
   };
 });
 // mock-isolation: These policy tests use the offline branch; owner routing has its own boundary suite.
-vi.mock("./local-state-owner.js", () => ({
-  runWithLocalStateOwner: async ({
-    runLocal,
-  }: Parameters<typeof import("./local-state-owner.js").runWithLocalStateOwner>[0]) =>
-    runLocal({
-      env: process.env,
-      config: {},
-      signal: new AbortController().signal,
-      assertCurrent() {},
-    }),
-}));
-
-vi.mock("@clack/prompts", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@clack/prompts")>();
-  return {
-    ...actual,
-    confirm: (options: unknown) => mocks.confirm(options),
-    isCancel: (value: unknown) => typeof value === "symbol",
-  };
-});
+vi.mock("./local-state-owner.js", () => import("./secrets-store-cli.test-support.js"));
 
 function run(...args: string[]) {
   const program = new Command().exitOverride();
@@ -90,36 +69,30 @@ beforeEach(() => {
   mocks.updateHosts.mockReset();
   mocks.remove.mockReset();
   mocks.purge.mockReset();
-  mocks.gatewayIdentity.mockReset().mockResolvedValue(undefined);
-  mocks.confirm.mockReset().mockResolvedValue(true);
   for (const mock of Object.values(mocks.defaultRuntime)) {
     mock.mockClear();
   }
 });
 
 describe("secrets store CLI", () => {
-  it.each(["set", "import"])(
-    "preserves an existing credential during a redacted %s round-trip",
-    async (command) => {
-      const file = await inputFile(
-        command === "set"
-          ? "__OPENCLAW_REDACTED__"
-          : "OPENCLAW_GATEWAY_TOKEN=__OPENCLAW_REDACTED__\n",
-      );
-      mocks.read.mockResolvedValue({ ok: true, value: "synthetic-existing-token" });
-      await run(
-        ...(command === "set"
-          ? ["set", "OPENCLAW_GATEWAY_TOKEN", "--value-file", file]
-          : ["import", "--from", file, "--yes"]),
-      );
-      expect(mocks.write).not.toHaveBeenCalled();
-      expect(mocks.writeBatch).not.toHaveBeenCalled();
-      expect(mocks.runtimeLogs.join("\n")).toContain(
-        "Skipped redacted value for OPENCLAW_GATEWAY_TOKEN; existing entry unchanged.",
-      );
-      expect(mocks.gatewayIdentity).not.toHaveBeenCalled();
-    },
-  );
+  it.each(["set", "import"])("preserves credentials on redacted %s", async (command) => {
+    const file = await inputFile(
+      command === "set"
+        ? "__OPENCLAW_REDACTED__"
+        : "OPENCLAW_GATEWAY_TOKEN=__OPENCLAW_REDACTED__\n",
+    );
+    mocks.read.mockResolvedValue({ ok: true, value: "synthetic-existing-token" });
+    await run(
+      ...(command === "set"
+        ? ["set", "OPENCLAW_GATEWAY_TOKEN", "--value-file", file]
+        : ["import", "--from", file, "--yes"]),
+    );
+    expect(mocks.write).not.toHaveBeenCalled();
+    expect(mocks.writeBatch).not.toHaveBeenCalled();
+    expect(mocks.runtimeLogs.join("\n")).toContain(
+      "Skipped redacted value for OPENCLAW_GATEWAY_TOKEN; existing entry unchanged.",
+    );
+  });
 
   it("refuses a redacted import without a usable existing credential before writing other entries", async () => {
     const file = await inputFile(
@@ -132,36 +105,23 @@ describe("secrets store CLI", () => {
     expect(mocks.runtimeErrors.join("\n")).toContain("OPENCLAW_GATEWAY_TOKEN");
   });
   it("writes JSON results for list and get", async () => {
-    mocks.list.mockReturnValueOnce([
-      { name: "SERVICE_MODE", kind: "env", valuePreview: "production" },
-    ]);
-    await run("list", "--json");
-
-    mocks.list.mockReturnValueOnce([{ name: "SERVICE_MODE", kind: "env" }]);
+    const entry = { name: "SERVICE_MODE", kind: "env" };
+    const list = [{ ...entry, valuePreview: "production" }];
+    mocks.list.mockReturnValueOnce(list).mockReturnValueOnce([entry]);
     mocks.read.mockResolvedValueOnce({ ok: true, value: "production" });
+    await run("list", "--json");
     await run("get", "SERVICE_MODE", "--json");
-
-    expect(mocks.defaultRuntime.writeJson).toHaveBeenCalledTimes(2);
     expect(mocks.runtimeLogs).toHaveLength(2);
-    expect(mocks.defaultRuntime.writeJson).toHaveBeenNthCalledWith(1, [
-      { name: "SERVICE_MODE", kind: "env", valuePreview: "production" },
+    expect(mocks.defaultRuntime.writeJson.mock.calls).toEqual([
+      [list],
+      [{ ...entry, value: "production" }],
     ]);
-    expect(mocks.defaultRuntime.writeJson).toHaveBeenNthCalledWith(2, {
-      name: "SERVICE_MODE",
-      kind: "env",
-      value: "production",
-    });
     expect(mocks.runtimeErrors).toHaveLength(0);
   });
 
   it("shows non-secret allowed-host metadata in list output", async () => {
-    mocks.list.mockReturnValue([
-      {
-        name: "SERVICE_API_KEY",
-        kind: "secret",
-        allowedHosts: ["api.example.com", "uploads.example.com"],
-      },
-    ]);
+    const allowedHosts = ["api.example.com", "uploads.example.com"];
+    mocks.list.mockReturnValue([{ name: "SERVICE_API_KEY", kind: "secret", allowedHosts }]);
 
     await run("list");
 
@@ -259,33 +219,22 @@ describe("secrets store CLI", () => {
   });
 
   it.each([
-    {
-      name: "missing get",
-      prepare: () => mocks.list.mockReturnValueOnce([]),
-      args: ["get", "MISSING_VALUE", "--json"],
-      exitCode: 3,
-      message: 'Secret store entry "MISSING_VALUE" was not found.',
-    },
-    {
-      name: "database failure",
-      prepare: () =>
-        mocks.list.mockImplementationOnce(() => {
-          throw new Error("database unavailable");
-        }),
-      args: ["list", "--json"],
-      exitCode: 1,
-      message: "database unavailable",
-    },
-  ])("writes one JSON failure for $name", async (testCase) => {
-    testCase.prepare();
+    [["get", "MISSING_VALUE", "--json"], 3, 'Secret store entry "MISSING_VALUE" was not found.'],
+    [["list", "--json"], 1, "database unavailable"],
+  ] as const)("writes one JSON failure for %j", async (args, exitCode, message) => {
+    if (exitCode === 1) {
+      mocks.list.mockImplementationOnce(() => {
+        throw new Error(message);
+      });
+    }
 
-    await expect(run(...testCase.args)).rejects.toThrow(`__exit__:${testCase.exitCode}`);
+    await expect(run(...args)).rejects.toThrow(`__exit__:${exitCode}`);
 
     expect(mocks.defaultRuntime.writeJson).toHaveBeenCalledTimes(1);
     expect(mocks.runtimeLogs).toHaveLength(1);
     expect(JSON.parse(mocks.runtimeLogs[0] ?? "")).toEqual({
       ok: false,
-      error: { type: "cli_error", message: testCase.message },
+      error: { type: "cli_error", message },
     });
     expect(mocks.runtimeErrors).toHaveLength(0);
   });

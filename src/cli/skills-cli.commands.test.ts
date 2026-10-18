@@ -13,6 +13,7 @@ import type { SkillStatusEntry, SkillStatusReport } from "../skills/discovery/st
 import type * as SourceInstall from "../skills/lifecycle/source-install.js";
 import { withTestDir } from "../test-helpers/temp-dir.js";
 import { registerSkillsCli } from "./skills-cli.js";
+import { verification } from "./skills-cli.test-support.js";
 
 const originalTty = [process.stdin, process.stdout].map((stream) =>
   Object.getOwnPropertyDescriptor(stream, "isTTY"),
@@ -22,61 +23,26 @@ function setTty(value: boolean) {
     Object.defineProperty(stream, "isTTY", { value, configurable: true });
   }
 }
-const mocks = vi.hoisted(() => {
-  const stdout: string[] = [];
-  const errors: string[] = [];
+const mocks = await vi.hoisted(async () => {
+  const { skill, runtimeFixture } = await import("./skills-cli.test-support.js");
   const report: SkillStatusReport = {
     workspaceDir: "/tmp/workspace",
     managedSkillsDir: "/tmp/workspace/skills",
     skills: [
-      {
-        name: "calendar",
+      skill("calendar", {
         description: "Calendar helpers",
-        source: "bundled",
-        bundled: false,
         filePath: "/tmp/workspace/skills/calendar/SKILL.md",
         baseDir: "/tmp/workspace/skills/calendar",
-        skillKey: "calendar",
         emoji: "📅",
         homepage: "https://example.com/calendar",
-        always: false,
-        disabled: false,
-        blockedByAllowlist: false,
-        blockedByAgentFilter: false,
-        eligible: true,
-        platformIncompatible: false,
-        modelVisible: true,
-        userInvocable: true,
-        commandVisible: true,
         primaryEnv: "CALENDAR_API_KEY",
         requirements: { bins: [], anyBins: [], env: ["CALENDAR_API_KEY"], config: [], os: [] },
-        missing: { bins: [], anyBins: [], env: [], config: [], os: [] },
-        configChecks: [],
-        install: [],
-      },
+      }),
     ],
   };
   return {
-    stdout,
-    errors,
+    ...runtimeFixture(false, true),
     report,
-    runtime: {
-      log: vi.fn(),
-      error: vi.fn((...args: unknown[]) => {
-        errors.push(args.map(String).join(" "));
-      }),
-      writeStdout: vi.fn((value: string) => {
-        stdout.push(value.endsWith("\n") ? value.slice(0, -1) : value);
-      }),
-      writeJson: vi.fn((value: unknown, space = 2) => {
-        stdout.push(JSON.stringify(value, null, space > 0 ? space : undefined));
-      }),
-      exit: vi.fn((code: number) => {
-        if (code !== 0) {
-          throw new Error(`__exit__:${code}`);
-        }
-      }),
-    },
     gateway: vi.fn(),
     config: vi.fn((_options?: unknown) => ({})),
     defaultAgent: vi.fn((_config: unknown, _context?: AgentSelectionContext) => "main"),
@@ -174,18 +140,7 @@ function primeVerification(overrides: Record<string, unknown> = {}) {
   mocks.verify.mockResolvedValue({
     ok: true,
     value: {
-      schema: "clawhub.skill.verify.v1",
-      ok: true,
-      decision: "pass",
-      reasons: [],
-      skill: { slug: "agentreceipt" },
-      publisher: null,
-      version: { version: "1.2.3" },
-      card: { available: true },
-      artifact: null,
-      provenance: null,
-      security: { status: "clean" },
-      signature: { status: "unsigned" },
+      ...verification({ publisher: null, version: { version: "1.2.3" }, artifact: null }),
       ...overrides,
     },
   });
@@ -202,7 +157,20 @@ async function runCommand(argv: string[]) {
   }
 }
 
-const expectFailure = (argv: string[]) => expect(runCommand(argv)).rejects.toThrow("__exit__:1");
+async function expectFailure(argv: string[], message?: string) {
+  await expect(runCommand(argv)).rejects.toThrow("__exit__:1");
+  if (message) {
+    expect(mocks.errors).toContain(message);
+  }
+}
+function expectUnused(...functions: unknown[]) {
+  for (const fn of functions) {
+    expect(fn).not.toHaveBeenCalled();
+  }
+}
+function expectOptions(fn: unknown, options: Record<string, unknown>) {
+  expect(fn).toHaveBeenCalledWith(expect.objectContaining(options));
+}
 function setSkill(overrides: Partial<SkillStatusEntry>) {
   const report = {
     ...mocks.report,
@@ -223,20 +191,20 @@ function installedCalendar(workspace = "/tmp/workspace") {
 
 describe("skills cli commands", () => {
   it.each([
-    {
-      argv: ["install", "skills-sh/invalid"],
-      message: "Invalid skills.sh skill reference: skills-sh/invalid",
-      json: false,
-    },
-    { argv: ["update"], message: "Provide a skill slug or use --all.", json: false },
-    {
-      argv: ["verify", "weather", "--global", "--agent", "main"],
-      message: "Use either --global or --agent, not both.",
-      json: true,
-    },
+    [
+      ["install", "skills-sh/invalid"],
+      "Invalid skills.sh skill reference: skills-sh/invalid",
+      false,
+    ],
+    [["update"], "Provide a skill slug or use --all.", false],
+    [
+      ["verify", "weather", "--global", "--agent", "main"],
+      "Use either --global or --agent, not both.",
+      true,
+    ],
   ])(
-    "preserves the reported failure for $argv with an exiting runtime",
-    async ({ argv, message, json }) => {
+    "preserves the reported failure for %s with an exiting runtime",
+    async (argv, message, json) => {
       const exit = new ExitError(1);
       await mocks.runtime.exit.withImplementation(
         () => {
@@ -251,9 +219,7 @@ describe("skills cli commands", () => {
       expect(mocks.stdout).toEqual(
         json ? [JSON.stringify({ ok: false, error: { type: "cli_error", message } }, null, 2)] : [],
       );
-      expect(mocks.install).not.toHaveBeenCalled();
-      expect(mocks.update).not.toHaveBeenCalled();
-      expect(mocks.verify).not.toHaveBeenCalled();
+      expectUnused(mocks.install, mocks.update, mocks.verify);
     },
   );
 
@@ -314,19 +280,17 @@ describe("skills cli commands", () => {
     mocks.gateway.mockResolvedValue(mocks.report);
     mocks.install.mockResolvedValue(installedCalendar("/tmp/openclaw-config"));
     await runCommand(["install", "calendar", "--version", "1.2.3", "--global", "--force-install"]);
-    expect(mocks.install).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workspaceDir: "/tmp/openclaw-config",
-        slug: "calendar",
-        version: "1.2.3",
-        force: false,
-        forceInstall: true,
-        config: {},
-        confirmInstall: expect.any(Function),
-        onInstallPolicyWarning: expect.any(Function),
-        logger: expect.any(Object),
-      }),
-    );
+    expectOptions(mocks.install, {
+      workspaceDir: "/tmp/openclaw-config",
+      slug: "calendar",
+      version: "1.2.3",
+      force: false,
+      forceInstall: true,
+      config: {},
+      confirmInstall: expect.any(Function),
+      onInstallPolicyWarning: expect.any(Function),
+      logger: expect.any(Object),
+    });
     expect(mocks.workspace).not.toHaveBeenCalled();
     expect(mocks.runtime.log).toHaveBeenCalledWith(
       "Installed calendar@1.2.3 -> /tmp/openclaw-config/skills/calendar",
@@ -341,23 +305,21 @@ describe("skills cli commands", () => {
     });
   });
   it.each([
-    {
-      args: ["skills-sh:openclaw/skills/weather", "--version", "1.2.3"],
-      error: "--version is not supported for skills-sh references.",
-    },
-    {
-      args: ["git:owner/tools", "--version", "1.2.3"],
-      error: "--version is only supported for ClawHub skill installs.",
-    },
-    {
-      args: ["./local-skill", "--force-install"],
-      error: "--force-install is only supported for ClawHub skill installs.",
-    },
-  ])("rejects invalid install arguments: $args", async ({ args, error }) => {
-    await expectFailure(["install", ...args]);
-    expect(mocks.errors).toContain(error);
-    expect(mocks.install).not.toHaveBeenCalled();
-    expect(mocks.sourceInstall).not.toHaveBeenCalled();
+    [
+      ["skills-sh:openclaw/skills/weather", "--version", "1.2.3"],
+      "--version is not supported for skills-sh references.",
+    ],
+    [
+      ["git:owner/tools", "--version", "1.2.3"],
+      "--version is only supported for ClawHub skill installs.",
+    ],
+    [
+      ["./local-skill", "--force-install"],
+      "--force-install is only supported for ClawHub skill installs.",
+    ],
+  ])("rejects invalid install arguments: %s", async (args, error) => {
+    await expectFailure(["install", ...args], error);
+    expectUnused(mocks.install, mocks.sourceInstall);
   });
   it("fails a source install with --as when its description cannot be parsed", async () => {
     await withTestDir({ prefix: "openclaw-skills-cli-invalid-source-" }, async (root) => {
@@ -395,17 +357,15 @@ describe("skills cli commands", () => {
       "tools",
       "--acknowledge-install-policy-warning",
     ]);
-    expect(mocks.sourceInstall).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workspaceDir: "/tmp/workspace",
-        spec: "git:owner/tools",
-        slug: "tools",
-        force: false,
-        config: {},
-        logger: expect.any(Object),
-        onInstallPolicyWarning: expect.any(Function),
-      }),
-    );
+    expectOptions(mocks.sourceInstall, {
+      workspaceDir: "/tmp/workspace",
+      spec: "git:owner/tools",
+      slug: "tools",
+      force: false,
+      config: {},
+      logger: expect.any(Object),
+      onInstallPolicyWarning: expect.any(Function),
+    });
     expect(mocks.install).not.toHaveBeenCalled();
     expect(mocks.runtime.log).toHaveBeenCalledWith(
       "Installed tools from git -> /tmp/workspace/skills/tools",
@@ -428,30 +388,23 @@ describe("skills cli commands", () => {
     const error =
       'ClawHub blocked artifact download for "calendar@1.2.3"; install was not started.';
     mocks.install.mockResolvedValue({ ok: false, code: "clawhub_download_blocked", error });
-    await expectFailure(["install", "calendar"]);
-    expect(mocks.errors).toContain(error);
+    await expectFailure(["install", "calendar"], error);
   });
   it("updates tracked skills with the requested force options", async () => {
     mocks.tracked.mockResolvedValue(["calendar"]);
     mocks.update.mockResolvedValue([
-      {
-        ...installedCalendar(),
-        previousVersion: "1.2.2",
-        changed: true,
-      },
+      { ...installedCalendar(), previousVersion: "1.2.2", changed: true },
     ]);
     await runCommand(["update", "--all", "--force", "--force-install"]);
     expect(mocks.tracked).toHaveBeenCalledWith("/tmp/workspace");
-    expect(mocks.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workspaceDir: "/tmp/workspace",
-        slug: undefined,
-        force: true,
-        forceInstall: true,
-        config: {},
-        logger: expect.any(Object),
-      }),
-    );
+    expectOptions(mocks.update, {
+      workspaceDir: "/tmp/workspace",
+      slug: undefined,
+      force: true,
+      forceInstall: true,
+      config: {},
+      logger: expect.any(Object),
+    });
     expect(mocks.runtime.log).toHaveBeenCalledWith("Updated calendar: 1.2.2 -> 1.2.3");
     expect(mocks.errors).toEqual([]);
   });
@@ -464,42 +417,31 @@ describe("skills cli commands", () => {
     expect(mocks.errors).toEqual([]);
   });
   it.each([
-    {
-      code: "force_required",
-      error: "Local skill files changed.",
-      expected: "Local skill files changed. Re-run with --force to update it anyway.",
-    },
-    {
-      code: undefined,
-      error: "blocked by install policy: calendar is not approved",
-      expected: "blocked by install policy: calendar is not approved",
-    },
-  ])("exits nonzero for update failure $code", async ({ code, error, expected }) => {
+    [
+      "force_required",
+      "Local skill files changed.",
+      "Local skill files changed. Re-run with --force to update it anyway.",
+    ],
+    [
+      undefined,
+      "blocked by install policy: calendar is not approved",
+      "blocked by install policy: calendar is not approved",
+    ],
+  ])("exits nonzero for update failure %s", async (code, error, expected) => {
     mocks.tracked.mockResolvedValue(["calendar"]);
     mocks.update.mockResolvedValue([{ ok: false, code, error }]);
-    await expectFailure(["update", "calendar"]);
-    expect(mocks.errors).toContain(expected);
+    await expectFailure(["update", "calendar"], expected);
     expect(mocks.runtime.log).not.toHaveBeenCalled();
   });
 
   it.each([
-    { label: "unavailable", card: { available: false }, error: "Skill Card is not available." },
-    {
-      label: "missing",
-      card: null,
-      error: "ClawHub verification response did not include a Skill Card URL.",
-    },
-    {
-      label: "missing URL",
-      card: { available: true },
-      error: "ClawHub verification response did not include a Skill Card URL.",
-    },
-  ])("rejects $label verified Skill Card metadata", async ({ card, error }) => {
+    [{ available: false }, "Skill Card is not available."],
+    [null, "ClawHub verification response did not include a Skill Card URL."],
+    [{ available: true }, "ClawHub verification response did not include a Skill Card URL."],
+  ])("rejects verified Skill Card metadata %s", async (card, error) => {
     primeVerification({ card });
-    await expectFailure(["verify", "agentreceipt", "--card"]);
-    expect(mocks.errors).toContain(error);
-    expect(mocks.card).not.toHaveBeenCalled();
-    expect(mocks.runtime.writeJson).not.toHaveBeenCalled();
+    await expectFailure(["verify", "agentreceipt", "--card"], error);
+    expectUnused(mocks.card, mocks.runtime.writeJson);
   });
   it.each([
     { label: "unknown decision", ok: true, decision: "quarantined" },
@@ -534,11 +476,13 @@ describe("skills cli commands", () => {
       "/tmp/workspace-main",
       expect.objectContaining({ config: {} }),
     );
-    expect(mocks.explicitAgent).not.toHaveBeenCalled();
     expect(mocks.runtime.writeStdout).toHaveBeenCalledOnce();
-    expect(mocks.runtime.writeJson).not.toHaveBeenCalled();
-    expect(mocks.runtime.log).not.toHaveBeenCalled();
-    expect(mocks.runtime.exit).not.toHaveBeenCalled();
+    expectUnused(
+      mocks.explicitAgent,
+      mocks.runtime.writeJson,
+      mocks.runtime.log,
+      mocks.runtime.exit,
+    );
     expect(mocks.errors).toEqual([]);
     const payload = JSON.parse(mocks.stdout[0] ?? "{}");
     if (label === "check") {

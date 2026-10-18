@@ -5,30 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { ClawHubSkillVerificationResponse } from "../infra/clawhub-skills.js";
 import { registerSkillsCli } from "./skills-cli.js";
+import { verification } from "./skills-cli.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-const mocks = vi.hoisted(() => {
-  const runtimeStdout: string[] = [];
-  const runtimeErrors: string[] = [];
-  const defaultRuntime = {
-    log: vi.fn(),
-    error: vi.fn((value: unknown) => {
-      runtimeErrors.push(String(value));
-    }),
-    writeStdout: vi.fn((value: string) => {
-      runtimeStdout.push(value.endsWith("\n") ? value.slice(0, -1) : value);
-    }),
-    writeJson: vi.fn((value: unknown, space = 2) => {
-      runtimeStdout.push(JSON.stringify(value, null, space > 0 ? space : undefined));
-    }),
-    exit: vi.fn((code: number) => {
-      throw new Error(`__exit__:${code}`);
-    }),
-  };
+const mocks = await vi.hoisted(async () => {
+  const { runtimeFixture } = await import("./skills-cli.test-support.js");
   return {
-    defaultRuntime,
-    runtimeStdout,
-    runtimeErrors,
+    ...runtimeFixture(true),
     workspaceDir: "",
     verify: vi.fn(),
     card: vi.fn(),
@@ -38,12 +21,11 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("../runtime.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../runtime.js")>()),
-  defaultRuntime: mocks.defaultRuntime,
+  defaultRuntime: mocks.runtime,
 }));
 
 vi.mock("./one-shot-exit.js", () => ({
-  exitCliAfterOutput: (runtime: typeof mocks.defaultRuntime, exitCode: number) =>
-    runtime.exit(exitCode),
+  exitCliAfterOutput: (runtime: typeof mocks.runtime, exitCode: number) => runtime.exit(exitCode),
 }));
 
 vi.mock("../utils.js", async (importOriginal) => ({
@@ -89,12 +71,12 @@ const { ClawHubRequestError } = await import("../infra/clawhub-client.js");
 
 describe("skills verify CLI", () => {
   beforeEach(() => {
-    mocks.runtimeStdout.length = 0;
-    mocks.runtimeErrors.length = 0;
+    mocks.stdout.length = 0;
+    mocks.errors.length = 0;
     mocks.workspaceDir = tempDirs.make("openclaw-skill-verify-cli-");
     mocks.verify.mockReset();
     mocks.card.mockReset();
-    for (const mock of Object.values(mocks.defaultRuntime)) {
+    for (const mock of Object.values(mocks.runtime)) {
       mock.mockClear();
     }
   });
@@ -110,11 +92,11 @@ describe("skills verify CLI", () => {
     openclaw?: { trust?: { state?: string; label?: string }; verifiedSourceUrl?: string };
     artifact?: unknown;
   } {
-    return JSON.parse(mocks.runtimeStdout.at(-1) ?? "{}");
+    return JSON.parse(mocks.stdout.at(-1) ?? "{}");
   }
   function expectSuccess() {
-    expect(mocks.defaultRuntime.exit).not.toHaveBeenCalled();
-    expect(mocks.runtimeErrors).toStrictEqual([]);
+    expect(mocks.runtime.exit).not.toHaveBeenCalled();
+    expect(mocks.errors).toStrictEqual([]);
   }
   function expectVerification(options: Record<string, unknown>) {
     expect(mocks.verify).toHaveBeenCalledWith({
@@ -126,21 +108,7 @@ describe("skills verify CLI", () => {
   }
 
   function mockVerification(overrides: Partial<ClawHubSkillVerificationResponse> = {}) {
-    mocks.verify.mockResolvedValueOnce({
-      schema: "clawhub.skill.verify.v1",
-      ok: true,
-      decision: "pass",
-      reasons: [],
-      skill: { slug: "agentreceipt" },
-      publisher: { handle: "openclaw" },
-      version: { version: "1.0.0" },
-      card: { available: true },
-      artifact: { sourceFingerprint: "source-fp" },
-      provenance: null,
-      security: { status: "clean" },
-      signature: { status: "unsigned" },
-      ...overrides,
-    });
+    mocks.verify.mockResolvedValueOnce(verification(overrides));
   }
 
   async function writeInstalledSkill(slug: string, requestedReference?: string) {
@@ -200,7 +168,7 @@ describe("skills verify CLI", () => {
         message: 'Skill "html" is not tracked from skills-sh:owner-b/repo-b/html.',
       },
     });
-    expect(mocks.runtimeErrors).toStrictEqual([]);
+    expect(mocks.errors).toStrictEqual([]);
     expect(mocks.verify).not.toHaveBeenCalled();
   });
 
@@ -222,33 +190,27 @@ describe("skills verify CLI", () => {
       }),
     );
     await expect(runCommand("nonexistent-skill-xyz", "--card")).rejects.toThrow("__exit__:1");
-    expect(mocks.runtimeStdout).toStrictEqual([]);
-    expect(mocks.runtimeErrors).toStrictEqual([
+    expect(mocks.stdout).toStrictEqual([]);
+    expect(mocks.errors).toStrictEqual([
       'Skill "nonexistent-skill-xyz" not found on ClawHub. Run `openclaw skills search nonexistent-skill-xyz` to find the right skill reference.',
     ]);
-    expect(mocks.runtimeErrors.join("\n")).not.toMatch(/\/api\/v1\/|\(404\)|remote-controlled/u);
+    expect(mocks.errors.join("\n")).not.toMatch(/\/api\/v1\/|\(404\)|remote-controlled/u);
   });
 
   it("does not reject an installed bundle just because ClawHub generated skill-card.md", async () => {
     const skillDir = await writeInstalledSkill("agentreceipt");
-    await fs.writeFile(
-      path.join(skillDir, "skill-card.md"),
-      "# Generated Skill Card\nClawHub bundle metadata.\n",
-    );
+    await fs.writeFile(path.join(skillDir, "skill-card.md"), "# Generated Skill Card\n");
     mockVerification({
       provenance: {
         source: "server-resolved-github-import",
-        kind: "github",
-        url: "https://github.com/openclaw/skills/tree/main/agentreceipt",
         repo: "openclaw/skills",
-        ref: "main",
         commit: "0123456789abcdef0123456789abcdef01234567",
         path: "agentreceipt",
       },
       version: { version: "1.2.3" },
       artifact: {
-        sourceFingerprint: "publisher-source-fingerprint-without-generated-card",
-        bundleFingerprints: ["generated-bundle-fingerprint-with-skill-card"],
+        sourceFingerprint: "source-without-card",
+        bundleFingerprints: ["bundle-with-card"],
       },
     });
 
@@ -262,8 +224,8 @@ describe("skills verify CLI", () => {
         "https://github.com/openclaw/skills/tree/0123456789abcdef0123456789abcdef01234567/agentreceipt",
     });
     expect(result.artifact).toEqual({
-      sourceFingerprint: "publisher-source-fingerprint-without-generated-card",
-      bundleFingerprints: ["generated-bundle-fingerprint-with-skill-card"],
+      sourceFingerprint: "source-without-card",
+      bundleFingerprints: ["bundle-with-card"],
     });
     expectSuccess();
   });
@@ -292,7 +254,7 @@ describe("skills verify CLI", () => {
       url: "https://cards.example.test/generated/weather.md",
       baseUrl: "https://clawhub.ai",
     });
-    expect(mocks.runtimeStdout.at(-1)).toBe("# Weather");
+    expect(mocks.stdout.at(-1)).toBe("# Weather");
     expectSuccess();
   });
 

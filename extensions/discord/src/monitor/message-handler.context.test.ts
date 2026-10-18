@@ -11,7 +11,7 @@ import { withOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { describe, expect, it, vi } from "vitest";
 import * as discordRuntime from "../runtime.js";
 import { resolveDiscordTextCommandAccess } from "./dm-command-auth.js";
-import { buildDiscordMessageProcessContext } from "./message-handler.context.js";
+import { buildDiscordMessageProcessContext as buildProcessContext } from "./message-handler.context.js";
 import { createBaseDiscordMessageContext } from "./message-handler.test-harness.js";
 
 vi.mock("openclaw/plugin-sdk/runtime-env", async (importOriginal) => ({
@@ -23,10 +23,10 @@ vi.mock("openclaw/plugin-sdk/runtime-env", async (importOriginal) => ({
 async function context(
   overrides: Record<string, unknown> = {},
   text = "hi",
-  mediaList: Parameters<typeof buildDiscordMessageProcessContext>[0]["mediaList"] = [],
+  mediaList: Parameters<typeof buildProcessContext>[0]["mediaList"] = [],
 ) {
   const ctx = await createBaseDiscordMessageContext(overrides);
-  const result = await buildDiscordMessageProcessContext({ ctx, text, mediaList });
+  const result = await buildProcessContext({ ctx, text, mediaList });
   expect(result).not.toBeNull();
   return result!.ctxPayload;
 }
@@ -121,7 +121,7 @@ describe("discord message context", () => {
             conversationThreadId: conversation?.threadId,
             contextBinding,
           });
-        const result = await buildDiscordMessageProcessContext({ ctx, text, mediaList: [] });
+        const result = await buildProcessContext({ ctx, text, mediaList: [] });
         if (!result) {
           throw new Error("expected a built Discord message context");
         }
@@ -148,28 +148,39 @@ describe("discord message context", () => {
     });
   });
 
-  it("records the canonical guild id when no configured guild entry exists", async () => {
-    const payload = await context({
-      data: { guild: { id: "guild-id", name: "Friendly Guild" } },
-      guildInfo: null,
-      guildSlug: "friendly-guild",
-    });
-
-    expect(payload.GroupSpace).toBe("guild-id");
-  });
-
-  it("omits SenderIsBot for PluralKit proxy senders despite the bot author", async () => {
-    const payload = await context({
-      author: { id: "U1", username: "pk", discriminator: "0", globalName: "PK", bot: true },
-      sender: { label: "user", name: "Member", tag: "member", isPluralKit: true },
-    });
-
-    expect(payload.SenderIsBot).toBeUndefined();
+  it.each([
+    {
+      name: "canonical guild id without a configured guild entry",
+      field: "GroupSpace",
+      expected: "guild-id",
+      overrides: {
+        data: { guild: { id: "guild-id", name: "Friendly Guild" } },
+        guildInfo: null,
+        guildSlug: "friendly-guild",
+      },
+    },
+    {
+      name: "no bot marker for PluralKit proxy senders",
+      field: "SenderIsBot",
+      expected: undefined,
+      overrides: {
+        author: { id: "U1", username: "pk", discriminator: "0", globalName: "PK", bot: true },
+        sender: { label: "user", name: "Member", tag: "member", isPluralKit: true },
+      },
+    },
+  ] as const)("preserves $name", async ({ overrides, field, expected }) => {
+    expect((await context(overrides))[field]).toBe(expected);
   });
 
   it("does not duplicate forwarded media already rendered in room-event history text", async () => {
     const guildHistories = new Map();
     const forwardedText = "[Forwarded message]\n<media:image>";
+    const attachment = {
+      id: "forwarded-image",
+      filename: "forwarded.png",
+      content_type: "image/png",
+      url: "https://cdn.discordapp.com/forwarded.png",
+    };
     await context(
       {
         guildHistories,
@@ -181,20 +192,7 @@ describe("discord message context", () => {
           channelId: "c1",
           timestamp: new Date().toISOString(),
           attachments: [],
-          message_snapshots: [
-            {
-              message: {
-                attachments: [
-                  {
-                    id: "forwarded-image",
-                    filename: "forwarded.png",
-                    content_type: "image/png",
-                    url: "https://cdn.discordapp.com/forwarded.png",
-                  },
-                ],
-              },
-            },
-          ],
+          message_snapshots: [{ message: { attachments: [attachment] } }],
         },
       },
       forwardedText,
@@ -203,11 +201,7 @@ describe("discord message context", () => {
 
     const entry = guildHistories.get("c1")?.[0];
     expect(entry?.body).toBe(forwardedText);
-    expect(entry?.senderProvenance).toEqual({
-      id: "U1",
-      name: "alice",
-      memberRoleIds: [],
-    });
+    expect(entry?.senderProvenance).toEqual({ id: "U1", name: "alice", memberRoleIds: [] });
     expect(Object.isFrozen(entry?.senderProvenance)).toBe(true);
     expect(Object.isFrozen(entry?.senderProvenance.memberRoleIds)).toBe(true);
   });
@@ -232,10 +226,10 @@ describe("discord message context", () => {
         { path: "/tmp/ok.png", contentType: "image/png", kind: "image" },
       ],
     );
-    expect(payload.Body).toContain("look at this");
-    expect(payload.Body).toContain("[discord attachment unavailable]");
-    expect(payload.BodyForAgent).toContain("look at this");
-    expect(payload.BodyForAgent).toContain("[discord attachment unavailable]");
+    for (const body of [payload.Body, payload.BodyForAgent]) {
+      expect(body).toContain("look at this");
+      expect(body).toContain("[discord attachment unavailable]");
+    }
   });
 
   it("escapes transcript contents so spoken framing cannot override the untrusted label", async () => {

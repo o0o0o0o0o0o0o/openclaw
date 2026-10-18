@@ -85,14 +85,11 @@ export function expectReactAckCallAt(
 }
 
 export function expectReactionCallsContain(channelId: string, messageId: string, emoji: string) {
-  const calls = sendMocks.reactMessageDiscord.mock.calls as unknown as Array<
-    [string, string, string]
-  >;
-  const hasCall = calls.some(
-    ([actualChannelId, actualMessageId, actualEmoji]) =>
-      actualChannelId === channelId && actualMessageId === messageId && actualEmoji === emoji,
-  );
-  expect(hasCall).toBe(true);
+  expect(sendMocks.reactMessageDiscord.mock.calls.map((call) => call.slice(0, 3))).toContainEqual([
+    channelId,
+    messageId,
+    emoji,
+  ]);
 }
 
 export function createMockDraftStreamForTest() {

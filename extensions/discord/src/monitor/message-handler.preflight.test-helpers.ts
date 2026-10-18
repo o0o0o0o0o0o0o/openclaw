@@ -1,4 +1,4 @@
-import type { APIAttachment, APIMessage } from "discord-api-types/v10";
+import type { APIAttachment, APIMessage, APIUser } from "discord-api-types/v10";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { registerSessionBindingAdapter } from "openclaw/plugin-sdk/conversation-runtime";
 import type { SessionBindingRecord } from "openclaw/plugin-sdk/conversation-runtime";
@@ -7,6 +7,8 @@ import { ChannelType, Message, MessageType } from "../internal/discord.js";
 import { createInternalTestClient } from "../internal/test-builders.test-support.js";
 import type { preflightDiscordMessage } from "./message-handler.preflight.js";
 import { createNoopThreadBindingManager, type ThreadBindingManager } from "./thread-bindings.js";
+type ThreadBindings = ReturnType<typeof createNoopThreadBindingManager>;
+type PreflightArgs = Parameters<typeof preflightDiscordMessage>[0];
 
 export type DiscordConfig = NonNullable<OpenClawConfig["channels"]>["discord"];
 export type DiscordMessageEvent = import("./listeners.js").DiscordMessageEvent;
@@ -15,6 +17,10 @@ export type DiscordClient = import("../internal/discord.js").Client;
 export const DEFAULT_PREFLIGHT_CFG: OpenClawConfig = {
   session: { mainKey: "main", scope: "per-sender" },
 };
+
+function user(id: string, username = id): APIUser {
+  return { id, username, global_name: null, discriminator: "0", avatar: null };
+}
 
 function channelClient(channels: Record<string, object>): DiscordClient {
   const byId = new Map(Object.entries(channels));
@@ -65,15 +71,8 @@ export function createGuildEvent(params: {
 }
 
 export function createDiscordMessage(
-  params: {
-    id: string;
-    channelId: string;
-    content: string;
-    author: {
-      id: string;
-      bot: boolean;
-      username?: string;
-    };
+  params: Pick<Message, "id" | "channelId" | "content"> & {
+    author: Pick<APIUser, "id"> & { bot: boolean; username?: string };
     mentionedUsers?: Array<{ id: string; username?: string }>;
     mentionedEveryone?: boolean;
     messageReference?: Message["messageReference"];
@@ -98,24 +97,14 @@ export function createDiscordMessage(
     attachments: (params.attachments ?? []).map((attachment) =>
       Object.assign({ size: 1, proxy_url: attachment.url }, attachment),
     ),
-    mentions: (params.mentionedUsers ?? []).map((user) => ({
-      id: user.id,
-      username: user.username ?? user.id,
-      global_name: null,
-      discriminator: "0",
-      avatar: null,
-    })),
+    mentions: (params.mentionedUsers ?? []).map((mentioned) =>
+      user(mentioned.id, mentioned.username),
+    ),
     mention_roles: [],
     mention_everyone: params.mentionedEveryone ?? false,
     message_reference: params.messageReference,
     ...(params.referencedMessage ? { referenced_message: params.referencedMessage.rawData } : {}),
-    author: {
-      username: params.author.id,
-      global_name: null,
-      discriminator: "0",
-      avatar: null,
-      ...params.author,
-    },
+    author: { ...user(params.author.id), ...params.author },
     edited_timestamp: null,
     tts: false,
     pinned: false,
@@ -125,16 +114,11 @@ export function createDiscordMessage(
   });
 }
 
-export function createDiscordPreflightArgs(params: {
-  cfg: OpenClawConfig;
-  discordConfig: DiscordConfig;
-  data: DiscordMessageEvent;
-  client: DiscordClient;
-  botUserId?: string;
-  threadBindings?: ReturnType<typeof createNoopThreadBindingManager>;
-}): Parameters<typeof preflightDiscordMessage>[0] & {
-  threadBindings: ReturnType<typeof createNoopThreadBindingManager>;
-} {
+export function createDiscordPreflightArgs(
+  params: Pick<PreflightArgs, "cfg" | "discordConfig" | "data" | "client" | "botUserId"> & {
+    threadBindings?: ThreadBindings;
+  },
+): PreflightArgs & { threadBindings: ThreadBindings } {
   const threadBindings = params.threadBindings ?? createNoopThreadBindingManager("default");
   if (!params.threadBindings) {
     onTestFinished(() => threadBindings.stop());
@@ -172,12 +156,7 @@ export function createThreadBinding(overrides?: Partial<SessionBindingRecord>) {
     },
     status: "active",
     boundAt: 1,
-    metadata: {
-      agentId: "main",
-      boundBy: "test",
-      webhookId: "wh-1",
-      webhookToken: "tok-1",
-    },
+    metadata: { agentId: "main", boundBy: "test", webhookId: "wh-1", webhookToken: "tok-1" },
     ...overrides,
   } satisfies SessionBindingRecord;
 }
@@ -188,7 +167,7 @@ export async function runThreadBoundPreflight(params: {
   message: Message;
   threadBinding: SessionBindingRecord;
   discordConfig: DiscordConfig;
-  threadBindings: ReturnType<typeof createNoopThreadBindingManager>;
+  threadBindings: ThreadBindings;
   registerBindingAdapter?: boolean;
 }) {
   if (params.registerBindingAdapter) {

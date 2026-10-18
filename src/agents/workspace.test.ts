@@ -105,6 +105,28 @@ function ensureWorkspace(
   return ensureAgentWorkspace({ dir: tempDir, ensureBootstrapFiles, ...options });
 }
 
+function workspaceGate(message = "workspace owner retired") {
+  const entered = createDeferred();
+  const release = createDeferred();
+  const retired = new Error(message);
+  const gate = {
+    entered,
+    release,
+    retired,
+    current: true,
+    assertHost: () => {
+      if (!gate.current) {
+        throw retired;
+      }
+    },
+    async enter() {
+      entered.resolve();
+      await release.promise;
+    },
+  };
+  return gate;
+}
+
 it.each([
   [undefined, ".openclaw"],
   ["work", ".openclaw-work"],
@@ -287,18 +309,14 @@ it("observes setup completed concurrently before writing optional bootstrap file
   await mergeWorkspaceSetupState(tempDir, SEEDED);
   const realAccess = fs.access.bind(fs);
   let completed = false;
-  const accessSpy = vi.spyOn(fs, "access").mockImplementation(async (filePath, mode) => {
+  vi.spyOn(fs, "access").mockImplementation(async (filePath, mode) => {
     if (!completed && filePath === agentsPath) {
       completed = true;
       await mergeWorkspaceSetupState(tempDir, { setupCompletedAt: COMPLETED.setupCompletedAt });
     }
     return await realAccess(filePath, mode);
   });
-  try {
-    await ensureWorkspace();
-  } finally {
-    accessSpy.mockRestore();
-  }
+  await ensureWorkspace();
   expect(completed).toBe(true);
   for (const filename of [SOUL, IDENTITY, USER, HEARTBEAT]) {
     await expectPathMissing(workspacePath(filename));
@@ -354,47 +372,32 @@ it("creates only the directory for runtime-managed-implicit provisioning (#92015
 it.each(["committed", "failed", "retired-before-commit", "retired-after-commit"] as const)(
   "waits for the completion write before bootstrap cleanup: %s",
   async (outcome) => {
-    const dir = testState!.workspaceDir;
-    await ensureWorkspace(true, { dir });
-    const bootstrapPath = path.join(dir, BOOTSTRAP);
-    await fs.writeFile(path.join(dir, USER), "A configured user.\n");
-    const entered = createDeferred();
-    const release = createDeferred();
+    await ensureWorkspace();
+    const bootstrapPath = workspacePath(BOOTSTRAP);
+    await writeWorkspaceFile(USER, "A configured user.\n");
+    const gate = workspaceGate();
     const realMerge = workspaceState.mergeWorkspaceSetupState;
-    const write = vi
-      .spyOn(workspaceState, "mergeWorkspaceSetupState")
-      .mockImplementation(async (...args) => {
-        entered.resolve();
-        await release.promise;
-        if (outcome === "failed") {
-          throw new Error("completion write failed");
-        }
-        const result = await realMerge(...args);
-        if (outcome === "retired-after-commit") {
-          current = false;
-        }
-        return result;
-      });
-    let current = true;
-    const pending = ensureWorkspace(true, {
-      dir,
-      guard: {
-        assertHost: () => {
-          if (!current) {
-            throw new Error("workspace owner retired");
-          }
-        },
-      },
+    vi.spyOn(workspaceState, "mergeWorkspaceSetupState").mockImplementation(async (...args) => {
+      await gate.enter();
+      if (outcome === "failed") {
+        throw new Error("completion write failed");
+      }
+      const result = await realMerge(...args);
+      if (outcome === "retired-after-commit") {
+        gate.current = false;
+      }
+      return result;
     });
+    const pending = ensureWorkspace(true, { guard: gate });
     const markSettled = vi.fn();
     void pending.then(markSettled, markSettled);
     try {
-      await withTestTimeout(entered.promise, 5_000, "Completion write was not reached");
+      await withTestTimeout(gate.entered.promise, 5_000, "Completion write was not reached");
       await checkpoint();
       expect(markSettled).not.toHaveBeenCalled();
       await fs.access(bootstrapPath);
-      current = outcome !== "retired-before-commit";
-      release.resolve();
+      gate.current = outcome !== "retired-before-commit";
+      gate.release.resolve();
       if (outcome === "committed") {
         await expect(pending).resolves.toMatchObject({ bootstrapPending: false });
         await expectPathMissing(bootstrapPath);
@@ -404,13 +407,12 @@ it.each(["committed", "failed", "retired-before-commit", "retired-after-commit"]
         );
         await fs.access(bootstrapPath);
       }
-      expect(Boolean((await readWorkspaceState(dir)).setupCompletedAt)).toBe(
+      expect(Boolean((await readWorkspaceState(tempDir)).setupCompletedAt)).toBe(
         outcome === "committed" || outcome === "retired-after-commit",
       );
     } finally {
-      release.resolve();
+      gate.release.resolve();
       await Promise.allSettled([pending]);
-      write.mockRestore();
     }
   },
 );
@@ -441,59 +443,46 @@ function gitTestEnvironment(): NodeJS.ProcessEnv {
   };
 }
 
-it("settles admitted Git work through success, failure, and caller retirement", async ({
-  signal,
-}) => {
-  const { state } = getWorkspaceTestFixture();
-  for (const outcome of ["success", "failure", "retired"] as const) {
+it.for(["success", "failure", "retired"] as const)(
+  "settles admitted Git work: %s",
+  async (outcome, { signal }) => {
+    const { state } = getWorkspaceTestFixture();
     const dir = state.path(`git-${outcome}`);
-    const entered = createDeferred();
-    const release = createDeferred();
+    const gate = workspaceGate("workspace owner retired during Git initialization");
     const baseEnv = gitTestEnvironment();
     const realRun = commandExec.runCommandWithTimeout;
     let attempts = 0;
     let gitSettled = false;
-    let current = true;
-    const retired = new Error("workspace owner retired during Git initialization");
-    const command = vi
-      .spyOn(commandExec, "runCommandWithTimeout")
-      .mockImplementation(async (argv, options) => {
-        if (argv[0] !== "git") {
-          return await realRun(argv, options);
+    vi.spyOn(commandExec, "runCommandWithTimeout").mockImplementation(async (argv, options) => {
+      if (argv[0] !== "git") {
+        return await realRun(argv, options);
+      }
+      const settings = typeof options === "number" ? { timeoutMs: options } : options;
+      if (argv[1] !== "init") {
+        return await realRun(argv, { ...settings, baseEnv });
+      }
+      expect(settings.cwd).toBe(dir);
+      attempts++;
+      await gate.enter();
+      try {
+        if (outcome === "failure") {
+          throw new Error("Injected Git initialization failure");
         }
-        const settings = typeof options === "number" ? { timeoutMs: options } : options;
-        if (argv[1] !== "init") {
-          return await realRun(argv, { ...settings, baseEnv });
-        }
-        expect(settings.cwd).toBe(dir);
-        attempts++;
-        entered.resolve();
-        await release.promise;
-        try {
-          if (outcome === "failure") {
-            throw new Error("Injected Git initialization failure");
-          }
-          return await realRun(argv, { ...settings, baseEnv });
-        } finally {
-          gitSettled = true;
-        }
-      });
-    const first = ensureAgentWorkspace({
-      dir,
-      ensureBootstrapFiles: true,
-      guard: {
-        assertHost: () => {
-          if (!current) {
-            throw retired;
-          }
-        },
-      },
+        return await realRun(argv, { ...settings, baseEnv });
+      } finally {
+        gitSettled = true;
+      }
     });
+    const first = ensureWorkspace(true, { dir, guard: gate });
     void first.catch(() => undefined);
     let follower: ReturnType<typeof ensureAgentWorkspace> | undefined;
     try {
       await withinTest(
-        awaitGateBeforeSettlement(entered.promise, first, "Git initialization was not reached"),
+        awaitGateBeforeSettlement(
+          gate.entered.promise,
+          first,
+          "Git initialization was not reached",
+        ),
         signal,
       );
       follower = ensureAgentWorkspace({
@@ -501,10 +490,10 @@ it("settles admitted Git work through success, failure, and caller retirement", 
         guard: { beforeLegacyApply: () => expect(gitSettled).toBe(true) },
       });
       void follower.catch(() => undefined);
-      current = outcome !== "retired";
-      release.resolve();
+      gate.current = outcome !== "retired";
+      gate.release.resolve();
       if (outcome === "retired") {
-        await expect(first).rejects.toBe(retired);
+        await expect(first).rejects.toBe(gate.retired);
       } else {
         await expect(first).resolves.toMatchObject({ bootstrapPending: true });
       }
@@ -523,12 +512,11 @@ it("settles admitted Git work through success, failure, and caller retirement", 
         await expectBootstrapSeeded(dir);
       }
     } finally {
-      release.resolve();
+      gate.release.resolve();
       await Promise.allSettled([first, follower]);
-      command.mockRestore();
     }
-  }
-});
+  },
+);
 
 describe.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
   "workspace permission failures",
@@ -547,15 +535,13 @@ describe.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
         await fs.chmod(tempDir, mode);
         await expect(fs.readdir(tempDir)).rejects.toMatchObject({ code: "EACCES" });
         const files = await loadWorkspaceBootstrapFiles(tempDir, names);
-        expect(files.map((file) => file.name).toSorted()).toEqual([...names].toSorted());
-        for (const file of files) {
-          expect(file.missing).toBe(false);
-          if (mode === 0o300) {
-            expect(file.content).toBe(`content:${file.name}`);
-          } else {
-            expect(file.content).toContain("[UNREADABLE:");
-          }
-        }
+        expect(files.toSorted((a, b) => a.name.localeCompare(b.name))).toMatchObject(
+          [...names].toSorted().map((name) => ({
+            name,
+            missing: false,
+            content: mode === 0o300 ? `content:${name}` : expect.stringContaining("[UNREADABLE:"),
+          })),
+        );
       },
     );
 
@@ -564,8 +550,7 @@ describe.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
       await fs.chmod(tempDir, 0o300);
       await expect(fs.readdir(tempDir)).rejects.toMatchObject({ code: "EACCES" });
       const files = await loadWorkspaceBootstrapFiles(tempDir, [AGENTS, MEMORY, USER]);
-      expect(files.map((file) => file.name)).toEqual([AGENTS]);
-      expect(files[0]?.content).toBe("instructions");
+      expect(files).toMatchObject([{ name: AGENTS, content: "instructions" }]);
     });
 
     it.each(["skip-bootstrap", "onboarding", "surviving skills"] as const)(

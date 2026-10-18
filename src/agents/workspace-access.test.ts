@@ -32,6 +32,34 @@ const prepareAttachments = (
 ) =>
   prepareAgentWorkspaceAttachments({ workspaceDir: root, turn, assertCurrent() {}, ...overrides });
 const expectStopped = (result: Promise<unknown>) => expect(result).rejects.toThrow(stopped);
+const workspace = () => getAgentWorkspaceAccess(root)!;
+const expectUnavailable = (capability?: Parameters<typeof getAgentWorkspaceAccess>[1]) =>
+  expect(() => getAgentWorkspaceAccess(root, capability)).toThrow(WorkspaceAccessUnavailableError);
+
+function callerLifetime() {
+  const controller = new AbortController();
+  let active = true;
+  return {
+    turn: { ...turn, abortSignal: controller.signal },
+    assertCurrent() {
+      if (!active) {
+        throw new Error("caller closed");
+      }
+    },
+    close(change: string, abortError: string) {
+      if (change === "caller") {
+        active = false;
+      } else {
+        controller.abort(new Error(abortError));
+      }
+    },
+  };
+}
+
+const deferredTurn = (recorder: UserTurnTranscriptRecorder) => ({
+  timeoutMs: turn.timeoutMs,
+  userTurnTranscriptRecorder: recorder,
+});
 
 function provider(overrides: Partial<AgentWorkspaceAccess> = {}): AgentWorkspaceAccess {
   return {
@@ -83,7 +111,7 @@ describe("host-owned workspace access", () => {
         },
       },
     });
-    const retained = getAgentWorkspaceAccess(root)!.memoryFiles!.maintenance!;
+    const retained = workspace().memoryFiles!.maintenance!;
     if (when === "before") {
       release();
     }
@@ -98,9 +126,7 @@ describe("host-owned workspace access", () => {
       ...(when === "after" ? { publication: "committed" } : {}),
     });
     expect(commitContent).toHaveBeenCalledTimes(when === "after" ? 1 : 0);
-    expect(() => getAgentWorkspaceAccess(root, "memoryFiles")).toThrow(
-      WorkspaceAccessUnavailableError,
-    );
+    expectUnavailable("memoryFiles");
   });
 
   it("preserves remote discovery failure causes across the SDK boundary", async () => {
@@ -110,7 +136,7 @@ describe("host-owned workspace access", () => {
         throw cause;
       },
     });
-    const loadSkills = getAgentWorkspaceAccess(root)!.loadSkills!;
+    const loadSkills = workspace().loadSkills!;
     const pending = loadSkills({
       sourcePlan: {
         workspaceDir: root,
@@ -135,25 +161,21 @@ describe("host-owned workspace access", () => {
       ].map(isWorkspaceAccessUnavailableError),
     ).toEqual([true, true, true, false, false]);
     release();
-    expect(() => getAgentWorkspaceAccess(root, "loadSkills")).toThrow(
-      WorkspaceAccessUnavailableError,
-    );
+    expectUnavailable("loadSkills");
   });
 
   it("leaves unconfigured workspaces local and declared workspaces unavailable until start", async () => {
     expect(getAgentWorkspaceAccess(root)).toBeUndefined();
     declareAgentWorkspaceAccess(root);
     for (const capability of [undefined, "memoryFiles", "loadSkills"] as const) {
-      expect(() => getAgentWorkspaceAccess(root, capability)).toThrow(
-        WorkspaceAccessUnavailableError,
-      );
+      expectUnavailable(capability);
     }
     const release = bindWorkspace();
     expect(getAgentWorkspaceAccess(root)).toBeDefined();
     expect(getAgentWorkspaceAccess(root, "memoryFiles")).toBeUndefined();
     expect(getAgentWorkspaceAccess(root, "loadSkills")).toBeUndefined();
     release();
-    expect(() => getAgentWorkspaceAccess(root)).toThrow(WorkspaceAccessUnavailableError);
+    expectUnavailable();
     expect(getAgentWorkspaceAccess(root, "memoryFiles")).toBeUndefined();
     expect(getAgentWorkspaceAccess(root, "loadSkills")).toBeUndefined();
     await expect(prepareAttachments()).resolves.toBeUndefined();
@@ -162,16 +184,16 @@ describe("host-owned workspace access", () => {
   it("rejects duplicate ownership and revokes retained methods without affecting a replacement", async () => {
     const host = provider();
     const release = bindWorkspace(host);
-    const retained = getAgentWorkspaceAccess(root)!;
+    const retained = workspace();
     expect(() => bindWorkspace(host)).toThrow("already registered");
     release();
     await expectStopped(retained.bridge.writeFile({ filePath: "AGENTS.md", data: "late" }));
     expect(host.bridge.writeFile).not.toHaveBeenCalled();
     bindWorkspace();
     release();
-    await expect(
-      getAgentWorkspaceAccess(root)!.bridge.readFile({ filePath: "AGENTS.md" }),
-    ).resolves.toEqual(Buffer.from("remote"));
+    await expect(workspace().bridge.readFile({ filePath: "AGENTS.md" })).resolves.toEqual(
+      Buffer.from("remote"),
+    );
     await expectStopped(retained.bridge.readFile({ filePath: "AGENTS.md" }));
   });
 
@@ -186,7 +208,7 @@ describe("host-owned workspace access", () => {
         return { ok: true, targetDir: "/host/skills/test", mode: "install" };
       },
     });
-    const retained = getAgentWorkspaceAccess(root)!.applySkillRoot!;
+    const retained = workspace().applySkillRoot!;
     const install = retained({
       workspaceDir: root,
       extractedRoot: "/source",
@@ -210,26 +232,23 @@ describe("host-owned workspace access", () => {
 
   it("preserves source-aware reads and revokes retained optional capabilities", async () => {
     const host = provider();
-    host.bridge.readFileWithSource = vi.fn(async () => ({
-      data: Buffer.from("remote"),
-      canonicalPath: "/remote/MEMORY.md",
-    }));
+    const source = { data: Buffer.from("remote"), canonicalPath: "/remote/MEMORY.md" };
+    const read = { filePath: "alias/MEMORY.md", maxBytes: 6 };
+    const create = { filePath: "MEMORY.md", data: "new memory" };
+    host.bridge.readFileWithSource = vi.fn(async () => source);
     host.bridge.readDirectory = vi.fn(async () => [{ name: "MEMORY.md", isDirectory: false }]);
     host.bridge.createFileExclusive = vi.fn(async () => "created" as const);
     const release = bindWorkspace(host);
-    const retained = getAgentWorkspaceAccess(root)!;
-    await expect(
-      retained.bridge.readFileWithSource!({ filePath: "alias/MEMORY.md", maxBytes: 6 }),
-    ).resolves.toEqual({ data: Buffer.from("remote"), canonicalPath: "/remote/MEMORY.md" });
-    await expect(
-      retained.bridge.createFileExclusive!({ filePath: "MEMORY.md", data: "new memory" }),
-    ).resolves.toBe("created");
+    const bridge = workspace().bridge;
+    await expect(bridge.readFileWithSource!(read)).resolves.toEqual({
+      data: Buffer.from("remote"),
+      canonicalPath: "/remote/MEMORY.md",
+    });
+    await expect(bridge.createFileExclusive!(create)).resolves.toBe("created");
     release();
-    await expectStopped(retained.bridge.readFileWithSource!({ filePath: "alias/MEMORY.md" }));
-    await expectStopped(retained.bridge.readDirectory!({ filePath: "." }));
-    await expectStopped(
-      retained.bridge.createFileExclusive!({ filePath: "MEMORY.md", data: "late memory" }),
-    );
+    await expectStopped(bridge.readFileWithSource!(read));
+    await expectStopped(bridge.readDirectory!({ filePath: "." }));
+    await expectStopped(bridge.createFileExclusive!({ ...create, data: "late memory" }));
     expect(host.bridge.readFileWithSource).toHaveBeenCalledTimes(1);
     expect(host.bridge.readDirectory).not.toHaveBeenCalled();
     expect(host.bridge.createFileExclusive).toHaveBeenCalledTimes(1);
@@ -250,7 +269,7 @@ describe("host-owned workspace access", () => {
       });
     }
     const release = bindWorkspace(host);
-    const bridge = getAgentWorkspaceAccess(root)!.bridge;
+    const bridge = workspace().bridge;
     const result =
       operation === "exclusive creation"
         ? bridge.createFileExclusive!({ filePath: "MEMORY.md", data: "new memory" })
@@ -326,23 +345,12 @@ describe("workspace attachment preparation", () => {
   });
 
   it.each(["binding", "caller", "abort"])("fences local %s changes", async (change) => {
-    const controller = new AbortController();
-    let active = true;
-    const pending = prepareAttachments({
-      localExecution,
-      turn: { ...turn, abortSignal: controller.signal },
-      assertCurrent: () => {
-        if (!active) {
-          throw new Error("caller closed");
-        }
-      },
-    });
+    const caller = callerLifetime();
+    const pending = prepareAttachments({ localExecution, ...caller });
     if (change === "binding") {
       bindWorkspace();
-    } else if (change === "caller") {
-      active = false;
     } else {
-      controller.abort(new Error("attachment cancelled"));
+      caller.close(change, "attachment cancelled");
     }
     await expect(pending).rejects.toThrow(
       change === "caller"
@@ -402,7 +410,7 @@ describe("workspace attachment preparation", () => {
 
     await expect(
       prepareAttachments({
-        turn: { ...turn, userTurnTranscriptRecorder: recorder },
+        turn: { ...turn, ...deferredTurn(recorder) },
         requirePreparation,
       }),
     ).resolves.toBe(
@@ -419,14 +427,10 @@ describe("workspace attachment preparation", () => {
     }
     await expect(
       prepareAttachments({
-        turn: {
-          timeoutMs: turn.timeoutMs,
-          ...(input === "deferred"
-            ? {
-                userTurnTranscriptRecorder: createDeferredRecorder({ text: "Text-only request" }),
-              }
-            : {}),
-        },
+        turn:
+          input === "deferred"
+            ? deferredTurn(createDeferredRecorder({ text: "Text-only request" }))
+            : { timeoutMs: turn.timeoutMs },
         requirePreparation: input === "deferred",
       }),
     ).resolves.toBeUndefined();
@@ -439,17 +443,14 @@ describe("workspace attachment preparation", () => {
     const recorder = createDeferredRecorder({ text: "Read the attachment", media: turn.media });
     await expect(
       prepareAttachments({
-        turn: {
-          timeoutMs: turn.timeoutMs,
-          userTurnTranscriptRecorder: {
-            ...recorder,
-            async resolveMessage() {
-              release();
-              bindWorkspace(host);
-              return await recorder.resolveMessage();
-            },
+        turn: deferredTurn({
+          ...recorder,
+          async resolveMessage() {
+            release();
+            bindWorkspace(host);
+            return await recorder.resolveMessage();
           },
-        },
+        }),
         requirePreparation: true,
       }),
     ).rejects.toThrow("Workspace access changed during attachment preparation");
@@ -469,8 +470,7 @@ describe("workspace attachment preparation", () => {
     { closure: "caller", when: "during", error: "caller closed" },
     { closure: "abort", when: "during", error: "aborted attachment" },
   ])("fences $closure closure $when attachment dispatch", async ({ closure, when, error }) => {
-    const controller = new AbortController();
-    let active = true;
+    const caller = callerLifetime();
     let assertUploadCurrent!: () => void;
     const host = provider();
     host.prepareTurnAttachments = vi.fn<
@@ -479,30 +479,19 @@ describe("workspace attachment preparation", () => {
       assertUploadCurrent = assertCurrent;
       if (closure === "binding") {
         release();
-      } else if (closure === "caller") {
-        active = false;
       } else {
-        controller.abort(new Error(error));
+        caller.close(closure, error);
       }
       expect(assertCurrent).toThrow(error);
       return "obsolete note";
     });
     const release = bindWorkspace(host);
-    const retained = getAgentWorkspaceAccess(root)!.prepareTurnAttachments!;
+    const retained = workspace().prepareTurnAttachments!;
     if (when === "before") {
       release();
     }
     const preparation =
-      closure === "binding"
-        ? retained(turn, () => {})
-        : prepareAttachments({
-            turn: { ...turn, abortSignal: controller.signal },
-            assertCurrent: () => {
-              if (!active) {
-                throw new Error("caller closed");
-              }
-            },
-          });
+      closure === "binding" ? retained(turn, () => {}) : prepareAttachments(caller);
     await expect(preparation).rejects.toThrow(error);
     expect(host.prepareTurnAttachments).toHaveBeenCalledTimes(when === "before" ? 0 : 1);
     if (when === "during") {

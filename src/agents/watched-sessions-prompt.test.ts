@@ -1,10 +1,10 @@
 import fs from "node:fs";
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as configSnapshot from "../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
 import * as sessionReader from "../config/sessions/session-entry-read-runtime.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { buildWatchedSessionsHarnessContext } from "../plugin-sdk/agent-harness-runtime.js";
+import { buildWatchedSessionsHarnessContext as harnessContext } from "../plugin-sdk/agent-harness-runtime.js";
 import * as sessionState from "../sessions/session-state-events.js";
 import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.paths.js";
 import * as stateRead from "../state/openclaw-state-db-readonly.js";
@@ -63,162 +63,156 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-describe("prepareWatchedSessionsPrompt", () => {
-  beforeEach(() => {
-    stubStateDir();
-    configSnapshot.setRuntimeConfigSnapshot({});
-  });
+beforeEach(() => {
+  stubStateDir();
+  configSnapshot.setRuntimeConfigSnapshot({});
+});
 
-  it("returns key-sorted watched sessions with store-derived titles", async () => {
-    await watchGroup(groupKey(), "Family group");
-    await watchGroup(groupKey("alpha:topic:7"));
-    expect(await preparePrompt()).toEqual({
-      sessions: [{ key: groupKey("alpha:topic:7") }, { key: groupKey(), title: "Family group" }],
-      hiddenCount: 0,
-      readToolNames: ["sessions_history", "sessions_search"],
-      listToolAvailable: true,
-    });
+it("returns key-sorted watched sessions with store-derived titles", async () => {
+  await watchGroup(groupKey(), "Family group");
+  await watchGroup(groupKey("alpha:topic:7"));
+  expect(await preparePrompt()).toEqual({
+    sessions: [{ key: groupKey("alpha:topic:7") }, { key: groupKey(), title: "Family group" }],
+    hiddenCount: 0,
+    readToolNames: ["sessions_history", "sessions_search"],
+    listToolAvailable: true,
   });
+});
 
-  it("caps rendered rows and reports the overflow count", async () => {
-    for (let index = 0; index < 23; index += 1) {
-      await watchGroup(
-        groupKey(`room-${String(index).padStart(2, "0")}`),
-        index === 0 ? "A".repeat(79) + "🦞tail" : undefined,
+it("caps rendered rows and reports the overflow count", async () => {
+  for (let index = 0; index < 23; index += 1) {
+    await watchGroup(
+      groupKey(`room-${String(index).padStart(2, "0")}`),
+      index === 0 ? "A".repeat(79) + "🦞tail" : undefined,
+    );
+  }
+
+  const input = { ...promptInput, toolNames: ["sessions_history"] };
+  const sql = observeMainThreadSql();
+  let prepared;
+  try {
+    // The sync golden also proves the SQL instrumentation observes caller-thread reads.
+    const original = prepareSync(input);
+    expect(sql.count()).toBeGreaterThan(0);
+    sql.clear();
+    prepared = await preparePrompt(input);
+    sql.expectIdle();
+    expect(renderPrompt(prepared)).toEqual(renderPrompt(original));
+  } finally {
+    sql.restore();
+  }
+
+  expect(prepared?.sessions).toHaveLength(20);
+  expect(prepared?.sessions[0]).toEqual({ title: "A".repeat(79), key: groupKey("room-00") });
+  expect(prepared).toMatchObject({
+    hiddenCount: 3,
+    readToolNames: ["sessions_history"],
+    listToolAvailable: false,
+  });
+});
+
+it("keeps sandboxed watches only when non-spawned reads are allowed", async () => {
+  await watchGroup();
+  expect(await preparePrompt({ sandboxed: true, config: {} })).toBe(undefined);
+  const prepared = await preparePrompt({
+    sandboxed: true,
+    config: sandboxConfig({ sessionToolsVisibility: "all" }),
+  });
+  expect(prepared?.sessions).toHaveLength(1);
+});
+
+it.each([
+  { enabled: false },
+  { sessionKey: undefined },
+  { sessionKey: "agent:main:subagent:worker" },
+  { sessionKey: groupKey() },
+  { toolNames: ["sessions_list"] },
+  { sessionKey: "agent:other:main" },
+])("omits inaccessible or unwatched sessions: %j", async (input) => {
+  await watchGroup();
+  expect(await preparePrompt(input)).toBeUndefined();
+});
+
+it.each(["authority", "watch", "watch-final", "sandbox", "sandbox-cleanup", "store"] as const)(
+  "revalidates %s while worker facts are loading",
+  async (change) => {
+    await watchGroup();
+    const sandbox: { sessionToolsVisibility: "all" | "spawned" } = {
+      sessionToolsVisibility: "all",
+    };
+    let active = true;
+    const withReader = sessionReader.withSessionStoreReaderInWorker;
+    if (change === "sandbox-cleanup") {
+      vi.spyOn(sessionReader, "withSessionStoreReaderInWorker").mockImplementation(
+        async (...args) => {
+          const result = await withReader(...args);
+          sandbox.sessionToolsVisibility = "spawned";
+          return result;
+        },
       );
     }
-
-    const input = { ...promptInput, toolNames: ["sessions_history"] };
-    const sql = observeMainThreadSql();
-    let prepared;
-    try {
-      // The sync golden also proves the SQL instrumentation observes caller-thread reads.
-      const original = prepareSync(input);
-      expect(sql.count()).toBeGreaterThan(0);
-      sql.clear();
-      prepared = await preparePrompt(input);
-      sql.expectIdle();
-      expect(renderPrompt(prepared)).toEqual(renderPrompt(original));
-    } finally {
-      sql.restore();
-    }
-
-    expect(prepared?.sessions).toHaveLength(20);
-    expect(prepared?.sessions[0]).toEqual({ title: "A".repeat(79), key: groupKey("room-00") });
-    expect(prepared).toMatchObject({
-      hiddenCount: 3,
-      readToolNames: ["sessions_history"],
-      listToolAvailable: false,
-    });
-  });
-
-  it("keeps the section for sandboxed sessions only when the clamp allows non-spawned reads", async () => {
-    await watchGroup();
-    expect(await preparePrompt({ sandboxed: true, config: {} })).toBe(undefined);
-    const prepared = await preparePrompt({
-      sandboxed: true,
-      config: sandboxConfig({ sessionToolsVisibility: "all" }),
-    });
-    expect(prepared?.sessions).toHaveLength(1);
-  });
-
-  it.each([
-    { enabled: false },
-    { sessionKey: undefined },
-    { sessionKey: "agent:main:subagent:worker" },
-    { sessionKey: groupKey() },
-    { toolNames: ["sessions_list"] },
-    { sessionKey: "agent:other:main" },
-  ])("omits inaccessible or unwatched sessions: %j", async (input) => {
-    await watchGroup();
-    expect(await preparePrompt(input)).toBeUndefined();
-  });
-
-  it.each(["authority", "watch", "watch-final", "sandbox", "sandbox-cleanup", "store"] as const)(
-    "revalidates %s while worker facts are loading",
-    async (change) => {
-      await watchGroup();
-      const sandbox: { sessionToolsVisibility: "all" | "spawned" } = {
-        sessionToolsVisibility: "all",
-      };
-      let active = true;
-      const withReader = sessionReader.withSessionStoreReaderInWorker;
-      if (change === "sandbox-cleanup") {
-        vi.spyOn(sessionReader, "withSessionStoreReaderInWorker").mockImplementation(
-          async (...args) => {
-            const result = await withReader(...args);
-            sandbox.sessionToolsVisibility = "spawned";
-            return result;
-          },
-        );
+    afterAmbientRead(async (reads) => {
+      if (change === "watch" || (change === "watch-final" && reads === 2)) {
+        await sessionState.handleSessionStateSessionReset(mainSessionKey);
       }
-      afterAmbientRead(async (reads) => {
-        if (change === "watch" || (change === "watch-final" && reads === 2)) {
-          await sessionState.handleSessionStateSessionReset(mainSessionKey);
-        }
-        if (change === "authority") {
-          active = false;
-        }
-        if (change === "sandbox") {
-          sandbox.sessionToolsVisibility = "spawned";
-        }
-        // Ambient process selection must not retarget captured readers.
-        if (change === "store") {
-          stubStateDir();
-        }
-      });
-      const pending = prepareAsync({
-        ...promptInput,
-        config: sandboxConfig(sandbox),
-        sandboxed: true,
-        assertCurrent: () => {
-          if (!active) {
-            throw new Error("caller revoked");
-          }
-        },
-      });
       if (change === "authority") {
-        await expect(pending).rejects.toThrow("caller revoked");
-      } else if (change === "store") {
-        expect((await pending)?.sessions).toEqual([{ key: groupKey() }]);
-      } else {
-        await expect(pending).resolves.toBeUndefined();
+        active = false;
       }
-    },
-  );
-
-  it("rejects replacing the title database at its captured path during a worker read", async () => {
-    await watchGroup(groupKey(), "Original");
-    const storePath = resolveOpenClawAgentSqlitePath({ agentId: "main" });
-    const originalPath = `${storePath}.original`;
-    let replaced = false;
-    afterAmbientRead(() => {
-      if (!replaced) {
-        fs.renameSync(storePath, originalPath);
-        fs.writeFileSync(storePath, "replacement must never be opened");
-        replaced = true;
+      if (change === "sandbox") {
+        sandbox.sessionToolsVisibility = "spawned";
+      }
+      // Ambient process selection must not retarget captured readers.
+      if (change === "store") {
+        stubStateDir();
       }
     });
-    try {
-      await expect(preparePrompt()).rejects.toThrow("Watched-session title store changed");
-    } finally {
-      if (replaced) {
-        fs.unlinkSync(storePath);
-        fs.renameSync(originalPath, storePath);
-      }
+    const pending = prepareAsync({
+      ...promptInput,
+      config: sandboxConfig(sandbox),
+      sandboxed: true,
+      assertCurrent: () => {
+        if (!active) {
+          throw new Error("caller revoked");
+        }
+      },
+    });
+    if (change === "authority") {
+      await expect(pending).rejects.toThrow("caller revoked");
+    } else if (change === "store") {
+      expect((await pending)?.sessions).toEqual([{ key: groupKey() }]);
+    } else {
+      await expect(pending).resolves.toBeUndefined();
+    }
+  },
+);
+
+it("rejects title database replacement during a worker read", async () => {
+  await watchGroup(groupKey(), "Original");
+  const storePath = resolveOpenClawAgentSqlitePath({ agentId: "main" });
+  const originalPath = `${storePath}.original`;
+  let replaced = false;
+  afterAmbientRead(() => {
+    if (!replaced) {
+      fs.renameSync(storePath, originalPath);
+      fs.writeFileSync(storePath, "replacement must never be opened");
+      replaced = true;
     }
   });
+  try {
+    await expect(preparePrompt()).rejects.toThrow("Watched-session title store changed");
+  } finally {
+    if (replaced) {
+      fs.unlinkSync(storePath);
+      fs.renameSync(originalPath, storePath);
+    }
+  }
+});
 
-  it("renders the harness context block plugin-owned runtimes inject per turn", async () => {
-    await watchGroup();
+it("renders the per-turn harness context block", async () => {
+  await watchGroup();
 
-    expect(
-      buildWatchedSessionsHarnessContext({ ...promptInput, toolNames: ["sessions_history"] }),
-    ).toBe(
-      `## Watched Sessions\nGroup/topic sessions this session ambiently watches. Readable now (read-only) via sessions_history.\n- ${groupKey()}`,
-    );
-    expect(buildWatchedSessionsHarnessContext({ sessionKey: mainSessionKey, toolNames: [] })).toBe(
-      undefined,
-    );
-  });
+  expect(harnessContext({ ...promptInput, toolNames: ["sessions_history"] })).toBe(
+    `## Watched Sessions\nGroup/topic sessions this session ambiently watches. Readable now (read-only) via sessions_history.\n- ${groupKey()}`,
+  );
+  expect(harnessContext({ sessionKey: mainSessionKey, toolNames: [] })).toBeUndefined();
 });

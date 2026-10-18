@@ -14,6 +14,13 @@ import { closePreparedModelRuntimeSnapshots } from "./prepared-model-runtime.lif
 import { discardPreparedPluginGeneration } from "./prepared-model-runtime.plugin-lifetime.js";
 import { prepareAgentCatalogSource } from "./prepared-model-runtime.scoped-catalog.js";
 
+type ModelCase = [
+  id: string,
+  expected: number,
+  config?: Partial<ModelDefinitionConfig>,
+  response?: Record<string, unknown>,
+];
+
 function model(id: string, overrides: Partial<ModelDefinitionConfig> = {}): ModelDefinitionConfig {
   return {
     id,
@@ -37,6 +44,7 @@ it("keeps observed serving limits through authored overrides and catalog refresh
   });
   const requests: string[] = [];
   let served: number | undefined = 49_152;
+  let cases: ModelCase[] = [];
   const server = await reserveTestPortListener({
     offsets: [0],
     createListener: () =>
@@ -47,39 +55,36 @@ it("keeps observed serving limits through authored overrides and catalog refresh
           return;
         }
         response.setHeader("content-type", "application/json");
-        response.end(
-          JSON.stringify({
-            data: [
-              ...["implicit", "upper", "lower", "prompt-cap", "other-route", "other-api"].map(
-                (id) => ({ id, max_model_len: served }),
-              ),
-              { id: "missing", meta: { n_ctx_train: 8_192 } },
-              { id: "invalid", max_model_len: "4096" },
-              { id: "zero", max_model_len: 0 },
-              { id: "fractional", max_model_len: 0.5 },
-            ],
-          }),
-        );
+        const data = cases.map((entry) => ({
+          id: entry[0],
+          ...(entry[3] ?? { max_model_len: served }),
+        }));
+        response.end(JSON.stringify({ data }));
       }),
   });
   // Discovery's production-only default is real; do not mock the provider or fetch guard.
   vi.stubEnv("VITEST", "");
   vi.stubEnv("NODE_ENV", "production");
   const baseUrl = "http://127.0.0.1:" + server.claim.port + "/v1";
+  cases = [
+    ["implicit", 49_152],
+    ["upper", 49_152],
+    ["lower", 32_768, { contextWindow: 32_768 }],
+    ["prompt-cap", 32_768, { contextTokens: 32_768 }],
+    ["other-route", 131_072, { baseUrl: baseUrl + "/other" }],
+    ["other-api", 131_072, { api: "openai-responses" }],
+    ["missing", 131_072, undefined, { meta: { n_ctx_train: 8_192 } }],
+    ["invalid", 131_072, undefined, { max_model_len: "4096" }],
+    ["zero", 131_072, undefined, { max_model_len: 0 }],
+    ["fractional", 131_072, undefined, { max_model_len: 0.5 }],
+  ];
   let cleanupPrepared: (() => Promise<void>) | undefined;
   try {
     const vllm = {
       api: "openai-completions" as const,
       apiKey: "vllm-local",
       baseUrl,
-      models: [
-        model("upper"),
-        model("lower", { contextWindow: 32_768 }),
-        model("prompt-cap", { contextTokens: 32_768 }),
-        model("other-route", { baseUrl: baseUrl + "/other" }),
-        model("other-api", { api: "openai-responses" }),
-        ...["missing", "invalid", "zero", "fractional"].map((id) => model(id)),
-      ],
+      models: cases.filter(([id]) => id !== "implicit").map(([id, , config]) => model(id, config)),
     };
     const config: OpenClawConfig = {
       plugins: { allow: ["vllm"], entries: { vllm: { enabled: true } }, slots: { memory: "none" } },
@@ -150,18 +155,7 @@ it("keeps observed serving limits through authored overrides and catalog refresh
       expect(budget(catalog, id, cfg).contextTokenBudget, id).toBe(tokens);
     const catalog = await acquire();
     expect(requests).toEqual(["/v1/models"]);
-    for (const [id, expected] of [
-      ["implicit", 49_152],
-      ["upper", 49_152],
-      ["lower", 32_768],
-      ["prompt-cap", 32_768],
-      ["other-route", 131_072],
-      ["other-api", 131_072],
-      ["missing", 131_072],
-      ["invalid", 131_072],
-      ["zero", 131_072],
-      ["fractional", 131_072],
-    ] as const) {
+    for (const [id, expected] of cases) {
       expectBudget(catalog, id, expected);
     }
     expect(budget(catalog, "upper").effectiveModel.contextWindow).toBe(49_152);

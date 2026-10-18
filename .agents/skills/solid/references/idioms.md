@@ -72,6 +72,7 @@ Start from the narrowest primitive that expresses the data's owner and lifetime:
 | A keyed collection derived from async or owner data                              | `createProjection(fn, initial, { key: "id" })`                                      |
 | An expected value shown before a mutation settles                                | `createOptimistic`/`createOptimisticStore` inside `action`                          |
 | Count-only repetition                                                            | `<Repeat count={n}>`                                                                |
+| Browser document title                                                           | `createDocumentTitle(title)` from `lib/reactive/document-title.ts`                  |
 
 `createMemo(fn, { lazy: true })` defers the first computation until something
 reads it and disposes it when nothing observes it; `createSignal(v, { unobserved })`

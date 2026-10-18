@@ -75,7 +75,8 @@ const gatewayQuestionMock = vi.hoisted(() => ({
 
 vi.mock("openclaw/plugin-sdk/agent-harness-runtime", async (importOriginal) => {
   const actual = await importOriginal<typeof import("openclaw/plugin-sdk/agent-harness-runtime")>();
-  const { copilotAttemptOverrides } = await import("./attempt-selectors.test-support.js");
+  const { copilotAttemptOverrides: overrides } =
+    await import("./attempt-selectors.test-support.js");
   type QuestionDispatcher = Exclude<
     Parameters<typeof actual.runAgentHarnessGatewayQuestion>[0]["gatewayCall"],
     AgentHarnessQuestionGatewayCall | undefined
@@ -126,11 +127,9 @@ vi.mock("openclaw/plugin-sdk/agent-harness-runtime", async (importOriginal) => {
   return {
     ...actual,
     resolveSandboxContext: (...args: Parameters<typeof actual.resolveSandboxContext>) =>
-      (copilotAttemptOverrides.resolveSandboxContext ?? actual.resolveSandboxContext)(...args),
+      (overrides.resolveSandboxContext ?? actual.resolveSandboxContext)(...args),
     isHostScopedAgentToolActive: (...args: Parameters<typeof actual.isHostScopedAgentToolActive>) =>
-      (copilotAttemptOverrides.isHostScopedAgentToolActive ?? actual.isHostScopedAgentToolActive)(
-        ...args,
-      ),
+      (overrides.isHostScopedAgentToolActive ?? actual.isHostScopedAgentToolActive)(...args),
     embeddedAgentLog: { ...actual.embeddedAgentLog, warn: gatewayQuestionMock.warn },
     cancelPendingAgentQuestionForSession: async (
       ...args: Parameters<typeof actual.cancelPendingAgentQuestionForSession>
@@ -1074,16 +1073,15 @@ describe("runCopilotAttempt", () => {
       if (stage === "mid-stream") {
         copilotAttemptOverrides.createToolBridge = async () => createStubToolBridge();
       }
-      const deps: Partial<CopilotAttemptDeps> = {
-        ...(stage === "session establishment"
+      const deps: Partial<CopilotAttemptDeps> =
+        stage === "session establishment"
           ? {
               onSessionEstablished: async () => {
                 await waitForEventLoopTurn();
                 controller.abort();
               },
             }
-          : {}),
-      };
+          : {};
       const attempt =
         stage === "before start"
           ? runInHarnessToolAuthorityForTest(makeParams(params), "copilot", (admitted) => {

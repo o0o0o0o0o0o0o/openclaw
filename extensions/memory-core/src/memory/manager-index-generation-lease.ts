@@ -116,6 +116,6 @@ export async function withMemoryIndexGeneration<T>(
   try {
     return await run();
   } finally {
-    await release();
+    release();
   }
 }

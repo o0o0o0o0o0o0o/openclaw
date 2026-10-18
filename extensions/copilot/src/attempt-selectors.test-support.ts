@@ -6,14 +6,16 @@ type AttemptSelectorOverrides = {
   isHostScopedAgentToolActive?: typeof import("openclaw/plugin-sdk/agent-harness-runtime").isHostScopedAgentToolActive;
 };
 
-export const copilotAttemptOverrides = vi.hoisted((): AttemptSelectorOverrides => ({}));
+const overrides = vi.hoisted((): AttemptSelectorOverrides => ({}));
+
+export const copilotAttemptOverrides = overrides;
 
 vi.mock("./tool-bridge.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./tool-bridge.js")>();
   return {
     ...actual,
     createCopilotToolBridge: (...args: Parameters<typeof actual.createCopilotToolBridge>) =>
-      (copilotAttemptOverrides.createToolBridge ?? actual.createCopilotToolBridge)(...args),
+      (overrides.createToolBridge ?? actual.createCopilotToolBridge)(...args),
   };
 });
 

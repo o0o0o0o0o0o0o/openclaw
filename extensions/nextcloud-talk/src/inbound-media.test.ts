@@ -325,7 +325,7 @@ describe("Nextcloud Talk inbound media policy", () => {
   ])(
     "preserves authenticated native voice intent declared as $declaredMimeType",
     async ({ declaredMimeType, expectedOverride }) => {
-      const fetchGuarded = mocks.fetchGuarded
+      mocks.fetchGuarded
         .mockReset()
         .mockResolvedValueOnce({
           response: new Response(JSON.stringify({ ocs: { data: { id: "alice" } } }), {

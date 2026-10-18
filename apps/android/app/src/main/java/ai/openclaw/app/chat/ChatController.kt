@@ -562,6 +562,7 @@ class ChatController internal constructor(
   val progressCard: StateFlow<ChatProgressCard?> = _progressCard.asStateFlow()
 
   @Volatile private var progressCardScopeKey: String? = null
+
   @Volatile private var progressCardNeedsRetry = false
 
   private val _sessions = MutableStateFlow<List<ChatSessionEntry>>(emptyList())
@@ -891,6 +892,7 @@ class ChatController internal constructor(
     synchronized(gatewayScopeApplyLock) {
       historyLoadGeneration.incrementAndGet()
       restoreRunStateOnReconnect = true
+      progressCardNeedsRetry = true
       pendingHealthRefresh = null
       _healthOk.value = false
       _defaultModelRef.value = null

@@ -13,7 +13,7 @@ import * as workerMessages from "../infra/worker-message-metrics.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
   emitDiagnosticMemorySample,
-  emitDiagnosticMemorySampleWithProcessFootprint,
+  createDiagnosticMemorySampler,
   resetDiagnosticMemoryForTest,
 } from "./diagnostic-memory.js";
 import {
@@ -95,8 +95,10 @@ describe("diagnostic memory", () => {
       .mockResolvedValue("Name:\topenclaw\nVmRSS:\t9000 kB\nRssAnon:\t1234 kB\nVmSwap:\t0 kB\n");
     const events: DiagnosticEventPayload[] = [];
     const stop = onDiagnosticEvent((event) => events.push(event));
+    const sampleMemory = createDiagnosticMemorySampler(() => true);
     try {
-      await emitDiagnosticMemorySampleWithProcessFootprint(true, () => true);
+      sampleMemory(true);
+      await flushDiagnosticEvents();
       expect(events[0]).toMatchObject({
         type: "diagnostic.memory.sample",
         memory: { anonymousRssBytes: 1_263_616, anonymousSwapBytes: 0 },
@@ -109,7 +111,8 @@ describe("diagnostic memory", () => {
           readFile.mockResolvedValueOnce(result);
         }
         events.length = 0;
-        await emitDiagnosticMemorySampleWithProcessFootprint(true, () => true);
+        sampleMemory(true);
+        await flushDiagnosticEvents();
         const sample = events.find((event) => event.type === "diagnostic.memory.sample");
         expect(sample).toBeDefined();
         expect(sample?.memory).not.toHaveProperty("anonymousRssBytes");
@@ -124,20 +127,21 @@ describe("diagnostic memory", () => {
     const events: DiagnosticEventPayload[] = [];
     const stop = onDiagnosticEvent((event) => events.push(event));
     const readFile = vi.spyOn(fs, "readFile").mockResolvedValue("RssAnon:\t1234 kB\n");
+    let current = true;
+    const sampleMemory = createDiagnosticMemorySampler(() => current);
     try {
       vi.stubGlobal("process", Object.create(process, { platform: { value: "darwin" } }));
-      await emitDiagnosticMemorySampleWithProcessFootprint(true, () => true);
+      sampleMemory(true);
       expect(readFile).not.toHaveBeenCalled();
       expect(events[0]).toMatchObject({ type: "diagnostic.memory.sample" });
 
       vi.stubGlobal("process", Object.create(process, { platform: { value: "linux" } }));
       events.length = 0;
-      await emitDiagnosticMemorySampleWithProcessFootprint(false, () => true);
+      sampleMemory(false);
       expect(readFile).not.toHaveBeenCalled();
-      let current = true;
-      const pending = emitDiagnosticMemorySampleWithProcessFootprint(true, () => current);
+      sampleMemory(true);
       current = false;
-      await pending;
+      await flushDiagnosticEvents();
       expect(events).toEqual([]);
     } finally {
       stop();

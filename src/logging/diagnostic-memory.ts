@@ -40,36 +40,61 @@ const lastPressureAtByKey = new Map<string, number>();
 
 type ProcessFootprint = Pick<DiagnosticMemoryUsage, "anonymousRssBytes" | "anonymousSwapBytes">;
 
-/** The heartbeat owns this asynchronous OS sample; unavailable counters stay absent. */
-export async function emitDiagnosticMemorySampleWithProcessFootprint(
-  emitSample: boolean,
-  isCurrent: () => boolean,
-  emitMemorySample?: EmitDiagnosticMemorySample,
-): Promise<void> {
-  if (emitMemorySample) {
-    emitMemorySample({ emitSample });
-    return;
-  }
+async function readProcessFootprint(): Promise<ProcessFootprint> {
   const processFootprint: ProcessFootprint = {};
-  if (emitSample && process.platform === "linux") {
-    try {
-      const status = await fs.readFile("/proc/self/status", "utf8");
-      for (const [counter, field] of [
-        ["RssAnon", "anonymousRssBytes"],
-        ["VmSwap", "anonymousSwapBytes"],
-      ] as const) {
-        const value = status.match(new RegExp(`^${counter}:\\s+(\\d+)\\s+kB$`, "m"))?.[1];
-        if (value !== undefined) {
-          processFootprint[field] = Number(value) * 1024;
-        }
+  try {
+    const status = await fs.readFile("/proc/self/status", "utf8");
+    for (const [counter, field] of [
+      ["RssAnon", "anonymousRssBytes"],
+      ["VmSwap", "anonymousSwapBytes"],
+    ] as const) {
+      const value = status.match(new RegExp(`^${counter}:\\s+(\\d+)\\s+kB$`, "m"))?.[1];
+      if (value !== undefined) {
+        processFootprint[field] = Number(value) * 1024;
       }
-    } catch {
-      // Other platforms and restricted proc mounts provide no anonymous-page counters.
     }
+  } catch {
+    // Restricted proc mounts may provide no anonymous-page counters.
   }
-  if (isCurrent()) {
-    emitDiagnosticMemorySample({ emitSample, processFootprint });
-  }
+  return processFootprint;
+}
+
+/** One pending OS read must never hold the heartbeat's liveness or pressure checks. */
+export function createDiagnosticMemorySampler(isCurrent: () => boolean) {
+  let pending = false;
+  return (
+    emitSample: boolean,
+    options?: { emitMemorySample?: EmitDiagnosticMemorySample },
+  ): void => {
+    if (options?.emitMemorySample) {
+      options.emitMemorySample({ emitSample });
+      return;
+    }
+    const linuxSample = emitSample && process.platform === "linux";
+    const memory = emitDiagnosticMemorySample({ emitSample: emitSample && !linuxSample });
+    if (!linuxSample || pending) {
+      return;
+    }
+    pending = true;
+    const uptimeMs = Math.round(process.uptime() * 1000);
+    void readProcessFootprint().then((processFootprint) => {
+      pending = false;
+      if (isCurrent()) {
+        publishMemorySample({ ...memory, ...processFootprint }, uptimeMs);
+      }
+    });
+  };
+}
+
+function publishMemorySample(memory: DiagnosticMemoryUsage, uptimeMs: number): void {
+  emitDiagnosticEvent({
+    type: "diagnostic.memory.sample",
+    memory: {
+      ...memory,
+      heapSpaces: DEFAULT_IS_BUN_RUNTIME ? undefined : getHeapSpaceStatistics(),
+    },
+    uptimeMs,
+  });
 }
 
 function isPositiveMemoryLimit(value: number | undefined): value is number {
@@ -265,7 +290,6 @@ export function emitDiagnosticMemorySample(
     uptimeMs?: number;
     thresholds?: DiagnosticMemoryThresholds;
     emitSample?: boolean;
-    processFootprint?: ProcessFootprint;
   },
   collectDiagnostics = true,
 ): DiagnosticMemoryUsage {
@@ -274,7 +298,6 @@ export function emitDiagnosticMemorySample(
     options?.memoryUsage ?? process.memoryUsage(),
     collectDiagnostics,
   );
-  Object.assign(memory, options?.processFootprint);
   const isBun = options?.isBunRuntime ?? DEFAULT_IS_BUN_RUNTIME;
   const heapLimitBytes = isBun
     ? undefined
@@ -288,14 +311,7 @@ export function emitDiagnosticMemorySample(
   const shouldEmitSample = collectDiagnostics && options?.emitSample !== false;
 
   if (shouldEmitSample) {
-    emitDiagnosticEvent({
-      type: "diagnostic.memory.sample",
-      memory: {
-        ...memory,
-        heapSpaces: DEFAULT_IS_BUN_RUNTIME ? undefined : getHeapSpaceStatistics(),
-      },
-      uptimeMs: options?.uptimeMs ?? Math.round(process.uptime() * 1000),
-    });
+    publishMemorySample(memory, options?.uptimeMs ?? Math.round(process.uptime() * 1000));
   }
 
   const pressure = pickPressure(memory, heapLimitBytes, rssLimitBytes, options?.thresholds);

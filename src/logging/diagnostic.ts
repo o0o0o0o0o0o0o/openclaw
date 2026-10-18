@@ -24,7 +24,7 @@ import {
 } from "./diagnostic-liveness.js";
 import {
   emitDiagnosticMemorySample,
-  emitDiagnosticMemorySampleWithProcessFootprint,
+  createDiagnosticMemorySampler,
   type EmitDiagnosticMemorySample,
 } from "./diagnostic-memory.js";
 import { emitMessageProcessedDiagnosticEvent } from "./diagnostic-message-content.js";
@@ -816,14 +816,17 @@ export function startGatewayDiagnosticHeartbeat(
     reconcileObservations();
   };
   reconcileObservations();
-  const tick = (): Promise<void> | undefined => {
+  const sampleMemory = createDiagnosticMemorySampler(
+    () => !scheduler.signal.aborted && heartbeatJob === job && observing,
+  );
+  const tick = () => {
     if (scheduler.signal.aborted || heartbeatJob !== job) {
-      return undefined;
+      return;
     }
     if (!reconcileObservations()) {
       // Critical pressure still retires idle Workers without diagnostic collection or callbacks.
       emitDiagnosticMemorySample(undefined, false);
-      return undefined;
+      return;
     }
     emitChildProcessSpawnSample();
     let heartbeatConfig = config;
@@ -867,14 +870,10 @@ export function startGatewayDiagnosticHeartbeat(
     const shouldEmitLivenessReport = shouldEmitLivenessEvent || shouldEmitLivenessWarning;
     const shouldRecordMemorySample =
       shouldEmitLivenessReport || hasRecentDiagnosticActivity(now) || hasOpenDiagnosticWork(work);
-    const memorySample = emitDiagnosticMemorySampleWithProcessFootprint(
-      shouldRecordMemorySample,
-      () => !scheduler.signal.aborted && heartbeatJob === job && observing,
-      opts?.emitMemorySample,
-    );
+    sampleMemory(shouldRecordMemorySample, opts);
 
     if (!shouldRecordMemorySample) {
-      return memorySample;
+      return;
     }
 
     if (shouldEmitLivenessReport && livenessSample) {
@@ -971,7 +970,6 @@ export function startGatewayDiagnosticHeartbeat(
         });
       }
     }
-    return memorySample;
   };
   const job = scheduler.schedule({
     id: "diagnostic-heartbeat",

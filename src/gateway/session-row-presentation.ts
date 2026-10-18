@@ -583,8 +583,10 @@ export function prepareProjectedSessionPresentation(
       // Current authorization and temporal presentation precede reuse. The retained vector
       // owns bytes only; it never retains a connection or grants permission to a later read.
       const view = listView(opts);
+      const conditional = opts.rowMode === "sidebar" || opts.ifRowsRevision !== undefined;
       const previous = view.rows;
       if (previous?.length === rows.length && rows.every((row, index) => row === previous[index])) {
+        view.conditional ||= conditional;
         return { sessions: previous, rowHistory: view.rowHistory };
       }
       Object.freeze(rows);
@@ -592,7 +594,7 @@ export function prepareProjectedSessionPresentation(
       if (opts.rowMode !== "sidebar") {
         registerSerializedJsonArray(rows, rows.map(serializeSessionRow));
       }
-      publicationState?.lists.setRows(view, rows, opts.rowMode === "sidebar");
+      publicationState?.lists.setRows(view, rows, conditional);
       return { sessions: rows, rowHistory: view.rowHistory };
     },
     snapshot(query: records.Lookup, options: PresentationOptions = {}) {

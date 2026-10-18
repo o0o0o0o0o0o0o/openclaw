@@ -1,4 +1,3 @@
-// Control UI tests cover mount fallback behavior.
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,7 +13,7 @@ async function readIndexHtml(): Promise<string> {
   return readFile(indexHtmlPath, "utf8");
 }
 
-function createIsolatedWindow(url?: string): TestWindow {
+function createIsolatedWindow(url?: string, fetch?: TestWindow["fetch"]): TestWindow {
   const frame = document.createElement("iframe");
   if (url) {
     frame.src = url;
@@ -29,36 +28,28 @@ function createIsolatedWindow(url?: string): TestWindow {
     frameWindow.document.write("<!doctype html><html><head></head><body></body></html>");
     frameWindow.document.close();
   }
+  if (fetch) {
+    Object.defineProperty(frameWindow, "fetch", { configurable: true, value: fetch });
+  }
   return frameWindow;
 }
 
-function installStartupPaintShell(window: TestWindow, html: string): void {
+function installShell(window: TestWindow, html: string, marker: string): void {
   const parsed = new window.DOMParser().parseFromString(html, "text/html");
   window.document.head.innerHTML = parsed.head.innerHTML;
   window.document.body.innerHTML = parsed.body.innerHTML;
 
-  const startupScript = Array.from(
-    parsed.querySelectorAll<HTMLScriptElement>("script:not([src])"),
-  ).find((script) => script.textContent?.includes("var THEMES = {"));
-  if (!startupScript?.textContent) {
-    throw new Error("Expected inline startup theme script in index.html");
-  }
-  window.eval(startupScript.textContent);
-}
-
-function installFallbackShell(window: TestWindow, html: string): void {
-  const parsed = new window.DOMParser().parseFromString(html, "text/html");
-  window.document.head.innerHTML = parsed.head.innerHTML;
-  window.document.body.innerHTML = parsed.body.innerHTML;
-
-  const sentinel = Array.from(parsed.querySelectorAll<HTMLScriptElement>("script:not([src])")).find(
-    (script) => script.textContent?.includes("openclaw-mount-fallback"),
+  const script = Array.from(parsed.querySelectorAll<HTMLScriptElement>("script:not([src])")).find(
+    (candidate) => candidate.textContent?.includes(marker),
   );
-  if (!sentinel?.textContent) {
-    throw new Error("Expected inline mount fallback script in index.html");
+  if (!script?.textContent) {
+    throw new Error(`Expected inline ${marker} script in index.html`);
   }
-  window.eval(sentinel.textContent);
+  window.eval(script.textContent);
 }
+
+const installFallbackShell = (window: TestWindow, html: string) =>
+  installShell(window, html, "openclaw-mount-fallback");
 
 function requireElementById<T extends HTMLElement>(
   window: TestWindow,
@@ -103,25 +94,23 @@ describe("Control UI mount fallback", () => {
     vi.useRealTimers();
   });
 
-  it.each([
-    ["Dash light", { theme: "dash", themeMode: "light" }, "dash-light", "rgb(247, 242, 236)"],
-  ])(
-    "paints %s before the app stylesheet loads",
-    async (_name, settings, expectedTheme, expectedBackground) => {
-      const frameWindow = createIsolatedWindow();
-      frameWindow.localStorage.clear();
-      frameWindow.localStorage.setItem("openclaw.control.settings.v1", JSON.stringify(settings));
-      installStartupPaintShell(frameWindow, await readIndexHtml());
+  it("paints Dash light before the app stylesheet loads", async () => {
+    const frameWindow = createIsolatedWindow();
+    frameWindow.localStorage.clear();
+    frameWindow.localStorage.setItem(
+      "openclaw.control.settings.v1",
+      JSON.stringify({ theme: "dash", themeMode: "light" }),
+    );
+    installShell(frameWindow, await readIndexHtml(), "var THEMES = {");
 
-      expect(frameWindow.document.documentElement.dataset.theme).toBe(expectedTheme);
-      expect(
-        frameWindow.getComputedStyle(frameWindow.document.documentElement).backgroundColor,
-      ).toBe(expectedBackground);
-      expect(frameWindow.getComputedStyle(frameWindow.document.body).backgroundColor).toBe(
-        expectedBackground,
-      );
-    },
-  );
+    expect(frameWindow.document.documentElement.dataset.theme).toBe("dash-light");
+    expect(frameWindow.getComputedStyle(frameWindow.document.documentElement).backgroundColor).toBe(
+      "rgb(247, 242, 236)",
+    );
+    expect(frameWindow.getComputedStyle(frameWindow.document.body).backgroundColor).toBe(
+      "rgb(247, 242, 236)",
+    );
+  });
 
   it("keeps the fallback visible until the app completes its first render", async () => {
     const frameWindow = createIsolatedWindow();
@@ -147,11 +136,9 @@ describe("Control UI mount fallback", () => {
   });
 
   it("probes a cache-busted current document when the original bundle did not start", async () => {
-    const frameWindow = createIsolatedWindow();
-    const html = await readIndexHtml();
     const fetch = vi.fn().mockResolvedValue({ ok: false });
-    Object.defineProperty(frameWindow, "fetch", { configurable: true, value: fetch });
-    installFallbackShell(frameWindow, html);
+    const frameWindow = createIsolatedWindow(undefined, fetch);
+    installFallbackShell(frameWindow, await readIndexHtml());
 
     await vi.advanceTimersByTimeAsync(mountTimeoutMs);
     expect(fetch).toHaveBeenCalledOnce();
@@ -168,12 +155,11 @@ describe("Control UI mount fallback", () => {
   });
 
   it("gives a slow module download a fresh grace window after DOMContentLoaded", async () => {
-    const frameWindow = createIsolatedWindow();
+    const fetch = vi.fn().mockRejectedValue(new Error("offline"));
+    const frameWindow = createIsolatedWindow(undefined, fetch);
     const readyState = vi
       .spyOn(frameWindow.document, "readyState", "get")
       .mockReturnValue("loading");
-    const fetch = vi.fn().mockRejectedValue(new Error("offline"));
-    Object.defineProperty(frameWindow, "fetch", { configurable: true, value: fetch });
     installFallbackShell(frameWindow, await readIndexHtml());
     await vi.advanceTimersByTimeAsync(mountTimeoutMs + 1_000);
     expect(fetch).not.toHaveBeenCalled();
@@ -186,12 +172,12 @@ describe("Control UI mount fallback", () => {
   });
 
   it.each([2, 3])("bounds recovery navigations after attempt %s", async (attempt) => {
+    const fetch = vi.fn().mockRejectedValue(new Error("offline"));
     const frameWindow = createIsolatedWindow(
       `http://localhost:3000/?openclaw_mount_recovery=${attempt}`,
+      fetch,
     );
     vi.spyOn(frameWindow.document, "readyState", "get").mockReturnValue("complete");
-    const fetch = vi.fn().mockRejectedValue(new Error("offline"));
-    Object.defineProperty(frameWindow, "fetch", { configurable: true, value: fetch });
     installFallbackShell(frameWindow, await readIndexHtml());
     await vi.advanceTimersByTimeAsync(mountTimeoutMs);
     if (attempt < 3) {
@@ -205,9 +191,8 @@ describe("Control UI mount fallback", () => {
   });
 
   it("does not begin recovery while the unsupported browser screen is loading", async () => {
-    const frameWindow = createIsolatedWindow();
     const fetch = vi.fn().mockResolvedValue({ ok: true });
-    Object.defineProperty(frameWindow, "fetch", { configurable: true, value: fetch });
+    const frameWindow = createIsolatedWindow(undefined, fetch);
     installFallbackShell(frameWindow, await readIndexHtml());
 
     frameWindow.dispatchEvent(new frameWindow.Event("openclaw-control-ui-unsupported-browser"));
@@ -277,11 +262,10 @@ describe("Control UI mount fallback", () => {
   );
 
   it("keeps probing beyond six failures while the gateway is unavailable", async () => {
-    const frameWindow = createIsolatedWindow();
     const fetch = vi.fn().mockRejectedValue(new Error("gateway unavailable"));
+    const frameWindow = createIsolatedWindow(undefined, fetch);
     const unregister = vi.fn().mockResolvedValue(true);
     const getRegistrations = vi.fn().mockResolvedValue([{ unregister }]);
-    Object.defineProperty(frameWindow, "fetch", { configurable: true, value: fetch });
     Object.defineProperty(frameWindow.navigator, "serviceWorker", {
       configurable: true,
       value: { getRegistrations },

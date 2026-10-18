@@ -23,6 +23,7 @@ const reader: ControlUiLinkReaderDescriptor = {
     detailMethod: "forge.item",
   },
 };
+const itemUrl = "https://forge.example/items/123";
 const cleanups: Array<() => void> = [];
 afterEach(() => {
   cleanups.splice(0).forEach((cleanup) => cleanup());
@@ -55,7 +56,7 @@ function setup(shouldOpenExternally?: () => boolean) {
   cleanups.push(() => window.removeEventListener(LINK_READER_PANEL_TOGGLE_EVENT, accept));
   const shell = document.createElement("openclaw-app-shell");
   const anchor = document.createElement("a");
-  anchor.href = "https://forge.example/items/123";
+  anchor.href = itemUrl;
   shell.append(anchor);
   document.body.append(shell);
   const click = (init: MouseEventInit = {}) => {
@@ -133,7 +134,7 @@ describe("Plugin reader link routing", () => {
               [
                 {
                   type: "open-link",
-                  url: "https://forge.example/items/123",
+                  url: itemUrl,
                   target: "external",
                 },
               ],
@@ -191,19 +192,14 @@ describe("Plugin reader link routing", () => {
 
 describe("Plugin reader destinations", () => {
   it("keys canonical URLs without losing query identity when fragments change", () => {
+    const canonical = `${itemUrl}?label=%23one`;
     const target = resolveLinkReaderTarget(
       "HTTPS://FORGE.EXAMPLE:443/items/123?label=%23one#start",
       [reader],
     )!;
-    expect(linkReaderTargetKey(target)).toBe(
-      "forge:items:https://forge.example/items/123?label=%23one",
-    );
-    expect(
-      linkReaderResponseMatchesTarget(target, "https://forge.example/items/123?label=%23one#other"),
-    ).toBe(true);
-    expect(
-      linkReaderResponseMatchesTarget(target, "https://forge.example/items/123?label=%23two#start"),
-    ).toBe(false);
+    expect(linkReaderTargetKey(target)).toBe(`forge:items:${canonical}`);
+    expect(linkReaderResponseMatchesTarget(target, `${canonical}#other`)).toBe(true);
+    expect(linkReaderResponseMatchesTarget(target, `${itemUrl}?label=%23two#start`)).toBe(false);
   });
 
   it("only claims URLs declared by an enabled plugin, including a non-forge provider", () => {
@@ -223,11 +219,9 @@ describe("Plugin reader destinations", () => {
         notes,
       ]),
     ).toEqual({ href: "https://notes.example/documents/hello-world#discussion", reader: notes });
-    expect(resolveLinkReaderTarget("https://forge.example/items/123", [])).toBeNull();
+    expect(resolveLinkReaderTarget(itemUrl, [])).toBeNull();
     const malformed = { ...reader, linkReader: { ...reader.linkReader, pathPattern: "[" } };
-    expect(
-      resolveLinkReaderTarget("https://forge.example/items/123", [malformed, reader])?.reader,
-    ).toBe(reader);
+    expect(resolveLinkReaderTarget(itemUrl, [malformed, reader])?.reader).toBe(reader);
   });
   it.each([
     "https://forge.example.evil.test/items/1",

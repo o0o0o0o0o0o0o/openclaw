@@ -3,6 +3,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
+import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { createLogger, createServer as createViteServer } from "vite";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -40,12 +41,7 @@ describe("configured UI development Gateway", () => {
     let phase = "normal";
     let interruptUpstream = false;
     const recordError = (event: string, error: { message: string; code?: string }) => {
-      events.push({
-        phase,
-        event,
-        code: error.code,
-        message: error.message,
-      });
+      events.push({ phase, event, code: error.code, message: error.message });
     };
     const closed = (socket: WebSocket, endpoint: string) => {
       const promise = new Promise<number>((resolve) => {
@@ -63,6 +59,17 @@ describe("configured UI development Gateway", () => {
       // Cleanup cancels every pending event, including a message armed before send fails.
       void promise.catch(() => undefined);
       return promise;
+    };
+    const trackProxy = (socket: Duplex, endpoint: string) => {
+      socket.on("error", (error) => recordError(`${endpoint}-error`, error));
+      proxyCloses.push(
+        new Promise((resolve) => {
+          socket.once("close", () => {
+            events.push({ phase, event: `${endpoint}-close` });
+            resolve();
+          });
+        }),
+      );
     };
     const withinDeadline = async <T>(promise: Promise<T>) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -126,25 +133,9 @@ describe("configured UI development Gateway", () => {
             configure?.(proxy, resolved);
             proxy.on("error", (error) => recordError("proxy-error", error));
             proxy.on("proxyReqWs", (request, _incoming, downstream) => {
-              downstream.on("error", (error) => recordError("downstream-error", error));
-              proxyCloses.push(
-                new Promise((resolve) => {
-                  downstream.once("close", () => {
-                    events.push({ phase, event: "downstream-close" });
-                    resolve();
-                  });
-                }),
-              );
+              trackProxy(downstream, "downstream");
               request.once("upgrade", (_response, upstreamSocket) => {
-                upstreamSocket.on("error", (error) => recordError("upstream-error", error));
-                proxyCloses.push(
-                  new Promise((resolve) => {
-                    upstreamSocket.once("close", () => {
-                      events.push({ phase, event: "upstream-close" });
-                      resolve();
-                    });
-                  }),
-                );
+                trackProxy(upstreamSocket, "upstream");
               });
             });
           };
@@ -177,6 +168,20 @@ describe("configured UI development Gateway", () => {
         const webSocketOptions = {
           // Removal: use ws's `origin` option after Bun's built-in client honors it.
           headers: { Origin: uiOrigin },
+        };
+        const connect = async () => {
+          socket = new WebSocket(
+            gatewayWebSocketTransportUrl(gateway.gatewayUrl),
+            webSocketOptions,
+          );
+          const close = closed(socket, "client");
+          await withinDeadline(nextEvent(socket, "open"));
+          return { close };
+        };
+        const echo = async (frame: string) => {
+          const message = nextEvent(socket!, "message");
+          socket!.send(frame);
+          expect(String((await withinDeadline(message))[0])).toBe(frame);
         };
         expect(server.httpServer?.address()).toMatchObject({ address: "127.0.0.1" });
         const resourcePath = `${uiDevGatewayResourceBasePath()}/control-ui-config.json`;
@@ -225,30 +230,20 @@ describe("configured UI development Gateway", () => {
         await retired.body?.cancel();
         expect(requests).toHaveLength(gatewayRequests);
 
-        socket = new WebSocket(gatewayWebSocketTransportUrl(gateway.gatewayUrl), webSocketOptions);
-        const firstClose = closed(socket, "client");
-        await withinDeadline(nextEvent(socket, "open"));
-        const message = nextEvent(socket, "message");
-        socket.send("normal-gateway-frame");
-        expect(String((await withinDeadline(message))[0])).toBe("normal-gateway-frame");
+        const { close: firstClose } = await connect();
+        await echo("normal-gateway-frame");
         expect(requests.at(-1)).toEqual({ path: "/", origin: uiOrigin });
 
         events.push({ phase, event: "client-close-requested" });
-        socket.close(1000, "fixture-reload");
+        socket!.close(1000, "fixture-reload");
         expect(await withinDeadline(firstClose)).toBe(1000);
         expect(await withinDeadline(peerCloses[0]!)).toBe(1000);
         await withinDeadline(Promise.all(proxyCloses));
         expect(events.filter(({ event }) => event.endsWith("-error"))).toEqual([]);
 
         phase = "upstream-abort";
-        socket = new WebSocket(gatewayWebSocketTransportUrl(gateway.gatewayUrl), webSocketOptions);
-        const interruptedClose = closed(socket, "client");
-        await withinDeadline(nextEvent(socket, "open"));
-        const reconnectedMessage = nextEvent(socket, "message");
-        socket.send("reconnected-gateway-frame");
-        expect(String((await withinDeadline(reconnectedMessage))[0])).toBe(
-          "reconnected-gateway-frame",
-        );
+        const { close: interruptedClose } = await connect();
+        await echo("reconnected-gateway-frame");
         interruptUpstream = true;
         const writes = Array.from(
           { length: 32 },
@@ -268,13 +263,9 @@ describe("configured UI development Gateway", () => {
         await withinDeadline(Promise.all([...proxyCloses, ...writes]));
 
         phase = "recovered";
-        socket = new WebSocket(gatewayWebSocketTransportUrl(gateway.gatewayUrl), webSocketOptions);
-        const recoveredClose = closed(socket, "client");
-        await withinDeadline(nextEvent(socket, "open"));
-        const recoveredMessage = nextEvent(socket, "message");
-        socket.send("recovered-gateway-frame");
-        expect(String((await withinDeadline(recoveredMessage))[0])).toBe("recovered-gateway-frame");
-        socket.close(1000, "fixture-complete");
+        const { close: recoveredClose } = await connect();
+        await echo("recovered-gateway-frame");
+        socket!.close(1000, "fixture-complete");
         expect(await withinDeadline(recoveredClose)).toBe(1000);
         expect(await withinDeadline(peerCloses[2]!)).toBe(1000);
         await withinDeadline(Promise.all(proxyCloses));

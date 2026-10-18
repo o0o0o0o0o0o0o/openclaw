@@ -88,7 +88,7 @@ type PaletteShell = {
 function paletteShell(element: TestOptionalCustomElement, open: () => void): PaletteShell {
   const shell = createShellOwner() as unknown as PaletteShell;
   shell.commandPaletteElement = element;
-  Object.defineProperty(shell, "updateComplete", { get: () => Promise.resolve(true) });
+  committedShell(shell);
   Object.defineProperty(shell.elements, "commandPalette", {
     get: () =>
       customElements.get(element.tagName)
@@ -97,6 +97,39 @@ function paletteShell(element: TestOptionalCustomElement, open: () => void): Pal
   });
   stubRenderedWhenDefined(shell);
   return shell;
+}
+
+function committedShell(shell: object) {
+  Object.defineProperty(shell, "updateComplete", { get: () => Promise.resolve(true) });
+}
+
+function coldPalette() {
+  const gate = createDeferred();
+  const element = createLazyElementSpec("cold palette");
+  const load = element.loadModule;
+  element.loadModule = async () => {
+    await gate.promise;
+    await load();
+  };
+  return { element, gate };
+}
+
+function captureInput(state: CommandPaletteLoadingState, value: string) {
+  const input = document.createElement("textarea");
+  state.inputRef(input);
+  input.value = value;
+  state.captureInput();
+}
+
+function keydown(key: string, code: string, bubbles = false) {
+  return new KeyboardEvent("keydown", {
+    key,
+    code,
+    ctrlKey: true,
+    shiftKey: true,
+    bubbles,
+    cancelable: true,
+  });
 }
 
 function stalePalette() {
@@ -123,13 +156,7 @@ describe("shell lazy events", () => {
   it("persists only open intent, never a cold prompt or event payload", async () => {
     const storage = createStorageMock();
     vi.stubGlobal("sessionStorage", storage);
-    const gate = createDeferred();
-    const element = createLazyElementSpec("private cold palette");
-    const load = element.loadModule;
-    element.loadModule = async () => {
-      await gate.promise;
-      await load();
-    };
+    const { gate, element } = coldPalette();
     const shell = paletteShell(element, vi.fn());
     await withConnectedShell(shell, async () => {
       window.dispatchEvent(
@@ -137,10 +164,7 @@ describe("shell lazy events", () => {
           detail: { value: "private payload" },
         }),
       );
-      const input = document.createElement("textarea");
-      shell.commandPaletteLoading.inputRef(input);
-      input.value = "private cold prompt";
-      shell.commandPaletteLoading.captureInput();
+      captureInput(shell.commandPaletteLoading, "private cold prompt");
       expect(readLazyShellAction()).toEqual({ eventType: COMMAND_PALETTE_OPEN_EVENT });
       expect(storage.getItem(storageKey)).not.toContain("private");
       shell.lazyCustomElements.close();
@@ -151,22 +175,13 @@ describe("shell lazy events", () => {
   it("retires a composing palette on disconnect while the shell owner remains reusable", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("sessionStorage", createStorageMock());
-    const gate = createDeferred();
-    const element = createLazyElementSpec("reconnected cold palette");
-    const load = element.loadModule;
-    element.loadModule = async () => {
-      await gate.promise;
-      await load();
-    };
+    const { gate, element } = coldPalette();
     const shell = paletteShell(element, vi.fn());
     try {
       shell.connect();
       shell.openPalette();
       const state = shell.commandPaletteLoading;
-      const input = document.createElement("textarea");
-      state.inputRef(input);
-      input.value = "retired prompt";
-      state.captureInput();
+      captureInput(state, "retired prompt");
       const file = new File(["image"], "retired.png", { type: "image/png" });
       const paste = new Event("paste", { cancelable: true }) as ClipboardEvent;
       Object.defineProperty(paste, "clipboardData", {
@@ -206,13 +221,7 @@ describe("shell lazy events", () => {
     "respects the canonical %s boundary while a cold palette is composing",
     async (change) => {
       vi.stubGlobal("sessionStorage", createStorageMock());
-      const gate = createDeferred();
-      const element = createLazyElementSpec("owned cold palette");
-      const load = element.loadModule;
-      element.loadModule = async () => {
-        await gate.promise;
-        await load();
-      };
+      const { gate, element } = coldPalette();
       const open = vi.fn();
       const shell = paletteShell(element, open);
       let snapshot: ApplicationGatewaySnapshot = {
@@ -236,10 +245,7 @@ describe("shell lazy events", () => {
       Object.defineProperty(shell, "context", { value: { gateway }, configurable: true });
       shell.openPalette();
       const state = shell.commandPaletteLoading;
-      const input = document.createElement("textarea");
-      state.inputRef(input);
-      input.value = "old-owner prompt";
-      state.captureInput();
+      captureInput(state, "old-owner prompt");
       state.handleCompositionStart();
       state.handoff(open);
       const take = state.captureHandoff();
@@ -407,7 +413,7 @@ describe("shell lazy events", () => {
       shell.element.append(detached);
       document.body.append(shell.element);
       detached.remove();
-      Object.defineProperty(shell, "updateComplete", { get: () => Promise.resolve(true) });
+      committedShell(shell);
       try {
         await withConnectedShell(shell, async () => {
           window.dispatchEvent(new CustomEvent(eventType));
@@ -438,16 +444,9 @@ describe("shell lazy events", () => {
     };
     Object.assign(shell.elements, { keyboardShortcuts: dialog });
     shell.element.append(dialog);
-    Object.defineProperty(shell, "updateComplete", { get: () => Promise.resolve(true) });
+    committedShell(shell);
     const input = document.body.appendChild(document.createElement("input"));
-    const shortcut = new KeyboardEvent("keydown", {
-      key: "/",
-      code: "Slash",
-      ctrlKey: true,
-      shiftKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
+    const shortcut = keydown("/", "Slash", true);
     window.addEventListener(KEYBOARD_SHORTCUTS_REQUEST_EVENT, requested);
     document.body.append(shell.element);
 
@@ -483,14 +482,8 @@ describe("shell lazy events", () => {
     shell.element.append(overlay);
     document.body.append(shell.element);
     onTestFinished(() => shell.element.remove());
-    Object.defineProperty(shell, "updateComplete", { get: () => Promise.resolve(true) });
-    const shortcut = new KeyboardEvent("keydown", {
-      key: "d",
-      code: "KeyD",
-      ctrlKey: true,
-      shiftKey: true,
-      cancelable: true,
-    });
+    committedShell(shell);
+    const shortcut = keydown("d", "KeyD");
 
     await withConnectedShell(shell, async () => {
       shell.handleDocumentKeydown(shortcut);
@@ -501,16 +494,7 @@ describe("shell lazy events", () => {
       const input = document.body.appendChild(document.createElement("input"));
       onTestFinished(() => input.remove());
       input.addEventListener("keydown", (event) => shell.handleDocumentKeydown(event));
-      input.dispatchEvent(
-        new KeyboardEvent("keydown", {
-          key: "d",
-          code: "KeyD",
-          ctrlKey: true,
-          shiftKey: true,
-          bubbles: true,
-          cancelable: true,
-        }),
-      );
+      input.dispatchEvent(keydown("d", "KeyD", true));
       expect(toggled).toHaveBeenCalledOnce();
     });
   });
@@ -532,7 +516,7 @@ describe("shell lazy events", () => {
         readonly pendingDebugOverlayMode: "expanded" | "minimized";
         togglePendingDebugOverlayMode(): void;
       };
-      Object.defineProperty(shell, "updateComplete", { get: () => Promise.resolve(true) });
+      committedShell(shell);
       Object.defineProperty(shell, "queryRenderedElement", {
         value: (tag: string) => shell.element.querySelector(tag),
       });
@@ -616,7 +600,7 @@ describe("shell lazy events", () => {
       execApprovalElement: TestOptionalCustomElement;
     };
     shell.execApprovalElement = element;
-    Object.defineProperty(shell, "updateComplete", { get: () => Promise.resolve(true) });
+    committedShell(shell);
     Object.defineProperty(shell.elements, "approvalOverlay", {
       get: () => (customElements.get(element.tagName) ? { isConnected: true, show } : undefined),
     });

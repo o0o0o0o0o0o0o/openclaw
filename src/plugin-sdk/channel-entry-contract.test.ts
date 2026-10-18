@@ -1,4 +1,3 @@
-// Channel entry contract tests cover SDK channel entrypoint exports and package boundaries.
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -7,38 +6,37 @@ import { importFreshModule } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { PluginModuleLoaderFactory } from "../plugins/plugin-module-loader-cache.js";
-import type { PluginRuntime } from "../plugins/runtime/types.js";
-import type { OpenClawPluginApi, PluginRegistrationMode } from "../plugins/types.js";
+import type { OpenClawPluginApi } from "../plugins/types.js";
 import { withMockedWindowsPlatform } from "../test-utils/vitest-spies.js";
 import {
   defineBundledChannelEntry,
   defineBundledChannelSetupEntry,
   loadBundledEntryExportSync,
 } from "./channel-entry-contract.js";
+import {
+  createChannelEntryApi as createApi,
+  expectLazyChannelSchema,
+  registerChannelEntryTestTool,
+} from "./channel-entry.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const pluginModuleLoaderJitiFactoryOverrideKey = Symbol.for(
   "openclaw.pluginModuleLoaderJitiFactoryOverride",
 );
+const loaderGlobals = globalThis as typeof globalThis & {
+  [pluginModuleLoaderJitiFactoryOverrideKey]?: PluginModuleLoaderFactory;
+};
 
 afterEach(() => {
   vi.resetModules();
   vi.doUnmock("jiti");
   vi.doUnmock("../plugins/native-module-require.js");
   vi.unstubAllEnvs();
-  delete (
-    globalThis as typeof globalThis & {
-      [pluginModuleLoaderJitiFactoryOverrideKey]?: PluginModuleLoaderFactory;
-    }
-  )[pluginModuleLoaderJitiFactoryOverrideKey];
+  delete loaderGlobals[pluginModuleLoaderJitiFactoryOverrideKey];
 });
 
 function stubPluginModuleLoaderJitiFactory(createJiti: PluginModuleLoaderFactory): void {
-  (
-    globalThis as typeof globalThis & {
-      [pluginModuleLoaderJitiFactoryOverrideKey]?: PluginModuleLoaderFactory;
-    }
-  )[pluginModuleLoaderJitiFactoryOverrideKey] = createJiti;
+  loaderGlobals[pluginModuleLoaderJitiFactoryOverrideKey] = createJiti;
 }
 
 function writeJson(targetPath: string, value: unknown): void {
@@ -55,15 +53,6 @@ const freshContract = (scope: string) =>
     import.meta.url,
     `./channel-entry-contract.js?scope=${scope}`,
   );
-
-function createApi(registrationMode: PluginRegistrationMode): OpenClawPluginApi {
-  return {
-    registrationMode,
-    runtime: { registrationMode } as unknown as PluginRuntime,
-    registerChannel: vi.fn(),
-    registerTool: vi.fn(),
-  } as unknown as OpenClawPluginApi;
-}
 
 function createSidecarRoot(artifactRoot = "dist", pluginId = "fixture", importer = "index.js") {
   const tempRoot = tempDirs.make("openclaw-channel-entry-contract-");
@@ -83,19 +72,6 @@ function createBundledFixture() {
     `module.exports = {
   channelPlugin: {
     id: ${JSON.stringify(pluginId)},
-    meta: {
-      id: ${JSON.stringify(pluginId)},
-      label: ${JSON.stringify(pluginId)},
-      selectionLabel: ${JSON.stringify(pluginId)},
-      docsPath: ${JSON.stringify(`/channels/${pluginId}`)},
-      blurb: "bundled channel",
-    },
-    capabilities: { chatTypes: ["direct"] },
-    config: {
-      listAccountIds: () => [],
-      resolveAccount: () => null,
-    },
-    outbound: { deliveryMode: "direct" },
   },
 };
 `,
@@ -135,116 +111,61 @@ function createBundledChannelEntry() {
 
 describe("defineBundledChannelEntry", () => {
   it("defers and memoizes config schema factories", () => {
-    const configSchema = {
-      schema: { type: "object" as const, additionalProperties: false },
-    };
-    const createConfigSchema = vi.fn(() => configSchema);
-    const entry = defineBundledChannelEntry({
-      id: "lazy-config-schema",
-      name: "Lazy Config Schema",
-      description: "lazy config schema test",
-      importMetaUrl: import.meta.url,
-      plugin: { specifier: "./unused.js" },
-      configSchema: createConfigSchema,
-    });
-
-    expect(createConfigSchema).not.toHaveBeenCalled();
-    expect(entry.configSchema).toBe(configSchema);
-    expect(entry.configSchema).toBe(configSchema);
-    expect(createConfigSchema).toHaveBeenCalledTimes(1);
+    expectLazyChannelSchema((configSchema) =>
+      defineBundledChannelEntry({
+        id: "lazy-config-schema",
+        name: "Lazy Config Schema",
+        description: "lazy config schema test",
+        importMetaUrl: import.meta.url,
+        plugin: { specifier: "./unused.js" },
+        configSchema,
+      }),
+    );
   });
 
-  it("runs tool registrations without channel sidecar hydration during tool discovery", () => {
-    const { entry, runtimeMarker, registerCliMetadata, registerCapabilities, registerFull } =
-      createBundledChannelEntry();
-    registerFull.mockImplementation((api) => {
-      api.registerTool(
-        {
-          name: "channel_tool",
-          label: "Channel Tool",
-          description: "channel tool",
-          parameters: {},
-          execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
-        },
-        { name: "channel_tool" },
-      );
-    });
+  it.each([
+    ["cli-metadata", 0, 1, 0, 0],
+    ["tool-discovery", 0, 0, 1, 1],
+    ["discovery", 1, 1, 0, 1],
+    ["setup-only", 1, 0, 0, 0],
+    ["setup-runtime", 1, 0, 0, 0],
+    ["full", 1, 1, 1, 1],
+  ] as const)(
+    "hydrates sidecars and registers only %s hooks",
+    (mode, runtime, cli, full, capabilities) => {
+      const { entry, runtimeMarker, registerCliMetadata, registerCapabilities, registerFull } =
+        createBundledChannelEntry();
+      registerFull.mockImplementation(registerChannelEntryTestTool);
 
-    const api = createApi("tool-discovery");
-    entry.register(api);
-
-    expect(api.registerChannel).not.toHaveBeenCalled();
-    expect(registerCliMetadata).not.toHaveBeenCalled();
-    expect(registerFull).toHaveBeenCalledWith(api);
-    expect(registerCapabilities).toHaveBeenCalledExactlyOnceWith(api);
-    expect(api.registerTool).toHaveBeenCalledTimes(1);
-    expect(fs.existsSync(runtimeMarker)).toBe(false);
-  });
-
-  it("loads runtime sidecars during discovery registration", () => {
-    const { entry, runtimeMarker, registerCliMetadata, registerCapabilities, registerFull } =
-      createBundledChannelEntry();
-
-    const api = createApi("discovery");
-    entry.register(api);
-
-    expect(api.registerChannel).toHaveBeenCalledTimes(1);
-    expect(registerCliMetadata).toHaveBeenCalledWith(api);
-    expect(registerFull).not.toHaveBeenCalled();
-    expect(registerCapabilities).toHaveBeenCalledExactlyOnceWith(api);
-    expect(fs.existsSync(runtimeMarker)).toBe(true);
-  });
-
-  it("keeps setup-runtime and full registration wired to runtime sidecars", () => {
-    const { entry, runtimeMarker, registerCliMetadata, registerCapabilities, registerFull } =
-      createBundledChannelEntry();
-
-    const cliApi = createApi("cli-metadata");
-    entry.register(cliApi);
-    expect(registerCliMetadata).toHaveBeenCalledWith(cliApi);
-    expect(registerCapabilities).not.toHaveBeenCalled();
-    expect(fs.existsSync(runtimeMarker)).toBe(false);
-    registerCliMetadata.mockClear();
-
-    entry.register(createApi("setup-only"));
-    expect(registerCapabilities).not.toHaveBeenCalled();
-    fs.rmSync(runtimeMarker, { force: true });
-
-    entry.register(createApi("setup-runtime"));
-    expect(fs.existsSync(runtimeMarker)).toBe(true);
-    expect(registerCliMetadata).not.toHaveBeenCalled();
-    expect(registerFull).not.toHaveBeenCalled();
-    expect(registerCapabilities).not.toHaveBeenCalled();
-
-    fs.rmSync(runtimeMarker, { force: true });
-    const fullApi = createApi("full");
-    entry.register(fullApi);
-    expect(fs.existsSync(runtimeMarker)).toBe(true);
-    expect(registerCliMetadata).toHaveBeenCalledWith(fullApi);
-    expect(registerFull).toHaveBeenCalledWith(fullApi);
-    expect(registerCapabilities).toHaveBeenCalledExactlyOnceWith(fullApi);
-  });
+      const api = createApi(mode);
+      entry.register(api);
+      expect(api.registerChannel).toHaveBeenCalledTimes(runtime);
+      expect(registerCliMetadata.mock.calls).toEqual(cli ? [[api]] : []);
+      expect(registerFull.mock.calls).toEqual(full ? [[api]] : []);
+      expect(registerCapabilities.mock.calls).toEqual(capabilities ? [[api]] : []);
+      expect(api.registerTool).toHaveBeenCalledTimes(full);
+      expect(fs.existsSync(runtimeMarker)).toBe(Boolean(runtime));
+    },
+  );
 });
 
-describe("defineBundledChannelSetupEntry", () => {
-  it("exposes setup-runtime registrations without loading the full channel entry", () => {
-    const setupRuntimeRegister = vi.fn<(api: OpenClawPluginApi) => void>();
-    const { importerPath, pluginId, runtimeMarker } = createBundledFixture();
-    const entry = defineBundledChannelSetupEntry({
-      importMetaUrl: pathToFileURL(importerPath).href,
-      plugin: { specifier: "./plugin.cjs", exportName: "channelPlugin" },
-      runtime: { specifier: "./runtime.cjs", exportName: "setRuntime" },
-      registerSetupRuntime: setupRuntimeRegister,
-    });
-
-    const api = createApi("setup-runtime");
-    expect(entry.loadSetupPlugin().id).toBe(pluginId);
-    entry.setChannelRuntime?.(api.runtime);
-    entry.registerSetupRuntime?.(api);
-
-    expect(fs.existsSync(runtimeMarker)).toBe(true);
-    expect(setupRuntimeRegister).toHaveBeenCalledWith(api);
+it("defineBundledChannelSetupEntry exposes setup-runtime without the full channel entry", () => {
+  const setupRuntimeRegister = vi.fn<(api: OpenClawPluginApi) => void>();
+  const { importerPath, pluginId, runtimeMarker } = createBundledFixture();
+  const entry = defineBundledChannelSetupEntry({
+    importMetaUrl: pathToFileURL(importerPath).href,
+    plugin: { specifier: "./plugin.cjs", exportName: "channelPlugin" },
+    runtime: { specifier: "./runtime.cjs", exportName: "setRuntime" },
+    registerSetupRuntime: setupRuntimeRegister,
   });
+
+  const api = createApi("setup-runtime");
+  expect(entry.loadSetupPlugin().id).toBe(pluginId);
+  entry.setChannelRuntime?.(api.runtime);
+  entry.registerSetupRuntime?.(api);
+
+  expect(fs.existsSync(runtimeMarker)).toBe(true);
+  expect(setupRuntimeRegister).toHaveBeenCalledWith(api);
 });
 
 async function expectBuiltArtifactNodeRequireFastPath(

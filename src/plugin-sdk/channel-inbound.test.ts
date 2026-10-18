@@ -24,8 +24,19 @@ import {
   runChannelInboundEvent,
   type AssembledInboundReply,
   type BuildChannelInboundEventContextParams,
+  type ChannelInboundEventRunnerParams,
 } from "./channel-inbound.js";
 import * as channelIngressRuntime from "./channel-ingress-runtime.js";
+
+function runInbound(
+  resolveTurn: ChannelInboundEventRunnerParams<string>["adapter"]["resolveTurn"],
+) {
+  return runChannelInboundEvent({
+    channel: "test",
+    raw: "hello",
+    adapter: { ingest: () => ({ id: "msg-1", rawText: "hello" }), resolveTurn },
+  });
+}
 
 function createInboundParams(
   overrides: Partial<BuildChannelInboundEventContextParams> = {},
@@ -87,14 +98,7 @@ describe("channel-inbound public helpers", () => {
       const result =
         surface === "assembled"
           ? await dispatchChannelInboundReply(turn)
-          : await runChannelInboundEvent({
-              channel: "test",
-              raw: "hello",
-              adapter: {
-                ingest: () => ({ id: "event-1", rawText: "hello" }),
-                resolveTurn: async () => turn,
-              },
-            });
+          : await runInbound(async () => turn);
       expect(result.dispatched).toBe(true);
       expect(dispatched).toBe(true);
       expect(replyOptions.onReplyOperationOwned).toBe(callback);
@@ -140,50 +144,43 @@ describe("channel-inbound public helpers", () => {
 
     try {
       const result = await withinTest(
-        runChannelInboundEvent({
+        runInbound(() => ({
           channel: "test",
-          raw: { id: "msg-1", text: "hello" },
-          adapter: {
-            ingest: () => ({ id: "msg-1", rawText: "hello" }),
-            resolveTurn: () => ({
-              channel: "test",
-              routeSessionKey: activeSessionKey,
-              storePath,
-              ctxPayload: {
-                Body: "hello",
-                CommandAuthorized: false,
-                RawBody: "hello",
-                CommandBody: "hello",
-                From: "test:user:peer",
-                To: "test:bot",
-                SessionKey: activeSessionKey,
-                Provider: "test",
-                Surface: "test",
-              },
-              recordInboundSession,
-              afterRecord: () => withinTest(maintenancePrepared.promise, signal),
-              record: {
-                updateLastRoute: {
-                  accountId: "default",
-                  channel: "test",
-                  sessionKey: activeSessionKey,
-                  to: "user:peer",
-                },
-                onRecordError: (error: unknown) => {
-                  throw error;
-                },
-              },
-              runDispatch: async () => {
-                staleEntryAtDispatch = loadSessionEntry({ storePath, sessionKey: staleSessionKey });
-                return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
-              },
-              runDispatchLifecycle: {
-                turnAdoptionLifecycle: undefined,
-                onDispatchSkipped: vi.fn(),
-              },
-            }),
+          routeSessionKey: activeSessionKey,
+          storePath,
+          ctxPayload: {
+            Body: "hello",
+            CommandAuthorized: false,
+            RawBody: "hello",
+            CommandBody: "hello",
+            From: "test:user:peer",
+            To: "test:bot",
+            SessionKey: activeSessionKey,
+            Provider: "test",
+            Surface: "test",
           },
-        }),
+          recordInboundSession,
+          afterRecord: () => withinTest(maintenancePrepared.promise, signal),
+          record: {
+            updateLastRoute: {
+              accountId: "default",
+              channel: "test",
+              sessionKey: activeSessionKey,
+              to: "user:peer",
+            },
+            onRecordError: (error: unknown) => {
+              throw error;
+            },
+          },
+          runDispatch: async () => {
+            staleEntryAtDispatch = loadSessionEntry({ storePath, sessionKey: staleSessionKey });
+            return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
+          },
+          runDispatchLifecycle: {
+            turnAdoptionLifecycle: undefined,
+            onDispatchSkipped: vi.fn(),
+          },
+        })),
         signal,
       );
 

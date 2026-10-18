@@ -93,81 +93,79 @@ describe("mutable allowlist table helpers", () => {
   });
 });
 
-describe("createRestrictSendersChannelSecurity", () => {
-  it("builds dm policy resolution and open-group warnings from one descriptor", () => {
-    const dmRouting = {
-      resolveDmScope: () => "per-peer" as const,
-      resolveDmRoute: () => ({ kind: "core" as const }),
-    };
-    const security = createRestrictSendersChannelSecurity<{
-      accountId: string;
-      allowFrom?: string[];
-      dmPolicy?: string;
-      groupPolicy?: GroupPolicy;
-    }>({
-      channelKey: "line",
-      resolveDmPolicy: (account) => account.dmPolicy,
-      resolveDmAllowFrom: (account) => account.allowFrom,
-      resolveGroupPolicy: (account) => account.groupPolicy,
-      surface: "LINE groups",
-      openScope: "any member in groups",
-      groupPolicyPath: "channels.line.groupPolicy",
-      groupAllowFromPath: "channels.line.groupAllowFrom",
-      mentionGated: false,
-      findingTitle: "LINE security warning",
-      policyPathSuffix: "dmPolicy",
-      classifyEntryAuthentication: () => "asserted",
-      dmRouting,
-    });
-
-    expect(security.dmRouting).toBe(dmRouting);
-
-    expect(
-      security.resolveDmPolicy?.({
-        cfg: { channels: {} },
-        accountId: "default",
-        account: {
-          accountId: "default",
-          dmPolicy: "allowlist",
-          allowFrom: ["line:user:abc"],
-        },
-      }),
-    ).toEqual({
-      policy: "allowlist",
-      allowFrom: ["line:user:abc"],
-      policyPath: "channels.line.dmPolicy",
-      allowFromPath: "channels.line.",
-      approveHint: formatPairingApproveHint("line"),
-      normalizeEntry: undefined,
-      classifyEntryAuthentication: expect.any(Function),
-    });
-
-    expect(
-      security
-        .resolveDmPolicy?.({
-          cfg: {},
-          accountId: "default",
-          account: { accountId: "default" },
-        })
-        ?.classifyEntryAuthentication?.("line:user:abc"),
-    ).toBe("asserted");
-
-    expect(
-      security.collectWarnings?.({
-        cfg: { channels: { line: {} } },
-        accountId: "default",
-        account: { accountId: "default", groupPolicy: "open" },
-      }),
-    ).toEqual([
-      {
-        checkId: "channels.line.groups.open",
-        severity: "warn",
-        title: "LINE security warning",
-        detail:
-          'LINE groups: groupPolicy="open" allows any member in groups to trigger. Set channels.line.groupPolicy="allowlist" + channels.line.groupAllowFrom to restrict senders.',
-      },
-    ]);
+it("createRestrictSendersChannelSecurity builds DM policy and warnings from one descriptor", () => {
+  const dmRouting = {
+    resolveDmScope: () => "per-peer" as const,
+    resolveDmRoute: () => ({ kind: "core" as const }),
+  };
+  const security = createRestrictSendersChannelSecurity<{
+    accountId: string;
+    allowFrom?: string[];
+    dmPolicy?: string;
+    groupPolicy?: GroupPolicy;
+  }>({
+    channelKey: "line",
+    resolveDmPolicy: (account) => account.dmPolicy,
+    resolveDmAllowFrom: (account) => account.allowFrom,
+    resolveGroupPolicy: (account) => account.groupPolicy,
+    surface: "LINE groups",
+    openScope: "any member in groups",
+    groupPolicyPath: "channels.line.groupPolicy",
+    groupAllowFromPath: "channels.line.groupAllowFrom",
+    mentionGated: false,
+    findingTitle: "LINE security warning",
+    policyPathSuffix: "dmPolicy",
+    classifyEntryAuthentication: () => "asserted",
+    dmRouting,
   });
+
+  expect(security.dmRouting).toBe(dmRouting);
+
+  expect(
+    security.resolveDmPolicy?.({
+      cfg: { channels: {} },
+      accountId: "default",
+      account: {
+        accountId: "default",
+        dmPolicy: "allowlist",
+        allowFrom: ["line:user:abc"],
+      },
+    }),
+  ).toEqual({
+    policy: "allowlist",
+    allowFrom: ["line:user:abc"],
+    policyPath: "channels.line.dmPolicy",
+    allowFromPath: "channels.line.",
+    approveHint: formatPairingApproveHint("line"),
+    normalizeEntry: undefined,
+    classifyEntryAuthentication: expect.any(Function),
+  });
+
+  expect(
+    security
+      .resolveDmPolicy?.({
+        cfg: {},
+        accountId: "default",
+        account: { accountId: "default" },
+      })
+      ?.classifyEntryAuthentication?.("line:user:abc"),
+  ).toBe("asserted");
+
+  expect(
+    security.collectWarnings?.({
+      cfg: { channels: { line: {} } },
+      accountId: "default",
+      account: { accountId: "default", groupPolicy: "open" },
+    }),
+  ).toEqual([
+    {
+      checkId: "channels.line.groups.open",
+      severity: "warn",
+      title: "LINE security warning",
+      detail:
+        'LINE groups: groupPolicy="open" allows any member in groups to trigger. Set channels.line.groupPolicy="allowlist" + channels.line.groupAllowFrom to restrict senders.',
+    },
+  ]);
 });
 
 describe("createDangerousNameMatchingMutableAllowlistWarningCollector", () => {
@@ -217,16 +215,13 @@ describe("normalizeAllowFromList", () => {
   });
 });
 
-describe("coerceNativeSetting", () => {
-  it("keeps boolean and auto values", () => {
-    expect(coerceNativeSetting(true)).toBe(true);
-    expect(coerceNativeSetting(false)).toBe(false);
-    expect(coerceNativeSetting("auto")).toBe("auto");
-  });
-
-  it("drops unsupported values", () => {
-    expect(coerceNativeSetting("true")).toBeUndefined();
-    expect(coerceNativeSetting("on")).toBeUndefined();
-    expect(coerceNativeSetting(1)).toBeUndefined();
-  });
+it.each([
+  [true, true],
+  [false, false],
+  ["auto", "auto"],
+  ["true", undefined],
+  ["on", undefined],
+  [1, undefined],
+] as const)("coerceNativeSetting(%j) returns %j", (input, expected) => {
+  expect(coerceNativeSetting(input)).toBe(expected);
 });

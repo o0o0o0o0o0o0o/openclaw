@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDeferredCore } from "../shared/deferred.js";
 import {
   createAccountStatusSink,
@@ -97,16 +97,27 @@ describe("plugin-sdk channel lifecycle helpers", () => {
     expect(stop).toHaveBeenCalledOnce();
   });
 
-  it.each(["readiness", "assertion"] as const)(
+  it.each(["readiness", "assertion", "startup"] as const)(
     "joins account startup when its %s check fails",
     async (failurePhase) => {
       const startup = createDeferredCore<() => void>();
+      const readiness = createDeferredCore();
       const stop = vi.fn();
+      const assertAfterAbort = vi.fn();
       const failure = new Error(`${failurePhase} failed`);
       const { abort, task, isSettled } = startPassiveAccount(
-        () => startup.promise,
+        async () => {
+          if (failurePhase === "startup") {
+            throw failure;
+          }
+          return startup.promise;
+        },
         (unregister) => unregister(),
       );
+      const accountOutcome =
+        failurePhase === "startup"
+          ? expect(task).rejects.toBe(failure)
+          : expect(task).resolves.toBeUndefined();
       try {
         await expect(
           expectPendingUntilAbort({
@@ -114,6 +125,9 @@ describe("plugin-sdk channel lifecycle helpers", () => {
             task,
             isSettled,
             waitForStarted: async () => {
+              if (failurePhase === "startup") {
+                return readiness.promise;
+              }
               startup.resolve(stop);
               if (failurePhase === "readiness") {
                 throw failure;
@@ -122,46 +136,23 @@ describe("plugin-sdk channel lifecycle helpers", () => {
             assertBeforeAbort: () => {
               throw failure;
             },
+            assertAfterAbort,
           }),
         ).rejects.toBe(failure);
-        expect(abort.signal.aborted).toBe(true);
-        expect(stop).toHaveBeenCalledOnce();
-        expect(isSettled()).toBe(true);
+        expect({ aborted: abort.signal.aborted, settled: isSettled() }).toEqual({
+          aborted: true,
+          settled: true,
+        });
+        expect(stop).toHaveBeenCalledTimes(failurePhase === "startup" ? 0 : 1);
+        expect(assertAfterAbort).not.toHaveBeenCalled();
       } finally {
         startup.resolve(stop);
+        readiness.resolve();
         abort.abort();
-        await task;
+        await accountOutcome;
       }
     },
   );
-
-  it("reports startup rejection before readiness and joins the failed account", async () => {
-    const readiness = createDeferredCore();
-    const failure = new Error("account startup failed");
-    const assertAfterAbort = vi.fn();
-    const { abort, task, isSettled } = startPassiveAccount(async () => {
-      throw failure;
-    });
-    const accountRejection = expect(task).rejects.toBe(failure);
-    const check = expectPendingUntilAbort({
-      abort,
-      task,
-      isSettled,
-      waitForStarted: () => readiness.promise,
-      assertAfterAbort,
-    });
-    const checkRejection = expect(check).rejects.toBe(failure);
-    onTestFinished(async () => {
-      readiness.resolve();
-      await accountRejection;
-      await checkRejection;
-    });
-    await checkRejection;
-    await accountRejection;
-    expect(abort.signal.aborted).toBe(true);
-    expect(isSettled()).toBe(true);
-    expect(assertAfterAbort).not.toHaveBeenCalled();
-  });
 
   it.each([false, true])("keeps server task pending until close (abort=%s)", async (useAbort) => {
     const server = new FakeServer();

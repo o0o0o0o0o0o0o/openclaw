@@ -70,16 +70,12 @@ function expectAdapterAllowFromAndDefaultTo(
   });
 }
 
-describe("mapAllowFromEntries", () => {
-  it("returns empty list for missing input", () => {
-    expect(mapAllowFromEntries(undefined)).toEqual([]);
-  });
+it("mapAllowFromEntries returns empty list for missing input", () => {
+  expect(mapAllowFromEntries(undefined)).toEqual([]);
 });
 
-describe("resolveOptionalConfigString", () => {
-  it.each(["   ", undefined])("returns undefined for empty or missing value %j", (input) => {
-    expect(resolveOptionalConfigString(input)).toBeUndefined();
-  });
+it.each(["   ", undefined])("resolveOptionalConfigString ignores empty or missing %j", (input) => {
+  expect(resolveOptionalConfigString(input)).toBeUndefined();
 });
 
 describe("channel DM access helpers", () => {
@@ -167,17 +163,15 @@ describe("config write helpers", () => {
   });
 });
 
-describe("adaptScopedAccountAccessor", () => {
-  it("binds positional callback args into the shared account context object", () => {
-    const accessor = adaptScopedAccountAccessor(({ cfg, accountId }) => ({
-      channel: cfg.channels?.demo,
-      accountId: accountId ?? "default",
-    }));
+it("adaptScopedAccountAccessor binds positional callback args into the shared account context", () => {
+  const accessor = adaptScopedAccountAccessor(({ cfg, accountId }) => ({
+    channel: cfg.channels?.demo,
+    accountId: accountId ?? "default",
+  }));
 
-    expect(accessor({ channels: { demo: { enabled: true } } }, "alt")).toEqual({
-      channel: { enabled: true },
-      accountId: "alt",
-    });
+  expect(accessor({ channels: { demo: { enabled: true } } }, "alt")).toEqual({
+    channel: { enabled: true },
+    accountId: "alt",
   });
 });
 
@@ -207,18 +201,14 @@ describe("createScopedAccountConfigAccessors", () => {
   });
 });
 
-describe("createScopedChannelConfigBase", () => {
-  it("wires shared account config CRUD through the section helper", () => {
-    const base = createScopedChannelConfigBase(namedAccountBase);
+it("createScopedChannelConfigBase wires shared account config CRUD through the section helper", () => {
+  const base = createScopedChannelConfigBase(namedAccountBase);
 
-    expect(base.listAccountIds({})).toEqual(["default", "alt"]);
-    expect(base.resolveAccount({}, "alt")).toEqual({ accountId: "alt" });
-    expect(base.defaultAccountId!({})).toBe("default");
-    expect(base.setAccountEnabled!(enableDefault).channels?.demo).toEqual({ enabled: true });
-    expect(
-      base.deleteAccount!({ cfg: credentials, accountId: "default" }).channels,
-    ).toBeUndefined();
-  });
+  expect(base.listAccountIds({})).toEqual(["default", "alt"]);
+  expect(base.resolveAccount({}, "alt")).toEqual({ accountId: "alt" });
+  expect(base.defaultAccountId!({})).toBe("default");
+  expect(base.setAccountEnabled!(enableDefault).channels?.demo).toEqual({ enabled: true });
+  expect(base.deleteAccount!({ cfg: credentials, accountId: "default" }).channels).toBeUndefined();
 });
 
 describe("createScopedChannelConfigAdapter", () => {
@@ -266,108 +256,100 @@ describe("createScopedChannelConfigAdapter", () => {
   });
 });
 
-describe("createTopLevelChannelConfigBase", () => {
-  it("wires top-level enable/delete semantics", () => {
-    const base = createTopLevelChannelConfigBase({
-      sectionKey: "demo",
-      resolveAccount: () => ({ accountId: "default" }),
-    });
+it("createTopLevelChannelConfigBase wires top-level enable/delete semantics", () => {
+  const base = createTopLevelChannelConfigBase({
+    sectionKey: "demo",
+    resolveAccount: () => ({ accountId: "default" }),
+  });
 
-    expect(base.listAccountIds({})).toEqual(["default"]);
-    expect(base.defaultAccountId!({})).toBe("default");
-    expect(base.setAccountEnabled!(enableDefault).channels?.demo).toEqual({ enabled: true });
-    expect(
-      base.deleteAccount!({
-        cfg: { channels: { demo: { enabled: true } } },
-        accountId: "default",
-      }).channels,
-    ).toBeUndefined();
+  expect(base.listAccountIds({})).toEqual(["default"]);
+  expect(base.defaultAccountId!({})).toBe("default");
+  expect(base.setAccountEnabled!(enableDefault).channels?.demo).toEqual({ enabled: true });
+  expect(
+    base.deleteAccount!({
+      cfg: { channels: { demo: { enabled: true } } },
+      accountId: "default",
+    }).channels,
+  ).toBeUndefined();
+});
+
+it("createTopLevelChannelConfigAdapter combines CRUD with separate accessor account resolution", () => {
+  const adapter = createTopLevelChannelConfigAdapter<
+    { accountId: string; enabled: boolean },
+    { allowFrom: string[]; defaultTo: string }
+  >({
+    sectionKey: "demo",
+    resolveAccount: () => ({ accountId: "default", enabled: true }),
+    resolveAccessorAccount: () => ({ allowFrom: ["owner"], defaultTo: " chat:123 " }),
+    deleteMode: "clear-fields",
+    clearBaseFields: ["token"],
+    resolveAllowFrom: (account) => account.allowFrom,
+    formatAllowFrom: (allowFrom) => allowFrom.map((entry) => String(entry)),
+    resolveDefaultTo: (account) => account.defaultTo,
+  });
+
+  expect(adapter.resolveAccount({})).toEqual({ accountId: "default", enabled: true });
+  expect(adapter.resolveAllowFrom?.({ cfg: {} })).toEqual(["owner"]);
+  expect(adapter.resolveDefaultTo?.({ cfg: {} })).toBe("chat:123");
+  expect(
+    adapter.deleteAccount!({
+      cfg: credentialsAndSettings,
+      accountId: "default",
+    }).channels?.demo,
+  ).toEqual({
+    markdown: { tables: false },
   });
 });
 
-describe("createTopLevelChannelConfigAdapter", () => {
-  it("combines top-level CRUD with separate accessor account resolution", () => {
-    const adapter = createTopLevelChannelConfigAdapter<
-      { accountId: string; enabled: boolean },
-      { allowFrom: string[]; defaultTo: string }
-    >({
-      sectionKey: "demo",
-      resolveAccount: () => ({ accountId: "default", enabled: true }),
-      resolveAccessorAccount: () => ({ allowFrom: ["owner"], defaultTo: " chat:123 " }),
-      deleteMode: "clear-fields",
-      clearBaseFields: ["token"],
-      resolveAllowFrom: (account) => account.allowFrom,
-      formatAllowFrom: (allowFrom) => allowFrom.map((entry) => String(entry)),
-      resolveDefaultTo: (account) => account.defaultTo,
-    });
+it("createHybridChannelConfigBase enables default at root and named accounts under accounts", () => {
+  const base = createHybridChannelConfigBase(namedAccountBase);
 
-    expect(adapter.resolveAccount({})).toEqual({ accountId: "default", enabled: true });
-    expect(adapter.resolveAllowFrom?.({ cfg: {} })).toEqual(["owner"]);
-    expect(adapter.resolveDefaultTo?.({ cfg: {} })).toBe("chat:123");
-    expect(
-      adapter.deleteAccount!({
-        cfg: credentialsAndSettings,
-        accountId: "default",
-      }).channels?.demo,
-    ).toEqual({
-      markdown: { tables: false },
-    });
-  });
-});
-
-describe("createHybridChannelConfigBase", () => {
-  it("writes default account enable at the channel root and named accounts under accounts", () => {
-    const base = createHybridChannelConfigBase(namedAccountBase);
-
-    expect(
-      base.setAccountEnabled!({
-        cfg: { channels: { demo: { accounts: { alt: { enabled: false } } } } },
-        accountId: "default",
-        enabled: true,
-      }).channels?.demo,
-    ).toEqual({
-      accounts: { alt: { enabled: false } },
+  expect(
+    base.setAccountEnabled!({
+      cfg: { channels: { demo: { accounts: { alt: { enabled: false } } } } },
+      accountId: "default",
       enabled: true,
-    });
-    expect(
-      base.setAccountEnabled!({
-        cfg: {},
-        accountId: "alt",
-        enabled: true,
-      }).channels?.demo,
-    ).toEqual({
-      accounts: { alt: { enabled: true } },
-    });
+    }).channels?.demo,
+  ).toEqual({
+    accounts: { alt: { enabled: false } },
+    enabled: true,
+  });
+  expect(
+    base.setAccountEnabled!({
+      cfg: {},
+      accountId: "alt",
+      enabled: true,
+    }).channels?.demo,
+  ).toEqual({
+    accounts: { alt: { enabled: true } },
   });
 });
 
-describe("createHybridChannelConfigAdapter", () => {
-  it("combines hybrid CRUD with allowFrom/defaultTo accessors", () => {
-    const adapter = createHybridChannelConfigAdapter<
-      { accountId: string; enabled: boolean },
-      { allowFrom: string[]; defaultTo: string }
-    >({
-      ...namedAccountBase,
-      resolveAccount: (_cfg, accountId) => ({
-        accountId: accountId ?? "default",
-        enabled: true,
-      }),
-      resolveAccessorAccount: ({ accountId }) => ({
-        allowFrom: [accountId ?? "default"],
-        defaultTo: " room:123 ",
-      }),
-      preserveSectionOnDefaultDelete: true,
-      ...selectors,
-    });
+it("createHybridChannelConfigAdapter combines hybrid CRUD with allowFrom/defaultTo accessors", () => {
+  const adapter = createHybridChannelConfigAdapter<
+    { accountId: string; enabled: boolean },
+    { allowFrom: string[]; defaultTo: string }
+  >({
+    ...namedAccountBase,
+    resolveAccount: (_cfg, accountId) => ({
+      accountId: accountId ?? "default",
+      enabled: true,
+    }),
+    resolveAccessorAccount: ({ accountId }) => ({
+      allowFrom: [accountId ?? "default"],
+      defaultTo: " room:123 ",
+    }),
+    preserveSectionOnDefaultDelete: true,
+    ...selectors,
+  });
 
-    expectAdapterAllowFromAndDefaultTo(adapter);
-    expect(
-      adapter.deleteAccount!({
-        cfg: credentialsAndSettings,
-        accountId: "default",
-      }).channels?.demo,
-    ).toEqual({
-      markdown: { tables: false },
-    });
+  expectAdapterAllowFromAndDefaultTo(adapter);
+  expect(
+    adapter.deleteAccount!({
+      cfg: credentialsAndSettings,
+      accountId: "default",
+    }).channels?.demo,
+  ).toEqual({
+    markdown: { tables: false },
   });
 });

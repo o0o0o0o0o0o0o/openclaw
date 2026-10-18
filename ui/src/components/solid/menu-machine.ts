@@ -94,7 +94,7 @@ export function useMenuMachine(
   const items = () =>
     [...itemNodes]
       .filter((item) => item.isConnected && ownsTarget(item))
-      .sort((left, right) =>
+      .toSorted((left, right) =>
         left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1,
       );
   const focusItem = (service: MenuService) => {
@@ -337,15 +337,15 @@ export function useMenuMachine(
   // Synchronize Zag's imperative direction and highlight with the current inputs.
   createEffect(
     () => [direction(), options.items?.(), read(), options.value?.()] as const,
-    ([dir, items, api, selected]) => {
+    ([dir, catalog, api, selected]) => {
       if (props.dir !== dir) {
         props.dir = dir;
         setRevision((n) => n + 1);
       }
-      if (!items) {
+      if (!catalog) {
         return;
       }
-      const enabled = items.filter((item) => !item.disabled);
+      const enabled = catalog.filter((item) => !item.disabled);
       if (!enabled.some((item) => item.value === api.highlightedValue)) {
         const next =
           enabled.find((item) => item.value === selected)?.value ?? enabled[0]?.value ?? null;

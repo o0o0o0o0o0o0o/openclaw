@@ -11,6 +11,7 @@ import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import type { NodeClaudeSkillInit } from "../infra/node-claude-skill-protocol.js";
 import { resetLogger, setLoggerOverride } from "../logging/logger.js";
 import { loggingState } from "../logging/state.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -20,64 +21,122 @@ import { prepareSkillResourceDelivery } from "../skills/runtime/resources.js";
 import { prepareNodeClaudeSkillSession } from "./claude-skill-session.js";
 
 const temps = useAutoCleanupTempDirTracker(afterEach);
+const workshopFixture = { description: "Fixture", inputSchema: {} };
+type SessionIo = Parameters<typeof prepareNodeClaudeSkillSession>[0];
+
+function prepareSession(
+  init: Omit<NodeClaudeSkillInit, "type">,
+  options: {
+    signal?: AbortSignal;
+    send?: NonNullable<SessionIo["frames"]>["send"];
+    unsubscribe?: () => void;
+  } = {},
+) {
+  let receive: ((bytes: Uint8Array) => void | Promise<void>) | undefined;
+  const session = prepareNodeClaudeSkillSession({
+    signal: options.signal ?? new AbortController().signal,
+    emitChunk: vi.fn(),
+    onInput: vi.fn(),
+    frames: {
+      send: options.send ?? vi.fn(),
+      onMessage: (listener) => {
+        receive = listener;
+        void listener(Buffer.from(JSON.stringify({ type: "init", ...init })));
+        return options.unsubscribe ?? vi.fn();
+      },
+    },
+  });
+  return {
+    session,
+    dispatch: (bytes: Uint8Array) => {
+      assert(receive);
+      return receive(bytes);
+    },
+  };
+}
+
+async function connectWorkshop(
+  sdk: string,
+  session: Awaited<ReturnType<typeof prepareNodeClaudeSkillSession>>,
+) {
+  const client =
+    sdk === "v1"
+      ? new Client({ name: "workshop-fixture", version: "1" })
+      : new V2Client(
+          { name: "workshop-fixture", version: "1" },
+          { versionNegotiation: { mode: "legacy" } },
+        );
+  onTestFinished(async () => {
+    try {
+      await client.close();
+    } finally {
+      try {
+        await session.close();
+      } finally {
+        await session.cleanup();
+      }
+    }
+  });
+  const configPath = session.argv[session.argv.indexOf("--mcp-config") + 1];
+  assert(configPath);
+  const config: unknown = JSON.parse(await fs.readFile(configPath, "utf8"));
+  assert(isRecord(config) && isRecord(config.mcpServers));
+  const endpoint = config.mcpServers.openclaw;
+  assert(isRecord(endpoint) && typeof endpoint.url === "string");
+  const url = new URL(endpoint.url);
+  return {
+    client,
+    url,
+    connect: () =>
+      client.connect(
+        sdk === "v1" ? new StreamableHTTPClientTransport(url) : new V2HttpTransport(url),
+      ),
+  };
+}
+
+async function skillResources(name: string, markdown: string, reference?: string) {
+  const workspace = temps.make("node-skill-session-");
+  const skillDir = path.join(workspace, "skills", name);
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(path.join(skillDir, "SKILL.md"), markdown);
+  if (reference) {
+    await fs.writeFile(path.join(skillDir, "reference.md"), reference);
+  }
+  const resources = await prepareSkillResourceDelivery(
+    await buildSkillSnapshot(workspace, {
+      entries: loadWorkspaceSkills(workspace, { workspaceOnly: true }),
+    }),
+    () => {},
+  );
+  return { skillDir, resources };
+}
+
+function captureWarnings() {
+  const warn = vi.fn();
+  const previousConsole = loggingState.rawConsole;
+  setLoggerOverride({ level: "silent", consoleLevel: "warn" });
+  loggingState.rawConsole = { log: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+  return {
+    warn,
+    restore: () => {
+      loggingState.rawConsole = previousConsole;
+      setLoggerOverride(null);
+      resetLogger();
+    },
+  };
+}
 
 describe("node Claude Workshop result settlement", () => {
   it.each(["v1", "v2"].flatMap((sdk) => [false, true].map((malformed) => ({ sdk, malformed }))))(
     "$sdk settles the real MCP request (malformed result: $malformed)",
     async ({ sdk, malformed }) => {
       const sent = createDeferredCore<Uint8Array>();
-      let receive: ((bytes: Uint8Array) => void | Promise<void>) | undefined;
-      const session = await prepareNodeClaudeSkillSession({
-        signal: new AbortController().signal,
-        emitChunk: vi.fn(),
-        onInput: vi.fn(),
-        frames: {
-          send: async (bytes) => {
-            sent.resolve(bytes);
-          },
-          onMessage: (listener) => {
-            receive = listener;
-            void listener(
-              Buffer.from(
-                JSON.stringify({
-                  type: "init",
-                  workshop: { description: "Fixture", inputSchema: {} },
-                }),
-              ),
-            );
-            return vi.fn();
-          },
-        },
-      });
-      const client =
-        sdk === "v1"
-          ? new Client({ name: "workshop-result-fixture", version: "1" })
-          : new V2Client(
-              { name: "workshop-result-fixture", version: "1" },
-              { versionNegotiation: { mode: "legacy" } },
-            );
-      onTestFinished(async () => {
-        try {
-          await client.close();
-        } finally {
-          try {
-            await session.close();
-          } finally {
-            await session.cleanup();
-          }
-        }
-      });
-      const configPath = session.argv[session.argv.indexOf("--mcp-config") + 1];
-      assert(configPath);
-      const config: unknown = JSON.parse(await fs.readFile(configPath, "utf8"));
-      assert(isRecord(config) && isRecord(config.mcpServers));
-      const endpoint = config.mcpServers.openclaw;
-      assert(isRecord(endpoint) && typeof endpoint.url === "string");
-      await client.connect(
-        sdk === "v1"
-          ? new StreamableHTTPClientTransport(new URL(endpoint.url))
-          : new V2HttpTransport(new URL(endpoint.url)),
+      const prepared = prepareSession(
+        { workshop: workshopFixture },
+        { send: async (bytes) => sent.resolve(bytes) },
       );
+      const { client, connect } = await connectWorkshop(sdk, await prepared.session);
+      await connect();
       const result = client.callTool({ name: "skill_workshop", arguments: {} });
       void result.catch(() => {});
       const request: unknown = JSON.parse(Buffer.from(await sent.promise).toString("utf8"));
@@ -89,8 +148,7 @@ describe("node Claude Workshop result settlement", () => {
           result: { content: [{ type: "text", text: malformed ? 42 : "Workshop result" }] },
         }),
       );
-      const dispatch = receive;
-      assert(dispatch);
+      const { dispatch } = prepared;
       if (malformed) {
         await expect(Promise.resolve().then(() => dispatch(response))).rejects.toMatchObject({
           name: "ZodError",
@@ -109,45 +167,11 @@ describe("node Claude Workshop result settlement", () => {
     "%s preserves route authority and tears down pending HTTP calls",
     async (sdk) => {
       const sent = createDeferredCore();
-      const controller = new AbortController();
-      const session = await prepareNodeClaudeSkillSession({
-        signal: controller.signal,
-        emitChunk: vi.fn(),
-        onInput: vi.fn(),
-        frames: {
-          send: async () => sent.resolve(),
-          onMessage: (listener) => {
-            void listener(
-              Buffer.from(
-                JSON.stringify({
-                  type: "init",
-                  workshop: { description: "Fixture", inputSchema: {} },
-                }),
-              ),
-            );
-            return () => {};
-          },
-        },
-      });
-      const client =
-        sdk === "v1"
-          ? new Client({ name: "workshop-close-fixture", version: "1" })
-          : new V2Client(
-              { name: "workshop-close-fixture", version: "1" },
-              { versionNegotiation: { mode: "legacy" } },
-            );
-      onTestFinished(async () => {
-        await client.close();
-        await session.close();
-        await session.cleanup();
-      });
-      const configPath = session.argv[session.argv.indexOf("--mcp-config") + 1];
-      assert(configPath);
-      const config: unknown = JSON.parse(await fs.readFile(configPath, "utf8"));
-      assert(isRecord(config) && isRecord(config.mcpServers));
-      const endpoint = config.mcpServers.openclaw;
-      assert(isRecord(endpoint) && typeof endpoint.url === "string");
-      const url = new URL(endpoint.url);
+      const session = await prepareSession(
+        { workshop: workshopFixture },
+        { send: async () => sent.resolve() },
+      ).session;
+      const { client, url, connect } = await connectWorkshop(sdk, session);
       expect((await fetch(new URL("/mcp/wrong-invocation", url), { method: "POST" })).status).toBe(
         404,
       );
@@ -156,9 +180,7 @@ describe("node Claude Workshop result settlement", () => {
           .status,
       ).toBe(404);
       expect((await fetch(url)).status).toBe(404);
-      await client.connect(
-        sdk === "v1" ? new StreamableHTTPClientTransport(url) : new V2HttpTransport(url),
-      );
+      await connect();
       const call = client.callTool({ name: "skill_workshop", arguments: {} });
       const rejected = expect(call).rejects.toBeInstanceOf(Error);
       await sent.promise;
@@ -174,48 +196,20 @@ describe("node Claude skill artifact cleanup", () => {
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0).each([false, true])(
     "grants only the artifact root and cleans independent inputs after close (Workshop: %s)",
     async (workshop) => {
-      const workspace = temps.make("node-skill-session-");
-      const skillDir = path.join(workspace, "skills", "guide");
-      await fs.mkdir(skillDir, { recursive: true });
-      await fs.writeFile(
-        path.join(skillDir, "SKILL.md"),
+      const { skillDir, resources } = await skillResources(
+        "guide",
         "---\ndescription: Guide\n---\n# Guide\n",
       );
-      const resources = await prepareSkillResourceDelivery(
-        await buildSkillSnapshot(workspace, {
-          entries: loadWorkspaceSkills(workspace, { workspaceOnly: true }),
-        }),
-        () => {},
-      );
-      const session = await prepareNodeClaudeSkillSession({
-        signal: new AbortController().signal,
-        emitChunk: vi.fn(),
-        onInput: vi.fn(),
-        frames: {
-          send: vi.fn(),
-          onMessage: (listener) => {
-            void listener(
-              Buffer.from(
-                JSON.stringify({
-                  type: "init",
-                  resources,
-                  ...(workshop ? { workshop: { description: "Fixture", inputSchema: {} } } : {}),
-                }),
-              ),
-            );
-            return vi.fn();
-          },
-        },
-      });
+      const session = await prepareSession({
+        resources,
+        ...(workshop ? { workshop: workshopFixture } : {}),
+      }).session;
       const artifactRoot = session.argv[session.argv.indexOf("--add-dir") + 1]!;
       const skillPath = session.rewriteReferences(path.join(skillDir, "SKILL.md"));
       const configPath = workshop
         ? session.argv[session.argv.indexOf("--mcp-config") + 1]!
         : undefined;
-      const warn = vi.fn();
-      const previousConsole = loggingState.rawConsole;
-      setLoggerOverride({ level: "silent", consoleLevel: "warn" });
-      loggingState.rawConsole = { log: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+      const { warn, restore } = captureWarnings();
       try {
         expect(session.argv.filter((arg) => arg === "--add-dir")).toHaveLength(1);
         expect(path.dirname(path.dirname(skillPath))).toBe(artifactRoot);
@@ -239,26 +233,14 @@ describe("node Claude skill artifact cleanup", () => {
         await session.close();
         await fs.chmod(path.dirname(skillPath), 0o700);
         await session.cleanup();
-        loggingState.rawConsole = previousConsole;
-        setLoggerOverride(null);
-        resetLogger();
+        restore();
       }
     },
   );
 
   it("preserves the exact frozen setup error when partial skill cleanup fails", async () => {
-    const workspace = temps.make("node-skill-rollback-");
-    const skillDir = path.join(workspace, "skills", "partial");
-    await fs.mkdir(skillDir, { recursive: true });
     const markdown = "---\ndescription: Partial materialization proof\n---\n# Instructions\n";
-    await fs.writeFile(path.join(skillDir, "SKILL.md"), markdown);
-    await fs.writeFile(path.join(skillDir, "reference.md"), "supporting resource");
-    const resources = await prepareSkillResourceDelivery(
-      await buildSkillSnapshot(workspace, {
-        entries: loadWorkspaceSkills(workspace, { workspaceOnly: true }),
-      }),
-      () => {},
-    );
+    const { resources } = await skillResources("partial", markdown, "supporting resource");
     const primary = new Error("Node skill setup cancelled");
     primary.name = "AbortError";
     Object.freeze(primary);
@@ -287,24 +269,13 @@ describe("node Claude skill artifact cleanup", () => {
       }
       return originalRm(target, options);
     });
-    const warn = vi.fn();
-    const previousConsole = loggingState.rawConsole;
-    setLoggerOverride({ level: "silent", consoleLevel: "warn" });
-    loggingState.rawConsole = { log: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
+    const { warn, restore } = captureWarnings();
     const unsubscribe = vi.fn();
     try {
-      const result = await prepareNodeClaudeSkillSession({
-        signal: controller.signal,
-        emitChunk: vi.fn(),
-        onInput: vi.fn(),
-        frames: {
-          send: vi.fn(),
-          onMessage: (listener) => {
-            void listener(Buffer.from(JSON.stringify({ type: "init", resources })));
-            return unsubscribe;
-          },
-        },
-      }).catch((error: unknown) => error);
+      const result = await prepareSession(
+        { resources },
+        { signal: controller.signal, unsubscribe },
+      ).session.catch((error: unknown) => error);
       expect.soft(result).toBe(primary);
       expect(unsubscribe).toHaveBeenCalledOnce();
       expect(retainedFile).toBeDefined();
@@ -321,9 +292,7 @@ describe("node Claude skill artifact cleanup", () => {
     } finally {
       writeFile.mockRestore();
       rm.mockRestore();
-      loggingState.rawConsole = previousConsole;
-      setLoggerOverride(null);
-      resetLogger();
+      restore();
       if (directory) {
         await fs.rm(directory, { recursive: true, force: true });
       }

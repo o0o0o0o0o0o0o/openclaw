@@ -4,12 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as runtimePaths from "../daemon/runtime-paths.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import type { prepareGitCandidateNodeRuntime } from "../infra/update-runner-git-node-preflight.js";
-import { OPENCLAW_AGENT_SCHEMA_VERSION } from "../state/openclaw-agent-db-contract.js";
 import { snapshotPreflightSourceManifest } from "../state/openclaw-database-preflight.test-support.js";
-import { OPENCLAW_STATE_SCHEMA_VERSION } from "../state/openclaw-state-db-contract.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { withTestDir } from "../test-helpers/temp-dir.js";
 import { assertNodeRuntimeUpdateCompatible } from "./auto-update-compatibility.js";
+import { writeNodeUpdateCandidate } from "./auto-update.test-support.js";
 
 const mocks = vi.hoisted(() => ({
   command: vi.fn(),
@@ -35,28 +34,7 @@ beforeEach(() => {
 async function createCompatibilityFixture(directory: string) {
   const stateDir = path.join(directory, "node-state");
   const packageRoot = path.join(directory, "candidate");
-  await fs.mkdir(path.join(packageRoot, "dist"), { recursive: true });
-  await Promise.all([
-    fs.writeFile(
-      path.join(packageRoot, "package.json"),
-      JSON.stringify({
-        name: "openclaw",
-        version: "2026.9.18",
-        openclaw: {
-          schemaVersions: {
-            state: OPENCLAW_STATE_SCHEMA_VERSION,
-            agent: OPENCLAW_AGENT_SCHEMA_VERSION,
-          },
-        },
-      }),
-    ),
-    ...[
-      "openclaw.mjs",
-      "node-host-launcher.mjs",
-      "dist/node-host-launcher-bootstrap.js",
-      "dist/entry.js",
-    ].map((relativePath) => fs.writeFile(path.join(packageRoot, relativePath), "export {};\n")),
-  ]);
+  await writeNodeUpdateCandidate(packageRoot);
   const statePath = resolveOpenClawStateSqlitePath({ OPENCLAW_STATE_DIR: stateDir });
   await fs.mkdir(path.dirname(statePath), { recursive: true });
   const { DatabaseSync } = requireNodeSqlite();

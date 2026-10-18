@@ -1,5 +1,5 @@
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { PreparedNodeRuntimeUpdate } from "./auto-update-install.js";
@@ -63,6 +63,12 @@ const candidate: PreparedNodeRuntimeUpdate = {
 const controllers: Array<ReturnType<typeof startNodeHostAutoUpdate>> = [];
 const releases: Array<() => void> = [];
 
+function expectCalls(count: number, ...functions: MockInstance[]) {
+  for (const fn of functions) {
+    expect(fn).toHaveBeenCalledTimes(count);
+  }
+}
+
 function hold<T>(value: T) {
   const deferred = createDeferred<T>();
   releases.push(() => deferred.resolve(value));
@@ -87,28 +93,14 @@ function start(busy = false) {
   return { abort, runtime, onRestartAccepted, log, controller };
 }
 
-function holdStage(
-  stage: "discovery" | "download" | "preflight" | "idle",
-  host: ReturnType<typeof start>,
-) {
+function holdStage(stage: "download" | "preflight" | "idle", host: ReturnType<typeof start>) {
   const pending = hold<void>(undefined);
-  if (stage === "discovery") {
-    mocks.discover.mockImplementationOnce(async () => {
-      await pending.promise;
-      return { tag: "latest", version: candidate.version };
-    });
-  } else if (stage === "download") {
-    mocks.prepare.mockImplementationOnce(async () => {
-      await pending.promise;
-      return candidate;
-    });
+  if (stage === "download") {
+    mocks.prepare.mockImplementationOnce(() => pending.promise.then(() => candidate));
   } else if (stage === "preflight") {
-    mocks.compatible.mockImplementationOnce(async () => await pending.promise);
+    mocks.compatible.mockImplementationOnce(() => pending.promise);
   } else {
-    host.runtime.tryPauseForUpdate.mockImplementationOnce(async () => {
-      await pending.promise;
-      return true;
-    });
+    host.runtime.tryPauseForUpdate.mockImplementationOnce(() => pending.promise.then(() => true));
   }
   return pending;
 }
@@ -159,8 +151,7 @@ describe("node auto-update controller", () => {
     expect(mocks.discover).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(HOUR);
     expect(mocks.discover).toHaveBeenCalledTimes(3);
-    expect(mocks.prepare).not.toHaveBeenCalled();
-    expect(mocks.restart).not.toHaveBeenCalled();
+    expectCalls(0, mocks.prepare, mocks.restart);
   });
 
   it.each([
@@ -185,8 +176,7 @@ describe("node auto-update controller", () => {
       mocks.config = config;
       start();
       await vi.advanceTimersByTimeAsync(24 * HOUR);
-      expect(mocks.discover).not.toHaveBeenCalled();
-      expect(mocks.prepare).not.toHaveBeenCalled();
+      expectCalls(0, mocks.discover, mocks.prepare);
     },
   );
 
@@ -215,12 +205,10 @@ describe("node auto-update controller", () => {
     const host = start(true);
     await vi.advanceTimersByTimeAsync(0);
     expect(mocks.prepare).toHaveBeenCalledOnce();
-    expect(mocks.compatible).not.toHaveBeenCalled();
-    expect(mocks.restart).not.toHaveBeenCalled();
+    expectCalls(0, mocks.compatible, mocks.restart);
     await vi.advanceTimersByTimeAsync(30_000);
     expect(host.runtime.tryPauseForUpdate).toHaveBeenCalledTimes(2);
-    expect(mocks.prepare).toHaveBeenCalledOnce();
-    expect(mocks.discover).toHaveBeenCalledOnce();
+    expectCalls(1, mocks.prepare, mocks.discover);
     expect(
       host.log.mock.calls.filter(([message]) => message.includes("waiting for active work")),
     ).toHaveLength(1);
@@ -228,8 +216,7 @@ describe("node auto-update controller", () => {
     host.runtime.tryPauseForUpdate.mockResolvedValue(true);
     await vi.advanceTimersByTimeAsync(30_000);
     expect(mocks.restart).toHaveBeenCalledOnce();
-    expect(host.onRestartAccepted).not.toHaveBeenCalled();
-    expect(host.runtime.resumeAfterUpdate).not.toHaveBeenCalled();
+    expectCalls(0, host.onRestartAccepted, host.runtime.resumeAfterUpdate);
     acknowledgment.resolve();
     await vi.advanceTimersByTimeAsync(0);
     expect(host.onRestartAccepted).toHaveBeenCalledOnce();
@@ -237,19 +224,13 @@ describe("node auto-update controller", () => {
     expect(host.runtime.resumeAfterUpdate).not.toHaveBeenCalled();
   });
 
-  it.each([
-    { stage: "preflight", change: "disabled" },
-    { stage: "preflight", change: "channel" },
-    { stage: "preflight", change: "interval" },
-  ] as const)(
-    "rechecks $change changed during $stage before activation",
-    async ({ stage, change }) => {
+  it.each(["disabled", "channel", "interval"] as const)(
+    "rechecks %s changed during preflight before activation",
+    async (change) => {
       const host = start();
-      const pending = holdStage(stage, host);
+      const pending = holdStage("preflight", host);
       await vi.advanceTimersByTimeAsync(0);
-      expect(
-        { discovery: mocks.discover, download: mocks.prepare, preflight: mocks.compatible }[stage],
-      ).toHaveBeenCalledOnce();
+      expect(mocks.compatible).toHaveBeenCalledOnce();
       if (change === "interval") {
         mocks.lstat.mockResolvedValue({ mtimeMs: Date.now() });
       } else {
@@ -260,8 +241,7 @@ describe("node auto-update controller", () => {
       }
       pending.resolve();
       await vi.advanceTimersByTimeAsync(0);
-      expect(mocks.restart).not.toHaveBeenCalled();
-      expect(host.onRestartAccepted).not.toHaveBeenCalled();
+      expectCalls(0, mocks.restart, host.onRestartAccepted);
       expect(host.runtime.resumeAfterUpdate).toHaveBeenCalledOnce();
     },
   );
@@ -276,8 +256,7 @@ describe("node auto-update controller", () => {
         stage === "download" ? mocks.prepare.mock.calls[0] : mocks.compatible.mock.calls[0];
       if (stage === "idle") {
         expect(host.runtime.tryPauseForUpdate).toHaveBeenCalledOnce();
-        expect(mocks.compatible).not.toHaveBeenCalled();
-        expect(mocks.restart).not.toHaveBeenCalled();
+        expectCalls(0, mocks.compatible, mocks.restart);
       } else {
         expect(invocation?.[0].signal?.aborted).toBe(false);
       }
@@ -296,8 +275,7 @@ describe("node auto-update controller", () => {
       if (stage === "idle") {
         expect(mocks.compatible).not.toHaveBeenCalled();
       }
-      expect(mocks.restart).not.toHaveBeenCalled();
-      expect(host.onRestartAccepted).not.toHaveBeenCalled();
+      expectCalls(0, mocks.restart, host.onRestartAccepted);
       expect(host.runtime.resumeAfterUpdate).toHaveBeenCalledTimes(stage === "download" ? 0 : 1);
     },
   );
@@ -306,13 +284,12 @@ describe("node auto-update controller", () => {
     "keeps the running node available after a $stage failure and retries hourly",
     async (stage) => {
       const error = new Error(`${stage} fixture failure`);
-      if (stage === "download") {
-        mocks.prepare.mockRejectedValueOnce(error);
-      } else if (stage === "preflight") {
-        mocks.compatible.mockRejectedValueOnce(error);
-      } else {
-        mocks.restart.mockRejectedValueOnce(error);
-      }
+      const failing = {
+        download: mocks.prepare,
+        preflight: mocks.compatible,
+        restart: mocks.restart,
+      };
+      failing[stage].mockRejectedValueOnce(error);
       const host = start();
       await vi.advanceTimersByTimeAsync(0);
       expect(host.log).toHaveBeenCalledWith(expect.stringContaining(error.message));

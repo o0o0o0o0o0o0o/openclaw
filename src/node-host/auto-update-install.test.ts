@@ -12,6 +12,7 @@ import { OPENCLAW_AGENT_SCHEMA_VERSION } from "../state/openclaw-agent-db-contra
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "../state/openclaw-state-db-contract.js";
 import { withTestDir } from "../test-helpers/temp-dir.js";
 import { prepareNodeRuntimeUpdate } from "./auto-update-install.js";
+import { nodeUpdateMetadata, writeNodeUpdateCandidate } from "./auto-update.test-support.js";
 
 const mocks = vi.hoisted(() => ({
   resolve: vi.fn(),
@@ -42,30 +43,21 @@ vi.mock("../state/openclaw-database-preflight.js", () => ({
   preflightOpenClawDatabaseSchemas: async () => ({ incompatible: [], indeterminate: [] }),
 }));
 
-const VERSION = "2026.9.18";
-const metadata: NpmSpecResolution = {
-  name: "openclaw",
-  version: VERSION,
-  integrity: `sha512-${Buffer.alloc(64, 1).toString("base64")}`,
-  packageOpenClaw: {
-    schemaVersions: { state: OPENCLAW_STATE_SCHEMA_VERSION, agent: OPENCLAW_AGENT_SCHEMA_VERSION },
-  },
-};
+const VERSION = nodeUpdateMetadata.version;
+const metadata: NpmSpecResolution = nodeUpdateMetadata;
+
+const prepare = (stateDir: string) =>
+  prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir });
+const readPackage = async (root: string): Promise<unknown> =>
+  JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8"));
+
+function expectNoNpm() {
+  expect(mocks.resolve).not.toHaveBeenCalled();
+  expect(mocks.pack).not.toHaveBeenCalled();
+}
 
 async function writeCandidate(packageRoot: string, version = VERSION): Promise<void> {
-  await fs.mkdir(path.join(packageRoot, "dist"), { recursive: true });
-  await Promise.all([
-    fs.writeFile(
-      path.join(packageRoot, "package.json"),
-      JSON.stringify({ name: "openclaw", version, openclaw: metadata.packageOpenClaw }),
-    ),
-    ...[
-      "openclaw.mjs",
-      "node-host-launcher.mjs",
-      "dist/node-host-launcher-bootstrap.js",
-      "dist/entry.js",
-    ].map((relativePath) => fs.writeFile(path.join(packageRoot, relativePath), "export {};\n")),
-  ]);
+  await writeNodeUpdateCandidate(packageRoot, version);
   await writePackageDistInventory(packageRoot);
 }
 
@@ -164,13 +156,12 @@ describe("Bun private node runtime installation", () => {
       },
     );
 
-    const candidate = await prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir });
+    const candidate = await prepare(stateDir);
     expect(candidate).toMatchObject({ version: VERSION, integrity });
     expect(candidate.packageRoot).toBe(
       path.join(candidate.runtimeRoot, "lib", "node_modules", "openclaw"),
     );
-    expect(mocks.resolve).not.toHaveBeenCalled();
-    expect(mocks.pack).not.toHaveBeenCalled();
+    expectNoNpm();
     expect(mocks.command.mock.calls.some(([argv]) => argv[0].startsWith("npm"))).toBe(false);
     const install = mocks.command.mock.calls.find(([argv]) => argv[1] === "add");
     expect(install?.[0]).toEqual([
@@ -201,7 +192,7 @@ describe("Bun private node runtime installation", () => {
     ]);
     mocks.command.mockClear();
     serveManifest();
-    expect(await prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir })).toEqual(candidate);
+    expect(await prepare(stateDir)).toEqual(candidate);
     expect(mocks.command).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
@@ -214,12 +205,9 @@ describe("Bun private node runtime installation", () => {
   ])("rejects $error before installing", async ({ error, ...dist }) => {
     const stateDir = tempDirs.make("openclaw-node-bun-invalid-");
     serveManifest(dist);
-    await expect(prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir })).rejects.toThrow(
-      error,
-    );
+    await expect(prepare(stateDir)).rejects.toThrow(error);
     expect(mocks.command).not.toHaveBeenCalled();
-    expect(mocks.resolve).not.toHaveBeenCalled();
-    expect(mocks.pack).not.toHaveBeenCalled();
+    expectNoNpm();
     expect(await fs.readdir(stateDir)).toEqual([]);
   });
 
@@ -231,9 +219,7 @@ describe("Bun private node runtime installation", () => {
     );
     Object.defineProperty(process, "platform", { value: "win32" });
     mocks.pack.mockResolvedValue({ ok: false, error: "synthetic npm pack failure" });
-    await expect(prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir })).rejects.toThrow(
-      "synthetic npm pack failure",
-    );
+    await expect(prepare(stateDir)).rejects.toThrow("synthetic npm pack failure");
     expect(mocks.resolve).toHaveBeenCalledWith({ spec: `openclaw@${VERSION}`, signal: undefined });
     expect(mocks.pack).toHaveBeenCalledOnce();
     expect(fetchMock).not.toHaveBeenCalled();
@@ -264,18 +250,14 @@ describe("private node runtime installation", () => {
       await writeCandidate(globalRoot, "2026.9.17");
       vi.stubEnv("npm_config_prefix", globalPrefix);
       const stateDir = path.join(directory, "state");
-      const candidate = await prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir });
+      const candidate = await prepare(stateDir);
 
       expect(
         candidate.runtimeRoot.startsWith(path.join(stateDir, "node-runtime", "releases")),
       ).toBe(true);
       expect(candidate).toMatchObject({ version: VERSION, integrity: metadata.integrity });
-      expect(
-        JSON.parse(await fs.readFile(path.join(candidate.packageRoot, "package.json"), "utf8")),
-      ).toMatchObject({ version: VERSION });
-      expect(
-        JSON.parse(await fs.readFile(path.join(globalRoot, "package.json"), "utf8")),
-      ).toMatchObject({ version: "2026.9.17" });
+      expect(await readPackage(candidate.packageRoot)).toMatchObject({ version: VERSION });
+      expect(await readPackage(globalRoot)).toMatchObject({ version: "2026.9.17" });
       await expect(
         fs.access(path.join(stateDir, "state", "openclaw.sqlite")),
       ).rejects.toMatchObject({ code: "ENOENT" });
@@ -285,14 +267,12 @@ describe("private node runtime installation", () => {
 
       mocks.pack.mockClear();
       mocks.command.mockClear();
-      expect(await prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir })).toEqual(
-        candidate,
-      );
+      expect(await prepare(stateDir)).toEqual(candidate);
       expect(mocks.pack).not.toHaveBeenCalled();
       expect(mocks.command).not.toHaveBeenCalled();
 
       await fs.unlink(path.join(candidate.packageRoot, "node-host-launcher.mjs"));
-      const recovered = await prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir });
+      const recovered = await prepare(stateDir);
       expect(recovered.runtimeRoot).not.toBe(candidate.runtimeRoot);
       expect(recovered.warnings?.[0]).toContain(candidate.runtimeRoot);
       expect(await fs.readFile(path.join(candidate.packageRoot, "package.json"), "utf8")).toBe(
@@ -333,9 +313,9 @@ describe("private node runtime installation", () => {
             },
           });
         }
-        await expect(
-          prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir }),
-        ).rejects.toThrow(changed === "integrity" ? "integrity drift" : "openclaw update");
+        await expect(prepare(stateDir)).rejects.toThrow(
+          changed === "integrity" ? "integrity drift" : "openclaw update",
+        );
         if (changed !== "integrity") {
           expect(mocks.pack).not.toHaveBeenCalled();
         }
@@ -362,9 +342,7 @@ describe("private node runtime installation", () => {
           : { code: 1, stdout: "", stderr: "registry offline" },
       );
 
-      await expect(prepareNodeRuntimeUpdate({ targetVersion: VERSION, stateDir })).rejects.toThrow(
-        "registry offline",
-      );
+      await expect(prepare(stateDir)).rejects.toThrow("registry offline");
       expect(await fs.realpath(path.join(runtimeDir, "current"))).toBe(oldRoot);
       expect(await fs.readFile(path.join(oldRoot, "running"), "utf8")).toBe("old runtime");
     });

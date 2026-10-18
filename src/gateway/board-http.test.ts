@@ -93,11 +93,9 @@ function putHtml(
 
 async function ticketFor(
   name: string,
-  revision = 1,
-  issuedAtMs = nowMs,
-  authority: Parameters<typeof createBoardViewTicket>[0]["authority"] = gatewayAAuthority,
-  target: { sessionKey: string; agentId?: string } = { sessionKey: mainSession.sessionKey },
+  options: Partial<Parameters<typeof createBoardViewTicket>[0]> = {},
 ): Promise<string> {
+  const target = { sessionKey: mainSession.sessionKey, ...options };
   const document = await readBoardHtml(store, target, name);
   if (!document) {
     throw new Error(`missing HTML widget: ${name}`);
@@ -105,10 +103,11 @@ async function ticketFor(
   return createBoardViewTicket({
     ...target,
     name,
-    revision,
+    revision: 1,
     viewGeneration: document.viewGeneration,
-    nowMs: issuedAtMs,
-    authority,
+    nowMs,
+    authority: gatewayAAuthority,
+    ...options,
   }).ticket;
 }
 
@@ -122,9 +121,8 @@ describe("board widget HTTP", () => {
   it("fences direct-listener replay of an ingress ticket when its grant ends", async () => {
     const grant = new AbortController();
     const ingress = createRemoteControlUiIngressTestContext({ signal: grant.signal });
-    const ticket = await ticketFor("status", 1, nowMs, {
-      ...gatewayAAuthority,
-      remoteIngressPrincipal: ingress.resolvePrincipal(),
+    const ticket = await ticketFor("status", {
+      authority: { ...gatewayAAuthority, remoteIngressPrincipal: ingress.resolvePrincipal() },
     });
     expect((await request("status", { ticket })).status).toBe(200);
     grant.abort();
@@ -139,7 +137,7 @@ describe("board widget HTTP", () => {
     }
     for (const agentId of ["main", "work"]) {
       const target = { sessionKey: "global", agentId };
-      const ticket = await ticketFor("global-status", 1, nowMs, gatewayAAuthority, target);
+      const ticket = await ticketFor("global-status", target);
       const read = (owner: string) =>
         fetch(
           `${baseUrl}/__openclaw__/board/agent%3A${owner}%3Aglobal/global-status/index.html?bt=${encodeURIComponent(ticket)}`,
@@ -159,7 +157,7 @@ describe("board widget HTTP", () => {
 
     requestGatewayContext = gatewayB;
     expect((await request("status", { ticket })).status).toBe(503);
-    const replacementTicket = await ticketFor("status", 1, nowMs, gatewayBAuthority);
+    const replacementTicket = await ticketFor("status", { authority: gatewayBAuthority });
     expect((await request("status", { ticket: replacementTicket })).status).toBe(200);
 
     requestGatewayContext = gatewayA;
@@ -171,43 +169,40 @@ describe("board widget HTTP", () => {
   it.each([
     ["status", 200, statusHtml, "text/html; charset=utf-8"],
     ["%E0%A4%A", 404, "Not Found", "text/plain; charset=utf-8"],
-  ] as const)(
-    "preserves GET metadata and suppresses HEAD body for %s",
-    async (name, status, html, contentType) => {
-      for (const method of ["GET", "HEAD"] as const) {
-        const ticket = status === 200 ? await ticketFor(name) : undefined;
-        const host = observeHostDataSql();
-        let response: Response;
-        try {
-          response = await request(name, { method, ticket });
-          expect(
-            host.queries.filter((sql) => /\bfrom\s+"?board_(?:tabs|widgets)"?\b/iu.test(sql)),
-          ).toEqual([]);
-        } finally {
-          host.restore();
-        }
-        const body = Buffer.from(await response.arrayBuffer());
-
-        expect(response.status).toBe(status);
-        expect(response.headers.get("content-type")).toBe(contentType);
-        expect(response.headers.get("content-length")).toBe(String(Buffer.byteLength(html)));
-        expect(response.headers.get("access-control-allow-origin")).toBe("*");
-        expect(body).toEqual(method === "GET" ? Buffer.from(html) : Buffer.alloc(0));
-
-        if (status === 200) {
-          const csp = response.headers.get("content-security-policy");
-          expect(csp).toContain("default-src 'none'");
-          expect(csp).toContain("connect-src 'none'");
-          expect(csp).toContain("webrtc 'block'");
-          expect(csp).toContain("sandbox allow-scripts");
-          expect(response.headers.get("cache-control")).toBe("no-cache");
-        }
+  ] as const)("preserves GET/HEAD metadata for %s", async (name, status, html, contentType) => {
+    for (const method of ["GET", "HEAD"] as const) {
+      const ticket = status === 200 ? await ticketFor(name) : undefined;
+      const host = observeHostDataSql();
+      let response: Response;
+      try {
+        response = await request(name, { method, ticket });
+        expect(
+          host.queries.filter((sql) => /\bfrom\s+"?board_(?:tabs|widgets)"?\b/iu.test(sql)),
+        ).toEqual([]);
+      } finally {
+        host.restore();
       }
-    },
-  );
+      const body = Buffer.from(await response.arrayBuffer());
+
+      expect(response.status).toBe(status);
+      expect(response.headers.get("content-type")).toBe(contentType);
+      expect(response.headers.get("content-length")).toBe(String(Buffer.byteLength(html)));
+      expect(response.headers.get("access-control-allow-origin")).toBe("*");
+      expect(body).toEqual(method === "GET" ? Buffer.from(html) : Buffer.alloc(0));
+
+      if (status === 200) {
+        const csp = response.headers.get("content-security-policy");
+        expect(csp).toContain("default-src 'none'");
+        expect(csp).toContain("connect-src 'none'");
+        expect(csp).toContain("webrtc 'block'");
+        expect(csp).toContain("sandbox allow-scripts");
+        expect(response.headers.get("cache-control")).toBe("no-cache");
+      }
+    }
+  });
 
   it("rejects garbage and expired tickets before reading the store", async () => {
-    const expired = await ticketFor("status", 1, nowMs - BOARD_VIEW_TICKET_TTL_MS - 1);
+    const expired = await ticketFor("status", { nowMs: nowMs - BOARD_VIEW_TICKET_TTL_MS - 1 });
     const valid = await ticketFor("status");
     const readSpy = vi.spyOn(store, "useWidgetDocument");
     for (const ticket of [undefined, "garbage", `${valid.slice(0, -1)}x`, expired]) {
@@ -310,7 +305,9 @@ describe("board widget HTTP", () => {
     const html = recreated ? "<p>old</p>" : "<p>two</p>";
     await putHtml(name, html);
     expect((await request(name, { ticket: stale })).status).toBe(401);
-    const current = await request(name, { ticket: await ticketFor(name, recreated ? 1 : 2) });
+    const current = await request(name, {
+      ticket: await ticketFor(name, { revision: recreated ? 1 : 2 }),
+    });
     expect(current.status).toBe(200);
     await expect(current.text()).resolves.toBe(html);
   });

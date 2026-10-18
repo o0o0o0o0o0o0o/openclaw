@@ -44,7 +44,16 @@ async function closeDatabases() {
 function progressHarness(cfg: OpenClawConfig) {
   const harness = createBoardHarness(undefined, {}, boardStore, { getRuntimeConfig: () => cfg });
   Object.assign(harness.handlers, createProgressCardHandlers());
-  return harness;
+  return {
+    ...harness,
+    async card(
+      method: string,
+      params: Record<string, unknown>,
+      fields: Record<string, unknown> | null,
+    ) {
+      expectCard(await harness.invoke(`progressCard.${method}`, params), fields);
+    },
+  };
 }
 
 function configure(
@@ -90,137 +99,119 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-it("keeps global boards and progress under each owner's canonical row across reopen", async () => {
-  const cfg = configure(["main", "work"], { scope: "global" });
-  const { invoke, broadcast } = progressHarness(cfg);
-
-  for (const agentId of ["main", "work"]) {
-    const database = openOpenClawAgentDatabase({ agentId });
-    const target = { agentId, sessionKey: "global" };
-    seedSession({ ...target, storePath: database.path }, `session-${agentId}`);
-    const written = await invoke("board.widget.put", {
-      ...target,
-      name: "status",
-      content: { kind: "html", html: `<p>${agentId}</p>` },
-    });
-    expectBoard(written, { sessionKey: `agent:${agentId}:global`, revision: 1 });
-    expect(database.db.prepare("SELECT session_key FROM board_tabs").all()).toEqual([
-      expect.objectContaining({ session_key: "global" }),
-    ]);
-    const progress = await invoke("progressCard.put", {
-      ...target,
-      plan: [{ step: `${agentId} done`, status: "completed" }],
-    });
-    expectCard(progress, { sessionKey: `agent:${agentId}:global`, revision: 1 });
-    for (const table of ["session_progress_cards", "session_nodes"]) {
-      expect(database.db.prepare(`SELECT session_key FROM ${table}`).all()).toEqual([
-        expect.objectContaining({ session_key: "global" }),
-      ]);
-    }
-  }
-  await closeDatabases();
-
-  for (const agentId of ["main", "work"]) {
-    const target = { sessionKey: "global", agentId };
-    for (const params of [target, { sessionKey: `agent:${agentId}:main` }]) {
-      expect(await boardStore.getSnapshot(params)).toMatchObject({
-        sessionKey: "global",
-        widgets: [{ name: "status", revision: 1 }],
-      });
-      expect((await readBoardHtml(boardStore, params, "status"))?.html).toBe(
-        buildWidgetDocument("status", `<p>${agentId}</p>`),
+it.each(["global", "per-sender"] as const)(
+  "keeps canonical global cards isolated across reopen in %s mode",
+  async (scope) => {
+    const global = scope === "global";
+    const cfg = configure(
+      ["main", "work"],
+      { scope },
+      global ? undefined : { systemAgent: { agentId: "main" } },
+    );
+    const { invoke, broadcast, card } = progressHarness(cfg);
+    const targets = [
+      { agentId: "main", sessionKey: "global" },
+      { agentId: "work", sessionKey: "global" },
+      ...(!global ? [{ agentId: "work", sessionKey: "agent:work:global" }] : []),
+    ];
+    const markdown = (target: (typeof targets)[number]) => `${target.agentId}/${target.sessionKey}`;
+    for (const target of targets) {
+      const { agentId } = target;
+      const database = openOpenClawAgentDatabase({ agentId });
+      seedSession({ ...target, storePath: database.path }, `${agentId}-${target.sessionKey}`);
+      if (global) {
+        expectBoard(
+          await invoke("board.widget.put", {
+            ...target,
+            name: "status",
+            content: { kind: "html", html: `<p>${agentId}</p>` },
+          }),
+          { sessionKey: `agent:${agentId}:global`, revision: 1 },
+        );
+      }
+      await card(
+        "put",
+        {
+          ...target,
+          markdown: global ? undefined : markdown(target),
+          plan: [{ step: global ? `${agentId} done` : "Done", status: "completed" }],
+        },
+        { sessionKey: `agent:${agentId}:global`, revision: 1 },
       );
-      const snapshot = await invoke("board.get", params);
-      expectBoard(snapshot, {
-        sessionKey: `agent:${agentId}:global`,
-        widgets: [expect.objectContaining({ name: "status", revision: 1 })],
-      });
+      if (global) {
+        for (const table of ["board_tabs", "session_progress_cards", "session_nodes"]) {
+          expect(database.db.prepare(`SELECT session_key FROM ${table}`).all()).toEqual([
+            expect.objectContaining({ session_key: "global" }),
+          ]);
+        }
+      }
     }
-    await closeOpenClawAgentDatabasesAsync();
-    await closeOpenClawStateDatabaseAsync();
-    const parentSql = observeMainThreadSql();
-    try {
-      const progress = await invoke("progressCard.get", { sessionKey: "global", agentId });
-      expectCard(progress, {
-        sessionKey: `agent:${agentId}:global`,
-        revision: 1,
-        steps: [{ step: `${agentId} done`, status: "completed" }],
-      });
+    await closeDatabases();
+    for (const target of targets) {
+      const { agentId } = target;
+      if (global) {
+        for (const params of [target, { sessionKey: `agent:${agentId}:main` }]) {
+          expect(await boardStore.getSnapshot(params)).toMatchObject({
+            sessionKey: "global",
+            widgets: [{ name: "status", revision: 1 }],
+          });
+          expect((await readBoardHtml(boardStore, params, "status"))?.html).toBe(
+            buildWidgetDocument("status", `<p>${agentId}</p>`),
+          );
+          expectBoard(await invoke("board.get", params), {
+            sessionKey: `agent:${agentId}:global`,
+            widgets: [expect.objectContaining({ name: "status", revision: 1 })],
+          });
+        }
+      }
       await closeOpenClawAgentDatabasesAsync();
       await closeOpenClawStateDatabaseAsync();
-      parentSql.expectIdle();
-    } finally {
-      parentSql.restore();
+      const parentSql = observeMainThreadSql();
+      try {
+        await card("get", target, {
+          sessionKey: `agent:${agentId}:global`,
+          revision: 1,
+          ...(global
+            ? { steps: [{ step: `${agentId} done`, status: "completed" }] }
+            : { markdown: markdown(target) }),
+        });
+        await closeOpenClawAgentDatabasesAsync();
+        await closeOpenClawStateDatabaseAsync();
+        parentSql.expectIdle();
+      } finally {
+        parentSql.restore();
+      }
     }
-  }
-  await invoke("progressCard.put", { sessionKey: "agent:work:main", expectedRevision: 2 });
-  expect((await progressCardStore.get("global", "work"))?.revision).toBe(1);
-  const cleared = await invoke("progressCard.put", {
-    sessionKey: "global",
-    agentId: "work",
-    expectedRevision: 1,
-  });
-  expectCard(cleared, null);
-  expect(broadcast).toHaveBeenLastCalledWith(
-    "progressCard.changed",
-    { sessionKey: "agent:work:global", revision: null },
-    { sessionKeys: ["global"], agentId: "work" },
-  );
-  expect((await progressCardStore.get("global", "main"))?.revision).toBe(1);
-});
-
-it("keeps retained global progress separate from an ordinary qualified global row in per-sender mode", async () => {
-  const cfg = configure(
-    ["main", "work"],
-    { scope: "per-sender" },
-    { systemAgent: { agentId: "main" } },
-  );
-  const { invoke } = progressHarness(cfg);
-  const targets = [
-    { sessionKey: "global", agentId: "main" },
-    { sessionKey: "global", agentId: "work" },
-    { sessionKey: "agent:work:global", agentId: "work" },
-  ];
-  for (const target of targets) {
-    const database = openOpenClawAgentDatabase({ agentId: target.agentId });
-    seedSession({ ...target, storePath: database.path }, `${target.agentId}-${target.sessionKey}`);
-    const written = await invoke("progressCard.put", {
-      ...target,
-      markdown: `${target.agentId}/${target.sessionKey}`,
-      plan: [{ step: "Done", status: "completed" }],
-    });
-    expectCard(written, { revision: 1 });
-  }
-  await closeDatabases();
-
-  for (const target of targets) {
-    const read = await invoke("progressCard.get", target);
-    expectCard(read, {
-      sessionKey: `agent:${target.agentId}:global`,
-      markdown: `${target.agentId}/${target.sessionKey}`,
+    if (!global) {
+      await card("get", { sessionKey: "global" }, { markdown: "main/global" });
+    }
+    const work = { sessionKey: "global", agentId: "work" };
+    await card(
+      "put",
+      { ...(global ? { sessionKey: "agent:work:main" } : work), expectedRevision: 2 },
+      { revision: 1, ...(!global ? { markdown: "work/global" } : {}) },
+    );
+    expect((await progressCardStore.get("global", "work"))?.revision).toBe(1);
+    await card("put", { ...work, expectedRevision: 1 }, null);
+    if (global) {
+      expect(broadcast).toHaveBeenLastCalledWith(
+        "progressCard.changed",
+        { sessionKey: "agent:work:global", revision: null },
+        { sessionKeys: ["global"], agentId: "work" },
+      );
+    }
+    expect(await progressCardStore.get("global", "work")).toBeNull();
+    expect(await progressCardStore.get("global", "main")).toMatchObject({
       revision: 1,
+      ...(!global ? { markdown: "main/global" } : {}),
     });
-  }
-  const unqualified = await invoke("progressCard.get", { sessionKey: "global" });
-  expectCard(unqualified, { markdown: "main/global" });
-  const stale = await invoke("progressCard.put", {
-    sessionKey: "global",
-    agentId: "work",
-    expectedRevision: 2,
-  });
-  expectCard(stale, { markdown: "work/global", revision: 1 });
-  const cleared = await invoke("progressCard.put", {
-    sessionKey: "global",
-    agentId: "work",
-    expectedRevision: 1,
-  });
-  expectCard(cleared, null);
-  expect(await progressCardStore.get("global", "work")).toBeNull();
-  expect((await progressCardStore.get("global", "main"))?.markdown).toBe("main/global");
-  expect((await progressCardStore.get("agent:work:global", "work"))?.markdown).toBe(
-    "work/agent:work:global",
-  );
-});
+    if (!global) {
+      expect((await progressCardStore.get("agent:work:global", "work"))?.markdown).toBe(
+        "work/agent:work:global",
+      );
+    }
+  },
+);
 
 it("prepares custom board targets off-thread and observes a newly registered store owner", async () => {
   const storePath = path.join(stateDir, "custom", "sessions.json");
@@ -292,16 +283,6 @@ it("reopens separate boards and progress cards in a shared database owned by ano
   const resolverSql: string[] = [];
   const observations: ReturnType<typeof observeHostDataSql>[] = [];
   let reads = 0;
-  const finishObservation = () => {
-    for (const host of observations.splice(0)) {
-      resolverSql.push(
-        ...host.queries.filter((sql) =>
-          /\bfrom\s+"?(?:agent_databases|schema_meta)"?\b/iu.test(sql),
-        ),
-      );
-      host.restore();
-    }
-  };
   const interception = interceptSnapshot(
     () => {
       reads++;
@@ -320,7 +301,14 @@ it("reopens separate boards and progress cards in a shared database owned by ano
           widgets: [expect.objectContaining({ name: agentId, revision: 1 })],
         });
       } finally {
-        finishObservation();
+        for (const host of observations.splice(0)) {
+          resolverSql.push(
+            ...host.queries.filter((sql) =>
+              /\bfrom\s+"?(?:agent_databases|schema_meta)"?\b/iu.test(sql),
+            ),
+          );
+          host.restore();
+        }
       }
     }
     expect(reads).toBe(2);

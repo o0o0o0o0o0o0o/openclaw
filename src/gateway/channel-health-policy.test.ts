@@ -24,8 +24,10 @@ function evaluateHealth(
 
 describe("evaluateChannelHealth", () => {
   it("treats explicitly unlinked accounts as healthy unmanaged", () => {
-    const evaluation = evaluateHealth({ running: false, linked: false });
-    expect(evaluation).toEqual({ healthy: true, reason: "unmanaged" });
+    expect(evaluateHealth({ running: false, linked: false })).toEqual({
+      healthy: true,
+      reason: "unmanaged",
+    });
   });
 
   it("trusts a fresh recorded starting lifecycle inside connect grace", () => {
@@ -141,30 +143,25 @@ describe("evaluateChannelHealth", () => {
   );
 });
 
-describe("resolveChannelHealthState", () => {
-  it("preserves authored terminal detail above the shared blocked projection", () => {
-    const snapshot = {
-      enabled: true,
-      configured: true,
-      running: false,
-      connected: false,
-      terminalDisconnect: true,
-      lifecycle: "blocked",
-      healthState: "conflict",
-    } satisfies Parameters<typeof resolveChannelHealthState>[0];
-    const evaluation = evaluateHealth(snapshot);
-
-    expect(evaluation).toEqual({ healthy: false, reason: "terminal-disconnect" });
-    expect(resolveChannelHealthState(snapshot, policy)).toBe("conflict");
-  });
+it("preserves authored terminal detail above the shared blocked projection", () => {
+  const snapshot = {
+    enabled: true,
+    configured: true,
+    running: false,
+    connected: false,
+    terminalDisconnect: true,
+    lifecycle: "blocked",
+    healthState: "conflict",
+  } satisfies Parameters<typeof resolveChannelHealthState>[0];
+  expect(evaluateHealth(snapshot)).toEqual({ healthy: false, reason: "terminal-disconnect" });
+  expect(resolveChannelHealthState(snapshot, policy)).toBe("conflict");
 });
 
-describe("resolveChannelRestartReason", () => {
-  it("maps not-running + high reconnect attempts to gave-up", () => {
-    const reason = resolveChannelRestartReason(
+it("maps not-running + high reconnect attempts to gave-up", () => {
+  expect(
+    resolveChannelRestartReason(
       { running: false, reconnectAttempts: 10 },
       { healthy: false, reason: "not-running" },
-    );
-    expect(reason).toBe("gave-up");
-  });
+    ),
+  ).toBe("gave-up");
 });

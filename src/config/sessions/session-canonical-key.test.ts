@@ -66,7 +66,7 @@ describe("cold canonical session validation", () => {
   });
 
   it.each([false, true])(
-    "reloads metadata after a commit during required validation (pending rewrite: %s)",
+    "invalidates the next read after a commit during validation (pending rewrite: %s)",
     (certifiedReopen) => {
       const scope = createScope();
       const entry = { sessionId: "cold-key", updatedAt: 1, label: "before" };
@@ -108,7 +108,7 @@ describe("cold canonical session validation", () => {
       });
       try {
         expect(listSessionEntriesReadOnly({ ...scope, projection: "list" })[0]?.entry.label).toBe(
-          "after",
+          "before",
         );
         expect(committed).toBe(true);
         expect(listSessionEntriesReadOnly({ ...scope, projection: "list" })[0]?.entry.label).toBe(

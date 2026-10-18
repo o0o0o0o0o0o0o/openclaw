@@ -24,6 +24,7 @@ vi.mock("../runtime.js", async (importOriginal) => ({
   defaultRuntime: mocks.runtime,
 }));
 
+// mock-isolation: Record CLI exit status without terminating the test worker.
 vi.mock("./one-shot-exit.js", () => ({
   exitCliAfterOutput: (runtime: typeof mocks.runtime, exitCode: number) => runtime.exit(exitCode),
 }));

@@ -1,16 +1,12 @@
 // @vitest-environment node
-import { once, type EventEmitter } from "node:events";
+import { once } from "node:events";
 import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLogger, createServer as createViteServer } from "vite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
-import {
-  closeHttpServer,
-  listenLoopback,
-} from "../../../test/helpers/gateway-integration-fixtures.ts";
-import { withTestTimeout } from "../../../test/helpers/promise.js";
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
 import { createControlUiDevGateway } from "../../config/control-ui-dev-gateway.ts";
 import controlUiViteConfig from "../../vite.config.ts";
@@ -33,27 +29,33 @@ describe("configured UI development Gateway", () => {
     const events: Array<{
       phase: string;
       event: string;
-      code?: number | string;
+      code?: string | number;
       message?: string;
     }> = [];
-    const proxyCloses: Promise<number | undefined>[] = [];
-    const peerCloses: Promise<number | undefined>[] = [];
-    const socketCloses: Promise<number | undefined>[] = [];
+    const proxyCloses: Promise<void>[] = [];
+    const peerCloses: Promise<number>[] = [];
+    const websocketCloses: Promise<number>[] = [];
     const pendingWrites: Promise<void>[] = [];
     const eventWait = new AbortController();
     let phase = "normal";
     let interruptUpstream = false;
     const recordError = (event: string, error: { message: string; code?: string }) => {
-      events.push({ phase, event, code: error.code, message: error.message });
+      events.push({
+        phase,
+        event,
+        code: error.code,
+        message: error.message,
+      });
     };
-    const closed = (socket: EventEmitter, endpoint: string) => {
-      const promise = new Promise<number | undefined>((resolve) => {
-        socket.on("error", (error: Error) => recordError(`${endpoint}-error`, error));
-        socket.once("close", (code: unknown) => {
-          resolve(typeof code === "number" ? code : undefined);
+    const closed = (socket: WebSocket, endpoint: string) => {
+      const promise = new Promise<number>((resolve) => {
+        socket.on("error", (error) => recordError(`${endpoint}-error`, error));
+        socket.once("close", (code) => {
+          events.push({ phase, event: `${endpoint}-close`, code });
+          resolve(code);
         });
       });
-      socketCloses.push(promise);
+      websocketCloses.push(promise);
       return promise;
     };
     const nextEvent = (socket: WebSocket, event: "open" | "message") => {
@@ -62,8 +64,19 @@ describe("configured UI development Gateway", () => {
       void promise.catch(() => undefined);
       return promise;
     };
-    const withinDeadline = <T>(promise: Promise<T>) =>
-      withTestTimeout(promise, 5_000, JSON.stringify(events));
+    const withinDeadline = async <T>(promise: Promise<T>) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error(JSON.stringify(events))), 5_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
     const upstream = createServer((request, response) => {
       requests.push({
         path: request.url ?? "",
@@ -99,7 +112,9 @@ describe("configured UI development Gateway", () => {
     let socket: WebSocket | undefined;
     await runQaGatewayFixture(
       async () => {
-        const upstreamUrl = await listenLoopback(upstream);
+        upstream.listen(0, "127.0.0.1");
+        await once(upstream, "listening");
+        const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
         vi.stubEnv("OPENCLAW_UI_DEV_GATEWAY_URL", upstreamUrl);
         const config = controlUiViteConfig({ command: "serve" });
         for (const options of Object.values(config.server?.proxy ?? {})) {
@@ -111,9 +126,25 @@ describe("configured UI development Gateway", () => {
             configure?.(proxy, resolved);
             proxy.on("error", (error) => recordError("proxy-error", error));
             proxy.on("proxyReqWs", (request, _incoming, downstream) => {
-              proxyCloses.push(closed(downstream, "downstream"));
+              downstream.on("error", (error) => recordError("downstream-error", error));
+              proxyCloses.push(
+                new Promise((resolve) => {
+                  downstream.once("close", () => {
+                    events.push({ phase, event: "downstream-close" });
+                    resolve();
+                  });
+                }),
+              );
               request.once("upgrade", (_response, upstreamSocket) => {
-                proxyCloses.push(closed(upstreamSocket, "upstream"));
+                upstreamSocket.on("error", (error) => recordError("upstream-error", error));
+                proxyCloses.push(
+                  new Promise((resolve) => {
+                    upstreamSocket.once("close", () => {
+                      events.push({ phase, event: "upstream-close" });
+                      resolve();
+                    });
+                  }),
+                );
               });
             });
           };
@@ -136,24 +167,16 @@ describe("configured UI development Gateway", () => {
         const gateway = createControlUiDevGateway(upstreamUrl)!.gateway;
         vi.stubGlobal("OPENCLAW_UI_DEV_GATEWAY", gateway);
         const httpServer = server.httpServer!;
-        // Bind the native server directly; Vite's listen(0) releases its probed port.
-        const uiOrigin = await listenLoopback(httpServer);
+        const listening = once(httpServer, "listening");
+        // Vite's listen(0) probes and releases a port before binding it. Bind its
+        // native server directly so the kernel retains the fixture's allocation.
+        httpServer.listen(0, "127.0.0.1");
+        await listening;
+        const uiOrigin = `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}`;
         vi.stubGlobal("location", new URL(uiOrigin));
         const webSocketOptions = {
           // Removal: use ws's `origin` option after Bun's built-in client honors it.
           headers: { Origin: uiOrigin },
-        };
-        const connect = async (frame: string) => {
-          socket = new WebSocket(
-            gatewayWebSocketTransportUrl(gateway.gatewayUrl),
-            webSocketOptions,
-          );
-          const close = closed(socket, "client");
-          await withinDeadline(nextEvent(socket, "open"));
-          const message = nextEvent(socket, "message");
-          socket.send(frame);
-          expect(String((await withinDeadline(message))[0])).toBe(frame);
-          return { close };
         };
         expect(server.httpServer?.address()).toMatchObject({ address: "127.0.0.1" });
         const resourcePath = `${uiDevGatewayResourceBasePath()}/control-ui-config.json`;
@@ -202,18 +225,30 @@ describe("configured UI development Gateway", () => {
         await retired.body?.cancel();
         expect(requests).toHaveLength(gatewayRequests);
 
-        const { close: firstClose } = await connect("normal-gateway-frame");
+        socket = new WebSocket(gatewayWebSocketTransportUrl(gateway.gatewayUrl), webSocketOptions);
+        const firstClose = closed(socket, "client");
+        await withinDeadline(nextEvent(socket, "open"));
+        const message = nextEvent(socket, "message");
+        socket.send("normal-gateway-frame");
+        expect(String((await withinDeadline(message))[0])).toBe("normal-gateway-frame");
         expect(requests.at(-1)).toEqual({ path: "/", origin: uiOrigin });
 
         events.push({ phase, event: "client-close-requested" });
-        socket!.close(1000, "fixture-reload");
+        socket.close(1000, "fixture-reload");
         expect(await withinDeadline(firstClose)).toBe(1000);
         expect(await withinDeadline(peerCloses[0]!)).toBe(1000);
         await withinDeadline(Promise.all(proxyCloses));
         expect(events.filter(({ event }) => event.endsWith("-error"))).toEqual([]);
 
         phase = "upstream-abort";
-        const { close: interruptedClose } = await connect("reconnected-gateway-frame");
+        socket = new WebSocket(gatewayWebSocketTransportUrl(gateway.gatewayUrl), webSocketOptions);
+        const interruptedClose = closed(socket, "client");
+        await withinDeadline(nextEvent(socket, "open"));
+        const reconnectedMessage = nextEvent(socket, "message");
+        socket.send("reconnected-gateway-frame");
+        expect(String((await withinDeadline(reconnectedMessage))[0])).toBe(
+          "reconnected-gateway-frame",
+        );
         interruptUpstream = true;
         const writes = Array.from(
           { length: 32 },
@@ -233,8 +268,13 @@ describe("configured UI development Gateway", () => {
         await withinDeadline(Promise.all([...proxyCloses, ...writes]));
 
         phase = "recovered";
-        const { close: recoveredClose } = await connect("recovered-gateway-frame");
-        socket!.close(1000, "fixture-complete");
+        socket = new WebSocket(gatewayWebSocketTransportUrl(gateway.gatewayUrl), webSocketOptions);
+        const recoveredClose = closed(socket, "client");
+        await withinDeadline(nextEvent(socket, "open"));
+        const recoveredMessage = nextEvent(socket, "message");
+        socket.send("recovered-gateway-frame");
+        expect(String((await withinDeadline(recoveredMessage))[0])).toBe("recovered-gateway-frame");
+        socket.close(1000, "fixture-complete");
         expect(await withinDeadline(recoveredClose)).toBe(1000);
         expect(await withinDeadline(peerCloses[2]!)).toBe(1000);
         await withinDeadline(Promise.all(proxyCloses));
@@ -267,8 +307,13 @@ describe("configured UI development Gateway", () => {
         new Promise<void>((resolve) => {
           sockets.close(() => resolve());
         }),
-      () => closeHttpServer(upstream),
-      () => withinDeadline(Promise.all([...proxyCloses, ...socketCloses, ...pendingWrites])),
+      () => {
+        upstream.closeAllConnections();
+        return new Promise<void>((resolve) => {
+          upstream.close(() => resolve());
+        });
+      },
+      () => withinDeadline(Promise.all([...proxyCloses, ...websocketCloses, ...pendingWrites])),
     );
   });
 

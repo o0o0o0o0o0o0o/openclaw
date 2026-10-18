@@ -287,7 +287,7 @@ describe("runGatewayConversationList", () => {
 
   it("retains configured peers when live discovery is empty or fails", async () => {
     const listPeers = directoryList("user", { "configured-peer": "Configured Peer" });
-    const listPeersLive = vi.fn(async ({ query }: { query?: string }) =>
+    const listPeersLive = vi.fn(async ({ query }: { query?: string | null }) =>
       query ? [{ kind: "user" as const, id: "live-peer", name: "Live Peer" }] : [],
     );
     listPeersLive.mockRejectedValueOnce(new Error("directory unavailable"));

@@ -16,46 +16,24 @@ import * as hostStats from "./host-stats.js";
 
 const stats = { cpuCount: 8, memoryTotalBytes: 100, memoryFreeBytes: 50 };
 const gateway = { url: "wss://gateway.example.test", protocol: 4, capabilities: [] };
-const connections: ReturnType<typeof startNodeHostConnection>[] = [];
-const settlePending: (() => void)[] = [];
-type Request = ReturnType<typeof startConnectionFixture>["request"];
-const runnerPublications = (request: Request) =>
-  request.mock.calls.filter(([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD);
-const latestRunnerInventory = (request: Request) => runnerPublications(request).at(-1)?.[1];
-function deferRequests(request: Request, method: string, once = false) {
-  const pending = createDeferred<unknown>();
-  let intercepted = false;
-  request.mockImplementation((called) => {
-    if (called !== method || (once && intercepted)) {
-      return Promise.resolve({});
-    }
-    intercepted = true;
-    return pending.promise;
-  });
-  settlePending.push(() => pending.resolve({}));
-  return pending;
-}
-const workerDeclaration = (workerHost: Record<string, unknown>) => ({
-  protocolFeatures: [NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE],
-  workerHost: { enabled: true, capacity: { total: 2, available: 2 }, ...workerHost },
-});
-function enabledInventory(request: Request) {
-  const declaration = latestRunnerInventory(request);
-  const parsed = parseNodeRunnerInventoryDeclaration(declaration);
-  expect(parsed).toEqual(declaration);
-  if (!parsed || !("workerHost" in parsed) || !parsed.workerHost.enabled) {
-    throw new Error("Expected an enabled worker declaration");
-  }
-  return parsed.workerHost;
-}
 
 it.each([
   {
     declared: undefined,
-    expected:
-      "read write edit apply_patch exec process browser computer skill_workshop sessions_spawn sessions_send portal".split(
-        " ",
-      ),
+    expected: [
+      "read",
+      "write",
+      "edit",
+      "apply_patch",
+      "exec",
+      "process",
+      "browser",
+      "computer",
+      "skill_workshop",
+      "sessions_spawn",
+      "sessions_send",
+      "portal",
+    ],
   },
   {
     declared: ["presence", "future_tool", "portal", "read"],
@@ -65,9 +43,25 @@ it.each([
 ])(
   "preserves declared launch names or the published 2026.9.6 vocabulary ($declared)",
   ({ declared, expected }) => {
-    const declaration = parseNodeRunnerInventoryDeclaration(
-      workerDeclaration(declared ? { launchToolNames: declared } : {}),
-    );
+    const declaration = parseNodeRunnerInventoryDeclaration({
+      protocolFeatures: [NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE],
+      workerHost: {
+        enabled: true,
+        capacity: { total: 2, available: 2 },
+        environmentSession: 1,
+        capturedExecPolicy: true,
+        ...(declared
+          ? {
+              bundlePrewarm: 1,
+              bundleRetention: 1,
+              bundleStatus: 1,
+              portalStream: 1,
+              preparedWorkspace: 1,
+              launchToolNames: declared,
+            }
+          : {}),
+      },
+    });
     if (!declaration || !("workerHost" in declaration)) {
       throw new Error("Expected the supervisor declaration to parse");
     }
@@ -92,7 +86,10 @@ it.each([
   { reason: "oversized array", value: Array.from({ length: 65 }, (_, index) => `tool_${index}`) },
 ])("rejects the whole worker declaration for $reason launch names", ({ value }) => {
   expect(
-    parseNodeRunnerInventoryDeclaration(workerDeclaration({ launchToolNames: value })),
+    parseNodeRunnerInventoryDeclaration({
+      protocolFeatures: [NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE],
+      workerHost: { enabled: true, capacity: { total: 2, available: 2 }, launchToolNames: value },
+    }),
   ).toBeNull();
 });
 
@@ -104,7 +101,7 @@ it.each([
 ])(
   "joins disconnect cleanup before reconnect publication (already failed=$reconnectAfterFailure, fails=$fails)",
   async ({ reconnectAfterFailure, fails }) => {
-    const { connection, request, hooks, runtime } = startConnectionFixture(true);
+    const { connection, request, start, runtime } = startConnectionFixture(true);
     const retirement = createDeferred();
     const retry = createDeferred();
     runtime.cancelAll.mockReturnValueOnce(retirement.promise);
@@ -116,7 +113,7 @@ it.each([
     const replacement = { request: vi.fn().mockResolvedValue({}) };
     const retired = { request: vi.fn().mockResolvedValue({}) };
     try {
-      hooks.onRunnerCapacityChanged?.({
+      start.mock.calls[0]![0].onRunnerCapacityChanged?.({
         total: 1,
         available: 0,
         reclaimableIdle: 1,
@@ -137,7 +134,7 @@ it.each([
         expect(retired.request).not.toHaveBeenCalled();
         expect(replacement.request).not.toHaveBeenCalled();
       }
-      hooks.onRunnerCapacityChanged?.({
+      start.mock.calls[0]![0].onRunnerCapacityChanged?.({
         total: 1,
         available: 1,
         reclaimableIdle: 0,
@@ -211,22 +208,13 @@ function startConnectionFixture(
     onManifestChanged: vi.fn(),
     writeStderrLine,
   });
-  connections.push(connection);
   const publications = () => request.mock.calls.filter(([method]) => method === "node.event");
-  return {
-    connection,
-    request,
-    publications,
-    writeStderrLine,
-    hooks: start.mock.calls[0]![0],
-    prepared,
-    runtime,
-  };
+  return { connection, request, publications, writeStderrLine, start, prepared, runtime };
 }
 
 it("sends permission details only while the connected Gateway advertises support", async () => {
-  const { connection, request, hooks } = startConnectionFixture();
-  const runtimeClient = hooks.client;
+  const { connection, request, start } = startConnectionFixture();
+  const runtimeClient = start.mock.calls[0]![0].client;
   const response = createNodeInvokeResponder(runtimeClient, {
     id: "screen-capture",
     nodeId: "test-mac",
@@ -246,20 +234,24 @@ it("sends permission details only while the connected Gateway advertises support
     ok: false,
     error: { code: "PERMISSION_MISSING", message: "PERMISSION_MISSING: screenRecording" },
   };
-  connection.connect({
-    ...gateway,
-    capabilities: [GATEWAY_SERVER_CAPS.NODE_PERMISSION_ERRORS],
-  });
-  await response.send(failure);
-  expect(request).toHaveBeenLastCalledWith("node.invoke.result", {
-    ...legacyResult,
-    error: failure.error,
-  });
-  connection.disconnect();
-  connection.connect(gateway);
-  await vi.advanceTimersByTimeAsync(0);
-  await response.send(failure);
-  expect(request).toHaveBeenLastCalledWith("node.invoke.result", legacyResult);
+  try {
+    connection.connect({
+      ...gateway,
+      capabilities: [GATEWAY_SERVER_CAPS.NODE_PERMISSION_ERRORS],
+    });
+    await response.send(failure);
+    expect(request).toHaveBeenLastCalledWith("node.invoke.result", {
+      ...legacyResult,
+      error: failure.error,
+    });
+    connection.disconnect();
+    connection.connect(gateway);
+    await vi.advanceTimersByTimeAsync(0);
+    await response.send(failure);
+    expect(request).toHaveBeenLastCalledWith("node.invoke.result", legacyResult);
+  } finally {
+    await connection.close();
+  }
 });
 
 beforeEach(() => {
@@ -267,78 +259,91 @@ beforeEach(() => {
   vi.spyOn(hostStats, "sampleNodeHostStats").mockReturnValue(stats);
 });
 
-afterEach(async () => {
-  try {
-    settlePending.splice(0).forEach((settle) => settle());
-    for (const connection of connections.splice(0)) {
-      await connection.close();
-    }
-  } finally {
-    vi.restoreAllMocks();
-    vi.useRealTimers();
-  }
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 it.each(["disconnect", "close", "manifest"] as const)(
   "publishes immediately and every minute until %s retires the connection",
   async (retire) => {
-    const { connection, publications, hooks, prepared } = startConnectionFixture();
-    expect(publications()).toEqual([]);
-    connection.connect(gateway);
-    expect(publications()).toEqual([
-      ["node.event", { event: NODE_HOST_STATS_EVENT, payloadJSON: JSON.stringify(stats) }],
-    ]);
-    await vi.advanceTimersByTimeAsync(NODE_HOST_STATS_INTERVAL_MS - 1);
-    expect(publications()).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(publications()).toHaveLength(2);
-    if (retire === "manifest") {
-      hooks.onManifestChanged?.(prepared.manifest);
-    } else {
-      await connection[retire]();
+    const { connection, publications, start, prepared } = startConnectionFixture();
+    try {
+      expect(publications()).toEqual([]);
+      connection.connect(gateway);
+      expect(publications()).toEqual([
+        ["node.event", { event: NODE_HOST_STATS_EVENT, payloadJSON: JSON.stringify(stats) }],
+      ]);
+      await vi.advanceTimersByTimeAsync(NODE_HOST_STATS_INTERVAL_MS - 1);
+      expect(publications()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(publications()).toHaveLength(2);
+      if (retire === "manifest") {
+        start.mock.calls[0]?.[0].onManifestChanged?.(prepared.manifest);
+      } else {
+        await connection[retire]();
+      }
+      await vi.advanceTimersByTimeAsync(NODE_HOST_STATS_INTERVAL_MS * 2);
+      expect(publications()).toHaveLength(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await connection.close();
     }
-    await vi.advanceTimersByTimeAsync(NODE_HOST_STATS_INTERVAL_MS * 2);
-    expect(publications()).toHaveLength(2);
-    expect(vi.getTimerCount()).toBe(0);
   },
 );
 
-it.each([
-  ["nativeInference", true, GATEWAY_SERVER_CAPS.NODE_WORKER_NATIVE_INFERENCE],
-  ["promptContext", true, GATEWAY_SERVER_CAPS.NODE_WORKER_PROMPT_CONTEXT],
-  ["preparedWorkspace", false, undefined],
-  ["preparedWorkspace", true, undefined],
-  ["deviceFolders", false, GATEWAY_SERVER_CAPS.NODE_WORKER_DEVICE_FOLDERS],
-  ["deviceFolders", true, GATEWAY_SERVER_CAPS.NODE_WORKER_DEVICE_FOLDERS],
-  ["deviceFolders", true, undefined],
-] as const)("advertises %s (enabled=%s, capability=%s)", async (field, enabled, capability) => {
-  const { connection, request, hooks } = startConnectionFixture(
-    true,
-    field === "preparedWorkspace" && enabled,
-    field === "nativeInference",
-    field === "deviceFolders" && enabled,
-  );
-  hooks.onRunnerCapacityChanged?.({ total: 1, available: 1 });
-  const reconnects = field === "nativeInference" || field === "promptContext";
-  for (const supported of reconnects ? [false, true, false] : [Boolean(capability)]) {
-    connection.connect({ ...gateway, capabilities: supported && capability ? [capability] : [] });
-    if (reconnects) {
+it("advertises configured native inference only to a capable Gateway", async () => {
+  const { connection, request, start } = startConnectionFixture(true, false, true);
+  try {
+    start.mock.calls[0]?.[0].onRunnerCapacityChanged?.({ total: 1, available: 1 });
+    for (const supported of [false, true, false]) {
+      connection.connect({
+        ...gateway,
+        capabilities: supported ? [GATEWAY_SERVER_CAPS.NODE_WORKER_NATIVE_INFERENCE] : [],
+      });
       await vi.advanceTimersByTimeAsync(0);
-    } else if (field === "deviceFolders") {
-      await Promise.resolve();
+      const declaration = request.mock.calls.findLast(
+        ([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+      )?.[1];
+      expect(declaration).toMatchObject({
+        workerHost: {
+          enabled: true,
+          ...(supported ? { nativeInference: 1 } : {}),
+        },
+      });
+      if (!supported) {
+        expect(declaration.workerHost).not.toHaveProperty("nativeInference");
+      }
+      expect(parseNodeRunnerInventoryDeclaration(declaration)).toEqual(declaration);
     }
-    const host = enabledInventory(request);
-    if (reconnects && !supported) {
-      expect(latestRunnerInventory(request).workerHost).not.toHaveProperty(field);
-    } else {
-      const advertised = enabled && (field === "preparedWorkspace" || supported);
-      expect(host[field]).toBe(advertised ? (field === "deviceFolders" ? true : 1) : undefined);
-    }
+  } finally {
+    await connection.close();
   }
-  if (field === "preparedWorkspace") {
-    hooks.onWorkerHostingDisabled?.("test revoked worker consent");
-    await vi.advanceTimersByTimeAsync(0);
-    expect(latestRunnerInventory(request)).toMatchObject({ workerHost: { enabled: false } });
+});
+
+it("negotiates assignment prompt context again on each Gateway connection", async () => {
+  const { connection, request, start } = startConnectionFixture(true);
+  try {
+    start.mock.calls[0]?.[0].onRunnerCapacityChanged?.({ total: 1, available: 1 });
+    for (const supported of [false, true, false]) {
+      connection.connect({
+        ...gateway,
+        capabilities: supported ? [GATEWAY_SERVER_CAPS.NODE_WORKER_PROMPT_CONTEXT] : [],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const declaration = request.mock.calls.findLast(
+        ([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+      )?.[1];
+      expect(declaration.workerHost.enabled).toBe(true);
+      if (supported) {
+        expect(declaration.workerHost.promptContext).toBe(1);
+      } else {
+        expect(declaration.workerHost).not.toHaveProperty("promptContext");
+      }
+      expect(parseNodeRunnerInventoryDeclaration(declaration)).toEqual(declaration);
+    }
+  } finally {
+    await connection.close();
   }
 });
 
@@ -350,36 +355,51 @@ it("logs failures once per connection, redacts secrets, and waits for the next c
     }
     return {};
   });
-  connection.connect(gateway);
-  await vi.advanceTimersByTimeAsync(0);
-  expect(writeStderrLine).toHaveBeenCalledOnce();
-  expect(writeStderrLine.mock.calls[0]?.[0]).toContain("node host stats publish failed:");
-  expect(writeStderrLine.mock.calls[0]?.[0]).not.toContain("fixture-secret");
-  await vi.advanceTimersByTimeAsync(NODE_HOST_STATS_INTERVAL_MS * 2);
-  expect(publications()).toHaveLength(3);
-  expect(writeStderrLine).toHaveBeenCalledOnce();
-  connection.connect(gateway);
-  await vi.advanceTimersByTimeAsync(0);
-  expect(writeStderrLine).toHaveBeenCalledTimes(2);
+  try {
+    connection.connect(gateway);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(writeStderrLine).toHaveBeenCalledOnce();
+    expect(writeStderrLine.mock.calls[0]?.[0]).toContain("node host stats publish failed:");
+    expect(writeStderrLine.mock.calls[0]?.[0]).not.toContain("fixture-secret");
+    await vi.advanceTimersByTimeAsync(NODE_HOST_STATS_INTERVAL_MS * 2);
+    expect(publications()).toHaveLength(3);
+    expect(writeStderrLine).toHaveBeenCalledOnce();
+    connection.connect(gateway);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(writeStderrLine).toHaveBeenCalledTimes(2);
+  } finally {
+    await connection.close();
+  }
 });
 
 it("fences late failures and sends replacement samples only through the new client", async () => {
   const { connection, request, publications, writeStderrLine } = startConnectionFixture();
-  const previous = deferRequests(request, "node.event");
-  const replacementRequest = vi.fn().mockResolvedValue({});
-  connection.connect(gateway);
-  connection.connect(gateway, { request: replacementRequest });
-  previous.reject(new Error("retired request failed"));
-  await vi.advanceTimersByTimeAsync(NODE_HOST_STATS_INTERVAL_MS);
-  expect(writeStderrLine).not.toHaveBeenCalled();
-  expect(publications()).toHaveLength(1);
-  expect(replacementRequest.mock.calls.filter(([method]) => method === "node.event")).toHaveLength(
-    2,
+  let rejectOld!: (error: Error) => void;
+  request.mockImplementation((method) =>
+    method === "node.event"
+      ? new Promise((_resolve, reject) => {
+          rejectOld = reject;
+        })
+      : Promise.resolve({}),
   );
+  const replacementRequest = vi.fn().mockResolvedValue({});
+  try {
+    connection.connect(gateway);
+    connection.connect(gateway, { request: replacementRequest });
+    rejectOld(new Error("retired request failed"));
+    await vi.advanceTimersByTimeAsync(NODE_HOST_STATS_INTERVAL_MS);
+    expect(writeStderrLine).not.toHaveBeenCalled();
+    expect(publications()).toHaveLength(1);
+    expect(
+      replacementRequest.mock.calls.filter(([method]) => method === "node.event"),
+    ).toHaveLength(2);
+  } finally {
+    await connection.close();
+  }
 });
 
 it("logs runner publication failure changes while continuing retries through recovery", async () => {
-  const { connection, request, hooks, writeStderrLine } = startConnectionFixture(true);
+  const { connection, request, start, writeStderrLine } = startConnectionFixture(true);
   const approvalMessage = "runner capability surface is awaiting operator approval";
   let failure: string | undefined = approvalMessage;
   request.mockImplementation(async (method) => {
@@ -388,123 +408,190 @@ it("logs runner publication failure changes while continuing retries through rec
     }
     return {};
   });
-  const publications = () => runnerPublications(request);
-  const capacityChanged = hooks.onRunnerCapacityChanged!;
-  capacityChanged({ total: 2, available: 2 });
-  connection.connect(gateway);
-  await vi.advanceTimersByTimeAsync(0);
-  expect(writeStderrLine).toHaveBeenCalledExactlyOnceWith(
-    `node host runner inventory publish failed: GatewayClientRequestError: ${approvalMessage}`,
-  );
-  for (const delay of [250, 500, 1_000, 2_000, 4_000, 5_000, 5_000]) {
-    const before = publications().length;
-    await vi.advanceTimersByTimeAsync(delay - 1);
-    expect(publications()).toHaveLength(before);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(publications()).toHaveLength(before + 1);
-    expect(writeStderrLine).toHaveBeenCalledOnce();
+  const publications = () =>
+    request.mock.calls.filter(([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD);
+  const capacityChanged = start.mock.calls[0]![0].onRunnerCapacityChanged!;
+  try {
+    capacityChanged({ total: 2, available: 2 });
+    connection.connect(gateway);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(writeStderrLine).toHaveBeenCalledExactlyOnceWith(
+      `node host runner inventory publish failed: GatewayClientRequestError: ${approvalMessage}`,
+    );
+    for (const delay of [250, 500, 1_000, 2_000, 4_000, 5_000, 5_000]) {
+      const before = publications().length;
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(publications()).toHaveLength(before);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(publications()).toHaveLength(before + 1);
+      expect(writeStderrLine).toHaveBeenCalledOnce();
+    }
+
+    failure = "Gateway unavailable";
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(writeStderrLine).toHaveBeenCalledTimes(2);
+    expect(writeStderrLine).toHaveBeenLastCalledWith(
+      "node host runner inventory publish failed: GatewayClientRequestError: Gateway unavailable",
+    );
+
+    failure = undefined;
+    await vi.advanceTimersByTimeAsync(5_000);
+    const recoveredPublications = publications().length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(publications()).toHaveLength(recoveredPublications);
+
+    failure = "Gateway unavailable";
+    capacityChanged({ total: 2, available: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(writeStderrLine).toHaveBeenCalledTimes(3);
+
+    connection.disconnect();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(writeStderrLine).toHaveBeenCalledTimes(3);
+    connection.connect(gateway);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(writeStderrLine).toHaveBeenCalledTimes(4);
+  } finally {
+    await connection.close();
   }
-
-  failure = "Gateway unavailable";
-  await vi.advanceTimersByTimeAsync(5_000);
-  expect(writeStderrLine).toHaveBeenCalledTimes(2);
-  expect(writeStderrLine).toHaveBeenLastCalledWith(
-    "node host runner inventory publish failed: GatewayClientRequestError: Gateway unavailable",
-  );
-
-  failure = undefined;
-  await vi.advanceTimersByTimeAsync(5_000);
-  const recoveredPublications = publications().length;
-  await vi.advanceTimersByTimeAsync(5_000);
-  expect(publications()).toHaveLength(recoveredPublications);
-
-  failure = "Gateway unavailable";
-  capacityChanged({ total: 2, available: 1 });
-  await vi.advanceTimersByTimeAsync(0);
-  expect(writeStderrLine).toHaveBeenCalledTimes(3);
-
-  connection.disconnect();
-  await vi.advanceTimersByTimeAsync(5_000);
-  expect(writeStderrLine).toHaveBeenCalledTimes(3);
-  connection.connect(gateway);
-  await vi.advanceTimersByTimeAsync(0);
-  expect(writeStderrLine).toHaveBeenCalledTimes(4);
 });
 
 it.each([false, true])(
   "refreshes acknowledged runner facts without changing hosting consent: %s",
   async (enabled) => {
-    const { connection, request, hooks } = startConnectionFixture(enabled);
-    hooks.onRunnerCapacityChanged?.({ total: 1, available: 0 });
-    connection.connect(gateway);
-    await vi.advanceTimersByTimeAsync(0);
-    const callsBefore = request.mock.calls.length;
-    const timersBefore = vi.getTimerCount();
-    connection.refreshRunnerInventory();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(request.mock.calls.slice(callsBefore)).toEqual([
-      [
-        NODE_RUNNER_INVENTORY_UPDATE_METHOD,
-        expect.objectContaining({
-          workerHost: enabled
-            ? expect.objectContaining({ enabled: true, capacity: { total: 1, available: 0 } })
-            : { enabled: false },
-        }),
-      ],
-    ]);
-    expect(vi.getTimerCount()).toBe(timersBefore);
-    connection.disconnect();
-    connection.refreshRunnerInventory();
-    expect(request).toHaveBeenCalledTimes(callsBefore + 1);
+    const { connection, request, start } = startConnectionFixture(enabled);
+    try {
+      start.mock.calls[0]?.[0].onRunnerCapacityChanged?.({ total: 1, available: 0 });
+      connection.connect(gateway);
+      await vi.advanceTimersByTimeAsync(0);
+      const callsBefore = request.mock.calls.length;
+      const timersBefore = vi.getTimerCount();
+      connection.refreshRunnerInventory();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(request.mock.calls.slice(callsBefore)).toEqual([
+        [
+          NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+          expect.objectContaining({
+            workerHost: enabled
+              ? expect.objectContaining({ enabled: true, capacity: { total: 1, available: 0 } })
+              : { enabled: false },
+          }),
+        ],
+      ]);
+      expect(vi.getTimerCount()).toBe(timersBefore);
+      connection.disconnect();
+      connection.refreshRunnerInventory();
+      expect(request).toHaveBeenCalledTimes(callsBefore + 1);
+    } finally {
+      await connection.close();
+    }
   },
 );
 
 it.each(["resolve", "reject"] as const)(
   "retires in-flight runner publication and its pending value before late %s",
   async (settle) => {
-    const { connection, request, hooks } = startConnectionFixture(true);
-    const previous = deferRequests(request, NODE_RUNNER_INVENTORY_UPDATE_METHOD, true);
-    const capacityChanged = hooks.onRunnerCapacityChanged!;
-    const publications = () => runnerPublications(request);
-    capacityChanged({ total: 2, available: 2 });
-    connection.connect(gateway);
-    capacityChanged({ total: 2, available: 1 });
-    expect(publications()).toHaveLength(1);
-    connection.refreshRunnerInventory();
-    await vi.advanceTimersByTimeAsync(0);
-    capacityChanged({ total: 2, available: 0 });
-    await vi.advanceTimersByTimeAsync(0);
-    if (settle === "resolve") {
+    const { connection, request, start } = startConnectionFixture(true);
+    const previous = createDeferred<unknown>();
+    let first = true;
+    request.mockImplementation((method) => {
+      if (method === NODE_RUNNER_INVENTORY_UPDATE_METHOD && first) {
+        first = false;
+        return previous.promise;
+      }
+      return Promise.resolve({});
+    });
+    const capacityChanged = start.mock.calls[0]![0].onRunnerCapacityChanged!;
+    const publications = () =>
+      request.mock.calls.filter(([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD);
+    try {
+      capacityChanged({ total: 2, available: 2 });
+      connection.connect(gateway);
+      capacityChanged({ total: 2, available: 1 });
+      expect(publications()).toHaveLength(1);
+      connection.refreshRunnerInventory();
+      await vi.advanceTimersByTimeAsync(0);
+      capacityChanged({ total: 2, available: 0 });
+      await vi.advanceTimersByTimeAsync(0);
+      if (settle === "resolve") {
+        previous.resolve({});
+      } else {
+        previous.reject(new Error("retired publication rejected"));
+      }
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(publications().map(([, params]) => params)).toEqual(
+        [2, 1, 0].map((available) =>
+          expect.objectContaining({
+            workerHost: expect.objectContaining({ capacity: { total: 2, available } }),
+          }),
+        ),
+      );
+    } finally {
       previous.resolve({});
-    } else {
-      previous.reject(new Error("retired publication rejected"));
+      await connection.close();
     }
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(publications().map(([, params]) => params)).toEqual(
-      [2, 1, 0].map((available) =>
-        expect.objectContaining({
-          workerHost: expect.objectContaining({ capacity: { total: 2, available } }),
-        }),
-      ),
-    );
   },
 );
 
 it("keeps refreshed publication on its replacement connection despite an old acknowledgment", async () => {
-  const { connection, request, hooks } = startConnectionFixture(true);
-  const previous = deferRequests(request, NODE_RUNNER_INVENTORY_UPDATE_METHOD);
+  const { connection, request, start } = startConnectionFixture(true);
+  const previous = createDeferred<unknown>();
+  request.mockImplementation((method) =>
+    method === NODE_RUNNER_INVENTORY_UPDATE_METHOD ? previous.promise : Promise.resolve({}),
+  );
   const replacementRequest = vi.fn().mockResolvedValue({});
-  hooks.onRunnerCapacityChanged?.({ total: 1, available: 1 });
-  connection.connect(gateway);
-  connection.refreshRunnerInventory();
-  connection.connect(gateway, { request: replacementRequest });
-  await vi.advanceTimersByTimeAsync(0);
-  connection.refreshRunnerInventory();
-  previous.resolve({});
-  await vi.advanceTimersByTimeAsync(5_000);
-  expect(runnerPublications(request)).toHaveLength(2);
-  expect(runnerPublications(replacementRequest)).toHaveLength(2);
+  try {
+    start.mock.calls[0]![0].onRunnerCapacityChanged?.({ total: 1, available: 1 });
+    connection.connect(gateway);
+    connection.refreshRunnerInventory();
+    connection.connect(gateway, { request: replacementRequest });
+    await vi.advanceTimersByTimeAsync(0);
+    connection.refreshRunnerInventory();
+    previous.resolve({});
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(
+      request.mock.calls.filter(([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD),
+    ).toHaveLength(2);
+    expect(
+      replacementRequest.mock.calls.filter(
+        ([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+      ),
+    ).toHaveLength(2);
+  } finally {
+    previous.resolve({});
+    await connection.close();
+  }
 });
+
+it.each([false, true])(
+  "advertises prepared workspace registration only when enabled: %s",
+  async (enabled) => {
+    const { connection, request, start } = startConnectionFixture(true, enabled);
+    try {
+      start.mock.calls[0]?.[0].onRunnerCapacityChanged?.({ total: 1, available: 1 });
+      connection.connect(gateway);
+      const declaration = request.mock.calls.find(
+        ([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+      )?.[1];
+      expect(declaration).toMatchObject({ workerHost: { enabled: true } });
+      const parsed = parseNodeRunnerInventoryDeclaration(declaration);
+      expect(parsed).toEqual(declaration);
+      if (!parsed || !("workerHost" in parsed) || !parsed.workerHost.enabled) {
+        throw new Error("Expected an enabled worker declaration");
+      }
+      expect(parsed.workerHost.preparedWorkspace).toBe(enabled ? 1 : undefined);
+      start.mock.calls[0]?.[0].onWorkerHostingDisabled?.("test revoked worker consent");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(
+        request.mock.calls.findLast(
+          ([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+        )?.[1],
+      ).toMatchObject({ workerHost: { enabled: false } });
+    } finally {
+      await connection.close();
+    }
+  },
+);
 
 const disabledReason =
   "State directory /srv/node-state is group-writable; run chmod go-w /srv/node-state";
@@ -527,7 +614,7 @@ it.each([
       configurable: true,
       value: bun ? "fixture" : undefined,
     });
-    const { connection, request, hooks, prepared } = startConnectionFixture(true);
+    const { connection, request, start, prepared } = startConnectionFixture(true);
     const capacity =
       kind === "idle"
         ? { total: 2, available: 0, reclaimableIdle: 2 }
@@ -548,39 +635,23 @@ it.each([
         GATEWAY_SERVER_CAPS.NODE_WORKER_LAUNCH_TOOL_NAMES,
       ],
     };
-    const extras = {
-      optional: {
-        capturedExecPolicy: true,
-        statusWait: 1,
-        launchToolNames: expect.arrayContaining(
-          "read sessions_spawn sessions_send skill_workshop portal presence".split(" "),
-        ),
-      },
-      idle: { idleRetention: true },
-      disabled: { reason: disabledReason },
-      workspace: {
-        statusWait: 1,
-        launchToolNames: [...CORE_WORKER_LAUNCH_TOOL_NAMES],
-        ...((platform === "linux" || platform === "win32") && !bun
-          ? { workspaceQuiescence: 1 }
-          : {}),
-      },
-    };
     try {
       if (kind === "disabled") {
-        hooks.onWorkerHostingDisabled?.(disabledReason);
+        start.mock.calls[0]![0].onWorkerHostingDisabled?.(disabledReason);
       } else {
-        hooks.onRunnerCapacityChanged?.(capacity);
+        start.mock.calls[0]![0].onRunnerCapacityChanged?.(capacity);
       }
       for (const supported of [false, true, false]) {
         connection.connect({ ...gateway, capabilities: supported ? capabilities[kind] : [] });
         await vi.advanceTimersByTimeAsync(0);
-        const declaration = latestRunnerInventory(request);
+        const declaration = request.mock.calls.findLast(
+          ([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+        )?.[1];
         expect(declaration).toEqual({
           protocolFeatures: ["node-worker-supervisor-v6"],
           workerHost:
             kind === "disabled"
-              ? { enabled: false, ...(supported ? extras.disabled : {}) }
+              ? { enabled: false, ...(supported ? { reason: disabledReason } : {}) }
               : {
                   enabled: true,
                   capacity: {
@@ -589,7 +660,30 @@ it.each([
                     ...(supported && kind === "idle" ? { reclaimableIdle: 2 } : {}),
                   },
                   bundlePrewarm: 1,
-                  ...(supported ? extras[kind] : {}),
+                  ...(supported && kind === "idle" ? { idleRetention: true } : {}),
+                  ...(supported && kind === "optional" ? { capturedExecPolicy: true } : {}),
+                  ...(supported && (kind === "optional" || kind === "workspace")
+                    ? {
+                        statusWait: 1,
+                        launchToolNames:
+                          kind === "optional"
+                            ? expect.arrayContaining([
+                                "read",
+                                "sessions_spawn",
+                                "sessions_send",
+                                "skill_workshop",
+                                "portal",
+                                "presence",
+                              ])
+                            : [...CORE_WORKER_LAUNCH_TOOL_NAMES],
+                      }
+                    : {}),
+                  ...(supported &&
+                  kind === "workspace" &&
+                  (platform === "linux" || platform === "win32") &&
+                  !bun
+                    ? { workspaceQuiescence: 1 }
+                    : {}),
                 },
         });
         expect(parseNodeRunnerInventoryDeclaration(declaration)).toEqual(declaration);
@@ -603,6 +697,36 @@ it.each([
       } else {
         delete process.versions.bun;
       }
+    }
+  },
+);
+
+it.each([
+  { enabled: false, supported: true },
+  { enabled: true, supported: true },
+  { enabled: true, supported: false },
+])(
+  "advertises device folders unless disabled, with Gateway support (%j)",
+  async ({ enabled, supported }) => {
+    const { connection, request, start } = startConnectionFixture(true, false, false, enabled);
+    try {
+      start.mock.calls[0]?.[0].onRunnerCapacityChanged?.({ total: 1, available: 1 });
+      connection.connect({
+        ...gateway,
+        capabilities: supported ? [GATEWAY_SERVER_CAPS.NODE_WORKER_DEVICE_FOLDERS] : [],
+      });
+      await Promise.resolve();
+      const inventory = request.mock.calls.find(
+        ([method]) => method === NODE_RUNNER_INVENTORY_UPDATE_METHOD,
+      )?.[1];
+      expect(inventory).toMatchObject({ workerHost: { enabled: true } });
+      const parsed = parseNodeRunnerInventoryDeclaration(inventory);
+      expect(parsed).not.toBeNull();
+      if (parsed && "workerHost" in parsed && parsed.workerHost.enabled) {
+        expect(parsed.workerHost.deviceFolders).toBe(enabled && supported ? true : undefined);
+      }
+    } finally {
+      await connection.close();
     }
   },
 );

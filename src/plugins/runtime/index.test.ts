@@ -17,6 +17,7 @@ vi.mock("../../infra/heartbeat-runner.js", () => {
   return { runHeartbeatOnce: heartbeatRunnerMocks.runHeartbeatOnce };
 });
 
+// mock-isolation: Exercise the lazy runtime facade without loading credential-backed model auth.
 vi.mock("./runtime-model-auth.runtime.js", () => runtimeModelAuthMocks);
 
 import { createPluginRuntime } from "./index.js";

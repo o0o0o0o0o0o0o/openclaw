@@ -43,6 +43,7 @@ vi.mock("../../config/plugin-auto-enable.js", () => ({
   applyPluginAutoEnable: applyPluginAutoEnableMock,
 }));
 
+// mock-isolation: Fix workspace selection independently of the host's configured workspace.
 vi.mock("../control-plane-workspace.js", () => ({
   resolvePluginControlPlaneWorkspace: (params: { workspaceDir?: string }) => ({
     workspaceDir: params.workspaceDir ?? "/resolved-workspace",

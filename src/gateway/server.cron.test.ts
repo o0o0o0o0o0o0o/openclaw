@@ -8,7 +8,7 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import type WebSocket from "ws";
 import { createInfoWarnErrorLogger } from "../../test/helpers/mock-logger.js";
-import { createDeferred, withinTest, withTestTimeout } from "../../test/helpers/promise.js";
+import { createDeferred, withinTest } from "../../test/helpers/promise.js";
 import { resetConfigRuntimeState } from "../config/config.js";
 import type * as CronDelivery from "../cron/delivery.js";
 import { readCronRunRecordsForTests } from "../cron/run-history.test-support.js";
@@ -26,7 +26,6 @@ import {
 } from "../test-utils/gateway-scheduler-clock.js";
 import { getGatewayProcessInstanceId } from "./process-instance.js";
 import {
-  CRON_WAIT_TIMEOUT_MS,
   expectEnqueuedRunPayload,
   runCronJobAndWaitForFinished,
   waitForCronEvent,
@@ -60,6 +59,7 @@ const sendCronAnnouncePayloadStrictMock = vi.hoisted(() =>
   })),
 );
 
+// mock-isolation: Record webhook delivery without issuing real network requests.
 vi.mock("../infra/net/fetch-guard.js", () => ({ fetchWithSsrFGuard: fetchWithSsrFGuardMock }));
 
 vi.mock("../cron/delivery.js", async () => {
@@ -198,7 +198,7 @@ async function createDirectCronState(params?: {
   return cronState;
 }
 
-function createCronEventCollector() {
+function createCronEventCollector(signal: AbortSignal) {
   const events: Record<string, unknown>[] = [];
   const waiters = new Set<(payload: Record<string, unknown>) => void>();
   return {
@@ -212,10 +212,7 @@ function createCronEventCollector() {
         notify(record);
       }
     },
-    async wait(
-      check: (payload: Record<string, unknown>) => boolean,
-      timeoutMs = CRON_WAIT_TIMEOUT_MS,
-    ) {
+    async wait(check: (payload: Record<string, unknown>) => boolean) {
       const existing = events.find(check);
       if (existing) {
         return existing;
@@ -229,7 +226,7 @@ function createCronEventCollector() {
       };
       waiters.add(notify);
       try {
-        return await withTestTimeout(result.promise, timeoutMs, "timeout waiting for cron event");
+        return await withinTest(result.promise, signal);
       } finally {
         waiters.delete(notify);
       }
@@ -548,12 +545,12 @@ describe("gateway server cron", () => {
     }
   });
 
-  test("writes cron run history and auto-runs due jobs", async () => {
+  test("writes cron run history and auto-runs due jobs", async ({ signal }) => {
     testState.cronEnabled = true;
     await writeCronConfig({
       agents: { defaults: { systemAgent: { agentId: "main" } }, entries: { main: {}, writer: {} } },
     });
-    const events = createCronEventCollector();
+    const events = createCronEventCollector(signal);
     const cronState = await createDirectCronState({ broadcast: events["broadcast"] });
 
     const addRes = await cronState.addJob("log test");
@@ -646,9 +643,11 @@ describe("gateway server cron", () => {
     expect(autoRuns.at(-1)).toMatchObject({ jobId: autoJobId });
   }, 45_000);
 
-  test("bundled plugin runtime runs enabled automations and skips disabled ones", async () => {
+  test("bundled plugin runtime runs enabled automations and skips disabled ones", async ({
+    signal,
+  }) => {
     testState.cronEnabled = true;
-    const events = createCronEventCollector();
+    const events = createCronEventCollector(signal);
     const cronState = await createDirectCronState({ broadcast: events["broadcast"] });
 
     const addRes = await cronState.addJob("plugin runtime nudge", {

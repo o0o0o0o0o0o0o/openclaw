@@ -355,6 +355,11 @@ describe("shell lazy events", () => {
           case "new-request":
             shell.lazyCustomElements.request(createLazyElementSpec("new request"));
             break;
+          case "denied":
+          case "reload":
+          case "replacement-write-failed":
+          case "unavailable":
+            break;
         }
         probe.resolve(new Response(null, { status: 200 }));
         await expect(Promise.all(recovery.pending)).resolves.toEqual([mode === "reload"]);

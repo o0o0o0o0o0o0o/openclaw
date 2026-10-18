@@ -33,7 +33,8 @@ const namedAccountBase = {
   clearBaseFields: ["token"],
 };
 const selectors = {
-  resolveAllowFrom: (account: { allowFrom: Array<string | number> }) => account.allowFrom,
+  resolveAllowFrom: (account: { allowFrom: Array<string | number>; defaultTo: string }) =>
+    account.allowFrom,
   formatAllowFrom: (entries: Array<string | number>) =>
     entries.map((entry) => String(entry).toUpperCase()),
   resolveDefaultTo: (account: { defaultTo: string }) => account.defaultTo,

@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => {
   };
 });
 
+// mock-isolation: Control candidate connection callbacks without opening real Gateway sockets.
 vi.mock("../gateway/client.js", () => ({
   GatewayClient: function GatewayClient(options: GatewayClientOptions) {
     const client = mocks.createClient(options);

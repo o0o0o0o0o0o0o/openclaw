@@ -106,7 +106,7 @@ function cliWire(
   });
   return {
     dispose,
-    async delta(text: string, delta: string) {
+    async delta(this: void, text: string, delta: string) {
       cli.emitCliAssistantDelta({ text, delta });
       await dispose.drain();
     },

@@ -73,7 +73,9 @@ export function emitAgentEvents(
 ) {
   return Promise.all(
     events.map(([stream, data, overrides], index) =>
-      emitAgentEvent(handler, runId, stream, data, { seq: index + 1, ...overrides }),
+      Promise.resolve(
+        emitAgentEvent(handler, runId, stream, data, { seq: index + 1, ...overrides }),
+      ),
     ),
   );
 }

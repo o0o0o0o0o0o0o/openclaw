@@ -54,7 +54,7 @@ function createAuthority(modelPolicy: ModelPolicy | undefined, signal?: AbortSig
   return {
     source,
     state,
-    update(next: ModelPolicy | undefined) {
+    update(this: void, next: ModelPolicy | undefined) {
       state.modelPolicy = next;
       for (const listener of state.listeners) {
         listener();

@@ -45,6 +45,7 @@ vi.mock("../security/fix.js", () => ({
   fixSecurityFootguns: () => mocks.fixSecurityFootguns(),
 }));
 
+// mock-isolation: Audit fixtures resolve secrets locally without connecting to a live Gateway.
 vi.mock("./command-secret-gateway.js", () => ({
   resolveCommandSecretRefsViaGateway: mocks.resolveCommandSecretRefsViaGateway,
 }));

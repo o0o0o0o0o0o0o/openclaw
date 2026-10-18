@@ -36,6 +36,7 @@ vi.mock("./bot.js", async () => ({
   ...(await vi.importActual<typeof FeishuBotModule>("./bot.js")),
   handleFeishuMessage: handleFeishuMessageMock,
 }));
+// mock-isolation: Capture dispatcher registration without constructing a real Feishu client.
 vi.mock("./client.js", () => ({ createEventDispatcher: createEventDispatcherMock }));
 vi.mock("./monitor.transport.js", () => ({
   monitorWebSocket: monitorWebSocketMock,

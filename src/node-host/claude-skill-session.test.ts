@@ -65,7 +65,15 @@ async function prepareWorkshop(sdk: string) {
       ? new Client(mcpIdentity)
       : new V2Client(mcpIdentity, { versionNegotiation: { mode: "legacy" } });
   onTestFinished(async () => {
-    await client.close().finally(() => session.close().finally(() => session.cleanup()));
+    try {
+      await client.close();
+    } finally {
+      try {
+        await session.close();
+      } finally {
+        await session.cleanup();
+      }
+    }
   });
   const configPath = session.argv[session.argv.indexOf("--mcp-config") + 1];
   assert(configPath);

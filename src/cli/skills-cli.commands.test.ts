@@ -79,6 +79,7 @@ vi.mock("../agents/agent-scope.js", () => ({
   resolveDefaultAgentId: mocks.defaultAgent,
   resolveAgentWorkspaceDir: mocks.workspace,
 }));
+// mock-isolation: Command fixtures own registry results and never download or install real skills.
 vi.mock("../skills/lifecycle/clawhub.js", () => ({
   installSkillFromClawHub: mocks.install,
   updateSkillsFromClawHub: mocks.update,
@@ -93,6 +94,7 @@ vi.mock("../infra/clawhub-skills.js", () => ({
   CLAWHUB_SKILLS_SH_TRUST_STATE: "not-scanned-by-clawhub",
   fetchClawHubSkillCard: mocks.card,
 }));
+// mock-isolation: Exercise command routing without filesystem or network skill installation.
 vi.mock("../skills/lifecycle/source-install.js", () => ({
   installSkillFromSource: mocks.sourceInstall,
   isSkillSourceInstallSpec: (raw: string) =>

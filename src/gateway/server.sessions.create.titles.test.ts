@@ -34,6 +34,27 @@ vi.mock("../plugins/session-discussion-registry.js", () => ({
 }));
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
+const adminClient = { client: { connect: { scopes: ["operator.admin"] } } as never };
+const sessionTitle = (storePath: string, sessionKey: string) =>
+  loadSessionEntry({ agentId: "main", sessionKey, storePath })?.displayName;
+
+async function prepareWorkspace(prefix: string) {
+  const workspace = await initializeRepository(tempDirs.make(prefix), "workspace");
+  testState.agentConfig = { workspace };
+  return { workspace, ...(await createSessionStoreDir()) };
+}
+
+async function removeWorktree(key: string | undefined) {
+  const owned = key ? await managedWorktrees.findLiveByOwner("session", key) : undefined;
+  if (owned) {
+    await managedWorktrees.remove({
+      id: owned.id,
+      reason: "test-cleanup",
+      allowSnapshotLoss: true,
+    });
+  }
+}
+
 afterEach(async () => {
   await disposeSessionReadContexts();
   titleMocks.generate.mockReset();
@@ -73,9 +94,7 @@ test.for(["keep", "delete"] as const)(
       key = created.payload!.key;
       await racePromiseWithAbortSignal(namingStarted.promise, signal);
       expect(titleMocks.generate).toHaveBeenCalledOnce();
-      expect(
-        loadSessionEntry({ agentId: "main", sessionKey: key, storePath })?.displayName,
-      ).toBeUndefined();
+      expect(sessionTitle(storePath, key)).toBeUndefined();
       expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
       // Cloud dispatch uses this drain before provisioning; optional naming cannot hold it.
       expect(
@@ -97,9 +116,7 @@ test.for(["keep", "delete"] as const)(
         return;
       }
       await vi.waitFor(() =>
-        expect(
-          loadSessionEntry({ agentId: "main", sessionKey: key!, storePath })?.displayName,
-        ).toBe("Explain safe updater rollback"),
+        expect(sessionTitle(storePath, key!)).toBe("Explain safe updater rollback"),
       );
       await vi.waitFor(() =>
         expect(context.broadcastToConnIds).toHaveBeenCalledWith(
@@ -124,22 +141,18 @@ test.each(["adopted", "incognito"] as const)(
     const { storePath } = await createSessionStoreDir();
     const key = "agent:main:dashboard:adopted-title";
     const params = { agentId: "main", ...(kind === "incognito" ? { incognito: true } : { key }) };
-    const client = { client: { connect: { scopes: ["operator.admin"] } } as never };
     if (kind === "adopted") {
-      expect((await directSessionReq("sessions.create", params, client)).ok).toBe(true);
+      expect((await directSessionReq("sessions.create", params, adminClient)).ok).toBe(true);
     }
     const result = await directSessionReq<{ key: string }>(
       "sessions.create",
       { ...params, titleSource: "A different task must not name this existing conversation" },
-      client,
+      adminClient,
     );
     expect(result.ok, JSON.stringify(result.error)).toBe(true);
     await settleWorkspaceRuns({}, storePath, key);
     expect(titleMocks.generate).not.toHaveBeenCalled();
-    expect(
-      loadSessionEntry({ agentId: "main", sessionKey: result.payload!.key, storePath })
-        ?.displayName,
-    ).toBeUndefined();
+    expect(sessionTitle(storePath, result.payload!.key)).toBeUndefined();
   },
 );
 
@@ -147,10 +160,7 @@ test("successful naming survives setup failure and is shared with discussion ope
   const naming = createDeferredCore<string>();
   titleMocks.generate.mockReturnValue(naming.promise);
   titleMocks.open.mockResolvedValue({ state: "available" });
-  const root = tempDirs.make("openclaw-session-worktree-retry-scope-");
-  const workspace = await initializeRepository(root, "workspace");
-  testState.agentConfig = { workspace };
-  const { storePath } = await createSessionStoreDir();
+  const { workspace, storePath } = await prepareWorkspace("openclaw-session-worktree-retry-scope-");
   const setup = path.join(workspace, ".openclaw");
   await fs.mkdir(setup);
   const starts = path.join(setup, "starts");
@@ -181,7 +191,7 @@ test("successful naming survives setup failure and is shared with discussion ope
         message: "Start work in the checkout",
         worktree: true,
       },
-      { client: { connect: { scopes: ["operator.admin"] } } as never, context },
+      { ...adminClient, context },
     );
     expect(created.ok, JSON.stringify(created.error)).toBe(true);
     expect(created.payload?.runStarted).toBe(true);
@@ -210,9 +220,7 @@ test("successful naming survives setup failure and is shared with discussion ope
     );
     expect(await fs.readFile(starts, "utf8")).toBe("started\n");
     expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
-    expect(loadSessionEntry({ agentId: "main", sessionKey: key, storePath })?.displayName).toBe(
-      "Workspace repair plan",
-    );
+    expect(sessionTitle(storePath, key)).toBe("Workspace repair plan");
     expect(titleMocks.generate).toHaveBeenCalledOnce();
 
     const retried = await directSessionReq(
@@ -242,23 +250,14 @@ test("successful naming survives setup failure and is shared with discussion ope
   } finally {
     naming.resolve("Workspace repair plan");
     await settleWorkspaceRuns(context, storePath, key, true);
-    const owned = key ? await managedWorktrees.findLiveByOwner("session", key) : undefined;
-    if (owned) {
-      await managedWorktrees.remove({
-        id: owned.id,
-        reason: "test-cleanup",
-        allowSnapshotLoss: true,
-      });
-    }
+    await removeWorktree(key);
   }
 });
 
 test.each(["generator error", "delayed title"])(
   "sessions.create preserves background title recovery after %s",
   async (failure) => {
-    const root = tempDirs.make("openclaw-session-worktree-recovery-");
-    testState.agentConfig = { workspace: await initializeRepository(root, "workspace") };
-    const { storePath } = await createSessionStoreDir();
+    const { storePath } = await prepareWorkspace("openclaw-session-worktree-recovery-");
     const key = "agent:main:dashboard:worktree-title-fallback";
     const target = { sessionKey: key, storePath };
     const title = createDeferredCore<string>();
@@ -304,7 +303,7 @@ test.each(["generator error", "delayed title"])(
           worktree: true,
           message: "Investigate the raw fallback title",
         },
-        { client: { connect: { scopes: ["operator.admin"] } } as never, context },
+        { ...adminClient, context },
       );
 
       expect(created.ok, JSON.stringify(created.error)).toBe(true);
@@ -335,14 +334,7 @@ test.each(["generator error", "delayed title"])(
       title.resolve("Fixture cleanup");
       dispatchFinished.resolve();
       await settleWorkspaceRuns(context, storePath, key, true);
-      const owned = await managedWorktrees.findLiveByOwner("session", key);
-      if (owned) {
-        await managedWorktrees.remove({
-          id: owned.id,
-          reason: "test-cleanup",
-          allowSnapshotLoss: true,
-        });
-      }
+      await removeWorktree(key);
       testState.agentConfig = undefined;
     }
   },
@@ -389,10 +381,7 @@ test("creates a two-word worktree name before an initial turn can generate its t
 });
 
 test("sessions.create rejects another plugin's session before naming or worktree preparation", async () => {
-  const root = tempDirs.make("openclaw-session-protected-title-");
-  const workspace = await initializeRepository(root, "workspace");
-  testState.agentConfig = { workspace };
-  const { storePath } = await createSessionStoreDir();
+  const { storePath } = await prepareWorkspace("openclaw-session-protected-title-");
   const sessionKey = "agent:main:dashboard:protected-title";
   const scope = { agentId: "main", sessionKey, storePath };
   const client = {

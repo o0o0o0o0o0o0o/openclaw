@@ -33,6 +33,25 @@ import {
 
 const { createSessionStoreDir, openClient } = setupSessionCreateTestHarness();
 
+type IncognitoResult = {
+  key: string;
+  entry: {
+    incognito?: true;
+    parentSessionKey?: string;
+    parentSessionId?: string;
+    sessionFile?: string;
+    sessionId: string;
+  };
+};
+type SessionList = { sessions: Array<{ key: string; incognito?: true }> };
+
+async function expectInvalidCreate(params: Record<string, unknown>, message: string) {
+  expect(await directSessionReq("sessions.create", params)).toMatchObject({
+    ok: false,
+    error: { code: "INVALID_REQUEST", message },
+  });
+}
+
 function closeIncognitoSessions() {
   for (const owner of memorySessionActorOwners.list()) {
     memorySessionActorOwners.closeDatabase(owner);
@@ -48,15 +67,10 @@ test("sessions.create keeps incognito rows process-local through list, spawn, re
         main: sessionStoreEntry("durable-parent"),
       },
     });
-    const created = await directSessionReq<{
-      key: string;
-      entry: {
-        incognito?: true;
-        parentSessionKey?: string;
-        sessionFile?: string;
-        sessionId: string;
-      };
-    }>("sessions.create", { agentId: "main", incognito: true });
+    const created = await directSessionReq<IncognitoResult>("sessions.create", {
+      agentId: "main",
+      incognito: true,
+    });
     expect(created.ok).toBe(true);
     const key = requireNonEmptyString(created.payload?.key, "incognito session key");
     expect(key).toMatch(/^agent:main:dashboard:incognito-/u);
@@ -82,56 +96,35 @@ test("sessions.create keeps incognito rows process-local through list, spawn, re
         .get(key),
     ).toBeUndefined();
 
-    const rejectedDurableParent = await directSessionReq("sessions.create", {
-      agentId: "main",
-      incognito: true,
-      parentSessionKey: durableParentKey,
-    });
-    expect(rejectedDurableParent).toMatchObject({
-      ok: false,
-      error: {
-        code: "INVALID_REQUEST",
-        message: "incognito sessions cannot have durable parents",
-      },
-    });
-
-    const listed = await directSessionReq<{ sessions: Array<{ key: string; incognito?: true }> }>(
-      "sessions.list",
-      {},
+    await expectInvalidCreate(
+      { agentId: "main", incognito: true, parentSessionKey: durableParentKey },
+      "incognito sessions cannot have durable parents",
     );
+
+    const listed = await directSessionReq<SessionList>("sessions.list", {});
     expect(listed.payload?.sessions).not.toContainEqual(
       expect.objectContaining({ key, incognito: true }),
     );
 
-    const rejectedReuse = await directSessionReq("sessions.create", {
-      agentId: "main",
-      key,
-    });
-    expect(rejectedReuse).toMatchObject({
-      ok: false,
-      error: {
-        code: "INVALID_REQUEST",
-        message: "incognito-shaped session keys require incognito: true",
-      },
-    });
+    await expectInvalidCreate(
+      { agentId: "main", key },
+      "incognito-shaped session keys require incognito: true",
+    );
     expect(loadSessionEntry({ agentId: "main", sessionKey: key })?.sessionId).toBe(
       entry?.sessionId,
     );
 
-    const child = await directSessionReq<{
-      key: string;
-      entry: {
-        incognito?: true;
-        parentSessionId?: string;
-        parentSessionKey?: string;
-        sessionFile?: string;
-      };
-    }>("sessions.create", { agentId: "main", parentSessionKey: key });
+    const child = await directSessionReq<IncognitoResult>("sessions.create", {
+      agentId: "main",
+      parentSessionKey: key,
+    });
     expect(child.ok).toBe(true);
     const childKey = requireNonEmptyString(child.payload?.key, "incognito child key");
-    expect(child.payload?.entry.incognito).toBe(true);
-    expect(child.payload?.entry.parentSessionKey).toBe(key);
-    expect(child.payload?.entry.parentSessionId).toBe(entry?.sessionId);
+    expect(child.payload?.entry).toMatchObject({
+      incognito: true,
+      parentSessionKey: key,
+      parentSessionId: entry?.sessionId,
+    });
     expect(child.payload?.entry).not.toHaveProperty("sessionFile");
 
     const durableSubagentKey = "agent:main:subagent:durable-existing";
@@ -139,15 +132,10 @@ test("sessions.create keeps incognito rows process-local through list, spawn, re
       { agentId: "main", sessionKey: durableSubagentKey, storePath },
       { sessionId: "durable-subagent", updatedAt: Date.now() },
     );
-    const rejectedInheritedExisting = await directSessionReq("sessions.create", {
-      agentId: "main",
-      key: durableSubagentKey,
-      parentSessionKey: key,
-    });
-    expect(rejectedInheritedExisting).toMatchObject({
-      ok: false,
-      error: { code: "INVALID_REQUEST", message: "incognito sessions are web-only" },
-    });
+    await expectInvalidCreate(
+      { agentId: "main", key: durableSubagentKey, parentSessionKey: key },
+      "incognito sessions are web-only",
+    );
     expect(
       persistentDatabase.db
         .prepare("SELECT current_session_id FROM session_nodes WHERE session_key = ?")
@@ -168,42 +156,21 @@ test("sessions.create keeps incognito rows process-local through list, spawn, re
     expect(loadSessionEntry({ agentId: "main", sessionKey: key })).toBeUndefined();
     expect(loadSessionEntry({ agentId: "main", sessionKey: childKey })).toBeUndefined();
     expect(existsSync(incognitoPath)).toBe(false);
-    const afterReset = await directSessionReq<{ sessions: Array<{ key: string }> }>(
-      "sessions.list",
-      {},
-    );
+    const afterReset = await directSessionReq<SessionList>("sessions.list", {});
     expect(afterReset.payload?.sessions.some((session) => session.key === key)).toBe(false);
 
-    const rejected = await directSessionReq("sessions.create", {
-      agentId: "main",
-      key: "agent:main:discord:channel:123",
-      incognito: true,
-    });
-    expect(rejected).toMatchObject({
-      ok: false,
-      error: { code: "INVALID_REQUEST", message: "incognito sessions are web-only" },
-    });
-    const rejectedSubagentKey = await directSessionReq("sessions.create", {
-      agentId: "main",
-      key: "agent:main:subagent:incognito-client-key",
-      incognito: true,
-    });
-    expect(rejectedSubagentKey).toMatchObject({
-      ok: false,
-      error: { code: "INVALID_REQUEST", message: "incognito sessions are web-only" },
-    });
-    const rejectedAgentMismatch = await directSessionReq("sessions.create", {
-      agentId: "main",
-      key: "agent:work:dashboard:incognito-client-key",
-      incognito: true,
-    });
-    expect(rejectedAgentMismatch).toMatchObject({
-      ok: false,
-      error: {
-        code: "INVALID_REQUEST",
-        message: 'agent "main" does not match session key agent "work"',
-      },
-    });
+    await expectInvalidCreate(
+      { agentId: "main", key: "agent:main:discord:channel:123", incognito: true },
+      "incognito sessions are web-only",
+    );
+    await expectInvalidCreate(
+      { agentId: "main", key: "agent:main:subagent:incognito-client-key", incognito: true },
+      "incognito sessions are web-only",
+    );
+    await expectInvalidCreate(
+      { agentId: "main", key: "agent:work:dashboard:incognito-client-key", incognito: true },
+      'agent "main" does not match session key agent "work"',
+    );
   } finally {
     closeIncognitoSessions();
   }
@@ -298,18 +265,14 @@ test("createGatewaySession rechecks admin scope after incognito inheritance reso
 test("incognito operator RPCs treat identityless connections as owner-equivalent", async () => {
   testState.agentsConfig = { entries: { main: {} } };
   const { dir } = await createSessionStoreDir();
-  const admin = await openClient({
-    scopes: ["operator.admin"],
-    deviceIdentityPath: path.join(dir, "admin-device.json"),
-  });
-  const reader = await openClient({
-    scopes: ["operator.read"],
-    deviceIdentityPath: path.join(dir, "reader-device.json"),
-  });
-  const writer = await openClient({
-    scopes: ["operator.write"],
-    deviceIdentityPath: path.join(dir, "writer-device.json"),
-  });
+  const connect = (name: string, scope: string) =>
+    openClient({
+      scopes: [scope],
+      deviceIdentityPath: path.join(dir, `${name}-device.json`),
+    });
+  const admin = await connect("admin", "operator.admin");
+  const reader = await connect("reader", "operator.read");
+  const writer = await connect("writer", "operator.write");
   try {
     const created = await rpcReq<{ key?: string; sessionId?: string }>(
       admin.ws,

@@ -39,6 +39,24 @@ afterEach(() => {
   closeOpenClawStateDatabaseForTest();
 });
 
+const ownerRepairError = () =>
+  new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "owner repair required", {
+    detailCode: "SESSION_OWNER_MIGRATION_REQUIRED",
+  });
+type ResetOptions = Parameters<
+  typeof import("./session-reset-service.js").performGatewaySessionReset
+>[0];
+async function resetSession(options: Partial<ResetOptions> = {}) {
+  const { performGatewaySessionReset } = await import("./session-reset-service.js");
+  return performGatewaySessionReset({
+    key: "main",
+    reason: "reset",
+    commandSource: "gateway:sessions.reset",
+    workerPlacementContext: {},
+    ...options,
+  });
+}
+
 function resolvedAcpMeta(): SessionAcpMeta {
   return {
     backend: "acpx",
@@ -112,13 +130,7 @@ test.each(["source-and-acp", "acp", "committed-callback"])(
     const committedCallbackFails = failure === "committed-callback";
     const sourceFailure = new Error("project source cleanup failed");
     const committedCallbackFailure = new Error("committed callback failed");
-    const postCommitFailure = new AcpRuntimeError(
-      "ACP_SESSION_INIT_FAILED",
-      "owner repair required",
-      {
-        detailCode: "SESSION_OWNER_MIGRATION_REQUIRED",
-      },
-    );
+    const postCommitFailure = ownerRepairError();
     const events: string[] = [];
     const notified = vi.fn();
     const unsubscribeReset = onGatewaySessionReset(notified);
@@ -155,13 +167,7 @@ test.each(["source-and-acp", "acp", "committed-callback"])(
         events.push("before-reset");
       });
     }
-    const { performGatewaySessionReset } = await import("./session-reset-service.js");
-
-    const reset = performGatewaySessionReset({
-      key: "main",
-      reason: "reset",
-      commandSource: "gateway:sessions.reset",
-      workerPlacementContext: {},
+    const reset = resetSession({
       onCommitted: () => {
         events.push("committed");
         if (committedCallbackFails) {
@@ -330,11 +336,7 @@ test.each(["owner-repair", "discard-error"] as const)(
     const { storePath } = await seedAcpSession();
     const before = loadSessionEntry({ storePath, sessionKey: "agent:main:main" });
     const error =
-      failure === "owner-repair"
-        ? new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "owner repair required", {
-            detailCode: "SESSION_OWNER_MIGRATION_REQUIRED",
-          })
-        : new Error("force discard failed");
+      failure === "owner-repair" ? ownerRepairError() : new Error("force discard failed");
     const timeoutSpy = accelerateAcpCleanupTimeout();
     let release: (() => void) | undefined;
     try {
@@ -349,13 +351,7 @@ test.each(["owner-repair", "discard-error"] as const)(
         );
         acpManagerMocks.forceDiscardSessionRuntime.mockRejectedValueOnce(error);
       }
-      const { performGatewaySessionReset } = await import("./session-reset-service.js");
-      const pending = performGatewaySessionReset({
-        key: "main",
-        reason: "reset",
-        commandSource: "gateway:sessions.reset",
-        workerPlacementContext: {},
-      });
+      const pending = resetSession();
       if (failure === "discard-error") {
         await expect(pending).rejects.toThrow("force discard failed");
       } else {

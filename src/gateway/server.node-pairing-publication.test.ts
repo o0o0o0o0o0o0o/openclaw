@@ -155,6 +155,22 @@ const unsupportedEvent = {
   event: "test.pairing-publication",
   payload: { synthetic: true },
 };
+const unsupportedResult = {
+  ok: true,
+  event: unsupportedEvent.event,
+  handled: false,
+  reason: "unsupported_event",
+};
+
+function answerSnapshot(node: Awaited<ReturnType<typeof connectPairedNode>>, frame: InvokeFrame) {
+  expect(frame).toMatchObject({ nodeId: node.nodeId, command: "canvas.snapshot" });
+  return node.client.request("node.invoke.result", {
+    id: frame.id,
+    nodeId: frame.nodeId,
+    ok: true,
+    payloadJSON: JSON.stringify({ snapshot: "synthetic" }),
+  });
+}
 
 test("delivers node commands and node requests across an unrelated missed pairing revision", async () => {
   const nodeA = await connectPairedNode("publication-node-a");
@@ -175,13 +191,7 @@ test("delivers node commands and node requests across an unrelated missed pairin
   const invoked = invokeCanvasSnapshot(nodeA.nodeId, "publication-unrelated-revision");
   const frame = await Promise.race([nodeA.invokeFrame, invoked.then(() => undefined)]);
   if (frame) {
-    expect(frame).toMatchObject({ nodeId: nodeA.nodeId, command: "canvas.snapshot" });
-    await nodeA.client.request("node.invoke.result", {
-      id: frame.id,
-      nodeId: frame.nodeId,
-      ok: true,
-      payloadJSON: JSON.stringify({ snapshot: "synthetic" }),
-    });
+    await answerSnapshot(nodeA, frame);
   }
   const result = await invoked;
   expect.soft(result.ok, result.error?.message).toBe(true);
@@ -189,12 +199,9 @@ test("delivers node commands and node requests across an unrelated missed pairin
   expect(pairingHook.afterResolve).toBeUndefined();
 
   afterNextResolution(nodeA.nodeId, "request-authorization", publishUnrelatedRevision);
-  await expect.soft(nodeA.client.request("node.event", unsupportedEvent)).resolves.toEqual({
-    ok: true,
-    event: unsupportedEvent.event,
-    handled: false,
-    reason: "unsupported_event",
-  });
+  await expect
+    .soft(nodeA.client.request("node.event", unsupportedEvent))
+    .resolves.toEqual(unsupportedResult);
   expect(pairingHook.afterResolve).toBeUndefined();
 });
 
@@ -269,17 +276,7 @@ test("delivers node commands and node requests during an unrelated pending pairi
         );
         // Receiving the frame before releasing the writer proves delivery during the mutation.
         expect.soft(nodeA.received).toHaveLength(1);
-        const answered = frame
-          ? nodeA.client.request("node.invoke.result", {
-              id: frame.id,
-              nodeId: frame.nodeId,
-              ok: true,
-              payloadJSON: JSON.stringify({ snapshot: "synthetic" }),
-            })
-          : undefined;
-        if (frame) {
-          expect(frame).toMatchObject({ nodeId: nodeA.nodeId, command: "canvas.snapshot" });
-        }
+        const answered = frame ? answerSnapshot(nodeA, frame) : undefined;
         release.resolve();
         await withinTest(Promise.resolve(answered), signal);
         const result = await withinTest(invoked, signal);
@@ -297,12 +294,7 @@ test("delivers node commands and node requests during an unrelated pending pairi
         expect.soft(authorization.error).toBeNull();
         // The handler performs another pairing lookup, which legitimately waits for this lock.
         release.resolve();
-        await expect.soft(withinTest(requested, signal)).resolves.toEqual({
-          ok: true,
-          event: unsupportedEvent.event,
-          handled: false,
-          reason: "unsupported_event",
-        });
+        await expect.soft(withinTest(requested, signal)).resolves.toEqual(unsupportedResult);
       }
       expect(pairingHook.afterResolve).toBeUndefined();
     } finally {
@@ -373,12 +365,9 @@ test.each(["token revoke", "token rotate", "unpair", "node reapproval"] as const
     expect(node.received).toEqual([]);
     if (change === "node reapproval") {
       // Reapproval refreshes the live session, while the old prepared invoke remains refused.
-      await expect(node.client.request("node.event", unsupportedEvent)).resolves.toEqual({
-        ok: true,
-        event: unsupportedEvent.event,
-        handled: false,
-        reason: "unsupported_event",
-      });
+      await expect(node.client.request("node.event", unsupportedEvent)).resolves.toEqual(
+        unsupportedResult,
+      );
     } else {
       await expect(node.client.request("node.event", unsupportedEvent)).rejects.toThrow(
         /device removed|not connected|pairing changed/,

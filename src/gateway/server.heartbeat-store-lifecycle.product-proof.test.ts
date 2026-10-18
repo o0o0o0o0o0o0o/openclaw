@@ -229,44 +229,37 @@ describe("session notification store ownership through the Gateway", () => {
               { runId, timeoutMs: 120_000 },
               { timeoutMs: 125_000 },
             );
-          const accepted = await gateway.client.request<{ runId: string }>(
-            "chat.send",
-            {
-              sessionKey: parentKey,
-              message: "Spawn one worker now.",
-              deliver: false,
-              idempotencyKey: randomUUID(),
-            },
-            { expectFinal: false },
-          );
-          const parentResult = await wait(accepted.runId);
-          expect(parentResult.status, JSON.stringify(parentResult)).toBe("ok");
+          const turn = async (
+            method: "agent" | "chat.send",
+            sessionKey: string,
+            message: string,
+          ) => {
+            const accepted = await gateway!.client.request<{ runId: string }>(
+              method,
+              { sessionKey, message, deliver: false, idempotencyKey: randomUUID() },
+              { expectFinal: false },
+            );
+            const result = await wait(accepted.runId);
+            expect(result.status, JSON.stringify(result)).toBe("ok");
+          };
+          const list = () =>
+            gateway!.client.request<SessionsListResult>("sessions.list", {
+              agentId: "main",
+              limit: 100,
+            });
+          await turn("chat.send", parentKey, "Spawn one worker now.");
           expect(provider.spawn?.status).toBe("accepted");
           const child = provider.spawn;
           if (!child) {
             throw new Error("Parent did not receive sessions_spawn receipt");
           }
           expect((await wait(child.runId)).status).toBe("ok");
-          const before = await gateway.client.request<SessionsListResult>("sessions.list", {
-            agentId: "main",
-            limit: 100,
-          });
+          const before = await list();
           const parentSessionId = before.sessions.find(
             (entry) => entry.key === parentKey,
           )?.sessionId;
           expect(parentSessionId).toBeTypeOf("string");
-          const followup = await gateway.client.request<{ runId: string }>(
-            "agent",
-            {
-              sessionKey: child.childSessionKey,
-              message: `Human followup ${WORKER}`,
-              deliver: false,
-              idempotencyKey: randomUUID(),
-            },
-            { expectFinal: false },
-          );
-          const followupResult = await wait(followup.runId);
-          expect(followupResult.status, JSON.stringify(followupResult)).toBe("ok");
+          await turn("agent", child.childSessionKey, `Human followup ${WORKER}`);
 
           if (transition === "different store") {
             const { hash } = await gateway.client.request<{ hash: string }>("config.get", {});
@@ -281,10 +274,7 @@ describe("session notification store ownership through the Gateway", () => {
               status: "skipped",
               reason: "store-replaced",
             });
-            const after = await gateway.client.request<SessionsListResult>("sessions.list", {
-              agentId: "main",
-              limit: 100,
-            });
+            const after = await list();
             expect(after.sessions.map((entry) => entry.key)).not.toContain(parentKey);
             expect(after.sessions.map((entry) => entry.key)).not.toContain(child.childSessionKey);
             expect(provider.requests.map((request) => request.model)).not.toContain("backup");
@@ -307,18 +297,7 @@ describe("session notification store ownership through the Gateway", () => {
             await gateway.server.startupSettled;
             await withinTest(sweepSettled.promise, signal);
             // Restart restores unread notices as context for the next ordinary turn.
-            const resumed = await gateway.client.request<{ runId: string }>(
-              "chat.send",
-              {
-                sessionKey: parentKey,
-                message: "Continue after the Gateway restart.",
-                deliver: false,
-                idempotencyKey: randomUUID(),
-              },
-              { expectFinal: false },
-            );
-            const resumedResult = await wait(resumed.runId);
-            expect(resumedResult.status, JSON.stringify(resumedResult)).toBe("ok");
+            await turn("chat.send", parentKey, "Continue after the Gateway restart.");
             const notice = await withinTest(replacementNotice, signal);
             expect(provider.requests.indexOf(notice)).toBeGreaterThanOrEqual(
               replacementRequestOffset,
@@ -326,10 +305,7 @@ describe("session notification store ownership through the Gateway", () => {
             expect(notice.model).toBe("primary");
             expect(JSON.stringify(notice.input)).toContain(child.childSessionKey);
             expect(JSON.stringify(notice.input)).toContain(WORKER);
-            const after = await gateway.client.request<SessionsListResult>("sessions.list", {
-              agentId: "main",
-              limit: 100,
-            });
+            const after = await list();
             expect(after.sessions.find((entry) => entry.key === parentKey)?.sessionId).toBe(
               parentSessionId,
             );

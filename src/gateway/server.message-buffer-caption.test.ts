@@ -132,6 +132,7 @@ it(
     }
     let selected = cases[0];
     let requests: Array<Record<string, unknown>> = [];
+    const primaryRequests = () => requests.filter((request) => request.model === "buffer-proof");
     const provider = createServer((request, response) => {
       void (async () => {
         const chunks: Buffer[] = [];
@@ -155,7 +156,7 @@ it(
           });
           return;
         }
-        if (requests.filter((candidate) => candidate.model === "buffer-proof").length === 1) {
+        if (primaryRequests().length === 1) {
           const item = {
             type: "function_call",
             id: `fc_${selected.name}`,
@@ -261,28 +262,35 @@ it(
         configPath,
         token: "buffer-proof-token",
       });
+      const client = gateway.client;
+      const wait = (runId: string) =>
+        client.request<{ status: string }>(
+          "agent.wait",
+          { runId, timeoutMs: 60_000 },
+          { timeoutMs: 65_000 },
+        );
+      const artifacts = (sessionKey: string) =>
+        client.request<ArtifactsListResult>("artifacts.list", {
+          sessionKey,
+          messageRole: "assistant",
+        });
+      const send = (sessionKey: string, name: string) =>
+        client.request<{ runId: string }>("chat.send", {
+          sessionKey,
+          message: "Send the attachment in this conversation.",
+          idempotencyKey: `buffer-${name}`,
+        });
       for (const scenario of cases) {
         selected = scenario;
         requests = [];
         const sessionKey = `agent:main:buffer-${scenario.name}`;
-        const started = await gateway.client.request<{ runId: string }>("chat.send", {
-          sessionKey,
-          message: "Send the attachment in this conversation.",
-          idempotencyKey: `buffer-${scenario.name}`,
-        });
-        const completed = await gateway.client.request<{ status: string }>(
-          "agent.wait",
-          { runId: started.runId, timeoutMs: 60_000 },
-          { timeoutMs: 65_000 },
-        );
+        const started = await send(sessionKey, scenario.name);
+        const completed = await wait(started.runId);
         const history = await gateway.client.request<{ messages: Array<Record<string, unknown>> }>(
           "chat.history",
           { sessionKey, limit: 20 },
         );
-        const listed = await gateway.client.request<ArtifactsListResult>("artifacts.list", {
-          sessionKey,
-          messageRole: "assistant",
-        });
+        const listed = await artifacts(sessionKey);
         const visibleText = history.messages
           .filter((message) => message.role === "assistant")
           .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
@@ -326,24 +334,12 @@ it(
             .soft(Buffer.from(await response.arrayBuffer()), scenario.name)
             .toEqual(scenario.bytes);
         }
-        const primaryCount = requests.filter((request) => request.model === "buffer-proof").length;
-        const replay = await gateway.client.request<{ runId: string }>("chat.send", {
-          sessionKey,
-          message: "Send the attachment in this conversation.",
-          idempotencyKey: `buffer-${scenario.name}`,
-        });
+        const primaryCount = primaryRequests().length;
+        const replay = await send(sessionKey, scenario.name);
         expect(replay.runId).toBe(started.runId);
-        await gateway.client.request(
-          "agent.wait",
-          { runId: replay.runId, timeoutMs: 60_000 },
-          { timeoutMs: 65_000 },
-        );
-        expect(
-          await gateway.client.request("artifacts.list", { sessionKey, messageRole: "assistant" }),
-        ).toEqual(listed);
-        expect(requests.filter((request) => request.model === "buffer-proof")).toHaveLength(
-          primaryCount,
-        );
+        await wait(replay.runId);
+        expect(await artifacts(sessionKey)).toEqual(listed);
+        expect(primaryRequests()).toHaveLength(primaryCount);
       }
     } finally {
       try {

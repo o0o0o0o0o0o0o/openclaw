@@ -3,9 +3,9 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
 import { makeProviderModelFixture } from "./test-helpers/provider-model-fixture.js";
 import {
-  resolveAutomaticUtilityRuntimeOverride,
-  resolveConfiguredSetupModelForAgent,
-  resolveUtilityModelRefForAgent,
+  resolveAutomaticUtilityRuntimeOverride as resolveRuntime,
+  resolveConfiguredSetupModelForAgent as resolveSetup,
+  resolveUtilityModelRefForAgent as resolveUtility,
 } from "./utility-model.js";
 
 type Defaults = NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]>;
@@ -13,6 +13,7 @@ type Entries = NonNullable<OpenClawConfig["agents"]>["entries"];
 const config = (defaults: Defaults, entries?: Entries): OpenClawConfig => ({
   agents: { defaults, ...(entries ? { entries } : {}) },
 });
+const utilityResult = (modelRef: string) => ({ modelRef, modelTarget: "utility" as const });
 
 function snapshotWithDefaults(defaults: Record<string, string>) {
   return createPluginMetadataSnapshotFixture({
@@ -27,84 +28,57 @@ function snapshotWithDefaults(defaults: Record<string, string>) {
 
 describe("resolveConfiguredSetupModelForAgent", () => {
   it.each([
-    { utilityModel: undefined, expected: undefined },
-    { utilityModel: "", expected: undefined },
-    {
-      utilityModel: "local-utility/shared",
-      agentId: "ops",
-      expected: { modelRef: "local-utility/ops", modelTarget: "utility" },
-    },
-    { utilityModel: "local-utility/shared", agentId: "disabled", expected: undefined },
-    {
-      utilityModel: " local-utility/tiny@local-utility:setup ",
-      expected: { modelRef: "local-utility/tiny@local-utility:setup", modelTarget: "utility" },
-    },
-  ])(
-    "uses only an enabled utility setting for setup: %j",
-    ({ utilityModel, expected, agentId = "main" }) => {
-      const cfg: OpenClawConfig = {
-        meta: { migrations: { utilityModelSeparation: true } },
-        agents: {
-          ownership: "explicit",
-          defaults: { utilityModel },
-          entries: { ops: { utilityModel: "local-utility/ops" }, disabled: { utilityModel: "" } },
-        },
+    [undefined, "main", undefined],
+    ["", "main", undefined],
+    ["local-utility/shared", "ops", "local-utility/ops"],
+    ["local-utility/shared", "disabled", undefined],
+    [" local-utility/tiny@local-utility:setup ", "main", "local-utility/tiny@local-utility:setup"],
+  ] as const)("uses utility %s for %s", (utilityModel, agentId, expectedRef) => {
+    const cfg: OpenClawConfig = {
+      meta: { migrations: { utilityModelSeparation: true } },
+      agents: {
+        ownership: "explicit",
+        defaults: { utilityModel },
+        entries: { ops: { utilityModel: "local-utility/ops" }, disabled: { utilityModel: "" } },
+      },
+    };
+    const expected = expectedRef === undefined ? undefined : utilityResult(expectedRef);
+    expect(resolveSetup({ cfg, agentId })).toEqual(expected);
+    cfg.agents!.defaults!.model = "openai/gpt-5.5";
+    expect(resolveSetup({ cfg, agentId, modelTarget: "utility" })).toEqual(expected);
+  });
+
+  it.each(["native", "acp", "legacy", "legacy-alias"] as const)(
+    "%s setup separates primary and utility without mutating config",
+    (mode) => {
+      const legacy = mode.startsWith("legacy");
+      const utilityModel = legacy
+        ? `${mode === "legacy" ? "local-utility/tiny" : "helper"}@local:utility`
+        : "local-utility/tiny";
+      const provider = "local-utility";
+      const route = { provider, api: "openai-completions", baseUrl: "http://127.0.0.1:9/v1" };
+      const localProvider = {
+        baseUrl: route.baseUrl,
+        models: [makeProviderModelFixture({ id: "tiny", ...route })],
       };
-      expect(resolveConfiguredSetupModelForAgent({ cfg, agentId })).toEqual(expected);
-      cfg.agents!.defaults!.model = "openai/gpt-5.5";
-      expect(resolveConfiguredSetupModelForAgent({ cfg, agentId, modelTarget: "utility" })).toEqual(
-        expected,
-      );
-    },
-  );
-
-  it.each([false, true])(
-    "keeps the native primary for setup unless utility is selected (ACP=%s)",
-    (acp) => {
-      const cfg = config(
-        { model: "openai/gpt-5.5@openai:primary", utilityModel: "local-utility/tiny" },
-        { main: acp ? { model: "harness-only", runtime: { type: "acp" } } : {} },
-      );
-
-      expect(resolveConfiguredSetupModelForAgent({ cfg, agentId: "main" })).toEqual({
-        modelRef: "openai/gpt-5.5@openai:primary",
-      });
-      expect(
-        resolveConfiguredSetupModelForAgent({ cfg, agentId: "main", modelTarget: "utility" }),
-      ).toEqual({ modelRef: "local-utility/tiny", modelTarget: "utility" });
-    },
-  );
-
-  it.each(["local-utility/tiny@local:utility", "helper@local:utility"])(
-    "keeps the legacy implicit primary for setup alongside utility ref %s",
-    (utilityModel) => {
-      const cfg: OpenClawConfig = {
-        ...config({ utilityModel, models: { "local-utility/tiny": { alias: "helper" } } }),
-        models: {
-          providers: {
-            "local-utility": {
-              baseUrl: "http://127.0.0.1:9/v1",
-              models: [
-                makeProviderModelFixture({
-                  id: "tiny",
-                  provider: "local-utility",
-                  api: "openai-completions",
-                  baseUrl: "http://127.0.0.1:9/v1",
-                }),
-              ],
-            },
-          },
-        },
-      };
+      const cfg: OpenClawConfig = legacy
+        ? {
+            ...config({ utilityModel, models: { "local-utility/tiny": { alias: "helper" } } }),
+            models: { providers: { [provider]: localProvider } },
+          }
+        : config(
+            { model: "openai/gpt-5.5@openai:primary", utilityModel },
+            { main: mode === "acp" ? { model: "harness-only", runtime: { type: "acp" } } : {} },
+          );
       const original = structuredClone(cfg);
-
-      expect(resolveConfiguredSetupModelForAgent({ cfg, agentId: "main" })).toEqual({
-        modelRef: "local-utility/tiny",
-        implicitPrimary: true,
-      });
-      expect(
-        resolveConfiguredSetupModelForAgent({ cfg, agentId: "main", modelTarget: "utility" }),
-      ).toEqual({ modelRef: utilityModel, modelTarget: "utility" });
+      expect(resolveSetup({ cfg, agentId: "main" })).toEqual(
+        legacy
+          ? { modelRef: "local-utility/tiny", implicitPrimary: true }
+          : { modelRef: "openai/gpt-5.5@openai:primary" },
+      );
+      expect(resolveSetup({ cfg, agentId: "main", modelTarget: "utility" })).toEqual(
+        utilityResult(utilityModel),
+      );
       expect(cfg).toEqual(original);
     },
   );
@@ -119,7 +93,7 @@ describe("resolveUtilityModelRefForAgent", () => {
     name: string,
     cfg: OpenClawConfig,
     expected?: string,
-    overrides?: Partial<Parameters<typeof resolveUtilityModelRefForAgent>[0]>,
+    overrides?: Partial<Parameters<typeof resolveUtility>[0]>,
   ];
   const primary = config({ model: "openai/gpt-5.5@work" }, { main: {} });
   const optOut = config({ utilityModel: "openai/gpt-5.4-mini" }, { ops: { utilityModel: "" } });
@@ -153,9 +127,7 @@ describe("resolveUtilityModelRefForAgent", () => {
     ["agent opt-out", optOut, undefined, { agentId: "ops" }],
     ["other agent retains shared model", optOut, "openai/gpt-5.4-mini"],
   ])("resolves %s", (_name, cfg, expected, overrides) => {
-    expect(
-      resolveUtilityModelRefForAgent({ cfg, agentId: "main", metadataSnapshot, ...overrides }),
-    ).toBe(expected);
+    expect(resolveUtility({ cfg, agentId: "main", metadataSnapshot, ...overrides })).toBe(expected);
   });
 });
 
@@ -164,57 +136,49 @@ describe("resolveAutomaticUtilityRuntimeOverride", () => {
   const utility = "anthropic/claude-haiku-4-5";
   const cliEntry = { agentRuntime: { id: "claude-cli" } };
   const metadataSnapshot = snapshotWithDefaults({ anthropic: "claude-haiku-4-5" });
-  type Scenario = {
-    name: string;
+  const models = (entry: NonNullable<Defaults["models"]>[string]) => ({
+    models: { [primary]: cliEntry, [utility]: entry },
+  });
+  type Options = Partial<Omit<Parameters<typeof resolveRuntime>[0], "cfg" | "agentId">> & {
     defaults?: Defaults;
     providers?: NonNullable<OpenClawConfig["models"]>["providers"];
-    utilityProvider?: string;
-    utilityModelId?: string;
-    metadataSnapshot?: typeof metadataSnapshot;
-    expected?: string;
   };
+  type Scenario = [name: string, options: Options, expected?: string];
   it.each<Scenario>([
-    { name: "model-level CLI pin", expected: "claude-cli" },
-    { name: "explicit same-provider selection", utilityModelId: "claude-sonnet-5" },
-    {
-      name: "provider without automatic default",
-      metadataSnapshot: snapshotWithDefaults({ openai: "gpt-5.4-mini" }),
-    },
-    { name: "explicit utility setting", defaults: { utilityModel: "openai/gpt-5.6-luna" } },
-    { name: "disabled utility setting", defaults: { utilityModel: "" } },
-    { name: "different provider", utilityProvider: "openai", utilityModelId: "gpt-5.6-luna" },
-    { name: "default primary runtime", defaults: { models: {} } },
-    {
-      name: "provider-level runtime",
-      defaults: { models: {} },
-      providers: { anthropic: { baseUrl: "https://api.anthropic.com", models: [], ...cliEntry } },
-    },
-    { name: "wildcard runtime", defaults: { models: { "anthropic/*": cliEntry } } },
-    {
-      name: "derived HTTP pin",
-      defaults: {
-        models: { [primary]: cliEntry, [utility]: { agentRuntime: { id: "openclaw" } } },
+    ["model-level CLI pin", {}, "claude-cli"],
+    ["explicit same-provider selection", { utilityModelId: "claude-sonnet-5" }],
+    [
+      "provider without default",
+      { metadataSnapshot: snapshotWithDefaults({ openai: "gpt-5.4-mini" }) },
+    ],
+    ["explicit utility", { defaults: { utilityModel: "openai/gpt-5.6-luna" } }],
+    ["disabled utility", { defaults: { utilityModel: "" } }],
+    ["different provider", { utilityProvider: "openai", utilityModelId: "gpt-5.6-luna" }],
+    ["default primary runtime", { defaults: { models: {} } }],
+    [
+      "provider-level runtime",
+      {
+        defaults: { models: {} },
+        providers: { anthropic: { baseUrl: "https://api.anthropic.com", models: [], ...cliEntry } },
       },
-    },
-    {
-      name: "bare derived entry",
-      defaults: { models: { [primary]: cliEntry, [utility]: {} } },
-      expected: "claude-cli",
-    },
-    {
-      name: "derived default alias",
-      defaults: { models: { [primary]: cliEntry, [utility]: { agentRuntime: { id: "default" } } } },
-      expected: "claude-cli",
-    },
+    ],
+    ["wildcard runtime", { defaults: { models: { "anthropic/*": cliEntry } } }],
+    ["derived HTTP pin", { defaults: models({ agentRuntime: { id: "openclaw" } }) }],
+    ["bare derived entry", { defaults: models({}) }, "claude-cli"],
+    [
+      "derived default alias",
+      { defaults: models({ agentRuntime: { id: "default" } }) },
+      "claude-cli",
+    ],
   ])(
-    "inherits only an automatic model's eligible runtime: $name",
-    ({ defaults, providers, expected, ...scenario }) => {
+    "inherits only an automatic model's eligible runtime: %s",
+    (_name, { defaults, providers, ...scenario }, expected) => {
       const cfg: OpenClawConfig = {
         agents: { defaults: { model: primary, models: { [primary]: cliEntry }, ...defaults } },
         ...(providers ? { models: { providers } } : {}),
       };
       expect(
-        resolveAutomaticUtilityRuntimeOverride({
+        resolveRuntime({
           cfg,
           agentId: "main",
           utilityProvider: "anthropic",

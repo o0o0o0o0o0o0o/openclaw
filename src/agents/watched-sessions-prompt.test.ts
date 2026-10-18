@@ -1,75 +1,79 @@
 import fs from "node:fs";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  clearRuntimeConfigSnapshot,
-  setRuntimeConfigSnapshot,
-} from "../config/runtime-snapshot.js";
+import * as configSnapshot from "../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
 import * as sessionReader from "../config/sessions/session-entry-read-runtime.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { buildWatchedSessionsHarnessContext } from "../plugin-sdk/agent-harness-runtime.js";
-import {
-  handleSessionStateSessionReset,
-  registerMainSessionGroupWatch,
-} from "../sessions/session-state-events.js";
+import * as sessionState from "../sessions/session-state-events.js";
 import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.paths.js";
 import * as stateRead from "../state/openclaw-state-db-readonly.js";
 import { observeMainThreadSql } from "../test-utils/main-thread-sql-spies.test-support.js";
+import * as sessionCleanup from "../test-utils/session-state-cleanup.js";
 import {
-  drainSessionStateForTest,
-  useSessionStoreTempDirs,
-} from "../test-utils/session-state-cleanup.js";
-import {
-  buildWatchedSessionsPromptLines,
-  prepareWatchedSessionsPrompt as prepareWatchedSessionsPromptSync,
-  prepareWatchedSessionsPromptAsync,
+  buildWatchedSessionsPromptLines as renderPrompt,
+  prepareWatchedSessionsPrompt as prepareSync,
+  prepareWatchedSessionsPromptAsync as prepareAsync,
 } from "./watched-sessions-prompt.js";
 
-const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-watched-sessions-");
+const sessionDirs = sessionCleanup.useSessionStoreTempDirs(afterAll, "openclaw-watched-sessions-");
 const mainSessionKey = "agent:main:main";
+const groupKey = (name = "beta") => `agent:main:telegram:group:${name}`;
 const sessionReadTools = ["sessions_history", "sessions_search", "sessions_list"];
 const promptInput = { enabled: true, sessionKey: mainSessionKey, toolNames: sessionReadTools };
-const prepareWatchedSessionsPrompt = (
-  params: Partial<Parameters<typeof prepareWatchedSessionsPromptSync>[0]> = {},
-) => prepareWatchedSessionsPromptAsync({ ...promptInput, ...params, assertCurrent: () => {} });
+const preparePrompt = (params: Partial<Parameters<typeof prepareSync>[0]> = {}) =>
+  prepareAsync({ ...promptInput, ...params, assertCurrent: () => {} });
 
 function stubStateDir() {
-  const stateDir = sessionDirs.make();
-  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+  vi.stubEnv("OPENCLAW_STATE_DIR", sessionDirs.make());
 }
 
-async function watchGroup(sessionKey: string) {
-  expect(await registerMainSessionGroupWatch({ sessionKey, agentId: "main" })).toBe(true);
+const sandboxConfig = (sandbox: { sessionToolsVisibility: "all" | "spawned" }): OpenClawConfig => ({
+  agents: { defaults: { sandbox } },
+});
+
+async function watchGroup(sessionKey = groupKey(), displayName?: string) {
+  expect(await sessionState.registerMainSessionGroupWatch({ sessionKey, agentId: "main" })).toBe(
+    true,
+  );
+  if (displayName) {
+    await upsertSessionEntryCore(
+      { sessionKey },
+      { sessionId: "test-session", displayName, updatedAt: 1 },
+    );
+  }
+}
+
+function afterAmbientRead(change: (reads: number) => void | Promise<void>) {
+  const read = stateRead.executeExistingOpenClawStateRead;
+  let reads = 0;
+  vi.spyOn(stateRead, "executeExistingOpenClawStateRead").mockImplementation(async (...args) => {
+    const result = await read(...args);
+    if (args[1].type === "sessionState.ambientTargets") {
+      await change(++reads);
+    }
+    return result;
+  });
 }
 
 afterEach(async () => {
-  await drainSessionStateForTest();
+  await sessionCleanup.drainSessionStateForTest();
   vi.restoreAllMocks();
-  clearRuntimeConfigSnapshot();
+  configSnapshot.clearRuntimeConfigSnapshot();
   vi.unstubAllEnvs();
 });
 
 describe("prepareWatchedSessionsPrompt", () => {
   beforeEach(() => {
     stubStateDir();
-    setRuntimeConfigSnapshot({});
+    configSnapshot.setRuntimeConfigSnapshot({});
   });
 
   it("returns key-sorted watched sessions with store-derived titles", async () => {
-    await watchGroup("agent:main:telegram:group:beta");
-    await watchGroup("agent:main:telegram:group:alpha:topic:7");
-    await upsertSessionEntryCore(
-      { sessionKey: "agent:main:telegram:group:beta" },
-      { sessionId: "session-beta", displayName: "Family group", updatedAt: 1 },
-    );
-
-    const prepared = await prepareWatchedSessionsPrompt();
-
-    expect(prepared).toEqual({
-      sessions: [
-        { key: "agent:main:telegram:group:alpha:topic:7" },
-        { key: "agent:main:telegram:group:beta", title: "Family group" },
-      ],
+    await watchGroup(groupKey(), "Family group");
+    await watchGroup(groupKey("alpha:topic:7"));
+    expect(await preparePrompt()).toEqual({
+      sessions: [{ key: groupKey("alpha:topic:7") }, { key: groupKey(), title: "Family group" }],
       hiddenCount: 0,
       readToolNames: ["sessions_history", "sessions_search"],
       listToolAvailable: true,
@@ -78,36 +82,29 @@ describe("prepareWatchedSessionsPrompt", () => {
 
   it("caps rendered rows and reports the overflow count", async () => {
     for (let index = 0; index < 23; index += 1) {
-      await watchGroup(`agent:main:telegram:group:room-${String(index).padStart(2, "0")}`);
+      await watchGroup(
+        groupKey(`room-${String(index).padStart(2, "0")}`),
+        index === 0 ? "A".repeat(79) + "🦞tail" : undefined,
+      );
     }
 
-    await upsertSessionEntryCore(
-      { sessionKey: "agent:main:telegram:group:room-00" },
-      { sessionId: "golden-title", displayName: "A".repeat(79) + "🦞tail", updatedAt: 1 },
-    );
-    const input = { enabled: true, sessionKey: mainSessionKey, toolNames: ["sessions_history"] };
+    const input = { ...promptInput, toolNames: ["sessions_history"] };
     const sql = observeMainThreadSql();
     let prepared;
     try {
-      // The released sync implementation is the pre-cutover golden and proves
-      // this instrumentation sees both original reads on the caller thread.
-      const original = prepareWatchedSessionsPromptSync(input);
+      // The sync golden also proves the SQL instrumentation observes caller-thread reads.
+      const original = prepareSync(input);
       expect(sql.count()).toBeGreaterThan(0);
       sql.clear();
-      prepared = await prepareWatchedSessionsPrompt(input);
+      prepared = await preparePrompt(input);
       sql.expectIdle();
-      expect(buildWatchedSessionsPromptLines(prepared).join("\n")).toBe(
-        buildWatchedSessionsPromptLines(original).join("\n"),
-      );
+      expect(renderPrompt(prepared)).toEqual(renderPrompt(original));
     } finally {
       sql.restore();
     }
 
     expect(prepared?.sessions).toHaveLength(20);
-    expect(prepared?.sessions[0]).toEqual({
-      title: "A".repeat(79),
-      key: "agent:main:telegram:group:room-00",
-    });
+    expect(prepared?.sessions[0]).toEqual({ title: "A".repeat(79), key: groupKey("room-00") });
     expect(prepared).toMatchObject({
       hiddenCount: 3,
       readToolNames: ["sessions_history"],
@@ -116,43 +113,35 @@ describe("prepareWatchedSessionsPrompt", () => {
   });
 
   it("keeps the section for sandboxed sessions only when the clamp allows non-spawned reads", async () => {
-    await watchGroup("agent:main:telegram:group:beta");
-    expect(await prepareWatchedSessionsPrompt({ sandboxed: true, config: {} })).toBe(undefined);
-    expect(
-      (
-        await prepareWatchedSessionsPrompt({
-          sandboxed: true,
-          config: { agents: { defaults: { sandbox: { sessionToolsVisibility: "all" } } } },
-        })
-      )?.sessions,
-    ).toHaveLength(1);
+    await watchGroup();
+    expect(await preparePrompt({ sandboxed: true, config: {} })).toBe(undefined);
+    const prepared = await preparePrompt({
+      sandboxed: true,
+      config: sandboxConfig({ sessionToolsVisibility: "all" }),
+    });
+    expect(prepared?.sessions).toHaveLength(1);
   });
 
-  it("returns undefined when disabled, keyless, non-main, toolless, or unwatched", async () => {
-    await watchGroup("agent:main:telegram:group:beta");
-    expect(await prepareWatchedSessionsPrompt({ enabled: false })).toBe(undefined);
-    expect(await prepareWatchedSessionsPrompt({ sessionKey: undefined })).toBe(undefined);
-    expect(await prepareWatchedSessionsPrompt({ sessionKey: "agent:main:subagent:worker" })).toBe(
-      undefined,
-    );
-    expect(
-      await prepareWatchedSessionsPrompt({ sessionKey: "agent:main:telegram:group:beta" }),
-    ).toBe(undefined);
-    expect(await prepareWatchedSessionsPrompt({ toolNames: ["sessions_list"] })).toBe(undefined);
-    expect(await prepareWatchedSessionsPrompt({ sessionKey: "agent:other:main" })).toBe(undefined);
+  it.each([
+    { enabled: false },
+    { sessionKey: undefined },
+    { sessionKey: "agent:main:subagent:worker" },
+    { sessionKey: groupKey() },
+    { toolNames: ["sessions_list"] },
+    { sessionKey: "agent:other:main" },
+  ])("omits inaccessible or unwatched sessions: %j", async (input) => {
+    await watchGroup();
+    expect(await preparePrompt(input)).toBeUndefined();
   });
 
   it.each(["authority", "watch", "watch-final", "sandbox", "sandbox-cleanup", "store"] as const)(
     "revalidates %s while worker facts are loading",
     async (change) => {
-      await watchGroup("agent:main:telegram:group:beta");
+      await watchGroup();
       const sandbox: { sessionToolsVisibility: "all" | "spawned" } = {
         sessionToolsVisibility: "all",
       };
-      const config: OpenClawConfig = { agents: { defaults: { sandbox } } };
       let active = true;
-      let reads = 0;
-      const read = stateRead.executeExistingOpenClawStateRead;
       const withReader = sessionReader.withSessionStoreReaderInWorker;
       if (change === "sandbox-cleanup") {
         vi.spyOn(sessionReader, "withSessionStoreReaderInWorker").mockImplementation(
@@ -163,34 +152,24 @@ describe("prepareWatchedSessionsPrompt", () => {
           },
         );
       }
-      vi.spyOn(stateRead, "executeExistingOpenClawStateRead").mockImplementation(
-        async (...args) => {
-          const result = await read(...args);
-          if (args[1].type === "sessionState.ambientTargets") {
-            reads += 1;
-            if (change === "watch-final" && reads === 2) {
-              await handleSessionStateSessionReset(mainSessionKey);
-            }
-            if (change === "authority") {
-              active = false;
-            }
-            if (change === "watch") {
-              await handleSessionStateSessionReset(mainSessionKey);
-            }
-            if (change === "sandbox") {
-              sandbox.sessionToolsVisibility = "spawned";
-            }
-            // Mutating ambient process selection must not retarget captured readers.
-            if (change === "store") {
-              stubStateDir();
-            }
-          }
-          return result;
-        },
-      );
-      const pending = prepareWatchedSessionsPromptAsync({
+      afterAmbientRead(async (reads) => {
+        if (change === "watch" || (change === "watch-final" && reads === 2)) {
+          await sessionState.handleSessionStateSessionReset(mainSessionKey);
+        }
+        if (change === "authority") {
+          active = false;
+        }
+        if (change === "sandbox") {
+          sandbox.sessionToolsVisibility = "spawned";
+        }
+        // Ambient process selection must not retarget captured readers.
+        if (change === "store") {
+          stubStateDir();
+        }
+      });
+      const pending = prepareAsync({
         ...promptInput,
-        config,
+        config: sandboxConfig(sandbox),
         sandboxed: true,
         assertCurrent: () => {
           if (!active) {
@@ -201,7 +180,7 @@ describe("prepareWatchedSessionsPrompt", () => {
       if (change === "authority") {
         await expect(pending).rejects.toThrow("caller revoked");
       } else if (change === "store") {
-        expect((await pending)?.sessions).toEqual([{ key: "agent:main:telegram:group:beta" }]);
+        expect((await pending)?.sessions).toEqual([{ key: groupKey() }]);
       } else {
         await expect(pending).resolves.toBeUndefined();
       }
@@ -209,29 +188,19 @@ describe("prepareWatchedSessionsPrompt", () => {
   );
 
   it("rejects replacing the title database at its captured path during a worker read", async () => {
-    const key = "agent:main:telegram:group:beta";
-    await watchGroup(key);
-    await upsertSessionEntryCore(
-      { sessionKey: key },
-      { sessionId: "before-replacement", displayName: "Original", updatedAt: 1 },
-    );
+    await watchGroup(groupKey(), "Original");
     const storePath = resolveOpenClawAgentSqlitePath({ agentId: "main" });
     const originalPath = `${storePath}.original`;
-    const read = stateRead.executeExistingOpenClawStateRead;
     let replaced = false;
-    vi.spyOn(stateRead, "executeExistingOpenClawStateRead").mockImplementation(async (...args) => {
-      const result = await read(...args);
-      if (args[1].type === "sessionState.ambientTargets" && !replaced) {
+    afterAmbientRead(() => {
+      if (!replaced) {
         fs.renameSync(storePath, originalPath);
         fs.writeFileSync(storePath, "replacement must never be opened");
         replaced = true;
       }
-      return result;
     });
     try {
-      await expect(prepareWatchedSessionsPrompt()).rejects.toThrow(
-        "Watched-session title store changed",
-      );
+      await expect(preparePrompt()).rejects.toThrow("Watched-session title store changed");
     } finally {
       if (replaced) {
         fs.unlinkSync(storePath);
@@ -241,19 +210,12 @@ describe("prepareWatchedSessionsPrompt", () => {
   });
 
   it("renders the harness context block plugin-owned runtimes inject per turn", async () => {
-    await watchGroup("agent:main:telegram:group:beta");
+    await watchGroup();
 
-    const block = buildWatchedSessionsHarnessContext({
-      sessionKey: mainSessionKey,
-      toolNames: ["sessions_history"],
-    });
-
-    expect(block).toBe(
-      [
-        "## Watched Sessions",
-        "Group/topic sessions this session ambiently watches. Readable now (read-only) via sessions_history.",
-        "- agent:main:telegram:group:beta",
-      ].join("\n"),
+    expect(
+      buildWatchedSessionsHarnessContext({ ...promptInput, toolNames: ["sessions_history"] }),
+    ).toBe(
+      `## Watched Sessions\nGroup/topic sessions this session ambiently watches. Readable now (read-only) via sessions_history.\n- ${groupKey()}`,
     );
     expect(buildWatchedSessionsHarnessContext({ sessionKey: mainSessionKey, toolNames: [] })).toBe(
       undefined,

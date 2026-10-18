@@ -5,7 +5,6 @@ import {
 } from "./message-handler.module-test-helpers.js";
 
 installDiscordIngressTestRuntime();
-// Discord tests cover durable gateway-message admission and replay recovery.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -16,7 +15,6 @@ import {
 } from "openclaw/plugin-sdk/channel-ingress-test-runtime";
 import type { ChannelIngressQueue } from "openclaw/plugin-sdk/channel-outbound";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as ingressRuntime from "./ingress.js";
 import type { DiscordIngressLifecycle } from "./ingress.js";
@@ -56,10 +54,6 @@ function createRawMessage(id: string, channelId = "channel-1"): APIMessage {
   } as unknown as APIMessage;
 }
 
-function runtime(): Pick<RuntimeEnv, "error" | "log"> {
-  return { error: vi.fn(), log: vi.fn() };
-}
-
 function payloadFor(rawMessage: APIMessage): DiscordIngressPayload {
   return { version: 1, receivedAt: Date.now(), rawMessage };
 }
@@ -82,10 +76,35 @@ async function withQueue<T>(
   }
 }
 
-type DiscordIngressMonitor = ReturnType<typeof createDiscordIngressMonitor>;
+function createMonitor(
+  queue: ChannelIngressQueue<DiscordIngressPayload>,
+  dispatch: Parameters<typeof createDiscordIngressMonitor>[0]["dispatch"],
+) {
+  return createDiscordIngressMonitor({
+    accountId: "default",
+    client: {} as never,
+    runtime: { error: vi.fn(), log: vi.fn() },
+    queue,
+    dispatch,
+  });
+}
 
-async function stopAll(monitors: DiscordIngressMonitor[]): Promise<void> {
-  await Promise.allSettled(monitors.map((monitor) => monitor.stop()));
+async function withMonitor(
+  dispatch: Parameters<typeof createDiscordIngressMonitor>[0]["dispatch"],
+  fn: (
+    queue: ChannelIngressQueue<DiscordIngressPayload>,
+    monitor: ReturnType<typeof createMonitor>,
+  ) => Promise<void>,
+) {
+  await withQueue(async (queue) => {
+    const monitor = createMonitor(queue, dispatch);
+    monitor.start();
+    try {
+      await fn(queue, monitor);
+    } finally {
+      await monitor.stop();
+    }
+  });
 }
 
 describe("Discord durable ingress", () => {
@@ -206,13 +225,7 @@ describe("Discord durable ingress", () => {
       const dispatch = vi.fn(async (_event, lifecycle: DiscordIngressLifecycle) => {
         await lifecycle.onAdopted();
       });
-      const monitor = createDiscordIngressMonitor({
-        accountId: "default",
-        client: {} as never,
-        runtime: runtime(),
-        queue: gatedQueue,
-        dispatch,
-      });
+      const monitor = createMonitor(gatedQueue, dispatch);
       monitor.start();
       const accepted = monitor.accept(createRawMessage("1001"));
       try {
@@ -236,42 +249,23 @@ describe("Discord durable ingress", () => {
   });
 
   it("rejects unstable message identity before durable allocation", async () => {
-    await withQueue(async (queue) => {
-      const dispatch = vi.fn();
-      const monitor = createDiscordIngressMonitor({
-        accountId: "default",
-        client: {} as never,
-        runtime: runtime(),
-        queue,
-        dispatch,
-      });
-      monitor.start();
-      try {
-        const missingMessageId = { ...createRawMessage("missing"), id: undefined };
-        const missingChannelId = { ...createRawMessage("missing"), channel_id: undefined };
+    const dispatch = vi.fn();
+    await withMonitor(dispatch, async (queue, monitor) => {
+      const missingMessageId = { ...createRawMessage("missing"), id: undefined };
+      const missingChannelId = { ...createRawMessage("missing"), channel_id: undefined };
 
-        await expect(monitor.accept(missingMessageId as never)).rejects.toThrow("snowflake");
-        await expect(monitor.accept(missingChannelId as never)).rejects.toThrow("channel_id");
-        expect(await queue.listPending({ limit: "all" })).toEqual([]);
-        expect(dispatch).not.toHaveBeenCalled();
-      } finally {
-        await monitor.stop();
-      }
+      await expect(monitor.accept(missingMessageId as never)).rejects.toThrow("snowflake");
+      await expect(monitor.accept(missingChannelId as never)).rejects.toThrow("channel_id");
+      expect(await queue.listPending({ limit: "all" })).toEqual([]);
+      expect(dispatch).not.toHaveBeenCalled();
     });
   });
 
   it("recovers a claimed row with a fresh drain and dispatches it exactly once", async () => {
     await withQueue(async (queue) => {
-      const monitors: DiscordIngressMonitor[] = [];
       const firstDispatch = vi.fn(async () => ({ kind: "deferred" as const }));
-      const first = createDiscordIngressMonitor({
-        accountId: "default",
-        client: {} as never,
-        runtime: runtime(),
-        queue,
-        dispatch: firstDispatch,
-      });
-      monitors.push(first);
+      const first = createMonitor(queue, firstDispatch);
+      const monitors = [first];
       first.start();
       try {
         await first.accept(createRawMessage("1002"));
@@ -281,13 +275,7 @@ describe("Discord durable ingress", () => {
         const recoveredDispatch = vi.fn(async (_event, lifecycle: DiscordIngressLifecycle) => {
           await lifecycle.onAdopted();
         });
-        const recovered = createDiscordIngressMonitor({
-          accountId: "default",
-          client: {} as never,
-          runtime: runtime(),
-          queue,
-          dispatch: recoveredDispatch,
-        });
+        const recovered = createMonitor(queue, recoveredDispatch);
         monitors.push(recovered);
         recovered.start();
 
@@ -297,99 +285,66 @@ describe("Discord durable ingress", () => {
         });
         expect(recoveredDispatch).toHaveBeenCalledTimes(1);
       } finally {
-        await stopAll(monitors);
+        await Promise.allSettled(monitors.map((monitor) => monitor.stop()));
       }
     });
   });
 
   it("rejects a duplicate after completion", async () => {
-    await withQueue(async (queue) => {
-      const dispatch = vi.fn(async (_event, lifecycle: DiscordIngressLifecycle) => {
-        await lifecycle.onAdopted();
+    const dispatch = vi.fn(async (_event, lifecycle: DiscordIngressLifecycle) => {
+      await lifecycle.onAdopted();
+    });
+    await withMonitor(dispatch, async (queue, monitor) => {
+      const rawMessage = createRawMessage("1003");
+      await monitor.accept(rawMessage);
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
+      await vi.waitFor(async () => {
+        const verdict = await queue.enqueue("1003", payloadFor(rawMessage));
+        expect(verdict.kind).toBe("completed");
       });
-      const monitor = createDiscordIngressMonitor({
-        accountId: "default",
-        client: {} as never,
-        runtime: runtime(),
-        queue,
-        dispatch,
-      });
-      monitor.start();
-      try {
-        const rawMessage = createRawMessage("1003");
-        await monitor.accept(rawMessage);
-        await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
-        await vi.waitFor(async () => {
-          const verdict = await queue.enqueue("1003", payloadFor(rawMessage));
-          expect(verdict.kind).toBe("completed");
-        });
 
-        await monitor.accept(rawMessage);
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, 25);
-        });
-        expect(dispatch).toHaveBeenCalledTimes(1);
-      } finally {
-        await monitor.stop();
-      }
+      await monitor.accept(rawMessage);
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 25);
+      });
+      expect(dispatch).toHaveBeenCalledTimes(1);
     });
   });
 
   it("matches the old guard for duplicate MESSAGE_CREATE delivery during RESUME", async () => {
-    await withQueue(async (queue) => {
-      let lifecycle: DiscordIngressLifecycle | undefined;
-      const dispatch = vi.fn(async (_event, claimedLifecycle: DiscordIngressLifecycle) => {
-        lifecycle = claimedLifecycle;
-        return { kind: "deferred" as const };
-      });
-      const monitor = createDiscordIngressMonitor({
-        accountId: "default",
-        client: {} as never,
-        runtime: runtime(),
-        queue,
-        dispatch,
-      });
-      monitor.start();
-      try {
-        const replayed = createRawMessage("1004");
-        await Promise.all([monitor.accept(replayed), monitor.accept(replayed)]);
-        await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
+    let lifecycle: DiscordIngressLifecycle | undefined;
+    const dispatch = vi.fn(async (_event, claimedLifecycle: DiscordIngressLifecycle) => {
+      lifecycle = claimedLifecycle;
+      return { kind: "deferred" as const };
+    });
+    await withMonitor(dispatch, async (queue, monitor) => {
+      const replayed = createRawMessage("1004");
+      await Promise.all([monitor.accept(replayed), monitor.accept(replayed)]);
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1));
 
-        await lifecycle?.onAdopted();
-        await vi.waitFor(async () => {
-          const verdict = await queue.enqueue("1004", payloadFor(replayed));
-          expect(verdict.kind).toBe("completed");
-        });
-        expect(dispatch).toHaveBeenCalledTimes(1);
-      } finally {
-        await monitor.stop();
-      }
+      await lifecycle?.onAdopted();
+      await vi.waitFor(async () => {
+        const verdict = await queue.enqueue("1004", payloadFor(replayed));
+        expect(verdict.kind).toBe("completed");
+      });
+      expect(dispatch).toHaveBeenCalledTimes(1);
     });
   });
 
   it("dead-letters a permanent Discord authentication failure", async () => {
-    await withQueue(async (queue) => {
-      const monitor = createDiscordIngressMonitor({
-        accountId: "default",
-        client: {} as never,
-        runtime: runtime(),
-        queue,
-        dispatch: async () => {
-          throw Object.assign(new Error("unauthorized"), { status: 401 });
-        },
-      });
-      monitor.start();
-      try {
+    await withMonitor(
+      async () => {
+        throw Object.assign(new Error("unauthorized"), { status: 401 });
+      },
+      async (queue, monitor) => {
         const rawMessage = createRawMessage("1005");
         await monitor.accept(rawMessage);
         await vi.waitFor(async () => {
           const verdict = await queue.enqueue("1005", payloadFor(rawMessage));
           expect(verdict.kind).toBe("failed");
         });
-      } finally {
-        await monitor.stop();
-      }
-    });
+      },
+    );
   });
 });
 

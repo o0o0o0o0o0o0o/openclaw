@@ -1,13 +1,9 @@
-// Exercises startup provider discovery scoping with disposable home and state boundaries.
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import type { ModelProviderConfig } from "../config/types.models.js";
 import type { PluginMetadataSnapshotOwnerMaps } from "../plugins/plugin-metadata-snapshot.js";
-import {
-  createPluginManifestRecordFixture,
-  createPluginMetadataSnapshotFixture,
-} from "../plugins/plugin-metadata.test-support.js";
+import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
 import {
   prepareProviderExternalAuthWithPlugin,
   resolveProviderSyntheticAuthWithPlugin,
@@ -24,6 +20,7 @@ import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
+import { modelDefinition } from "./model-auth.fixtures.test-support.js";
 import { MODELS_CONFIG_IMPLICIT_ENV_VARS } from "./models-config.e2e-harness.js";
 
 const mocks = vi.hoisted(() => ({
@@ -45,9 +42,7 @@ vi.mock("../plugins/provider-runtime.js", async (importOriginal) => {
 });
 
 vi.mock("../plugins/provider-discovery.js", () => ({
-  resolveRuntimePluginDiscoveryProviders: mocks.resolveRuntimePluginDiscoveryProviders,
-  runProviderCatalog: mocks.runProviderCatalog,
-  runProviderStaticCatalog: mocks.runProviderStaticCatalog,
+  ...mocks,
   groupPluginDiscoveryProvidersByOrder: (providers: ProviderPlugin[]) => ({
     simple: providers,
     profile: [],
@@ -70,7 +65,6 @@ vi.mock("../plugins/provider-discovery.js", () => ({
           ]),
         )
       : {}),
-  prepareProviderStaticCatalog: mocks.prepareProviderStaticCatalog,
 }));
 
 import {
@@ -101,15 +95,7 @@ function catalogConfig(
 }
 
 function createTextModel(id: string, name: string) {
-  return {
-    id,
-    name,
-    reasoning: false,
-    input: ["text" as const],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 8192,
-  };
+  return modelDefinition(id, { name, reasoning: false, contextWindow: 128000 });
 }
 
 describe("resolveImplicitProviders startup discovery scope", () => {
@@ -329,11 +315,8 @@ describe("resolveImplicitProviders startup discovery scope", () => {
         providerDiscoveryTimeoutMs: 1,
         pluginMetadataSnapshot: createPluginMetadataSnapshotFixture({
           plugins: [
-            createPluginManifestRecordFixture({
-              id: "family",
-              providers: ["family", "family-plan"],
-            }),
-            createPluginManifestRecordFixture({ id: "healthy", providers: ["healthy"] }),
+            { id: "family", providers: ["family", "family-plan"] },
+            { id: "healthy", providers: ["healthy"] },
           ],
         }),
         onProviderCatalogOutcome: (outcome) => outcomes.push(outcome),
@@ -411,18 +394,10 @@ describe("resolveImplicitProviders startup discovery scope", () => {
         hookAliases: ["openai-responses"],
         prepareSyntheticAuth: prepareNative,
       };
-      const metadata = createPluginMetadataSnapshotFixture({
+      const pluginMetadataSnapshot = createPluginMetadataSnapshotFixture({
         plugins: [{ id: "auth-owner", providers: [provider.id] }],
       });
-      const pluginMetadataSnapshot = {
-        ...metadata,
-        index: {
-          ...metadata.index,
-          plugins: metadata.index.plugins.map((plugin) =>
-            Object.assign({}, plugin, { syntheticAuthRefs: [provider.id] }),
-          ),
-        },
-      };
+      pluginMetadataSnapshot.index.plugins[0]!.syntheticAuthRefs = [provider.id];
       const config = {
         models: {
           providers: {

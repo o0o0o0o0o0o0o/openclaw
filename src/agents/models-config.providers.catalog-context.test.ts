@@ -16,7 +16,7 @@ import { registerResolvedAgentDir, unregisterResolvedAgentDir } from "./agent-di
 import {
   createApiKeyCredential,
   createAuthProfileStoreFixture,
-  oauthCred,
+  createOAuthRefreshCredential,
 } from "./auth-profiles/credential-fixtures.test-support.js";
 import { OAuthRefreshFailureError } from "./auth-profiles/oauth-refresh-failure.js";
 import { resolveApiKeyForProfile } from "./auth-profiles/oauth.js";
@@ -120,15 +120,10 @@ it("revalidates selected-account authority before consuming an awaited discovery
 it("passes refreshed OAuth grant metadata to the catalog", async () => {
   const agentDir = tempDirs.make("catalog-oauth-grant-");
   const profileId = "openai:sharing";
-  const credential = {
-    ...oauthCred({
-      provider: "openai",
-      access: "expired-sharing-access",
-      refresh: "sharing-refresh",
-      expires: 1,
-    }),
+  const credential = createOAuthRefreshCredential({
+    expires: 1,
     authFlow: "chatgpt-token-sharing",
-  };
+  });
   const store = createAuthProfileStoreFixture({ [profileId]: credential });
   const refreshed = {
     ...credential,
@@ -185,9 +180,8 @@ it.each([true, false])(
     const profileId = "fixture:owner";
     const refresh = "synthetic-refresh-secret-that-must-not-be-logged";
     const store = createAuthProfileStoreFixture({
-      [profileId]: oauthCred({
+      [profileId]: createOAuthRefreshCredential({
         provider: "fixture",
-        access: "expired-access",
         refresh,
         expires: 1,
       }),

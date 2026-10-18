@@ -2,7 +2,7 @@ import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import type { ModelDefinitionConfig, ModelProviderConfig } from "../config/types.models.js";
+import type { ModelProviderConfig } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createTestPluginApi } from "../plugin-sdk/plugin-test-api.js";
 import { clearLiveCatalogCacheForTests } from "../plugin-sdk/provider-catalog-shared.js";
@@ -18,7 +18,8 @@ import {
   setRuntimeAuthProfileStoreSnapshot,
 } from "./auth-profiles/runtime-snapshots.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
-import { planOpenClawModelsJson } from "./models-config.plan.js";
+import { modelDefinition, providerConfig } from "./model-auth.fixtures.test-support.js";
+import { planModelsJsonForTest } from "./models-config.plan.test-support.js";
 import { encodePluginModelCatalogRelativePath } from "./plugin-model-catalog.js";
 
 const discovery = vi.hoisted(() => ({ providers: new Array<ProviderPlugin>() }));
@@ -26,39 +27,28 @@ vi.mock("../plugins/provider-discovery.runtime.js", () => ({
   resolvePluginDiscoveryProvidersRuntime: () => discovery.providers,
 }));
 
-const configFor = (ollama: ModelProviderConfig): OpenClawConfig => ({
-  models: { providers: { ollama } },
-});
-const modelFor = (id: string, name = id): ModelDefinitionConfig => ({
-  id,
-  name,
-  reasoning: false,
-  input: ["text"],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 8192,
-  maxTokens: 2048,
-});
+const modelFor = (id: string, name = id) =>
+  modelDefinition(id, {
+    name,
+    reasoning: false,
+    contextWindow: 8192,
+    maxTokens: 2048,
+  });
 async function catalogPlan(
   cfg: OpenClawConfig,
   agentDir: string,
   authStore: AuthProfileStore = { version: 1, profiles: {} },
   discoveryAuthConfig = cfg,
 ) {
-  const plan = await planOpenClawModelsJson({
-    context: {
-      cfg,
-      discoveryAuthConfig,
-      sourceConfigForSecrets: cfg,
-      agentDir,
-      env: {},
-      envFingerprint: {},
-      pluginMetadataSnapshot: createPluginMetadataSnapshotFixture({
-        plugins: [{ id: "ollama", providers: discovery.providers.map(({ id }) => id) }],
-      }),
-    },
+  const plan = await planModelsJsonForTest({
+    cfg,
+    discoveryAuthConfig,
+    agentDir,
+    env: {},
+    pluginMetadataSnapshot: createPluginMetadataSnapshotFixture({
+      plugins: [{ id: "ollama", providers: discovery.providers.map(({ id }) => id) }],
+    }),
     authStore,
-    existingRaw: "",
-    existingParsed: null,
   });
   const catalog = JSON.parse(
     expectDefined(
@@ -75,10 +65,8 @@ describe("registered Ollama catalog", () => {
     const { default: plugin } = await loadBundledPluginFacade<{
       default: OpenClawPluginDefinition;
     }>({ pluginId: "ollama", artifactBasename: "index.js" });
-    expectDefined(
-      plugin.register,
-      "Ollama public register",
-    )(
+    const register = expectDefined(plugin.register, "Ollama public register");
+    register(
       createTestPluginApi({
         id: "ollama",
         registrationMode: "discovery",
@@ -129,9 +117,12 @@ describe("registered Ollama catalog", () => {
         }
         const model = modelFor("fixture-model", "Fixture model");
         const provider = { baseUrl, models: explicitModels ? [model] : [] };
-        const cfg = configFor({ ...provider, ...(owner === "config" ? { apiKey: ref } : {}) });
+        const cfg = providerConfig("ollama", {
+          ...provider,
+          ...(owner === "config" ? { apiKey: ref } : {}),
+        });
         const discoveryAuthConfig: OpenClawConfig =
-          owner === "config" ? configFor({ ...provider, apiKey: runtimeKey }) : cfg;
+          owner === "config" ? providerConfig("ollama", { ...provider, apiKey: runtimeKey }) : cfg;
         const authorization: Array<string | null> = [];
         const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
           authorization.push(new Headers(init?.headers).get("authorization"));
@@ -187,7 +178,7 @@ describe("registered Ollama catalog", () => {
         compat: { supportsTools: false },
       };
       // Setup saves the models it found; later pulls must not need a config edit.
-      const cfg = configFor({
+      const cfg = providerConfig("ollama", {
         baseUrl: local,
         api: "ollama",
         apiKey: "ollama-local",

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { expectDefined } from "@openclaw/normalization-core";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
@@ -9,15 +10,16 @@ import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.
 import type { ProviderPlugin } from "../plugins/types.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { planOpenClawModelsJsonSource } from "./models-config.js";
-import { planOpenClawModelsJson } from "./models-config.plan.js";
 import { planModelsJsonForTest } from "./models-config.plan.test-support.js";
 import type { ProviderConfig } from "./models-config.providers.secrets.js";
 import { createPreparedModelCatalogWorkerInput } from "./prepared-model-catalog-worker.js";
 
-afterEach(() => {
-  vi.restoreAllMocks();
-  clearRuntimeConfigSnapshot();
-});
+afterEach(clearRuntimeConfigSnapshot);
+
+const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const rates = { input: 11, output: 22, cacheRead: 3, cacheWrite: 4 };
+const scopedRates = { input: 33, output: 44, cacheRead: 5, cacheWrite: 6 };
+type Cost = ModelDefinitionConfig["cost"];
 
 function model(id: string, input: Array<"text" | "image"> = ["text"]) {
   return {
@@ -25,7 +27,7 @@ function model(id: string, input: Array<"text" | "image"> = ["text"]) {
     name: id,
     reasoning: false,
     input,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: { ...zeroCost },
     contextWindow: 1024,
     maxTokens: 1024,
   };
@@ -70,8 +72,6 @@ describe("models config input presence", () => {
     "keeps one-step identities and exact source fields through repeated %s planning",
     async (mode) => {
       const providerId = "custom";
-      const rates = { input: 11, output: 22, cacheRead: 3, cacheWrite: 4 };
-      const scopedRates = { input: 33, output: 44, cacheRead: 5, cacheWrite: 6 };
       const sourceModel = (
         id: string,
         fields: {
@@ -128,22 +128,13 @@ describe("models config input presence", () => {
         ],
       });
       const merged = mode === "merge";
-      const emptyRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
       const inheritedInput = merged ? ["text", "image"] : undefined;
       const expected = [
-        {
-          id: "middle",
-          input: inheritedInput,
-          cost: { ...(merged ? rates : emptyRates), input: 7 },
-        },
-        { id: "bare", input: ["text"], cost: { ...(merged ? rates : emptyRates), input: 2 } },
-        {
-          id: "custom/bare",
-          input: inheritedInput,
-          cost: { ...(merged ? scopedRates : emptyRates), output: 8 },
-        },
-        { id: "exact", input: inheritedInput, cost: merged ? rates : undefined },
-        ...(merged ? [{ id: "discovered-only", input: ["text", "image"], cost: rates }] : []),
+        ["middle", inheritedInput, { ...(merged ? rates : zeroCost), input: 7 }],
+        ["bare", ["text"], { ...(merged ? rates : zeroCost), input: 2 }],
+        ["custom/bare", inheritedInput, { ...(merged ? scopedRates : zeroCost), output: 8 }],
+        ["exact", inheritedInput, merged ? rates : undefined],
+        ...(merged ? [["discovered-only", ["text", "image"], rates]] : []),
       ];
       const discovery = discoveryOptions(providerId, discovered);
       await withOpenClawTestState({ label: "catalog-authored-fields" }, async (state) => {
@@ -152,36 +143,27 @@ describe("models config input presence", () => {
         let pluginCatalogs: Array<{ pluginId: string; contents: string }> = [];
         for (let pass = 0; pass < 2; pass++) {
           const plan = writePlan(
-            await planOpenClawModelsJson({
+            await planModelsJsonForTest({
               authStore: { version: 1, profiles: {} },
-              context: {
-                cfg,
-                discoveryAuthConfig: cfg,
-                sourceConfigForSecrets: cfg,
-                agentDir: state.agentDir(),
-                env: state.env,
-                envFingerprint: state.env,
-                pluginMetadataSnapshot,
-                ...discovery,
-              },
+              cfg,
+              agentDir: state.agentDir(),
+              env: state.env,
+              pluginMetadataSnapshot,
+              ...discovery,
               existingRaw,
               existingParsed,
               pluginCatalogs,
             }),
           );
-          const contents = plan.pluginCatalogWrites?.["plugins/custom/catalog.json"];
-          if (!contents) {
-            throw new Error("Expected the plugin-owned catalog");
-          }
+          const contents = expectDefined(
+            plan.pluginCatalogWrites?.["plugins/custom/catalog.json"],
+            "Expected the plugin-owned catalog",
+          );
           const generated = JSON.parse(contents) as {
             providers: Record<string, { models: ModelDefinitionConfig[] }>;
           };
           expect(
-            generated.providers[providerId]?.models.map(({ id, input, cost }) => ({
-              id,
-              input,
-              cost,
-            })),
+            generated.providers[providerId]?.models.map(({ id, input, cost }) => [id, input, cost]),
           ).toEqual(expected);
           expect(cfg).toStrictEqual(original);
           existingRaw = plan.contents;
@@ -193,36 +175,24 @@ describe("models config input presence", () => {
   );
 
   const liveCost = {
-    input: 11,
-    output: 22,
-    cacheRead: 3,
-    cacheWrite: 4,
-    tieredPricing: [{ input: 33, output: 44, cacheRead: 5, cacheWrite: 6, range: [0] as [number] }],
+    ...rates,
+    tieredPricing: [{ ...scopedRates, range: [0] as [number] }],
   };
   const oldCost = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 };
-  it.each<{
-    name: string;
-    cost?: Partial<ModelDefinitionConfig["cost"]>;
-    expected: ModelDefinitionConfig["cost"];
-    independent?: boolean;
-    duplicateCost?: Partial<ModelDefinitionConfig["cost"]>;
-  }>([
-    { name: "empty cost", cost: {}, expected: liveCost },
-    {
-      name: "zero cost",
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      expected: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    },
-    { name: "independent config", independent: true, expected: oldCost },
-    {
-      name: "duplicate partial costs",
-      cost: { input: 7 },
-      duplicateCost: { input: 9, output: 8 },
-      expected: { input: 7, output: 8, cacheRead: 3, cacheWrite: 4 },
-    },
+  it.each<[string, Partial<Cost> | undefined, Cost, boolean?, Partial<Cost>?]>([
+    ["empty cost", {}, liveCost],
+    ["zero cost", zeroCost, zeroCost],
+    ["independent config", undefined, oldCost, true],
+    [
+      "duplicate partial costs",
+      { input: 7 },
+      { ...rates, input: 7, output: 8 },
+      false,
+      { input: 9, output: 8 },
+    ],
   ])(
-    "uses authored $name through discovery and final catalog merging",
-    async ({ cost, expected, independent, duplicateCost }) => {
+    "uses authored %s through discovery and final catalog merging",
+    async (_name, cost, expected, independent, duplicateCost) => {
       const providerId = "catalog-price-fixture";
       const configuredModel = {
         ...model("priced-model", ["text", "image"]),

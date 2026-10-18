@@ -1,5 +1,5 @@
 import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ModelDefinitionConfig, ModelProviderConfig } from "../config/types.models.js";
+import type { ModelProviderConfig } from "../config/types.models.js";
 import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
 import type { ProviderPlugin } from "../plugins/types.js";
 import {
@@ -15,6 +15,11 @@ vi.mock("../plugins/provider-discovery.js", async (importOriginal) => ({
   resolveRuntimePluginDiscoveryProviders,
 }));
 
+import {
+  configForProviders,
+  modelDefinition,
+  providerEntry,
+} from "./model-auth.fixtures.test-support.js";
 import { planOpenClawModelsJsonSource } from "./models-config.js";
 import {
   prepareImplicitProviderStaticCatalog,
@@ -25,20 +30,15 @@ import {
   PLUGIN_MODEL_CATALOG_GENERATED_BY,
 } from "./plugin-model-catalog.js";
 
-const nativeModel: ModelDefinitionConfig = {
-  id: "native-model",
+const nativeModel = modelDefinition("native-model", {
   name: "Native model",
   reasoning: false,
-  input: ["text"],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   contextWindow: 128000,
-  maxTokens: 8192,
-};
-const nativeCatalog: ModelProviderConfig = {
-  baseUrl: "https://native.example/v1",
+});
+const nativeCatalog = providerEntry("https://native.example/v1", {
   api: "openai-completions",
   models: [nativeModel],
-};
+});
 const provider: ProviderPlugin = {
   id: "fixture",
   pluginId: "catalog-owner",
@@ -60,8 +60,7 @@ function createMetadata(providers = ["fixture"]) {
 
 describe("provider endpoint source eligibility", () => {
   let state: OpenClawTestState;
-  let pluginMetadataSnapshot: ReturnType<typeof createMetadata>;
-  const customProvider = { baseUrl: "https://proxy.example/v1", models: [] };
+  const customProvider = providerEntry("https://proxy.example/v1");
   function discoveryParams(providers = ["fixture"], ids = providers) {
     return {
       env: state.env,
@@ -73,7 +72,6 @@ describe("provider endpoint source eligibility", () => {
   }
   beforeEach(async () => {
     state = await createOpenClawTestState({ label: "endpoint-eligibility" });
-    pluginMetadataSnapshot = createMetadata();
     resolveRuntimePluginDiscoveryProviders.mockResolvedValue([provider]);
   });
   afterEach(async () => {
@@ -104,7 +102,7 @@ describe("provider endpoint source eligibility", () => {
       ],
     };
     const planned = await planOpenClawModelsJsonSource(
-      { models: { providers: { fixture: explicit } } },
+      configForProviders({ fixture: explicit }),
       state.agentDir(),
       discoveryParams(),
     );
@@ -118,16 +116,11 @@ describe("provider endpoint source eligibility", () => {
   it("preserves a selected native alias when its sibling has a custom endpoint", async () => {
     const aliasedProvider = { ...provider, aliases: ["alternate"] };
     resolveRuntimePluginDiscoveryProviders.mockResolvedValue([aliasedProvider]);
-    const config = {
-      models: {
-        providers: {
-          fixture: customProvider,
-          alternate: { baseUrl: "https://native.example/v1", models: [] },
-        },
-      },
-    };
     const params = {
-      config,
+      config: configForProviders({
+        fixture: customProvider,
+        alternate: providerEntry(nativeCatalog.baseUrl),
+      }),
       ...discoveryParams(["fixture", "alternate"], ["alternate"]),
     };
     const preparedStaticProviderCatalog = await prepareImplicitProviderStaticCatalog(params);
@@ -165,10 +158,8 @@ describe("provider endpoint source eligibility", () => {
     const excludedProvider: ProviderPlugin = { ...provider, staticCatalog: { run } };
     resolveRuntimePluginDiscoveryProviders.mockResolvedValue([excludedProvider]);
     const prepared = await prepareImplicitProviderStaticCatalog({
-      env: state.env,
-      pluginMetadataSnapshot,
-      providerDiscoveryProviderIds: ["fixture"],
-      config: { models: { providers: { fixture: customProvider } } },
+      ...discoveryParams(),
+      config: configForProviders({ fixture: customProvider }),
     });
     expect(prepared.providers).toEqual([excludedProvider]);
     expect(prepared.entries).toEqual([{ provider: excludedProvider, providerConfigs: {} }]);
@@ -187,7 +178,7 @@ describe("provider endpoint source eligibility", () => {
     const params = {
       ...discoveryParams(["fixture", "alternate"]),
       providerDiscoveryProviderIds: undefined,
-      config: { models: { providers: { fixture: customProvider } } },
+      config: configForProviders({ fixture: customProvider }),
     };
     const preparedStaticProviderCatalog = await prepareImplicitProviderStaticCatalog(params);
     const discovered = await resolveImplicitProviders({

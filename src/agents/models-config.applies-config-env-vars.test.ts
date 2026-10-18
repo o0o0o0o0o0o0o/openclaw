@@ -61,24 +61,21 @@ afterEach(() => {
 const discover = (providers: Record<string, ProviderConfig>) =>
   vi.spyOn(modelsConfigProviders, "resolveImplicitProviders").mockResolvedValue(providers);
 
-function provider(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
-  return {
-    baseUrl: "https://api.openai.com/v1",
-    api: "openai-responses",
-    models: [
-      {
-        id: "gpt-5.5",
-        name: "GPT-5.5",
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 400000,
-        maxTokens: 128000,
-      },
-    ],
-    ...overrides,
-  };
-}
+const defaultModel: ProviderConfig["models"][number] = {
+  id: "gpt-5.5",
+  name: "GPT-5.5",
+  reasoning: true,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 400000,
+  maxTokens: 128000,
+};
+const provider = (overrides: Partial<ProviderConfig> = {}): ProviderConfig => ({
+  baseUrl: "https://api.openai.com/v1",
+  api: "openai-responses",
+  models: [structuredClone(defaultModel)],
+  ...overrides,
+});
 async function generate(params: Partial<Parameters<typeof planModelsJsonForTest>[0]> = {}) {
   const authStore = params.authStore ?? { version: 1, profiles: {} };
   vi.spyOn(authProfileStoreRuntime, "ensureAuthProfileStoreAsync").mockResolvedValue(authStore);
@@ -200,7 +197,7 @@ describe("models-config planning", () => {
       api: "google-vertex",
       models: [
         {
-          ...provider().models[0]!,
+          ...structuredClone(defaultModel),
           id: "gemini-2.5-pro",
           name: "Gemini 2.5 Pro",
           input: ["text", "image"],

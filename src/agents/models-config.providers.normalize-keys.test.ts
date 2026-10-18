@@ -66,18 +66,20 @@ describe("normalizeProviders", () => {
 
   it("deduplicates model rows and keeps repeated publication stable with secret ownership", async () => {
     const agentDir = tempDirs.make("provider-normalize-");
+    const pinned = createModel({
+      id: "gemini-3-pro-preview",
+      name: "Pinned Gemini",
+      contextWindow: 12345,
+      cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
+    });
+    const expected = { ...structuredClone(pinned), id: "gemini-3.1-pro-preview" };
     const providers = {
       google: {
         baseUrl: "https://generativelanguage.googleapis.com/v1beta",
         api: "google-generative-ai",
         apiKey: "GOOGLE_API_KEY", // pragma: allowlist secret
         models: [
-          createModel({
-            id: "gemini-3-pro-preview",
-            name: "Pinned Gemini",
-            contextWindow: 12345,
-            cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
-          }),
+          pinned,
           createModel({
             id: "gemini-3.1-pro-preview",
             name: "Discovered Gemini",
@@ -94,21 +96,8 @@ describe("normalizeProviders", () => {
     expect(normalized?.google?.models).toBe(providers.google.models);
     const published = normalizeProviderCatalogModelsForConfig(normalized);
 
-    expect(published?.google?.models).toHaveLength(1);
     // The first normalized row wins so explicit config details are not replaced by discovery.
-    expect(published?.google?.models?.[0]).toMatchObject({
-      id: "gemini-3.1-pro-preview",
-      name: "Pinned Gemini",
-      contextWindow: 12345,
-      maxTokens: 2048,
-      reasoning: false,
-    });
-    expect(published?.google?.models?.[0]?.cost).toEqual({
-      input: 1,
-      output: 2,
-      cacheRead: 3,
-      cacheWrite: 4,
-    });
+    expect(published?.google?.models).toEqual([expected]);
 
     expect(normalizeProviderCatalogModelsForConfig(published)).toBe(published);
     const secretRefManagedProviders = new Set<string>();
@@ -161,21 +150,16 @@ describe("normalizeProviders", () => {
   });
 
   it.each([
-    {
-      label: "substituted literal",
-      authored: "${HEADER_SOURCE}",
-      env: { HEADER_SOURCE: "${HEADER_LITERAL}" },
-      expected: "${HEADER_LITERAL}",
-    },
-    {
-      label: "pending reference",
-      authored: "$HEADER_PENDING",
-      env: {},
-      expected: "secretref-env:HEADER_PENDING",
-    },
-  ])(
-    "preserves loader $label headers through normalization and source enforcement",
-    async ({ authored, env, expected }) => {
+    [
+      "substituted literal",
+      "${HEADER_SOURCE}",
+      { HEADER_SOURCE: "${HEADER_LITERAL}" },
+      "${HEADER_LITERAL}",
+    ],
+    ["pending reference", "$HEADER_PENDING", {}, "secretref-env:HEADER_PENDING"],
+  ] satisfies Array<[string, string, NodeJS.ProcessEnv, string]>)(
+    "preserves loader %s headers through normalization and source enforcement",
+    async (_label, authored, env, expected) => {
       await withOpenClawTestState(
         {
           label: "catalog-header-facts",
@@ -234,7 +218,7 @@ describe("normalizeProviders", () => {
         range: [0, 1_000_000] as [number, number],
       },
     ];
-    const providers = {
+    const providers: Providers = {
       custom: {
         baseUrl: "https://models.example/v1",
         models: [
@@ -244,7 +228,7 @@ describe("normalizeProviders", () => {
           modelWithPartialCost("duplicate", { cacheRead: 0.3, cacheWrite: 3.75 }),
         ],
       },
-    } as unknown as Providers;
+    };
 
     expect(ModelsConfigSchema.safeParse({ providers }).success).toBe(true);
     expect(normalizeProviderCatalogModelsForConfig(providers)?.custom?.models).toEqual([

@@ -11,14 +11,7 @@ import { bindAgentHarnessHookMessages } from "./lifecycle-hook-messages.js";
 const EVENT = {
   runId: "run-1",
   sessionId: "session-1",
-  sessionKey: "agent:main:session-1",
-  turnId: "turn-1",
-  provider: "codex",
-  model: "gpt-5.4",
-  cwd: "/repo",
-  transcriptPath: "/tmp/session.jsonl",
   stopHookActive: false,
-  lastAssistantMessage: "done",
   messages: [],
   success: true,
 };
@@ -86,10 +79,7 @@ describe("agent harness lifecycle hook helpers", () => {
   );
 
   it("resolves after agent_end hooks settle", async () => {
-    let releaseHook: () => void = () => undefined;
-    const agentEndSettled = new Promise<void>((resolve) => {
-      releaseHook = resolve;
-    });
+    const { promise: agentEndSettled, resolve: releaseHook } = Promise.withResolvers<void>();
     const hookRunner = {
       hasHooks: vi.fn((hookName: string) => hookName === "agent_end"),
       runAgentEnd: vi.fn(() => agentEndSettled),

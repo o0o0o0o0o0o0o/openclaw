@@ -10,6 +10,14 @@ import {
   isPreparedNativeModelCatalogReady,
 } from "./model-catalog.js";
 
+function row(id: string, fields: Partial<ModelCatalogEntry> = {}): ModelCatalogEntry {
+  return { provider: "fixture", id, name: id, ...fields };
+}
+const catalog = (entries: ModelCatalogEntry[]): ModelCatalogSnapshot => ({
+  entries,
+  routeVariants: entries,
+});
+
 const cfg = {
   agents: {
     defaults: { model: { primary: "openai/gpt-5.6-sol" } },
@@ -68,12 +76,10 @@ const snapshot: ModelCatalogSnapshot = {
         supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
       },
     },
-    {
+    row("provider-empty-reasoner", {
       provider: "openai",
-      id: "provider-empty-reasoner",
-      name: "Provider Empty Reasoner",
       compat: { supportedReasoningEfforts: [] },
-    },
+    }),
   ],
 };
 
@@ -109,20 +115,26 @@ const modelInput = {
   workspaceDir: "/tmp/workspace",
   defaultModel: "openai/gpt-5.6-sol",
 };
-function pickerConfig(runtime: string): OpenClawConfig {
+function pickerConfig(
+  runtime: string,
+  name = "model",
+  extraModels = {},
+  runtimes = ["native-two"],
+): OpenClawConfig {
   return {
     agents: {
       defaults: {
-        model: "fixture/model",
+        model: `fixture/${name}`,
         models: {
-          "fixture/model": { agentRuntime: { id: runtime }, pickerRuntimes: ["native-two"] },
+          [`fixture/${name}`]: { agentRuntime: { id: runtime }, pickerRuntimes: runtimes },
+          ...extraModels,
         },
       },
     },
   };
 }
-function sharedRuntimes(catalog: ModelCatalogSnapshot) {
-  return catalog.routeVariants
+function sharedRuntimes(snapshotToInspect: ModelCatalogSnapshot) {
+  return snapshotToInspect.routeVariants
     .filter((entry) => entry.provider === "fixture" && entry.id === "shared")
     .map((entry) => entry.nativeRuntime)
     .toSorted((a, b) => (a ?? "").localeCompare(b ?? ""));
@@ -138,13 +150,8 @@ describe("agent harness model catalog", () => {
     "observes only the selected runtime with configured=$baseRuntime selected=$agentRuntime",
     async ({ baseRuntime, agentRuntime, observedRuntime }) => {
       const config = pickerConfig(baseRuntime);
-      const host: ModelCatalogEntry = {
-        provider: "fixture",
-        id: "model",
-        name: "Host model",
-        reasoning: true,
-      };
-      const initial: ModelCatalogSnapshot = { entries: [host], routeVariants: [host] };
+      const host = row("model", { name: "Host model", reasoning: true });
+      const initial = catalog([host]);
       const loadOne = vi.fn(async () => [{ ...host, nativeRuntime: "native-one" }]);
       const loadTwo = vi.fn(async () => [{ ...host, nativeRuntime: "native-two" }]);
       const registry = catalogRegistry({ "native-one": loadOne, "native-two": loadTwo });
@@ -167,13 +174,8 @@ describe("agent harness model catalog", () => {
 
   it("retains successful default acquisition when an alternative fails", async () => {
     const config = pickerConfig("native-one");
-    const initial: ModelCatalogSnapshot = { entries: [], routeVariants: [] };
-    const observed: ModelCatalogEntry = {
-      provider: "fixture",
-      id: "model",
-      name: "Observed model",
-      nativeRuntime: "native-one",
-    };
+    const initial = catalog([]);
+    const observed = row("model", { name: "Observed model", nativeRuntime: "native-one" });
     const failure = new Error("Alternative catalog is unavailable");
     const successfulLoad = vi.fn(async () => [observed]);
     const failedLoad = vi.fn(async () => {
@@ -191,8 +193,7 @@ describe("agent harness model catalog", () => {
     });
     expect(successfulLoad).toHaveBeenCalledOnce();
     expect(failedLoad).toHaveBeenCalledOnce();
-    expect(result.entries).toEqual([observed]);
-    expect(result.routeVariants).toEqual([observed]);
+    expect([result.entries, result.routeVariants]).toEqual([[observed], [observed]]);
     expect(onError).toHaveBeenCalledExactlyOnceWith(failure, ["fixture"]);
     expect(onDiscoveryCompleted).toHaveBeenCalledExactlyOnceWith([observed]);
   });
@@ -200,43 +201,23 @@ describe("agent harness model catalog", () => {
   it.each([false, true])(
     "acquires picker runtimes once and preserves their refresh ownership (provider scoped: %s)",
     async (providerScoped) => {
-      const config: OpenClawConfig = {
-        agents: {
-          defaults: {
-            model: "fixture/shared",
-            models: {
-              "fixture/shared": {
-                agentRuntime: { id: "openclaw" },
-                pickerRuntimes: ["native-one", "native-two"],
-              },
-              "fixture/second": { pickerRuntimes: ["native-one", "native-two"] },
-              "other/third": { pickerRuntimes: ["native-one"] },
-            },
-          },
+      const config = pickerConfig(
+        "openclaw",
+        "shared",
+        {
+          "fixture/second": { pickerRuntimes: ["native-one", "native-two"] },
+          "other/third": { pickerRuntimes: ["native-one"] },
         },
-      };
-      const host: ModelCatalogEntry = {
-        provider: "fixture",
-        id: "shared",
-        name: "Host model",
-        reasoning: false,
-      };
-      const foreign: ModelCatalogEntry = {
+        ["native-one", "native-two"],
+      );
+      const host = row("shared", { name: "Host model", reasoning: false });
+      const foreign = row("foreign", {
         provider: "other",
-        id: "foreign",
         name: "Foreign model",
         nativeRuntime: "native-two",
-      };
-      const initial: ModelCatalogSnapshot = {
-        entries: [host, foreign],
-        routeVariants: [host, foreign],
-      };
-      const first: ModelCatalogEntry = {
-        provider: "fixture",
-        id: "shared",
-        name: "Native one",
-        nativeRuntime: "native-one",
-      };
+      });
+      const initial = catalog([host, foreign]);
+      const first = row("shared", { name: "Native one", nativeRuntime: "native-one" });
       const second: ModelCatalogEntry = {
         ...first,
         name: "Native two",
@@ -303,7 +284,7 @@ describe("agent harness model catalog", () => {
     const result = await augmentModelCatalogWithAgentHarness({
       ...modelInput,
       defaultProvider: "openai",
-      snapshot: { entries: [], routeVariants: [] },
+      snapshot: catalog([]),
       preparedSnapshot: snapshot,
       pluginRegistry: registryWithCatalog(async () => [native, host]),
     });
@@ -338,18 +319,14 @@ describe("agent harness model catalog", () => {
           supportsTools: true,
         },
       },
-      {
+      row("custom-reasoner", {
         provider: "openai",
-        id: "custom-reasoner",
-        name: "Custom Reasoner",
         compat: { supportedReasoningEfforts: ["high"] },
-      },
-      {
+      }),
+      row("provider-empty-reasoner", {
         provider: "openai",
-        id: "provider-empty-reasoner",
-        name: "Provider Empty Reasoner",
         compat: { supportedReasoningEfforts: ["high"] },
-      },
+      }),
     ]);
 
     const result = await augmentModelCatalogWithAgentHarness({
@@ -388,9 +365,9 @@ describe("agent harness model catalog", () => {
     );
     expect(loadModelCatalog).toHaveBeenCalledWith({
       config: cfg,
-      agentId: "main",
-      agentDir: "/tmp/main-agent",
-      workspaceDir: "/tmp/workspace",
+      agentId: modelInput.agentId,
+      agentDir: modelInput.agentDir,
+      workspaceDir: modelInput.workspaceDir,
       configuredModelRefs: [
         { provider: "openai", model: "gpt-5.6-sol" },
         { provider: "openai", model: "gpt-5.6-sol" },
@@ -440,7 +417,7 @@ it("checks resident native readiness with linear catalog work and observes revoc
       inlineProviderModels: [],
       configuredCatalogEntries: [],
     },
-    snapshot: { entries: rows, routeVariants: rows },
+    snapshot: catalog(rows),
     catalogAcquired: true,
   };
   expect(isPreparedNativeModelCatalogReady(params)).toBe(true);

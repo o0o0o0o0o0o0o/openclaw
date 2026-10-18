@@ -17,7 +17,6 @@ import {
 } from "../../gateway/mcp-grant-store.js";
 import { closeMcpLoopbackServer, ensureMcpLoopbackServer } from "../../gateway/mcp-http.js";
 import {
-  beginMcpLoopbackToolCallCapture,
   clearMcpLoopbackToolCallCapture,
   getActiveMcpLoopbackRuntime,
 } from "../../gateway/mcp-http.loopback-runtime.js";
@@ -127,8 +126,10 @@ async function createCaller(
     });
     sessionEntry = await readResolvedSessionEntryInWorker(scope);
   }
-  expect(sessionEntry?.delegatedToolPolicy?.requesterDeny).toEqual(denied);
-  expect(sessionEntry?.inheritedToolDeny).toEqual(denied);
+  expect(sessionEntry).toMatchObject({
+    delegatedToolPolicy: { requesterDeny: denied },
+    inheritedToolDeny: denied,
+  });
   const admission = prepareSystemAgentRunAdmission(
     currentConfig,
     runId,
@@ -139,23 +140,26 @@ async function createCaller(
   const admittedRunContext = await admission.admit(
     route === "cli-loopback" ? "embedded" : "plugin-harness",
   );
-  const trace: string[] = [];
   const workspaceDir = state.workspaceDir;
+  const attempt = {
+    config: currentConfig,
+    runId,
+    agentId: "coder",
+    sessionId: sessionEntry!.sessionId,
+    sessionKey,
+    workspaceDir,
+    cwd: workspaceDir,
+    admittedRunContext,
+  };
   if (route === "cli-loopback") {
     const run: RunCliAgentParams = {
-      config: currentConfig,
-      sessionId: sessionEntry!.sessionId,
-      sessionKey,
+      ...attempt,
       sessionEntry,
       sessionFile: state.path(runId + ".jsonl"),
-      workspaceDir,
-      cwd: workspaceDir,
       provider: "fixture-cli",
       model: "fixture",
       prompt: "exercise mediated effects",
-      runId,
       timeoutMs: 10_000,
-      admittedRunContext,
     };
     const policy = await resolveCliRuntimeToolPolicy({
       params: run,
@@ -169,7 +173,6 @@ async function createCaller(
     });
     if (currentConfig === config) {
       expect(policy.params.cliToolAvailability?.native).toEqual([]);
-      trace.push("native=[]");
     }
     const context = buildCliMcpGrantContext({
       run: policy.params,
@@ -204,10 +207,6 @@ async function createCaller(
         captureKey,
       }),
     ).not.toBe(false);
-    beginMcpLoopbackToolCallCapture({
-      captureKey,
-      onToolCallResult: (call) => trace.push(call.toolName + ":" + call.outcome),
-    });
     const request = async (method: string, params?: object) => {
       const response = await fetch("http://127.0.0.1:" + runtime.port + "/mcp", {
         method: "POST",
@@ -237,10 +236,8 @@ async function createCaller(
     return {
       sessionKey,
       names,
-      trace,
       call: async (name: string, args: Record<string, unknown>): Promise<Receipt> => {
         const reply = await request("tools/call", { name, arguments: args });
-        trace.push("mcp-client:" + name + ":" + (reply.result.isError ? "error" : "ok"));
         return {
           isError: reply.result.isError === true,
           text: (reply.result.content ?? []).map((block) => block.text ?? "").join("\n"),
@@ -250,24 +247,11 @@ async function createCaller(
   }
   const host = createAgentHarnessHostCapabilities({
     pluginId: "fixture-mediated-harness",
-    attempt: {
-      config: currentConfig,
-      runId,
-      agentId: "coder",
-      sessionId: sessionEntry!.sessionId,
-      sessionKey,
-      workspaceDir,
-      cwd: workspaceDir,
-      admittedRunContext,
-    },
+    attempt,
   });
   cleanups.push(host.close);
   const tools = await host.capabilities.createToolSurfaceAsync!({
-    config: currentConfig,
-    agentId: "coder",
-    sessionKey,
-    workspaceDir,
-    runId,
+    ...attempt,
     includeToolSearchControls: false,
   });
   const boundaries = createAgentHarnessToolExecutionBoundaryRegistry();
@@ -275,7 +259,6 @@ async function createCaller(
   return {
     sessionKey,
     names: tools.map((tool) => tool.name),
-    trace,
     call: (name: string, args: Record<string, unknown>): Promise<Receipt> =>
       runAgentHarnessToolInvocation({
         tool: tools.find((tool) => tool.name === name),
@@ -290,32 +273,24 @@ async function createCaller(
         boundaries,
         assertCurrent: host.capabilities.assertActive,
         applyMiddleware: (event) => middleware.applyToolResultMiddleware(event),
-        onResult: (result) => {
-          trace.push(name + ":" + (result.isError ? "failed" : "completed"));
-          return {
-            isError: result.isError,
-            text: result.result.content
-              .map((block) => (block.type === "text" ? block.text : ""))
-              .join("\n"),
-          };
-        },
-        onError: ({ error }) => {
-          trace.push(name + ":failed");
-          return { isError: true, text: String(error) };
-        },
+        onResult: (result) => ({
+          isError: result.isError,
+          text: result.result.content
+            .map((block) => (block.type === "text" ? block.text : ""))
+            .join("\n"),
+        }),
+        onError: ({ error }) => ({ isError: true, text: String(error) }),
       }),
   };
 }
 
-function observeLaunches(trace: string[]) {
+function observeLaunches() {
   const supervisor = getProcessSupervisor();
   const original = supervisor.spawn.bind(supervisor);
   let launches = 0;
   vi.spyOn(supervisor, "spawn").mockImplementation(async (input) => {
-    trace.push("supervisor:spawn-requested");
     const run = await original(input);
     launches += 1;
-    trace.push("supervisor:launched");
     return run;
   });
   return () => launches;
@@ -339,12 +314,10 @@ async function revokeAtGate(
   signal: AbortSignal,
   message: string,
   release: () => void,
-  trace: string[],
 ) {
   try {
     await withinTest(awaitGateBeforeSettlement(entered, running, message), signal);
     revoke();
-    trace.push("delegation:revoked");
   } finally {
     release();
   }
@@ -358,7 +331,7 @@ describe.each(["cli-loopback", "plugin-harness"] as const)(
     it("executes the persisted exception, then restores the deny fallback on resume", async () => {
       const caller = await createCaller(route);
       expect(caller.names).toEqual(expect.arrayContaining(denied));
-      const launches = observeLaunches(caller.trace);
+      const launches = observeLaunches();
       const basename = route + "-allowed.txt";
       const target = path.join(state.workspaceDir, basename);
       const exec = await caller.call("exec", {
@@ -385,7 +358,7 @@ describe.each(["cli-loopback", "plugin-harness"] as const)(
 
     it("does not waive sender restrictions even with a persisted delegation exception", async () => {
       const { caller, basename, target } = await prepareEffect(route, "-sender-denied.txt", true);
-      const launches = observeLaunches(caller.trace);
+      const launches = observeLaunches();
       expect(caller.names).not.toContain("exec");
       expect(caller.names).not.toContain("write");
       for (const [name, args] of [
@@ -399,68 +372,52 @@ describe.each(["cli-loopback", "plugin-harness"] as const)(
       expect(await fs.readFile(target, "utf8")).toBe("original");
     });
 
-    it("rejects revocation during awaited command preparation before process launch", async ({
-      signal,
-    }) => {
-      const { caller, basename, target } = await prepareEffect(route, "-revoked-command.txt");
-      const launches = observeLaunches(caller.trace);
-      const entered = Promise.withResolvers<void>();
-      const release = Promise.withResolvers<void>();
-      const original = shellSnapshot.maybeWrapCommandWithShellSnapshot;
-      vi.spyOn(shellSnapshot, "maybeWrapCommandWithShellSnapshot").mockImplementation(
-        async (...args) => {
-          caller.trace.push("command-preparation:waiting");
+    it.for(["exec", "write"] as const)(
+      "rejects revocation at the final %s boundary",
+      async (tool, { signal }) => {
+        const { caller, basename, target } = await prepareEffect(route, `-revoked-${tool}.txt`);
+        const launches = tool === "exec" ? observeLaunches() : undefined;
+        const entered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        const pause = async () => {
           entered.resolve();
           await release.promise;
-          caller.trace.push("command-preparation:released");
-          return original(...args);
-        },
-      );
-      const running = caller.call("exec", {
-        command: "printf forbidden > " + basename,
-        yieldMs: 10_000,
-      });
-      await revokeAtGate(
-        entered.promise,
-        running,
-        signal,
-        "command did not reach preparation",
-        release.resolve,
-        caller.trace,
-      );
-      const receipt = await running;
-      await expectRejected(receipt, target);
-      expect(launches()).toBe(0);
-    });
-
-    it("rejects revocation after the write descriptor opens but before mutation", async ({
-      signal,
-    }) => {
-      const { caller, target } = await prepareEffect(route, "-revoked-write.txt");
-      const entered = Promise.withResolvers<void>();
-      const release = Promise.withResolvers<void>();
-      const originalOpen = fs.open;
-      vi.spyOn(fs, "open").mockImplementation(async (...args) => {
-        const handle = await originalOpen(...args);
-        if (args[0] === target && args[1] === "r+") {
-          caller.trace.push("file-open:waiting-before-mutation");
-          entered.resolve();
-          await release.promise;
-          caller.trace.push("file-open:released");
+        };
+        if (tool === "exec") {
+          const original = shellSnapshot.maybeWrapCommandWithShellSnapshot;
+          vi.spyOn(shellSnapshot, "maybeWrapCommandWithShellSnapshot").mockImplementation(
+            async (...args) => {
+              await pause();
+              return original(...args);
+            },
+          );
+        } else {
+          const originalOpen = fs.open;
+          vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+            const handle = await originalOpen(...args);
+            if (args[0] === target && args[1] === "r+") {
+              await pause();
+            }
+            return handle;
+          });
         }
-        return handle;
-      });
-      const running = caller.call("write", { path: target, content: "forbidden" });
-      await revokeAtGate(
-        entered.promise,
-        running,
-        signal,
-        "write did not open its descriptor",
-        release.resolve,
-        caller.trace,
-      );
-      const receipt = await running;
-      await expectRejected(receipt, target);
-    });
+        const args =
+          tool === "exec"
+            ? { command: "printf forbidden > " + basename, yieldMs: 10_000 }
+            : { path: target, content: "forbidden" };
+        const running = caller.call(tool, args);
+        await revokeAtGate(
+          entered.promise,
+          running,
+          signal,
+          "tool did not reach its final boundary",
+          release.resolve,
+        );
+        await expectRejected(await running, target);
+        if (launches) {
+          expect(launches()).toBe(0);
+        }
+      },
+    );
   },
 );

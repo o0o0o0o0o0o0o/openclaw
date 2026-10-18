@@ -17,6 +17,11 @@ import {
 import type { CronCreatorAuthorityGrant } from "../cron-creator-authority-grant.types.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
 
+type MutationOptions = {
+  commitGuard?: () => void;
+  captureRuntimeAuthority?: () => CronRuntimeAuthority | undefined;
+};
+
 function createPrefixOnlyChannelPlugin(
   id: string,
   targetPrefixes: readonly string[],
@@ -26,54 +31,35 @@ function createPrefixOnlyChannelPlugin(
     id,
     config: {
       isConfigured: (_account, cfg) => {
-        const channelConfig = cfg.channels?.[id];
-        return Boolean(channelConfig && channelConfig.enabled !== false);
+        const configured = cfg.channels?.[id];
+        return Boolean(configured && configured.enabled !== false);
       },
     },
   });
   return {
     ...base,
-    meta: {
-      ...base.meta,
-      ...(aliases ? { aliases } : {}),
-    },
+    meta: { ...base.meta, ...(aliases ? { aliases } : {}) },
     messaging: { targetPrefixes },
   };
 }
 
 export function setCronValidationTestRegistry(): void {
   setActivePluginRegistry(
-    createTestRegistry([
-      {
-        pluginId: "discord",
-        plugin: createPrefixOnlyChannelPlugin("discord", ["discord"]),
-        source: "test:discord",
-      },
-      {
-        pluginId: "telegram",
-        plugin: createPrefixOnlyChannelPlugin("telegram", ["telegram", "tg"]),
-        source: "test:telegram",
-      },
-      {
-        pluginId: "slack",
-        plugin: createPrefixOnlyChannelPlugin("slack", ["slack"]),
-        source: "test:slack",
-      },
-      {
-        pluginId: "msteams",
-        plugin: createPrefixOnlyChannelPlugin("msteams", ["msteams", "teams"], ["teams"]),
-        source: "test:msteams",
-      },
-      {
-        pluginId: "synology-chat",
-        plugin: createPrefixOnlyChannelPlugin("synology-chat", [
-          "synology-chat",
-          "synology_chat",
-          "synology",
-        ]),
-        source: "test:synology-chat",
-      },
-    ]),
+    createTestRegistry(
+      (
+        [
+          ["discord", ["discord"]],
+          ["telegram", ["telegram", "tg"]],
+          ["slack", ["slack"]],
+          ["msteams", ["msteams", "teams"], ["teams"]],
+          ["synology-chat", ["synology-chat", "synology_chat", "synology"]],
+        ] satisfies [id: string, prefixes: string[], aliases?: string[]][]
+      ).map(([id, prefixes, aliases]) => ({
+        pluginId: id,
+        plugin: createPrefixOnlyChannelPlugin(id, prefixes, aliases),
+        source: `test:${id}`,
+      })),
+    ),
   );
 }
 
@@ -86,6 +72,11 @@ export function createCronTestContext(
   const committedRuntimeAuthorities: Array<CronRuntimeAuthority | undefined> = [];
   const committedRuntimeAuthorityCaptures: boolean[] = [];
   const committedUpdates: Array<{ id: string; patch: Partial<CronJob> }> = [];
+  const captureAuthority = (opts?: MutationOptions) => {
+    opts?.commitGuard?.();
+    committedRuntimeAuthorityCaptures.push(opts?.captureRuntimeAuthority !== undefined);
+    committedRuntimeAuthorities.push(opts?.captureRuntimeAuthority?.());
+  };
   const update = vi.fn(async (id: string, patch: Partial<CronJob>) => {
     committedUpdates.push({ id, patch });
     return createCronJob({
@@ -100,40 +91,25 @@ export function createCronTestContext(
     committedRuntimeAuthorityCaptures,
     committedUpdates,
     cron: {
-      add: vi.fn(
-        async (
-          input: Partial<CronJob>,
-          opts?: {
-            commitGuard?: () => void;
-            captureRuntimeAuthority?: () => CronRuntimeAuthority | undefined;
-          },
-        ) => {
-          opts?.commitGuard?.();
-          committedRuntimeAuthorityCaptures.push(opts?.captureRuntimeAuthority !== undefined);
-          committedRuntimeAuthorities.push(opts?.captureRuntimeAuthority?.());
-          committedAdds.push(input);
-          return createCronJob({ ...input, id: "cron-1" });
-        },
-      ),
+      add: vi.fn(async (input: Partial<CronJob>, opts?: MutationOptions) => {
+        captureAuthority(opts);
+        committedAdds.push(input);
+        return createCronJob({ ...input, id: "cron-1" });
+      }),
       update,
       updateWithPrecondition: vi.fn(
         async (
           id: string,
           patch: Partial<CronJob>,
           precondition: (job: CronJob, nowMs: number) => void | Promise<void>,
-          opts?: {
-            commitGuard?: () => void;
-            captureRuntimeAuthority?: () => CronRuntimeAuthority | undefined;
-          },
+          opts?: MutationOptions,
         ) => {
           const job = jobs.find((candidate) => candidate.id === id);
           if (!job) {
             throw new Error(`unknown automation id: ${id}`);
           }
           await precondition(job, Date.now());
-          opts?.commitGuard?.();
-          committedRuntimeAuthorityCaptures.push(opts?.captureRuntimeAuthority !== undefined);
-          committedRuntimeAuthorities.push(opts?.captureRuntimeAuthority?.());
+          captureAuthority(opts);
           return await update(id, patch);
         },
       ),
@@ -251,83 +227,51 @@ export function pluginEntries(...ids: string[]): OpenClawConfig["plugins"] {
 }
 
 export function telegramConfig(): OpenClawConfig {
-  return {
-    channels: {
-      telegram: {
-        botToken: "telegram-token",
-      },
-    },
-    plugins: pluginEntries("telegram"),
-  } as OpenClawConfig;
+  return channelConfig({ telegram: { botToken: "telegram-token" } });
 }
 
 export function telegramSlackConfig(params: { includeMainSession?: boolean } = {}): OpenClawConfig {
   return {
-    ...(params.includeMainSession ? { session: { mainKey: "main" } } : {}),
-    channels: {
-      telegram: {
-        botToken: "telegram-token",
-      },
-      slack: {
-        botToken: "xoxb-slack-token",
-        appToken: "xapp-slack-token",
-      },
-    },
+    ...slackConfig(params),
+    channels: { ...telegramConfig().channels, ...slackConfig().channels },
     plugins: pluginEntries("telegram", "slack"),
-  } as OpenClawConfig;
+  };
 }
 
 export function telegramDisabledAccountConfig(): OpenClawConfig {
-  return {
-    channels: {
-      telegram: {
-        accounts: {
-          primary: { botToken: "telegram-token-primary" },
-          retired: { botToken: "telegram-token-retired", enabled: false },
-        },
+  return channelConfig({
+    telegram: {
+      accounts: {
+        primary: { botToken: "telegram-token-primary" },
+        retired: { botToken: "telegram-token-retired", enabled: false },
       },
     },
-    plugins: pluginEntries("telegram"),
-  } as OpenClawConfig;
+  });
 }
 
 export function msteamsConfig(): OpenClawConfig {
   return {
-    channels: {
-      msteams: {
-        botToken: "teams-token",
-      },
-    },
+    channels: { msteams: { botToken: "teams-token" } },
     plugins: pluginEntries("msteams"),
   } as OpenClawConfig;
 }
 
 export function slackSynologyConfig(): OpenClawConfig {
   return {
-    channels: {
-      slack: {
-        botToken: "xoxb-slack-token",
-        appToken: "xapp-slack-token",
-      },
-      "synology-chat": {
-        token: "synology-token",
-      },
-    },
+    channels: { ...slackConfig().channels, "synology-chat": { token: "synology-token" } },
     plugins: pluginEntries("slack", "synology-chat"),
-  } as OpenClawConfig;
+  };
+}
+
+function channelConfig(channels: NonNullable<OpenClawConfig["channels"]>): OpenClawConfig {
+  return { channels, plugins: pluginEntries(...Object.keys(channels)) };
 }
 
 export function slackConfig(params: { includeMainSession?: boolean } = {}): OpenClawConfig {
   return {
     ...(params.includeMainSession ? { session: { mainKey: "main" } } : {}),
-    channels: {
-      slack: {
-        botToken: "xoxb-slack-token",
-        appToken: "xapp-slack-token",
-      },
-    },
-    plugins: pluginEntries("slack"),
-  } as OpenClawConfig;
+    ...channelConfig({ slack: { botToken: "xoxb-slack-token", appToken: "xapp-slack-token" } }),
+  };
 }
 
 export function createCronCallerClient(

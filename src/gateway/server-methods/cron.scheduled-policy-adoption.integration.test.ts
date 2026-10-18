@@ -25,7 +25,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { CronService } from "../../cron/service.js";
 import { createNoopLogger } from "../../cron/service.test-harness.js";
 import { loadCronStore, saveCronStore } from "../../cron/store.js";
-import type { CronJobPatch } from "../../cron/types.js";
+import type { CronJobCreate, CronJobPatch } from "../../cron/types.js";
 import {
   claimAgentRunDelegatedAuthority,
   clearAgentRunContext,
@@ -131,6 +131,40 @@ async function withAgentManagement<T>(
   }
 }
 
+function createFixture() {
+  const storePath = path.join(expectDefined(stateDir, "test state"), "cron", "jobs.json");
+  const service = new CronService({
+    scheduler: createTestGatewayScheduler(),
+    nowMs: () => Date.now(),
+    storePath,
+    cronEnabled: false,
+    defaultAgentId: "main",
+    log: createNoopLogger(),
+    enqueueSystemEvent: vi.fn(),
+    requestHeartbeat: vi.fn(),
+    runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
+  });
+  cron = service;
+  const context = createDirectChatContext({
+    cron: service,
+    cronStorePath: storePath,
+    getRuntimeConfig: () => cfg,
+    validateAgentRuntimeApprovalAuthority: createAgentRuntimeApprovalAuthorityValidator(),
+  });
+  const makeJob = (overrides: Partial<CronJobCreate>): CronJobCreate => ({
+    name: "Scheduled account policy",
+    enabled: true,
+    schedule: { kind: "every", everyMs: 3_600_000 },
+    agentId: "main",
+    sessionTarget: "isolated",
+    wakeMode: "next-heartbeat",
+    payload: { kind: "agentTurn", message: "Check status", toolsAllow: ["message"] },
+    delivery: { mode: "none" },
+    ...overrides,
+  });
+  return { storePath, service, context, makeJob };
+}
+
 describe("cron.update scheduled policy adoption", () => {
   it.each([
     "owner",
@@ -140,18 +174,7 @@ describe("cron.update scheduled policy adoption", () => {
     "borrowed capture",
     "no capture",
   ] as const)("captures owner authority and preserves manager cap edits: %s", async (caller) => {
-    const storePath = path.join(expectDefined(stateDir, "test state"), "cron", "jobs.json");
-    const service = new CronService({
-      scheduler: createTestGatewayScheduler(),
-      storePath,
-      cronEnabled: false,
-      defaultAgentId: "main",
-      log: createNoopLogger(),
-      enqueueSystemEvent: vi.fn(),
-      requestHeartbeat: vi.fn(),
-      runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
-    });
-    cron = service;
+    const { storePath, service, context, makeJob } = createFixture();
     const owner = {
       agentId: "main",
       sessionKey:
@@ -167,21 +190,15 @@ describe("cron.update scheduled policy adoption", () => {
       payload: { apps: [{ id: "calendar" }] },
     };
     const created = await service.add(
-      {
+      makeJob({
         name: "App automation",
-        enabled: true,
-        schedule: { kind: "every", everyMs: 3_600_000 },
-        agentId: "main",
-        sessionTarget: "isolated",
-        wakeMode: "next-heartbeat",
         payload: {
           kind: "agentTurn",
           message: "Check calendar",
           toolsAllow: ["read", "calendar_search"],
         },
-        delivery: { mode: "none" },
         owner,
-      },
+      }),
       {
         scheduledToolPolicy: {
           version: 1,
@@ -193,12 +210,6 @@ describe("cron.update scheduled policy adoption", () => {
       },
     );
     const before = (await loadCronStore(storePath)).jobs;
-    const context = createDirectChatContext({
-      cron: service,
-      cronStorePath: storePath,
-      getRuntimeConfig: () => cfg,
-      validateAgentRuntimeApprovalAuthority: createAgentRuntimeApprovalAuthorityValidator(),
-    });
     await withAgentManagement(async (identity, _management, capability) => {
       const tool = createCronTool(
         {
@@ -300,44 +311,10 @@ describe("cron.update scheduled policy adoption", () => {
   ] as const)(
     "applies the authorized policy when $caller restores $definition",
     async ({ caller, definition, expected }) => {
-      const storePath = path.join(
-        expectDefined(stateDir, "test state directory"),
-        "cron",
-        "jobs.json",
-      );
-      const service = new CronService({
-        scheduler: createTestGatewayScheduler(),
-        nowMs: () => Date.now(),
-        storePath,
-        cronEnabled: false,
-        defaultAgentId: "main",
-        log: createNoopLogger(),
-        enqueueSystemEvent: vi.fn(),
-        requestHeartbeat: vi.fn(),
-        runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
-      });
-      cron = service;
+      const { storePath, service, context, makeJob } = createFixture();
       const owner = { agentId: "main", sessionKey, accountId };
-      const created = await service.add(
-        {
-          name: "Scheduled account policy",
-          enabled: true,
-          schedule: { kind: "every", everyMs: 3_600_000 },
-          agentId: "main",
-          sessionKey,
-          sessionTarget: "isolated",
-          wakeMode: "next-heartbeat",
-          payload: { kind: "agentTurn", message: "Check status", toolsAllow: ["message"] },
-          delivery: { mode: "none" },
-          owner,
-        },
-        { scheduledToolPolicy: accountPolicy },
-      );
-      const context = createDirectChatContext({
-        cron: service,
-        cronStorePath: storePath,
-        getRuntimeConfig: () => cfg,
-        validateAgentRuntimeApprovalAuthority: createAgentRuntimeApprovalAuthorityValidator(),
+      const created = await service.add(makeJob({ sessionKey, owner }), {
+        scheduledToolPolicy: accountPolicy,
       });
       const update = async (client: GatewayClient, patch: CronJobPatch) => {
         const params = { id: created.id, patch };

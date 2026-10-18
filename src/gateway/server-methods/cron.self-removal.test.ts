@@ -7,9 +7,11 @@ import {
   prepareAgentRunAdmission,
 } from "../../agents/admitted-run-context.js";
 import { getActiveCronJobCount } from "../../cron/active-jobs.js";
-import { CronService, type CronEvent } from "../../cron/service.js";
-import { setupCronServiceSuite } from "../../cron/service.test-harness.js";
-import * as cronServiceState from "../../cron/service/state.js";
+import type { CronEvent } from "../../cron/service.js";
+import {
+  createCronServiceWithStateForTest,
+  setupCronServiceSuite,
+} from "../../cron/service.test-harness.js";
 import type { CronServiceDeps } from "../../cron/service/state.js";
 import { onTimer } from "../../cron/service/timer.test-support.js";
 import {
@@ -131,15 +133,7 @@ describe("cron self-removal", () => {
           admission.close();
         }
       };
-      let ownedState: ReturnType<typeof cronServiceState.createCronServiceState> | undefined;
-      const createState = cronServiceState.createCronServiceState;
-      const captureState = vi.spyOn(cronServiceState, "createCronServiceState");
-      captureState.mockImplementationOnce((deps) => {
-        captureState.mockRestore();
-        ownedState = createState(deps);
-        return ownedState;
-      });
-      const cron = new CronService({
+      const { cron, state } = createCronServiceWithStateForTest({
         scheduler,
         storePath,
         cronEnabled: true,
@@ -178,7 +172,7 @@ describe("cron self-removal", () => {
         } else {
           await cron.start();
           clock.setTime(clock.clock.now() + 1_000);
-          await onTimer(expectDefined(ownedState, "constructed cron state"));
+          await onTimer(state);
         }
         await finished.promise;
         expect(events.filter((event) => event.action === "finished")).toEqual([

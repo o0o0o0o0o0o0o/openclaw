@@ -6,7 +6,7 @@ import {
 } from "../../../test/helpers/cron/service-regression-fixtures.js";
 import { CronService } from "../../cron/service.js";
 import { loadCronStore, saveCronStore } from "../../cron/store.js";
-import type { CronJob, CronJobCreate } from "../../cron/types.js";
+import type { CronJobCreate } from "../../cron/types.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   consumeCronCreatorAuthorityGrant,
@@ -20,23 +20,7 @@ import {
   readCronCallerScope,
   resolveCronCreatorAuthorityCapture,
 } from "./cron-caller-scope.js";
-
-function createScopedJob(): CronJob {
-  return {
-    id: "ops-job",
-    name: "Ops job",
-    enabled: true,
-    createdAtMs: 1,
-    updatedAtMs: 1,
-    schedule: { kind: "every", everyMs: 60_000 },
-    sessionTarget: "main",
-    sessionKey: "agent:ops:main",
-    agentId: " ",
-    wakeMode: "next-heartbeat",
-    payload: { kind: "agentTurn", message: "work" },
-    state: {},
-  };
-}
+import { createCronJob } from "./cron.validation.test-support.js";
 
 describe("cron caller scope ownership", () => {
   it.each(["before dispatch", "after commit"] as const)(
@@ -193,22 +177,18 @@ describe("cron caller scope ownership", () => {
   });
 
   it("uses a scoped session key before the configured default", () => {
-    const job = createScopedJob();
-
-    expect(
+    const job = createCronJob({
+      sessionTarget: "main",
+      sessionKey: "agent:ops:main",
+      agentId: " ",
+    });
+    const matches = (agentId: string) =>
       cronJobMatchesCallerScope({
         job,
-        callerScope: { kind: "agentTool", agentId: "main", accountId: "default" },
+        callerScope: { kind: "agentTool", agentId, accountId: "default" },
         defaultAgentId: "main",
-      }),
-    ).toBe(false);
-    expect(
-      cronJobMatchesCallerScope({
-        job,
-        callerScope: { kind: "agentTool", agentId: "ops", accountId: "default" },
-        defaultAgentId: "main",
-      }),
-    ).toBe(true);
+      });
+    expect([matches("main"), matches("ops")]).toEqual([false, true]);
 
     const input: CronJobCreate = {
       ...job,

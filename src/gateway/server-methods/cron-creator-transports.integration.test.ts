@@ -93,6 +93,17 @@ beforeEach(async () => {
   });
 });
 
+function automationJob(name: string, overrides: Record<string, unknown> = {}) {
+  return {
+    name,
+    schedule: { kind: "every", everyMs: 60_000 },
+    sessionTarget: "current",
+    payload: { kind: "agentTurn", message: "Check status" },
+    delivery: { mode: "none" },
+    ...overrides,
+  };
+}
+
 describe("original caller through Cron creator transports", () => {
   it.for([
     ["fresh operator", "none"],
@@ -229,14 +240,7 @@ describe("original caller through Cron creator transports", () => {
                   });
                   const created = tools.invoke(AUTOMATIONS_TOOL_NAME, {
                     action: "add",
-                    job: {
-                      name: "Recovered caller job",
-                      enabled: false,
-                      schedule: { kind: "every", everyMs: 60_000 },
-                      sessionTarget: "current",
-                      payload: { kind: "agentTurn", message: "Check status" },
-                      delivery: { mode: "none" },
-                    },
+                    job: automationJob("Recovered caller job", { enabled: false }),
                   });
                   if (source === "legacy System") {
                     await expect(created).rejects.toThrow("missing scope: operator.admin");
@@ -251,14 +255,10 @@ describe("original caller through Cron creator transports", () => {
                       hold = true;
                       const pending = tools.invoke(AUTOMATIONS_TOOL_NAME, {
                         action: "add",
-                        job: {
-                          name: "Revoked recovered caller job",
+                        job: automationJob("Revoked recovered caller job", {
                           enabled: false,
-                          schedule: { kind: "every", everyMs: 60_000 },
-                          sessionTarget: "current",
                           payload: { kind: "agentTurn", message: "Must not persist" },
-                          delivery: { mode: "none" },
-                        },
+                        }),
                       });
                       const rejected = expect(pending).rejects.toThrow(/authority|claim retired/i);
                       void rejected.catch(() => undefined);
@@ -344,13 +344,9 @@ describe("original caller through Cron creator transports", () => {
         });
         await tools.invoke(AUTOMATIONS_TOOL_NAME, {
           action: "add",
-          job: {
-            name: "Restricted caller job",
-            schedule: { kind: "every", everyMs: 60_000 },
-            sessionTarget: "current",
+          job: automationJob("Restricted caller job", {
             payload: { kind: "agentTurn", message: "Check status", timeoutSeconds: 0 },
-            delivery: { mode: "none" },
-          },
+          }),
         });
         const jobs = await fixture.read();
         expect(jobs).toMatchObject([
@@ -467,14 +463,10 @@ describe("original caller through Cron creator transports", () => {
           const invoke = (name: string) =>
             tools.invoke(AUTOMATIONS_TOOL_NAME, {
               action: "add",
-              job: {
-                name,
-                schedule: { kind: "every", everyMs: 60_000 },
-                sessionTarget: "current",
+              job: automationJob(name, {
                 wakeMode: "next-heartbeat",
                 payload: { kind: "agentTurn", message: "Check service health", timeoutSeconds: 0 },
-                delivery: { mode: "none" },
-              },
+              }),
             });
 
           await invoke("Live creator");

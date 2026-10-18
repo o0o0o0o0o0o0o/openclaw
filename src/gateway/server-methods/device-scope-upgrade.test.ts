@@ -38,50 +38,20 @@ const FULL_SCOPES = [
   "operator.pairing",
 ];
 
-const ROLE_SCOPE_CASES = [
-  {
-    name: "admin implies the full Control UI scope set",
-    allowedScopes: ["operator.admin"],
-    scopes: FULL_SCOPES,
-    allowed: true,
-  },
-  {
-    name: "write implies read and talk",
-    allowedScopes: ["operator.write"],
-    scopes: ["operator.read", "operator.talk"],
-    allowed: true,
-  },
-  {
-    name: "no operator role policy",
-    allowedScopes: undefined,
-    scopes: FULL_SCOPES,
-    allowed: true,
-  },
-  {
-    name: "guest cannot request admin",
-    allowedScopes: GUEST_ROLE.scopes,
-    scopes: FULL_SCOPES,
-    allowed: false,
-  },
-  {
-    name: "empty ceiling denies read",
-    allowedScopes: [],
-    scopes: ["operator.read"],
-    allowed: false,
-  },
+const ROLE_SCOPE_CASES: [string, string[] | undefined, string[], boolean][] = [
+  ["admin implies full Control UI scopes", ["operator.admin"], FULL_SCOPES, true],
+  ["write implies read and talk", ["operator.write"], ["operator.read", "operator.talk"], true],
+  ["no operator role policy", undefined, FULL_SCOPES, true],
+  ["guest cannot request admin", GUEST_ROLE.scopes, FULL_SCOPES, false],
+  ["empty ceiling denies read", [], ["operator.read"], false],
 ];
 
 function createUpgradeContext() {
-  const coordinator = {
-    register: vi.fn(() => true),
-    notify: vi.fn(),
-    wait: vi.fn(),
-  };
   return {
     broadcast: vi.fn(),
     getRuntimeConfig: () => ({}),
     logGateway: { warn: vi.fn() },
-    scopeUpgradeCoordinator: coordinator,
+    scopeUpgradeCoordinator: { register: vi.fn(() => true), notify: vi.fn(), wait: vi.fn() },
   };
 }
 
@@ -134,7 +104,7 @@ describe("device scope upgrade role ceiling", () => {
     resolveOperatorRolePolicyMock.mockReturnValue(undefined);
   });
 
-  describe.each(ROLE_SCOPE_CASES)("$name", ({ allowedScopes, scopes, allowed }) => {
+  describe.each(ROLE_SCOPE_CASES)("%s", (_name, allowedScopes, scopes, allowed) => {
     const rolePolicy = allowedScopes ? { ...GUEST_ROLE, scopes: allowedScopes } : undefined;
     const roleDenial = expect.objectContaining({
       code: "INVALID_REQUEST",

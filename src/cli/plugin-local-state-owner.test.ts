@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { GatewayClientRequestError } from "../../packages/gateway-client/src/request-error.js";
 import { awaitGateBeforeSettlement, createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
@@ -184,7 +184,7 @@ function printJson(value: unknown) {
 
 async function runSyntheticBatches() {
   let operationOwnerId: string | undefined;
-  const batches: ReturnType<typeof backfillExecution>["result"][] = [];
+  let result: ReturnType<typeof backfillExecution>["result"];
   for (;;) {
     const reply = await runWithLocalStateOwner<{
       execution: ReturnType<typeof backfillExecution>;
@@ -205,14 +205,10 @@ async function runSyntheticBatches() {
       return;
     }
     operationOwnerId ??= reply.ownerId;
-    batches.push(reply.execution.result);
+    result = reply.execution.result;
     if (!reply.execution.continuation.hasMore) {
       break;
     }
-  }
-  const result = { ...batches[0], batchCount: batches.length };
-  for (const field of ["candidateCount", "writtenDiaryEntries", "replacedDiaryEntries"] as const) {
-    result[field] = batches.reduce((sum, batch) => sum + batch[field], 0);
   }
   printJson(result);
 }
@@ -260,25 +256,10 @@ async function dispatchToGateway(options: CallGatewayOptions) {
   return response[1];
 }
 
-function backfillExecution(
-  overrides: { continuation?: { advanced: boolean; hasMore: boolean } } = {},
-) {
+function backfillExecution(hasMore = false) {
   return {
-    result: {
-      agentId: "main",
-      workspaceDir: "/gateway/workspace",
-      applied: true,
-      rem: false,
-      days: [
-        { day: "2026-10-01", candidateCount: 4, topCandidates: ["one", "two", "three", "four"] },
-      ],
-      candidateCount: 4,
-      stagedEntries: 3,
-      writtenDiaryEntries: 1,
-      replacedDiaryEntries: 2,
-    },
-    continuation: { advanced: true, hasMore: false },
-    ...overrides,
+    result: { agentId: "main" },
+    continuation: { advanced: true, hasMore },
   };
 }
 
@@ -338,7 +319,7 @@ afterEach(async () => {
   process.exitCode = 0;
 });
 
-async function runCli(args: string[]) {
+async function runCli(...args: string[]) {
   const program = new Command();
   await registrar({
     program,
@@ -362,208 +343,198 @@ async function occupyState() {
   fixture.external = true;
 }
 
-describe("synthetic plugin commands respect the local state owner", () => {
-  it("refuses offline memory access while the Gateway owns state", async () => {
-    await occupyState();
-    await expect(runCli(["memory", "status"])).rejects.toThrow("exclusive offline state ownership");
-    expect(fixture.memory).not.toHaveBeenCalled();
-  });
+it("refuses offline memory access while the Gateway owns state", async () => {
+  await occupyState();
+  await expect(runCli("memory", "status")).rejects.toThrow("exclusive offline state ownership");
+  expect(fixture.memory).not.toHaveBeenCalled();
+});
 
-  it("retains offline memory ownership until the command settles", async () => {
+it("retains offline memory ownership until the command settles", async () => {
+  const entered = createDeferred();
+  const finish = createDeferred();
+  const ownerPath = resolveGatewayLockPaths(process.env).ownerLockPath;
+  fixture.memory.mockImplementationOnce(async () => {
+    entered.resolve();
+    await finish.promise;
+    expect(readLockPayloadSync(ownerPath, true)).toMatchObject({
+      pid: process.pid,
+      role: "agent-embedded",
+    });
+  });
+  const operation = runCli("memory", "index");
+  try {
+    await awaitGateBeforeSettlement(entered.promise, operation, "command did not enter");
+    expect(readLockPayloadSync(ownerPath, true)).toMatchObject({ role: "agent-embedded" });
+  } finally {
+    finish.resolve();
+    await operation;
+  }
+  expect(process.exitCode).toBe(0);
+  expect(fs.existsSync(ownerPath)).toBe(false);
+});
+
+it("does not replay search locally when owner method is missing or dispatch is uncertain", async () => {
+  await occupyState();
+  for (const dispatched of [false, true]) {
+    fixture.callGateway.mockImplementationOnce(async (options) => {
+      if (dispatched) {
+        await options.prepareDispatchCurrent?.();
+        options.assertDispatchCurrent?.();
+      }
+      throw new Error(dispatched ? "connection closed after dispatch" : "required method missing");
+    });
+    await expect(runCli("memory", "search", "query", "--json")).rejects.toThrow(
+      dispatched ? "No local fallback was attempted" : "No local mutation was attempted",
+    );
+  }
+  expect(fixture.memory).not.toHaveBeenCalled();
+  expect(fixture.executeBatch).not.toHaveBeenCalled();
+  expect(fixture.memoryManager).not.toHaveBeenCalled();
+});
+
+it("releases offline memory custody after command failure", async () => {
+  const ownerPath = resolveGatewayLockPaths(process.env).ownerLockPath;
+  fixture.memory.mockImplementationOnce(async () => {
+    expect(readLockPayloadSync(ownerPath, true)).toMatchObject({ role: "agent-embedded" });
+    throw new Error("fixture command failure");
+  });
+  await expect(runCli("memory", "index")).rejects.toThrow("fixture command failure");
+  expect(fs.existsSync(ownerPath)).toBe(false);
+});
+
+it.each(["memory", "matrix", "search"] as const)(
+  "does not disclose a completed %s result after owner revocation",
+  async (family) => {
+    await occupyState();
     const entered = createDeferred();
     const finish = createDeferred();
-    const ownerPath = resolveGatewayLockPaths(process.env).ownerLockPath;
-    fixture.memory.mockImplementationOnce(async () => {
-      entered.resolve();
-      await finish.promise;
-      expect(readLockPayloadSync(ownerPath, true)).toMatchObject({
-        pid: process.pid,
-        role: "agent-embedded",
+    if (family === "memory") {
+      fixture.executeBatch.mockImplementationOnce(async () => {
+        entered.resolve();
+        await finish.promise;
+        return backfillExecution();
       });
-    });
-    const operation = runCli(["memory", "index"]);
-    try {
-      await awaitGateBeforeSettlement(entered.promise, operation, "command did not enter");
-      expect(readLockPayloadSync(ownerPath, true)).toMatchObject({ role: "agent-embedded" });
-    } finally {
-      finish.resolve();
-      await operation;
-    }
-    expect(process.exitCode).toBe(0);
-    expect(fs.existsSync(ownerPath)).toBe(false);
-  });
-
-  it("does not replay search locally when owner method is missing or dispatch is uncertain", async () => {
-    await occupyState();
-    for (const dispatched of [false, true]) {
-      fixture.callGateway.mockImplementationOnce(async (options) => {
-        if (dispatched) {
-          await options.prepareDispatchCurrent?.();
-          options.assertDispatchCurrent?.();
-        }
-        throw new Error(
-          dispatched ? "connection closed after dispatch" : "required method missing",
-        );
+    } else if (family === "search") {
+      fixture.searchClose.mockImplementationOnce(async () => {
+        entered.resolve();
+        await finish.promise;
       });
-      await expect(runCli(["memory", "search", "query", "--json"])).rejects.toThrow(
-        dispatched ? "No local fallback was attempted" : "No local mutation was attempted",
-      );
+    } else {
+      fixture.status.mockImplementationOnce(async () => {
+        entered.resolve();
+        await finish.promise;
+        return { recoveryKey: "synthetic-key-must-not-escape" };
+      });
     }
-    expect(fixture.memory).not.toHaveBeenCalled();
-    expect(fixture.executeBatch).not.toHaveBeenCalled();
-    expect(fixture.memoryManager).not.toHaveBeenCalled();
-  });
-
-  it("releases offline memory custody after command failure", async () => {
-    const ownerPath = resolveGatewayLockPaths(process.env).ownerLockPath;
-    fixture.memory.mockImplementationOnce(async () => {
-      expect(readLockPayloadSync(ownerPath, true)).toMatchObject({ role: "agent-embedded" });
-      throw new Error("fixture command failure");
-    });
-    await expect(runCli(["memory", "index"])).rejects.toThrow("fixture command failure");
-    expect(fs.existsSync(ownerPath)).toBe(false);
-  });
-
-  it.each(["memory", "matrix", "search"] as const)(
-    "does not disclose a completed %s result after owner revocation",
-    async (family) => {
-      await occupyState();
-      const entered = createDeferred();
-      const finish = createDeferred();
-      if (family === "memory") {
-        fixture.executeBatch.mockImplementationOnce(async () => {
-          entered.resolve();
-          await finish.promise;
-          return backfillExecution();
-        });
-      } else if (family === "search") {
-        fixture.searchClose.mockImplementationOnce(async () => {
-          entered.resolve();
-          await finish.promise;
-        });
-      } else {
-        fixture.status.mockImplementationOnce(async () => {
-          entered.resolve();
-          await finish.promise;
-          return { recoveryKey: "synthetic-key-must-not-escape" };
-        });
-      }
-      const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-      const operation = runCli(
-        family === "memory"
-          ? ["memory", "session-backfill", "--apply", "--json"]
-          : family === "search"
-            ? ["memory", "search", "query", "--json"]
-            : ["matrix", "verify", "status", "--include-recovery-key", "--json"],
-      );
-      const outcome = operation.then(
-        () => undefined,
-        (error: unknown) => error,
-      );
-      try {
-        await awaitGateBeforeSettlement(
-          entered.promise,
-          operation,
-          "Gateway handler did not enter",
-        );
-        await owner?.release();
-        owner = null;
-      } finally {
-        finish.resolve();
-      }
-      if (family !== "matrix") {
-        expect(await outcome).toMatchObject({ code: "OUTCOME_UNKNOWN" });
-        expect(output).not.toHaveBeenCalled();
-      } else {
-        await outcome;
-        expect(process.exitCode).toBe(1);
-        expect(output.mock.calls.at(-1)?.[0]).toContain("No local fallback was attempted");
-        expect(output.mock.calls.flat().join("")).not.toContain("synthetic-key-must-not-escape");
-      }
-      expect(fixture.memory).not.toHaveBeenCalled();
-    },
-  );
-
-  it("does not continue a routed backfill locally when its Gateway stops between batches", async () => {
-    await occupyState();
-    fixture.executeBatch.mockResolvedValueOnce(
-      backfillExecution({ continuation: { advanced: true, hasMore: true } }),
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const operation = runCli(
+      ...(family === "memory"
+        ? ["memory", "session-backfill", "--apply", "--json"]
+        : family === "search"
+          ? ["memory", "search", "query", "--json"]
+          : ["matrix", "verify", "status", "--include-recovery-key", "--json"]),
     );
-    fixture.callGateway.mockImplementationOnce(async (options) => {
-      const reply = await dispatchToGateway(options);
+    const outcome = operation.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    try {
+      await awaitGateBeforeSettlement(entered.promise, operation, "Gateway handler did not enter");
       await owner?.release();
       owner = null;
-      return reply;
-    });
-    await expect(runCli(["memory", "session-backfill", "--apply", "--json"])).rejects.toThrow(
-      "The selected Gateway is no longer running",
-    );
-    expect(fixture.executeBatch).toHaveBeenCalledTimes(1);
+    } finally {
+      finish.resolve();
+    }
+    if (family !== "matrix") {
+      expect(await outcome).toMatchObject({ code: "OUTCOME_UNKNOWN" });
+      expect(output).not.toHaveBeenCalled();
+    } else {
+      await outcome;
+      expect(process.exitCode).toBe(1);
+      expect(output.mock.calls.at(-1)?.[0]).toContain("No local fallback was attempted");
+      expect(output.mock.calls.flat().join("")).not.toContain("synthetic-key-must-not-escape");
+    }
     expect(fixture.memory).not.toHaveBeenCalled();
-    expect(fs.existsSync(resolveGatewayLockPaths(process.env).ownerLockPath)).toBe(false);
-  });
+  },
+);
 
-  it("routes configured memory search and options without local database credentials", async () => {
-    await occupyState();
-    vi.stubEnv("MISSING_ROUTED_CLI_DATABASE_DSN", undefined);
-    fs.writeFileSync(
-      path.join(root, "openclaw.json"),
-      JSON.stringify({
-        database: {
-          engine: "postgres",
-          postgres: {
-            connection: {
-              source: "env",
-              provider: "default",
-              id: "MISSING_ROUTED_CLI_DATABASE_DSN",
-            },
+it("does not continue a routed backfill locally when its Gateway stops between batches", async () => {
+  await occupyState();
+  fixture.executeBatch.mockResolvedValueOnce(backfillExecution(true));
+  fixture.callGateway.mockImplementationOnce(async (options) => {
+    const reply = await dispatchToGateway(options);
+    await owner?.release();
+    owner = null;
+    return reply;
+  });
+  await expect(runCli("memory", "session-backfill", "--apply", "--json")).rejects.toThrow(
+    "The selected Gateway is no longer running",
+  );
+  expect(fixture.executeBatch).toHaveBeenCalledTimes(1);
+  expect(fixture.memory).not.toHaveBeenCalled();
+  expect(fs.existsSync(resolveGatewayLockPaths(process.env).ownerLockPath)).toBe(false);
+});
+
+it("routes configured memory search and options without local database credentials", async () => {
+  await occupyState();
+  vi.stubEnv("MISSING_ROUTED_CLI_DATABASE_DSN", undefined);
+  fs.writeFileSync(
+    path.join(root, "openclaw.json"),
+    JSON.stringify({
+      database: {
+        engine: "postgres",
+        postgres: {
+          connection: {
+            source: "env",
+            provider: "default",
+            id: "MISSING_ROUTED_CLI_DATABASE_DSN",
           },
         },
-      }),
-    );
-    const hits = [
-      {
-        path: "memory/fact.md",
-        startLine: 1,
-        endLine: 2,
-        score: 0.8,
-        snippet: "A remembered fact",
-        source: "memory" as const,
       },
-    ];
-    fixture.search.mockResolvedValueOnce(hits);
-    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    await runCli([
-      "memory",
-      "search",
-      " exact query ",
-      "--agent",
-      "main",
-      "--max-results",
-      "75",
-      "--min-score",
-      "-0.25",
-      "--json",
-    ]);
-    expect(JSON.parse(String(output.mock.calls.at(-1)?.[0]))).toEqual({ results: hits });
-    expect(fixture.callGateway).toHaveBeenCalledWith(
-      expect.objectContaining({
-        method: "memory.search.owner",
-        requiredMethods: ["memory.search.owner"],
-        params: {
-          query: " exact query ",
-          agentId: "main",
-          maxResults: 75,
-          minScore: -0.25,
-          expectedOwnerId: ownerId,
-        },
-      }),
-    );
-    expect(fixture.search).toHaveBeenCalledWith(
-      " exact query ",
-      expect.objectContaining({ maxResults: 75, minScore: -0.25 }),
-    );
-    expect(fixture.searchClose).toHaveBeenCalledTimes(1);
-    expect(fixture.memory).not.toHaveBeenCalled();
-  });
+    }),
+  );
+  const hits = [
+    {
+      path: "memory/fact.md",
+      startLine: 1,
+      endLine: 2,
+      score: 0.8,
+      snippet: "A remembered fact",
+      source: "memory" as const,
+    },
+  ];
+  fixture.search.mockResolvedValueOnce(hits);
+  const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  await runCli(
+    "memory",
+    "search",
+    " exact query ",
+    "--agent",
+    "main",
+    "--max-results",
+    "75",
+    "--min-score",
+    "-0.25",
+    "--json",
+  );
+  expect(JSON.parse(String(output.mock.calls.at(-1)?.[0]))).toEqual({ results: hits });
+  expect(fixture.callGateway).toHaveBeenCalledWith(
+    expect.objectContaining({
+      method: "memory.search.owner",
+      requiredMethods: ["memory.search.owner"],
+      params: {
+        query: " exact query ",
+        agentId: "main",
+        maxResults: 75,
+        minScore: -0.25,
+        expectedOwnerId: ownerId,
+      },
+    }),
+  );
+  expect(fixture.search).toHaveBeenCalledWith(
+    " exact query ",
+    expect.objectContaining({ maxResults: 75, minScore: -0.25 }),
+  );
+  expect(fixture.searchClose).toHaveBeenCalledTimes(1);
+  expect(fixture.memory).not.toHaveBeenCalled();
 });

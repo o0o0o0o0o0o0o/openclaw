@@ -225,7 +225,7 @@ describe("cron ownership access matrix", () => {
             const { respond } = await updateAs(caller, { id: seeded.id, patch }, context);
             const [responseOk, , error] = respond.mock.calls[0] ?? [];
             ok = responseOk === true;
-            message = String(error?.message ?? "");
+            message = error?.message ?? "";
           } catch (err) {
             violations.push(`${cell}: handler threw ${String(err)}`);
           } finally {

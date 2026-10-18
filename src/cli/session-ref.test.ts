@@ -34,6 +34,25 @@ function gatewayTransportError(params: {
   });
 }
 
+function errorText(run: () => unknown): string {
+  try {
+    run();
+  } catch (error) {
+    return String(error);
+  }
+  throw new Error("Expected invocation to throw");
+}
+
+const remote = "gateway.example/main/a1166b81";
+const resolveRemote = () => resolveSessionTarget({ raw: remote });
+function requestError(message: string, code?: string) {
+  return new GatewayClientRequestError({
+    code: "INVALID_REQUEST",
+    message,
+    ...(code ? { details: { code } } : {}),
+  });
+}
+
 describe("session target parsing", () => {
   beforeEach(() => {
     callGatewayMock.mockReset();
@@ -77,28 +96,22 @@ describe("session target parsing", () => {
 
   it("rejects credentials without echoing them", () => {
     const secret = "do-not-print-me";
-    let error: unknown;
-    try {
+    const error = errorText(() =>
       parseSessionTargetInput(
         `https://user:${secret}@gateway.example/dashboard/main/movies-a1166b81`,
-      );
-    } catch (caught) {
-      error = caught;
-    }
-    expect(String(error)).toContain("must not contain credentials");
-    expect(String(error)).not.toContain(secret);
+      ),
+    );
+    expect(error).toContain("must not contain credentials");
+    expect(error).not.toContain(secret);
   });
 
   it("rejects credential query and fragment parameters without echoing them", () => {
     for (const suffix of ["?token=do-not-print-me", "#password=do-not-print-me"]) {
-      let error: unknown;
-      try {
-        parseSessionTargetInput(`https://gateway.example/dashboard/main/movies-a1166b81${suffix}`);
-      } catch (caught) {
-        error = caught;
-      }
-      expect(String(error)).toContain("must not contain credentials");
-      expect(String(error)).not.toContain("do-not-print-me");
+      const error = errorText(() =>
+        parseSessionTargetInput(`https://gateway.example/dashboard/main/movies-a1166b81${suffix}`),
+      );
+      expect(error).toContain("must not contain credentials");
+      expect(error).not.toContain("do-not-print-me");
     }
   });
 
@@ -111,93 +124,67 @@ describe("session target parsing", () => {
 
 describe("bare-root session URL options", () => {
   const target = "https://gateway.example/dashboard/main/movies-a1166b81";
-  const argv = (...args: string[]) => ["node", "openclaw", ...args];
+  const parse = (...args: string[]) => parseBareSessionInvocation(["node", "openclaw", ...args]);
 
-  it.each([["--message", "message", "https://example.com/article"]] as const)(
-    "parses %s (%s=%s) before and after the URL",
-    (flag, key, value) => {
-      for (const args of [
-        [flag, value, target],
-        [`${flag}=${value}`, target],
-        [target, flag, value],
-        [target, `${flag}=${value}`],
-      ]) {
-        expect(parseBareSessionInvocation(argv(...args))).toEqual({
-          target,
-          options: { [key]: value },
-        });
-      }
-    },
-  );
+  it("parses --message before and after the URL, split or inline", () => {
+    const value = "https://example.com/article";
+    for (const args of [
+      ["--message", value, target],
+      [`--message=${value}`, target],
+      [target, "--message", value],
+      [target, `--message=${value}`],
+    ]) {
+      expect(parse(...args)).toEqual({ target, options: { message: value } });
+    }
+  });
 
   it("parses boolean options on either side and preserves root globals", () => {
     expect(
-      parseBareSessionInvocation(
-        argv(
-          "--no-color",
-          "--profile",
-          "work",
-          "--deliver",
-          target,
-          "--log-level=debug",
-          "--token=direct-token",
-        ),
+      parse(
+        "--no-color",
+        "--profile",
+        "work",
+        "--deliver",
+        target,
+        "--log-level=debug",
+        "--token=direct-token",
       ),
     ).toEqual({ target, options: { deliver: true, token: "direct-token" } });
-    expect(parseBareSessionInvocation(argv(target, "--deliver"))).toEqual({
+    expect(parse(target, "--deliver")).toEqual({
       target,
       options: { deliver: true },
     });
   });
 
-  it.each([["host shorthand", ["gateway.example/main/a1166b81"]]])(
-    "does not claim %s",
-    (_label, args) => {
-      expect(parseBareSessionInvocation(argv(...args))).toBeNull();
-    },
-  );
+  it("does not claim host shorthand", () => {
+    expect(parse("gateway.example/main/a1166b81")).toBeNull();
+  });
 
-  it.each(["unowned-command"])(
-    "leaves an explicit %s command's URL argument to its owner",
-    (command) => {
-      expect(parseBareSessionInvocation(argv(command, target))).toBeNull();
-    },
-  );
+  it("leaves an explicit command's URL argument to its owner", () => {
+    expect(parse("unowned-command", target)).toBeNull();
+  });
 
   it.each([
     ["split before", ["--token", target]],
     ["split after", [target, "--token"]],
   ])("rejects a missing value %s", (_label, args) => {
-    expect(() => parseBareSessionInvocation(argv(...args))).toThrow("--token requires a value");
+    expect(() => parse(...args)).toThrow("--token requires a value");
   });
 
-  it.each([["inline after", [target, "--typo=do-not-print-me"]]])(
-    "rejects an unknown option %s without reflecting its value",
-    (_label, args) => {
-      let error: unknown;
-      try {
-        parseBareSessionInvocation(argv(...args));
-      } catch (caught) {
-        error = caught;
-      }
-      expect(String(error)).toContain("Unsupported bare session URL option: --typo");
-      expect(String(error)).not.toContain("do-not-print-me");
-    },
-  );
+  it("rejects an inline unknown option without reflecting its value", () => {
+    const error = errorText(() => parse(target, "--typo=do-not-print-me"));
+    expect(error).toContain("Unsupported bare session URL option: --typo");
+    expect(error).not.toContain("do-not-print-me");
+  });
 
   it.each([
     ["terminator after", [target, "--"], "Unsupported bare session URL option: --"],
     ["extra after", [target, "do-not-print-me"], "Unexpected extra argument"],
   ])("rejects %s without reflecting extra values", (_label, args, expected) => {
-    let error: unknown;
-    try {
-      parseBareSessionInvocation(argv(...args));
-    } catch (caught) {
-      error = caught;
-    }
-    expect(String(error)).toContain(expected);
-    expect(String(error)).not.toContain("do-not-print-me");
-    expect(String(error)).not.toContain("secret.example");
+    const error = errorText(() => parse(...args));
+    expect(error).toContain(expected);
+    expect(error).not.toContain("do-not-print-me");
+    expect(error).not.toContain("secret.example");
   });
 });
 
@@ -303,10 +290,7 @@ describe("session target resolution", () => {
 
   it("reports old gateways without falling back to sessions.list", async () => {
     callGatewayMock.mockRejectedValue(
-      new GatewayClientRequestError({
-        code: "INVALID_REQUEST",
-        message: "invalid sessions.resolve params: at root: unexpected property 'shortId'",
-      }),
+      requestError("invalid sessions.resolve params: at root: unexpected property 'shortId'"),
     );
 
     await expect(
@@ -321,16 +305,11 @@ describe("session target resolution", () => {
   });
 
   it("sends remote not-found recovery to the target Control UI, not the local session store", async () => {
-    callGatewayMock.mockRejectedValue(
-      new GatewayClientRequestError({
-        code: "INVALID_REQUEST",
-        message: "No session found: a1166b81",
-      }),
-    );
+    callGatewayMock.mockRejectedValue(requestError("No session found: a1166b81"));
 
     let error: unknown;
     try {
-      await resolveSessionTarget({ raw: "gateway.example/main/a1166b81" });
+      await resolveRemote();
     } catch (caught) {
       error = caught;
     }
@@ -339,25 +318,13 @@ describe("session target resolution", () => {
   });
 
   it("turns structured pairing and revoked-token failures into actions", async () => {
-    callGatewayMock.mockRejectedValueOnce(
-      new GatewayClientRequestError({
-        code: "INVALID_REQUEST",
-        message: "connect failed",
-        details: { code: "PAIRING_REQUIRED" },
-      }),
-    );
-    await expect(resolveSessionTarget({ raw: "gateway.example/main/a1166b81" })).rejects.toThrow(
-      "openclaw devices approve --latest",
-    );
+    callGatewayMock.mockRejectedValueOnce(requestError("connect failed", "PAIRING_REQUIRED"));
+    await expect(resolveRemote()).rejects.toThrow("openclaw devices approve --latest");
 
     callGatewayMock.mockRejectedValueOnce(
-      new GatewayClientRequestError({
-        code: "INVALID_REQUEST",
-        message: "connect failed",
-        details: { code: "AUTH_DEVICE_TOKEN_MISMATCH" },
-      }),
+      requestError("connect failed", "AUTH_DEVICE_TOKEN_MISMATCH"),
     );
-    await expect(resolveSessionTarget({ raw: "gateway.example/main/a1166b81" })).rejects.toThrow(
+    await expect(resolveRemote()).rejects.toThrow(
       "openclaw devices rotate --device <deviceId> --role operator",
     );
   });
@@ -367,21 +334,16 @@ describe("session target resolution", () => {
       new GatewayStoredDeviceAuthUnavailableError("No stored device auth"),
     );
 
-    await expect(resolveSessionTarget({ raw: "gateway.example/main/a1166b81" })).rejects.toThrow(
-      "Pass --token or --password once",
-    );
+    await expect(resolveRemote()).rejects.toThrow("Pass --token or --password once");
   });
 
-  it.each([
-    {
-      code: "ENOTFOUND",
-      target: "gateway.example/main/a1166b81",
-      expected: /Could not reach gateway wss:\/\/gateway\.example[\s\S]*tailnet or SSH tunnel/u,
-    },
-  ])("names unreachable origins for $code", async ({ code, target, expected }) => {
-    callGatewayMock.mockRejectedValue(Object.assign(new Error(`connect ${code}`), { code }));
-
-    await expect(resolveSessionTarget({ raw: target })).rejects.toThrow(expected);
+  it("names unreachable origins for ENOTFOUND", async () => {
+    callGatewayMock.mockRejectedValue(
+      Object.assign(new Error("connect ENOTFOUND"), { code: "ENOTFOUND" }),
+    );
+    await expect(resolveRemote()).rejects.toThrow(
+      /Could not reach gateway wss:\/\/gateway\.example[\s\S]*tailnet or SSH tunnel/u,
+    );
   });
 
   it("uses transport connection details for configured-remote bare refs", async () => {
@@ -398,10 +360,7 @@ describe("session target resolution", () => {
         raw: "a1166b81",
         gateway: {
           config: {
-            gateway: {
-              mode: "remote",
-              remote: { url: "wss://claw.example.ts.net/base" },
-            },
+            gateway: { mode: "remote", remote: { url: "wss://claw.example.ts.net/base" } },
           },
         },
       }),
@@ -418,8 +377,6 @@ describe("session target resolution", () => {
     });
     callGatewayMock.mockRejectedValue(mismatch);
 
-    await expect(resolveSessionTarget({ raw: "gateway.example/main/a1166b81" })).rejects.toBe(
-      mismatch,
-    );
+    await expect(resolveRemote()).rejects.toBe(mismatch);
   });
 });

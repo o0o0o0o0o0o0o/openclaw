@@ -1,6 +1,5 @@
 import "../test-utils/prepare-compiled-subprocesses.js";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -69,11 +68,16 @@ vi.mock("@clack/prompts", async (importOriginal) => {
   };
 });
 
-function createProgram(): Command {
-  const program = new Command();
-  program.exitOverride();
+function run(...args: string[]) {
+  const program = new Command().exitOverride();
   registerSecretsCli(program);
-  return program;
+  return program.parseAsync(["secrets", "store", ...args], { from: "user" });
+}
+
+async function inputFile(value: string) {
+  const file = path.join(tempDirs.make("store-cli-"), "input");
+  await fs.writeFile(file, value);
+  return file;
 }
 
 beforeEach(() => {
@@ -88,30 +92,25 @@ beforeEach(() => {
   mocks.purge.mockReset();
   mocks.gatewayIdentity.mockReset().mockResolvedValue(undefined);
   mocks.confirm.mockReset().mockResolvedValue(true);
-  mocks.defaultRuntime.log.mockClear();
-  mocks.defaultRuntime.error.mockClear();
-  mocks.defaultRuntime.writeStdout.mockClear();
-  mocks.defaultRuntime.writeJson.mockClear();
-  mocks.defaultRuntime.exit.mockClear();
+  for (const mock of Object.values(mocks.defaultRuntime)) {
+    mock.mockClear();
+  }
 });
 
 describe("secrets store CLI", () => {
   it.each(["set", "import"])(
     "preserves an existing credential during a redacted %s round-trip",
     async (command) => {
-      const file = path.join(tempDirs.make("store-cli-redacted-"), "input");
-      await fs.writeFile(
-        file,
+      const file = await inputFile(
         command === "set"
           ? "__OPENCLAW_REDACTED__"
           : "OPENCLAW_GATEWAY_TOKEN=__OPENCLAW_REDACTED__\n",
       );
       mocks.read.mockResolvedValue({ ok: true, value: "synthetic-existing-token" });
-      await createProgram().parseAsync(
-        command === "set"
-          ? ["secrets", "store", "set", "OPENCLAW_GATEWAY_TOKEN", "--value-file", file]
-          : ["secrets", "store", "import", "--from", file, "--yes"],
-        { from: "user" },
+      await run(
+        ...(command === "set"
+          ? ["set", "OPENCLAW_GATEWAY_TOKEN", "--value-file", file]
+          : ["import", "--from", file, "--yes"]),
       );
       expect(mocks.write).not.toHaveBeenCalled();
       expect(mocks.writeBatch).not.toHaveBeenCalled();
@@ -123,14 +122,11 @@ describe("secrets store CLI", () => {
   );
 
   it("refuses a redacted import without a usable existing credential before writing other entries", async () => {
-    const file = path.join(tempDirs.make("store-cli-redacted-"), "input.env");
-    await fs.writeFile(file, "SERVICE_MODE=test\nOPENCLAW_GATEWAY_TOKEN=__OPENCLAW_REDACTED__\n");
+    const file = await inputFile(
+      "SERVICE_MODE=test\nOPENCLAW_GATEWAY_TOKEN=__OPENCLAW_REDACTED__\n",
+    );
     mocks.read.mockResolvedValue({ ok: false, error: { code: "SECRET_STORE_NOT_FOUND" } });
-    await expect(
-      createProgram().parseAsync(["secrets", "store", "import", "--from", file, "--yes"], {
-        from: "user",
-      }),
-    ).rejects.toThrow("__exit__:2");
+    await expect(run("import", "--from", file, "--yes")).rejects.toThrow("__exit__:2");
     expect(mocks.write).not.toHaveBeenCalled();
     expect(mocks.writeBatch).not.toHaveBeenCalled();
     expect(mocks.runtimeErrors.join("\n")).toContain("OPENCLAW_GATEWAY_TOKEN");
@@ -139,13 +135,11 @@ describe("secrets store CLI", () => {
     mocks.list.mockReturnValueOnce([
       { name: "SERVICE_MODE", kind: "env", valuePreview: "production" },
     ]);
-    await createProgram().parseAsync(["secrets", "store", "list", "--json"], { from: "user" });
+    await run("list", "--json");
 
     mocks.list.mockReturnValueOnce([{ name: "SERVICE_MODE", kind: "env" }]);
     mocks.read.mockResolvedValueOnce({ ok: true, value: "production" });
-    await createProgram().parseAsync(["secrets", "store", "get", "SERVICE_MODE", "--json"], {
-      from: "user",
-    });
+    await run("get", "SERVICE_MODE", "--json");
 
     expect(mocks.defaultRuntime.writeJson).toHaveBeenCalledTimes(2);
     expect(mocks.runtimeLogs).toHaveLength(2);
@@ -169,7 +163,7 @@ describe("secrets store CLI", () => {
       },
     ]);
 
-    await createProgram().parseAsync(["secrets", "store", "list"], { from: "user" });
+    await run("list");
 
     expect(mocks.runtimeLogs.join("\n")).toContain(
       "allowed hosts: api.example.com, uploads.example.com",
@@ -178,10 +172,7 @@ describe("secrets store CLI", () => {
 
   it("refuses --value for secret entries with all safe alternatives and exit 2", async () => {
     await expect(
-      createProgram().parseAsync(
-        ["secrets", "store", "set", "SERVICE_API_KEY", "--kind", "secret", "--value", "leaked"],
-        { from: "user" },
-      ),
+      run("set", "SERVICE_API_KEY", "--kind", "secret", "--value", "leaked"),
     ).rejects.toThrow("__exit__:2");
 
     expect(mocks.runtimeErrors.join("\n")).toContain("stdin pipe");
@@ -191,63 +182,37 @@ describe("secrets store CLI", () => {
   });
 
   it("reports an oversized --value-file as validation (exit 2), matching the stdin path", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "secret-store-cli-oversize-"));
-    const file = path.join(dir, "too-big.txt");
-    await fs.writeFile(file, "a".repeat(64 * 1024 + 1), "utf8");
-    try {
-      // Same violation as an oversized stdin value, so it must share exit code 2
-      // rather than falling through to the generic runtime-failure code.
-      await expect(
-        createProgram().parseAsync(
-          ["secrets", "store", "set", "BIG_ENV_VALUE", "--kind", "env", "--value-file", file],
-          { from: "user" },
-        ),
-      ).rejects.toThrow("__exit__:2");
-      expect(mocks.write).not.toHaveBeenCalled();
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+    const file = await inputFile("a".repeat(64 * 1024 + 1));
+    await expect(
+      run("set", "BIG_ENV_VALUE", "--kind", "env", "--value-file", file),
+    ).rejects.toThrow("__exit__:2");
+    expect(mocks.write).not.toHaveBeenCalled();
   });
 
   it.each(["secret", "env"])("validates an empty %s value during set dry-run", async (kind) => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-store-empty-"));
-    const valueFile = path.join(root, "empty.txt");
-    await fs.writeFile(valueFile, "");
-    try {
-      const command = createProgram().parseAsync(
-        [
-          "secrets",
-          "store",
-          "set",
-          "SERVICE_VALUE",
-          "--kind",
-          kind,
-          "--value-file",
-          valueFile,
-          "--dry-run",
-        ],
-        { from: "user" },
-      );
-      if (kind === "secret") {
-        await expect(command).rejects.toThrow("__exit__:2");
-        expect(mocks.runtimeErrors.join("\n")).toContain("Secret store value is empty");
-      } else {
-        await command;
-        expect(mocks.runtimeLogs.join("\n")).toContain("Would set SERVICE_VALUE (env)");
-      }
-      expect(mocks.write).not.toHaveBeenCalled();
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
+    const valueFile = await inputFile("");
+    const command = run(
+      "set",
+      "SERVICE_VALUE",
+      "--kind",
+      kind,
+      "--value-file",
+      valueFile,
+      "--dry-run",
+    );
+    if (kind === "secret") {
+      await expect(command).rejects.toThrow("__exit__:2");
+      expect(mocks.runtimeErrors.join("\n")).toContain("Secret store value is empty");
+    } else {
+      await command;
+      expect(mocks.runtimeLogs.join("\n")).toContain("Would set SERVICE_VALUE (env)");
     }
+    expect(mocks.write).not.toHaveBeenCalled();
   });
 
   it("refuses get for secret entries without reading their values", async () => {
     mocks.list.mockReturnValue([{ name: "SERVICE_API_KEY", kind: "secret" }]);
-    await expect(
-      createProgram().parseAsync(["secrets", "store", "get", "SERVICE_API_KEY"], {
-        from: "user",
-      }),
-    ).rejects.toThrow("__exit__:2");
+    await expect(run("get", "SERVICE_API_KEY")).rejects.toThrow("__exit__:2");
 
     expect(mocks.runtimeErrors.join("\n")).toContain("write-only by design");
     expect(mocks.read).not.toHaveBeenCalled();
@@ -256,52 +221,37 @@ describe("secrets store CLI", () => {
   it("normalizes repeatable allowed hosts and can clear them without replacing the secret", async () => {
     mocks.list.mockReturnValue([{ name: "MISC_VALUE", kind: "secret" }]);
 
-    await createProgram().parseAsync(
-      [
-        "secrets",
-        "store",
-        "set",
-        "MISC_VALUE",
-        "--allow-host",
-        "API.EXAMPLE.COM",
-        "--allow-host",
-        "bücher.example",
-      ],
-      { from: "user" },
+    await run(
+      "set",
+      "MISC_VALUE",
+      "--allow-host",
+      "API.EXAMPLE.COM",
+      "--allow-host",
+      "bücher.example",
     );
-    await createProgram().parseAsync(
-      ["secrets", "store", "set", "MISC_VALUE", "--clear-allowed-hosts"],
-      { from: "user" },
-    );
+    await run("set", "MISC_VALUE", "--clear-allowed-hosts");
 
-    expect(mocks.updateHosts).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        scope: { kind: "team" },
-        name: "MISC_VALUE",
-        allowedHosts: ["api.example.com", "xn--bcher-kva.example"],
-        updatedBy: "cli",
-      }),
-    );
-    expect(mocks.updateHosts).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        scope: { kind: "team" },
-        name: "MISC_VALUE",
-        allowedHosts: [],
-        updatedBy: "cli",
-      }),
-    );
+    for (const [index, allowedHosts] of [
+      ["api.example.com", "xn--bcher-kva.example"],
+      [],
+    ].entries()) {
+      expect(mocks.updateHosts).toHaveBeenNthCalledWith(
+        index + 1,
+        expect.objectContaining({
+          scope: { kind: "team" },
+          name: "MISC_VALUE",
+          allowedHosts,
+          updatedBy: "cli",
+        }),
+      );
+    }
     expect(mocks.write).not.toHaveBeenCalled();
   });
 
   it("rejects wildcard allowed hosts before reading or writing a value", async () => {
-    await expect(
-      createProgram().parseAsync(
-        ["secrets", "store", "set", "SERVICE_API_KEY", "--allow-host", "*.example.com"],
-        { from: "user" },
-      ),
-    ).rejects.toThrow("__exit__:2");
+    await expect(run("set", "SERVICE_API_KEY", "--allow-host", "*.example.com")).rejects.toThrow(
+      "__exit__:2",
+    );
 
     expect(mocks.runtimeErrors.join("\n")).toContain("cannot contain a wildcard");
     expect(mocks.write).not.toHaveBeenCalled();
@@ -312,7 +262,7 @@ describe("secrets store CLI", () => {
     {
       name: "missing get",
       prepare: () => mocks.list.mockReturnValueOnce([]),
-      args: ["secrets", "store", "get", "MISSING_VALUE", "--json"],
+      args: ["get", "MISSING_VALUE", "--json"],
       exitCode: 3,
       message: 'Secret store entry "MISSING_VALUE" was not found.',
     },
@@ -322,16 +272,14 @@ describe("secrets store CLI", () => {
         mocks.list.mockImplementationOnce(() => {
           throw new Error("database unavailable");
         }),
-      args: ["secrets", "store", "list", "--json"],
+      args: ["list", "--json"],
       exitCode: 1,
       message: "database unavailable",
     },
   ])("writes one JSON failure for $name", async (testCase) => {
     testCase.prepare();
 
-    await expect(createProgram().parseAsync(testCase.args, { from: "user" })).rejects.toThrow(
-      `__exit__:${testCase.exitCode}`,
-    );
+    await expect(run(...testCase.args)).rejects.toThrow(`__exit__:${testCase.exitCode}`);
 
     expect(mocks.defaultRuntime.writeJson).toHaveBeenCalledTimes(1);
     expect(mocks.runtimeLogs).toHaveLength(1);
@@ -343,22 +291,15 @@ describe("secrets store CLI", () => {
   });
 
   it("keeps rm idempotent when entries are already missing", async () => {
-    await createProgram().parseAsync(["secrets", "store", "rm", "MISSING_VALUE", "--yes"], {
-      from: "user",
-    });
-    await createProgram().parseAsync(["secrets", "store", "rm", "MISSING_VALUE", "--yes"], {
-      from: "user",
-    });
+    await run("rm", "MISSING_VALUE", "--yes");
+    await run("rm", "MISSING_VALUE", "--yes");
 
     expect(mocks.remove).toHaveBeenCalledTimes(2);
     expect(mocks.runtimeErrors).toEqual([]);
   });
 
   it("imports quoted and multiline dotenv values without exposing them", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-store-import-"));
-    const dotenvPath = path.join(root, "values.env");
-    await fs.writeFile(
-      dotenvPath,
+    const dotenvPath = await inputFile(
       [
         'SERVICE_URL="https://service.test/path with spaces"',
         'SERVICE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----',
@@ -366,35 +307,21 @@ describe("secrets store CLI", () => {
         '-----END PRIVATE KEY-----"',
         "SERVICE_EMPTY=",
       ].join("\n"),
-      "utf8",
     );
-    try {
-      await createProgram().parseAsync(
-        ["secrets", "store", "import", "--from", dotenvPath, "--yes"],
-        { from: "user" },
-      );
-    } finally {
-      await fs.rm(root, { recursive: true, force: true });
-    }
+    await run("import", "--from", dotenvPath, "--yes");
 
     expect(mocks.writeBatch).toHaveBeenCalledTimes(1);
-    expect(mocks.writeBatch.mock.calls[0]?.[0]?.entries).toEqual([
-      {
-        name: "SERVICE_URL",
-        value: "https://service.test/path with spaces",
-        kind: "env",
-      },
-      {
-        name: "SERVICE_PRIVATE_KEY",
-        value: "-----BEGIN PRIVATE KEY-----\nmultiline-body\n-----END PRIVATE KEY-----",
-        kind: "secret",
-      },
-      {
-        name: "SERVICE_EMPTY",
-        value: "",
-        kind: "env",
-      },
-    ]);
+    expect(mocks.writeBatch.mock.calls[0]?.[0]?.entries).toEqual(
+      [
+        ["SERVICE_URL", "https://service.test/path with spaces", "env"],
+        [
+          "SERVICE_PRIVATE_KEY",
+          "-----BEGIN PRIVATE KEY-----\nmultiline-body\n-----END PRIVATE KEY-----",
+          "secret",
+        ],
+        ["SERVICE_EMPTY", "", "env"],
+      ].map(([name, value, kind]) => ({ name, value, kind })),
+    );
     const output = [...mocks.runtimeLogs, ...mocks.runtimeErrors].join("\n");
     expect(output).not.toContain("multiline-body");
   });

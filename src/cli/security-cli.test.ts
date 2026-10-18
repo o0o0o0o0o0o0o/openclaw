@@ -1,4 +1,3 @@
-// Security CLI tests cover security command registration and diagnostics output.
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerSecurityCli } from "./security-cli.js";
@@ -55,11 +54,10 @@ vi.mock("./command-secret-targets.js", () => ({
   getSecurityAuditCommandSecretTargetIds: () => mocks.getSecurityAuditCommandSecretTargetIds(),
 }));
 
-function createProgram() {
-  const program = new Command();
-  program.exitOverride();
+function run(...args: string[]) {
+  const program = new Command().exitOverride();
   registerSecurityCli(program);
-  return program;
+  return program.parseAsync(["security", "audit", ...args], { from: "user" });
 }
 
 function primeDeepAuditConfig(sourceConfig = { gateway: { mode: "local" } }) {
@@ -79,13 +77,11 @@ function primeDeepAuditConfig(sourceConfig = { gateway: { mode: "local" } }) {
 }
 
 function lastSecretResolverOptions(): Record<string, unknown> | undefined {
-  const calls = resolveCommandSecretRefsViaGateway.mock.calls;
-  return calls[calls.length - 1]?.[0] as Record<string, unknown> | undefined;
+  return resolveCommandSecretRefsViaGateway.mock.lastCall?.[0];
 }
 
 function lastSecurityAuditOptions(): Record<string, unknown> | undefined {
-  const calls = runSecurityAuditCore.mock.calls;
-  return calls[calls.length - 1]?.[0] as Record<string, unknown> | undefined;
+  return runSecurityAuditCore.mock.lastCall?.[0];
 }
 
 describe("security CLI", () => {
@@ -96,11 +92,7 @@ describe("security CLI", () => {
     fixSecurityFootguns.mockReset();
     resolveCommandSecretRefsViaGateway.mockReset();
     getSecurityAuditCommandSecretTargetIds.mockClear();
-    fixSecurityFootguns.mockResolvedValue({
-      changes: [],
-      actions: [],
-      errors: [],
-    });
+    fixSecurityFootguns.mockResolvedValue({ changes: [], actions: [], errors: [] });
   });
 
   it("runs audit with read-only SecretRef resolution and prints JSON diagnostics", async () => {
@@ -111,61 +103,42 @@ describe("security CLI", () => {
           token: { source: "env", provider: "default", id: "OPENCLAW_GATEWAY_TOKEN" },
         },
       },
-      secrets: {
-        providers: {
-          default: { source: "env" },
-        },
-      },
+      secrets: { providers: { default: { source: "env" } } },
     };
     const resolvedConfig = {
       ...sourceConfig,
-      gateway: {
-        ...sourceConfig.gateway,
-        auth: {
-          ...sourceConfig.gateway.auth,
-          token: "resolved-token",
-        },
-      },
+      gateway: { auth: { ...sourceConfig.gateway.auth, token: "resolved-token" } },
     };
+    const diagnostic =
+      "security audit: gateway secrets.resolve unavailable (gateway closed); resolved command secrets locally.";
+    primeDeepAuditConfig();
     loadConfig.mockReturnValue(sourceConfig);
     resolveCommandSecretRefsViaGateway.mockResolvedValue({
       resolvedConfig,
-      diagnostics: [
-        "security audit: gateway secrets.resolve unavailable (gateway closed); resolved command secrets locally.",
-      ],
+      diagnostics: [diagnostic],
       targetStatesByPath: {},
       hadUnresolvedTargets: false,
     });
-    runSecurityAuditCore.mockResolvedValue({
-      ts: 0,
-      summary: { critical: 0, warn: 1, info: 0 },
-      findings: [
-        {
-          checkId: "gateway.probe_failed",
-          severity: "warn",
-          title: "Gateway check failed (deep)",
-          detail: "connect failed: connect ECONNREFUSED 127.0.0.1:18789",
-        },
-      ],
-    });
 
-    await createProgram().parseAsync(["security", "audit", "--json"], { from: "user" });
+    await run("--json");
 
     const resolverOptions = lastSecretResolverOptions();
     expect(resolverOptions?.config).toBe(sourceConfig);
-    expect(resolverOptions?.commandName).toBe("security audit");
-    expect(resolverOptions?.mode).toBe("read_only_status");
-    expect(resolverOptions?.targetIds).toBeInstanceOf(Set);
+    expect(resolverOptions).toMatchObject({
+      commandName: "security audit",
+      mode: "read_only_status",
+      targetIds: expect.any(Set),
+    });
     const auditOptions = lastSecurityAuditOptions();
     expect(auditOptions?.config).toBe(resolvedConfig);
     expect(auditOptions?.sourceConfig).toBe(sourceConfig);
-    expect(auditOptions?.deep).toBe(false);
-    expect(auditOptions?.includeFilesystem).toBe(true);
-    expect(auditOptions?.includeChannelSecurity).toBe(true);
+    expect(auditOptions).toMatchObject({
+      deep: false,
+      includeFilesystem: true,
+      includeChannelSecurity: true,
+    });
     const payload = JSON.parse(String(runtimeLogs.at(-1)));
-    expect(payload.secretDiagnostics).toEqual([
-      "security audit: gateway secrets.resolve unavailable (gateway closed); resolved command secrets locally.",
-    ]);
+    expect(payload.secretDiagnostics).toEqual([diagnostic]);
   });
 
   it("reports an unexpected fixer failure instead of emitting a successful JSON audit", async () => {
@@ -173,70 +146,48 @@ describe("security CLI", () => {
     const failure = new Error("Fixture repair failed");
     fixSecurityFootguns.mockRejectedValueOnce(failure);
 
-    await expect(
-      createProgram().parseAsync(["security", "audit", "--fix", "--json"], { from: "user" }),
-    ).rejects.toBe(failure);
+    await expect(run("--fix", "--json")).rejects.toBe(failure);
     expect(runtimeLogs).toEqual([]);
   });
 
   it.each([
-    {
-      title: "forwards --token to deep probe auth without altering command-level resolver mode",
-      argv: ["--token", "explicit-token"],
-      deepProbeAuth: { token: "explicit-token" },
-      auditGatewayAuthOverride: undefined,
-    },
-    {
-      title: "forwards --password to deep probe auth without altering command-level resolver mode",
-      argv: ["--password", "explicit-password"],
-      deepProbeAuth: { password: "explicit-password" },
-      auditGatewayAuthOverride: undefined,
-    },
-    {
-      title: "forwards --auth with explicit gateway password",
-      argv: ["--auth", "password", "--password", "explicit-password"],
-      deepProbeAuth: { password: "explicit-password" },
-      auditGatewayAuthOverride: { mode: "password", password: "explicit-password" },
-    },
-    {
-      title: "forwards both --token and --password to deep probe auth",
-      argv: ["--token", "explicit-token", "--password", "explicit-password"],
-      deepProbeAuth: {
-        token: "explicit-token",
-        password: "explicit-password",
-      },
-      auditGatewayAuthOverride: undefined,
-    },
-  ])("$title", async ({ argv, deepProbeAuth, auditGatewayAuthOverride }) => {
-    primeDeepAuditConfig();
-
-    await createProgram().parseAsync(["security", "audit", "--deep", ...argv, "--json"], {
-      from: "user",
-    });
-
-    expect(lastSecretResolverOptions()?.mode).toBe("read_only_status");
-    expect(lastSecurityAuditOptions()?.deep).toBe(true);
-    expect(lastSecurityAuditOptions()?.deepProbeAuth).toEqual(deepProbeAuth);
-    expect(lastSecurityAuditOptions()?.auditGatewayAuthOverride).toEqual(auditGatewayAuthOverride);
-  });
-
-  it.each([
-    {
-      argv: ["--auth", "token"],
-      message: /pass --token <token>/i,
-    },
-    {
-      argv: ["--auth", "password"],
-      message: /pass --password <password>/i,
-    },
-  ])(
-    "rejects shared-secret auth override without the matching secret",
-    async ({ argv, message }) => {
+    [["--token", "explicit-token"], { token: "explicit-token" }, undefined],
+    [["--password", "explicit-password"], { password: "explicit-password" }, undefined],
+    [
+      ["--auth", "password", "--password", "explicit-password"],
+      { password: "explicit-password" },
+      { mode: "password", password: "explicit-password" },
+    ],
+    [
+      ["--token", "explicit-token", "--password", "explicit-password"],
+      { token: "explicit-token", password: "explicit-password" },
+      undefined,
+    ],
+  ] as const)(
+    "forwards deep probe auth for %j without changing resolver mode",
+    async (argv, deepProbeAuth, auditGatewayAuthOverride) => {
       primeDeepAuditConfig();
 
-      await expect(
-        createProgram().parseAsync(["security", "audit", ...argv, "--json"], { from: "user" }),
-      ).rejects.toThrow(message);
+      await run("--deep", ...argv, "--json");
+
+      expect(lastSecretResolverOptions()?.mode).toBe("read_only_status");
+      expect(lastSecurityAuditOptions()?.deep).toBe(true);
+      expect(lastSecurityAuditOptions()?.deepProbeAuth).toEqual(deepProbeAuth);
+      expect(lastSecurityAuditOptions()?.auditGatewayAuthOverride).toEqual(
+        auditGatewayAuthOverride,
+      );
+    },
+  );
+
+  it.each([
+    ["token", /pass --token <token>/i],
+    ["password", /pass --password <password>/i],
+  ] as const)(
+    "rejects shared-secret auth override without the matching secret",
+    async (mode, message) => {
+      primeDeepAuditConfig();
+
+      await expect(run("--auth", mode, "--json")).rejects.toThrow(message);
       expect(runSecurityAuditCore).not.toHaveBeenCalled();
     },
   );

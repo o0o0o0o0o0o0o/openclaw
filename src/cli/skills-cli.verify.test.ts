@@ -1,11 +1,12 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { ClawHubSkillVerificationResponse } from "../infra/clawhub-skills.js";
 import { registerSkillsCli } from "./skills-cli.js";
 
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const mocks = vi.hoisted(() => {
   const runtimeStdout: string[] = [];
   const runtimeErrors: string[] = [];
@@ -87,13 +88,10 @@ vi.mock("../infra/clawhub-client.js", async (importOriginal) => ({
 const { ClawHubRequestError } = await import("../infra/clawhub-client.js");
 
 describe("skills verify CLI", () => {
-  let workspaceDir: string;
-
-  beforeEach(async () => {
-    workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-skill-verify-cli-"));
+  beforeEach(() => {
     mocks.runtimeStdout.length = 0;
     mocks.runtimeErrors.length = 0;
-    mocks.workspaceDir = workspaceDir;
+    mocks.workspaceDir = tempDirs.make("openclaw-skill-verify-cli-");
     mocks.verify.mockReset();
     mocks.card.mockReset();
     for (const mock of Object.values(mocks.defaultRuntime)) {
@@ -101,15 +99,30 @@ describe("skills verify CLI", () => {
     }
   });
 
-  afterEach(async () => {
-    await fs.rm(workspaceDir, { recursive: true, force: true });
-  });
-
-  async function runCommand(argv: string[]) {
-    const program = new Command();
-    program.exitOverride();
+  async function runCommand(...argv: string[]) {
+    const program = new Command().exitOverride();
     registerSkillsCli(program);
-    await program.parseAsync(argv, { from: "user" });
+    await program.parseAsync(["skills", "verify", ...argv], { from: "user" });
+  }
+
+  function payload(): {
+    ok?: boolean;
+    openclaw?: { trust?: { state?: string; label?: string }; verifiedSourceUrl?: string };
+    artifact?: unknown;
+  } {
+    return JSON.parse(mocks.runtimeStdout.at(-1) ?? "{}");
+  }
+  function expectSuccess() {
+    expect(mocks.defaultRuntime.exit).not.toHaveBeenCalled();
+    expect(mocks.runtimeErrors).toStrictEqual([]);
+  }
+  function expectVerification(options: Record<string, unknown>) {
+    expect(mocks.verify).toHaveBeenCalledWith({
+      version: undefined,
+      tag: undefined,
+      baseUrl: "https://private.example.com/clawhub",
+      ...options,
+    });
   }
 
   function mockVerification(overrides: Partial<ClawHubSkillVerificationResponse> = {}) {
@@ -131,7 +144,7 @@ describe("skills verify CLI", () => {
   }
 
   async function writeInstalledSkill(slug: string, requestedReference?: string) {
-    const skillDir = path.join(workspaceDir, "skills", slug);
+    const skillDir = path.join(mocks.workspaceDir, "skills", slug);
     const metadata = {
       version: 1,
       registry: "https://private.example.com/clawhub",
@@ -143,9 +156,9 @@ describe("skills verify CLI", () => {
     await fs.mkdir(path.join(skillDir, ".clawhub"), { recursive: true });
     await fs.writeFile(path.join(skillDir, "SKILL.md"), `# ${slug}\n`);
     await fs.writeFile(path.join(skillDir, ".clawhub", "origin.json"), JSON.stringify(metadata));
-    await fs.mkdir(path.join(workspaceDir, ".clawhub"), { recursive: true });
+    await fs.mkdir(path.join(mocks.workspaceDir, ".clawhub"), { recursive: true });
     await fs.writeFile(
-      path.join(workspaceDir, ".clawhub", "lock.json"),
+      path.join(mocks.workspaceDir, ".clawhub", "lock.json"),
       JSON.stringify({
         version: 1,
         skills: { [slug]: { ...metadata, version: metadata.installedVersion } },
@@ -156,7 +169,6 @@ describe("skills verify CLI", () => {
 
   it("verifies an installed skills.sh skill by its exact reference without a version selector", async () => {
     const requestedReference = "skills-sh:patrick-erichsen/skills/html";
-    const trustState = "not-scanned-by-clawhub";
     await writeInstalledSkill("html", requestedReference);
     mockVerification({
       decision: "unscanned",
@@ -167,32 +179,21 @@ describe("skills verify CLI", () => {
       security: { status: "not-scanned", passed: false },
     });
 
-    await expect(runCommand(["skills", "verify", requestedReference])).rejects.toThrow(
-      "__exit__:1",
-    );
+    await expect(runCommand(requestedReference)).rejects.toThrow("__exit__:1");
 
-    expect(mocks.verify).toHaveBeenCalledWith({
-      slug: "html",
-      requestedReference,
-      version: undefined,
-      tag: undefined,
-      baseUrl: "https://private.example.com/clawhub",
-    });
-    const payload = JSON.parse(mocks.runtimeStdout.at(-1) ?? "{}") as {
-      openclaw?: { trust?: { state?: string; label?: string } };
-    };
-    expect(payload.openclaw?.trust).toEqual({
-      state: trustState,
+    expectVerification({ slug: "html", requestedReference });
+    expect(payload().openclaw?.trust).toEqual({
+      state: "not-scanned-by-clawhub",
       label: "Not scanned by ClawHub",
     });
   });
 
   it("rejects an installed skills.sh reference from another owner in JSON", async () => {
     await writeInstalledSkill("html", "skills-sh:owner-a/repo-a/html");
-    await expect(
-      runCommand(["skills", "verify", "skills-sh:owner-b/repo-b/html", "--json"]),
-    ).rejects.toThrow("__exit__:1");
-    expect(JSON.parse(mocks.runtimeStdout.at(-1) ?? "{}")).toEqual({
+    await expect(runCommand("skills-sh:owner-b/repo-b/html", "--json")).rejects.toThrow(
+      "__exit__:1",
+    );
+    expect(payload()).toEqual({
       ok: false,
       error: {
         type: "cli_error",
@@ -204,10 +205,8 @@ describe("skills verify CLI", () => {
   });
 
   it("reports workspace resolution exceptions as JSON", async () => {
-    await expect(runCommand(["skills", "verify", "weather", "--agent", " "])).rejects.toThrow(
-      "__exit__:1",
-    );
-    expect(JSON.parse(mocks.runtimeStdout.at(-1) ?? "{}")).toEqual({
+    await expect(runCommand("weather", "--agent", " ")).rejects.toThrow("__exit__:1");
+    expect(payload()).toEqual({
       ok: false,
       error: { type: "cli_error", message: "--agent must not be blank" },
     });
@@ -222,9 +221,7 @@ describe("skills verify CLI", () => {
         body: "remote-controlled not-found detail",
       }),
     );
-    await expect(
-      runCommand(["skills", "verify", "nonexistent-skill-xyz", "--card"]),
-    ).rejects.toThrow("__exit__:1");
+    await expect(runCommand("nonexistent-skill-xyz", "--card")).rejects.toThrow("__exit__:1");
     expect(mocks.runtimeStdout).toStrictEqual([]);
     expect(mocks.runtimeErrors).toStrictEqual([
       'Skill "nonexistent-skill-xyz" not found on ClawHub. Run `openclaw skills search nonexistent-skill-xyz` to find the right skill reference.',
@@ -255,26 +252,20 @@ describe("skills verify CLI", () => {
       },
     });
 
-    await runCommand(["skills", "verify", "agentreceipt", "--json"]);
+    await runCommand("agentreceipt", "--json");
 
-    expect(mocks.verify).toHaveBeenCalledWith({
-      slug: "agentreceipt",
-      version: "1.2.3",
-      tag: undefined,
-      baseUrl: "https://private.example.com/clawhub",
-    });
-    const payload = JSON.parse(mocks.runtimeStdout.at(-1) ?? "{}") as Record<string, unknown>;
-    expect(payload.ok).toBe(true);
-    expect(payload.openclaw).toMatchObject({
+    expectVerification({ slug: "agentreceipt", version: "1.2.3" });
+    const result = payload();
+    expect(result.ok).toBe(true);
+    expect(result.openclaw).toMatchObject({
       verifiedSourceUrl:
         "https://github.com/openclaw/skills/tree/0123456789abcdef0123456789abcdef01234567/agentreceipt",
     });
-    expect(payload.artifact).toEqual({
+    expect(result.artifact).toEqual({
       sourceFingerprint: "publisher-source-fingerprint-without-generated-card",
       bundleFingerprints: ["generated-bundle-fingerprint-with-skill-card"],
     });
-    expect(mocks.defaultRuntime.exit).not.toHaveBeenCalled();
-    expect(mocks.runtimeErrors).toStrictEqual([]);
+    expectSuccess();
   });
 
   it("prints cards for owner-qualified tag verification", async () => {
@@ -289,12 +280,11 @@ describe("skills verify CLI", () => {
     });
     mocks.card.mockResolvedValueOnce("# Weather\n");
 
-    await runCommand(["skills", "verify", "@demo-owner/weather", "--tag", "latest", "--card"]);
+    await runCommand("@demo-owner/weather", "--tag", "latest", "--card");
 
-    expect(mocks.verify).toHaveBeenCalledWith({
+    expectVerification({
       slug: "weather",
       ownerHandle: "demo-owner",
-      version: undefined,
       tag: "latest",
       baseUrl: "https://clawhub.ai",
     });
@@ -303,8 +293,7 @@ describe("skills verify CLI", () => {
       baseUrl: "https://clawhub.ai",
     });
     expect(mocks.runtimeStdout.at(-1)).toBe("# Weather");
-    expect(mocks.defaultRuntime.exit).not.toHaveBeenCalled();
-    expect(mocks.runtimeErrors).toStrictEqual([]);
+    expectSuccess();
   });
 
   it("does not promote unavailable provenance URLs in verify JSON", async () => {
@@ -315,13 +304,9 @@ describe("skills verify CLI", () => {
       },
     });
 
-    await runCommand(["skills", "verify", "agentreceipt"]);
+    await runCommand("agentreceipt");
 
-    const payload = JSON.parse(mocks.runtimeStdout.at(-1) ?? "{}") as {
-      openclaw?: { verifiedSourceUrl?: string };
-    };
-    expect(payload.openclaw?.verifiedSourceUrl).toBeUndefined();
-    expect(mocks.defaultRuntime.exit).not.toHaveBeenCalled();
-    expect(mocks.runtimeErrors).toStrictEqual([]);
+    expect(payload().openclaw?.verifiedSourceUrl).toBeUndefined();
+    expectSuccess();
   });
 });

@@ -119,6 +119,72 @@ export function extractAssistantDisplayText(
   return combineNonStreamingReplyParts(parts) || undefined;
 }
 
+/**
+ * Match source MEDIA positions against the final, sanitized text and prepared attachments.
+ * The source segment text may omit separators around removed MEDIA lines. Project onto
+ * the final text rather than reconstructing it, and fail closed if another transform
+ * changed the wording. Normal channel delivery stays unchanged.
+ */
+function projectOrderedAssistantMediaContent(params: {
+  segments: NonNullable<
+    NonNullable<ReturnType<typeof getReplyPayloadMetadata>>["replyMediaOutputSegments"]
+  >;
+  text: string | undefined;
+  preparedBySource: ReadonlyMap<string, readonly AssistantDisplayContentBlock[]>;
+  mediaBlocks: readonly AssistantDisplayContentBlock[];
+}): AssistantDisplayContentBlock[] | undefined {
+  const text = params.text ?? "";
+  const matchedTexts = new Map<number, string>();
+  let cursor = 0;
+  let lastTextIndex: number | undefined;
+  for (const [index, segment] of params.segments.entries()) {
+    if (segment.type !== "text") {
+      continue;
+    }
+    const source = sanitizeAssistantDisplayText(segment.text)?.trim();
+    if (!source) {
+      continue;
+    }
+    const found = text.indexOf(source, cursor);
+    if (found < 0 || text.slice(cursor, found).trim()) {
+      return undefined;
+    }
+    matchedTexts.set(index, text.slice(cursor, found + source.length));
+    cursor = found + source.length;
+    lastTextIndex = index;
+  }
+  if (text.slice(cursor).trim()) {
+    return undefined;
+  }
+  if (lastTextIndex !== undefined) {
+    matchedTexts.set(lastTextIndex, `${matchedTexts.get(lastTextIndex)}${text.slice(cursor)}`);
+  } else if (text.trim()) {
+    return undefined;
+  }
+
+  const placedBlocks = new Set<AssistantDisplayContentBlock>();
+  const ordered: AssistantDisplayContentBlock[] = [];
+  for (const [index, segment] of params.segments.entries()) {
+    if (segment.type === "text") {
+      const value = matchedTexts.get(index);
+      if (value) {
+        ordered.push({ type: "text", text: value });
+      }
+      continue;
+    }
+    const blocks = params.preparedBySource.get(normalizeMediaReferenceForComparison(segment.url));
+    for (const block of blocks ?? []) {
+      if (!placedBlocks.has(block)) {
+        ordered.push(block);
+        placedBlocks.add(block);
+      }
+    }
+  }
+  // Keep extra tool attachments, unmatched sources, and failure blocks visible.
+  ordered.push(...params.mediaBlocks.filter((block) => !placedBlocks.has(block)));
+  return ordered;
+}
+
 type AssistantReplyContentParams = {
   assertCurrent?: () => void;
   abortSignal?: AbortSignal;
@@ -250,6 +316,7 @@ export async function buildAssistantReplyContentFromInputs(
     const sourceMedia = new Map(
       collectReplyMediaEntries(payload).map((media) => [media.url.trim(), media.sourceUrls]),
     );
+    const preparedBySource = new Map<string, readonly AssistantDisplayContentBlock[]>();
     const mediaBlocks = await createManagedOutgoingMediaBlocks({
       assertCurrent: params.assertCurrent,
       abortSignal: params.abortSignal,
@@ -260,7 +327,9 @@ export async function buildAssistantReplyContentFromInputs(
       continueOnPrepareError: true,
       onPrepared: (item, blocks) => {
         for (const url of [item.url, ...(sourceMedia.get(item.url.trim()) ?? [])]) {
-          mediaBySource.set(normalizeMediaReferenceForComparison(url), blocks);
+          const key = normalizeMediaReferenceForComparison(url);
+          mediaBySource.set(key, blocks);
+          preparedBySource.set(key, blocks);
         }
       },
       onPrepareError: (error) => {
@@ -275,8 +344,40 @@ export async function buildAssistantReplyContentFromInputs(
       }
     }
     const mediaContent = [...mediaBlocks, ...mediaFailures.map(buildManagedMediaFailureBlock)];
-    content.push(...mediaContent);
-    persistedContent.push(...mediaContent);
+    const sourceMetadata = getReplyPayloadMetadata(metadataSource);
+    const segments =
+      sourceMetadata?.replyMediaOutputSegments ??
+      getReplyPayloadMetadata(payload)?.replyMediaOutputSegments;
+    const displayOrder =
+      plan.length === 1 &&
+      !statusNotice &&
+      sourceMetadata?.replyMediaSelectionChanged !== true &&
+      getReplyPayloadMetadata(payload)?.replyMediaSelectionChanged !== true &&
+      !readPairingQrReplyChannelData(payload) &&
+      segments?.some((segment) => segment.type === "media")
+        ? projectOrderedAssistantMediaContent({
+            segments,
+            text,
+            preparedBySource,
+            mediaBlocks: mediaContent,
+          })
+        : undefined;
+    const persistedOrder = displayOrder && transcriptText === text ? displayOrder : undefined;
+    if (displayOrder && persistedOrder) {
+      // This path is restricted to a single payload, so the prior text block
+      // cannot be an array shared with another reply payload.
+      if (text) {
+        content.pop();
+      }
+      if (transcriptText) {
+        persistedContent.pop();
+      }
+      content.push(...displayOrder);
+      persistedContent.push(...persistedOrder);
+    } else {
+      content.push(...mediaContent);
+      persistedContent.push(...mediaContent);
+    }
   }
 
   const assistantContent =

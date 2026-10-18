@@ -339,6 +339,25 @@ describe("createBlockReplyDeliveryHandler", () => {
     },
   );
 
+  it("retains ordered MEDIA positions in private metadata without changing outbound fields", () => {
+    const payload = normalizeReplyPayloadDirectives({
+      payload: { text: "Before\nMEDIA:/tmp/first.png\nAfter\nMEDIA:/tmp/second.png" },
+    }).payload;
+    expect(payload.text).toBe("Before\nAfter");
+    expect(payload.mediaUrls).toEqual(["/tmp/first.png", "/tmp/second.png"]);
+    expect(
+      getReplyPayloadMetadata(payload)?.replyMediaOutputSegments?.map((segment) => segment.type),
+    ).toEqual(["text", "media", "text", "media"]);
+    expect(JSON.stringify(payload)).not.toContain("replyMediaOutputSegments");
+  });
+
+  it("does not assign MEDIA source positions to an explicitly selected attachment", () => {
+    const payload = normalizeReplyPayloadDirectives({
+      payload: { text: "Before\nMEDIA:/tmp/first.png", mediaUrls: ["/tmp/other.png"] },
+    }).payload;
+    expect(getReplyPayloadMetadata(payload)?.replyMediaOutputSegments).toBeUndefined();
+  });
+
   it.each([
     { name: "prepared literal marker", text: "NO_REPLY", parsedSilent: false, expectWarning: true },
     { name: "recorded silence", text: "", parsedSilent: true, expectWarning: false },

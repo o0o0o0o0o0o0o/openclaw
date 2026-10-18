@@ -77,21 +77,26 @@ export function normalizeReplyPayloadDirectives(params: {
   const mediaUrls = params.payload.mediaUrls ?? parsed?.mediaUrls;
   const mediaUrl = params.payload.mediaUrl ?? parsed?.mediaUrls?.[0] ?? mediaUrls?.[0];
 
-  return {
-    payload: addReplyPayloadMediaFailures(
-      copyReplyPayloadMetadata(params.payload, {
-        ...params.payload,
-        text,
-        mediaUrls,
-        mediaUrl,
-        replyToId: params.payload.replyToId ?? parsed?.replyToId,
-        replyToTag: params.payload.replyToTag || parsed?.replyToTag,
-        replyToCurrent: params.payload.replyToCurrent || parsed?.replyToCurrent,
-        audioAsVoice: Boolean(params.payload.audioAsVoice || parsed?.audioAsVoice),
-      }),
-      parsed?.mediaFailures,
-    ),
-  };
+  const normalizedPayload = copyReplyPayloadMetadata(params.payload, {
+    ...params.payload,
+    text,
+    mediaUrls,
+    mediaUrl,
+    replyToId: params.payload.replyToId ?? parsed?.replyToId,
+    replyToTag: params.payload.replyToTag || parsed?.replyToTag,
+    replyToCurrent: params.payload.replyToCurrent || parsed?.replyToCurrent,
+    audioAsVoice: Boolean(params.payload.audioAsVoice || parsed?.audioAsVoice),
+  });
+  // Explicit attachment selection must not inherit stale positions from the source text.
+  const segments = parsed ? getReplyPayloadMetadata(parsed)?.replyMediaOutputSegments : undefined;
+  if (
+    segments?.some((segment) => segment.type === "media") &&
+    params.payload.mediaUrls === undefined &&
+    params.payload.mediaUrl === undefined
+  ) {
+    setReplyPayloadMetadata(normalizedPayload, { replyMediaOutputSegments: segments });
+  }
+  return { payload: addReplyPayloadMediaFailures(normalizedPayload, parsed?.mediaFailures) };
 }
 
 export function createBlockReplyDeliveryHandler(params: {

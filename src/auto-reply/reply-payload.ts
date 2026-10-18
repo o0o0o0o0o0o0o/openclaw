@@ -267,6 +267,11 @@ export type ReplyPayloadMetadata = {
   replyMediaSourceUrls?: ReadonlyMap<string, readonly string[]>;
   /** A delivery modifier selected the current payload media for this operation. */
   replyMediaSelectionChanged?: true;
+  /** Transient source positions for WebChat display only; never serialized to channel payloads. */
+  replyMediaOutputSegments?: readonly (
+    | { type: "text"; text: string }
+    | { type: "media"; url: string }
+  )[];
   /** Ordered per-source failures retained until transcript/display projection. */
   assistantMediaFailures?: ReplyMediaFailure[];
   /** The runtime owns the transcript decision for this assistant payload. */

@@ -14,6 +14,7 @@ import {
 } from "vitest";
 import { buildEmbeddedRunPayloads } from "../../agents/embedded-agent-runner/run/payloads.js";
 import { consumePendingToolMediaIntoReply } from "../../agents/embedded-agent-subscribe.handlers.messages.replies.js";
+import { normalizeReplyPayloadDirectives } from "../../auto-reply/reply/reply-delivery.js";
 import { parseReplyDirectives } from "../../auto-reply/reply/reply-directives.js";
 import { createReplyMediaPathNormalizer } from "../../auto-reply/reply/reply-media-paths.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
@@ -203,6 +204,111 @@ describe("normalizeWebchatReplyMediaPathsForDisplay", () => {
         },
       },
     ]);
+    expect(persistedAssistantContent).toEqual(assistantContent);
+  });
+
+  it("keeps interleaved MEDIA positions in final and persisted assistant content", async () => {
+    const { workspaceDir } = createMediaTestContext({ allowRead: true });
+    await fs.mkdir(workspaceDir, { recursive: true });
+    const first = path.join(workspaceDir, "first.png");
+    const second = path.join(workspaceDir, "second.png");
+    await Promise.all([fs.writeFile(first, PNG_BYTES), fs.writeFile(second, PNG_BYTES)]);
+    const sourceText = `First paragraph\n\nMEDIA:${first}\n\nSecond paragraph\n\nMEDIA:${second}\n\nClosing paragraph`;
+    const payload = normalizeReplyPayloadDirectives({ payload: { text: sourceText } }).payload;
+    const { assistantContent, persistedAssistantContent } = await buildAssistantReplyContent({
+      sessionKey: TEST_SESSION_KEY,
+      payloads: [payload],
+      managedMediaLocalRoots: [workspaceDir],
+      transcriptMediaMessage: await buildWebchatAssistantMessageFromReplyPayloads([payload]),
+    });
+    for (const blocks of [assistantContent, persistedAssistantContent]) {
+      expect(blocks?.map((block) => block.type)).toEqual([
+        "text",
+        "image",
+        "text",
+        "image",
+        "text",
+      ]);
+      expect(
+        blocks?.filter((block) => block.type === "text").map((block) => String(block.text).trim()),
+      ).toEqual(["First paragraph", "Second paragraph", "Closing paragraph"]);
+    }
+  });
+
+  it("keeps positions when a raw payload is normalized by the outbound plan", async () => {
+    const { workspaceDir } = createMediaTestContext({ allowRead: true });
+    await fs.mkdir(workspaceDir, { recursive: true });
+    const source = path.join(workspaceDir, "raw.png");
+    await fs.writeFile(source, PNG_BYTES);
+    const { assistantContent, persistedAssistantContent } = await buildAssistantReplyContent({
+      sessionKey: TEST_SESSION_KEY,
+      payloads: [{ text: `Intro\nMEDIA:${source}\nOutro` }],
+      managedMediaLocalRoots: [workspaceDir],
+    });
+    expect(assistantContent?.map((block) => block.type)).toEqual(["text", "image", "text"]);
+    expect(persistedAssistantContent?.map((block) => block.type)).toEqual([
+      "text",
+      "image",
+      "text",
+    ]);
+  });
+
+  it("does not duplicate an identical MEDIA source in a saved reply", async () => {
+    const { workspaceDir } = createMediaTestContext({ allowRead: true });
+    await fs.mkdir(workspaceDir, { recursive: true });
+    const source = path.join(workspaceDir, "same.png");
+    await fs.writeFile(source, PNG_BYTES);
+    const payload = normalizeReplyPayloadDirectives({
+      payload: { text: `First\nMEDIA:${source}\nMiddle\nMEDIA:${source}\nEnd` },
+    }).payload;
+    const { persistedAssistantContent } = await buildAssistantReplyContent({
+      sessionKey: TEST_SESSION_KEY,
+      payloads: [payload],
+      managedMediaLocalRoots: [workspaceDir],
+    });
+    expect(persistedAssistantContent?.map((block) => block.type)).toEqual([
+      "text",
+      "image",
+      "text",
+      "text",
+    ]);
+    expect(persistedAssistantContent?.filter((block) => block.type === "image")).toHaveLength(1);
+  });
+
+  it("falls back to the existing content order when source text was changed", async () => {
+    const { workspaceDir } = createMediaTestContext({ allowRead: true });
+    await fs.mkdir(workspaceDir, { recursive: true });
+    const source = path.join(workspaceDir, "edited.png");
+    await fs.writeFile(source, PNG_BYTES);
+    const payload = normalizeReplyPayloadDirectives({
+      payload: { text: `Before\nMEDIA:${source}\nAfter` },
+    }).payload;
+    payload.text = "Replaced text";
+    const { assistantContent, persistedAssistantContent } = await buildAssistantReplyContent({
+      sessionKey: TEST_SESSION_KEY,
+      payloads: [payload],
+      managedMediaLocalRoots: [workspaceDir],
+    });
+    expect(assistantContent?.map((block) => block.type)).toEqual(["text", "image"]);
+    expect(persistedAssistantContent).toEqual(assistantContent);
+  });
+
+  it("preserves readable text and a media failure when an ordered source is missing", async () => {
+    const { workspaceDir } = createMediaTestContext({ allowRead: true });
+    const source = path.join(workspaceDir, "missing.png");
+    const payload = normalizeReplyPayloadDirectives({
+      payload: { text: `Before\nMEDIA:${source}\nAfter` },
+    }).payload;
+    const { assistantContent, persistedAssistantContent } = await buildAssistantReplyContent({
+      sessionKey: TEST_SESSION_KEY,
+      payloads: [payload],
+      managedMediaLocalRoots: [workspaceDir],
+    });
+    expect(assistantContent?.filter((block) => block.type === "text")).toEqual([
+      { type: "text", text: "Before" },
+      { type: "text", text: expect.stringContaining("After") },
+    ]);
+    expect(assistantContent?.some((block) => block.type === "attachment_error")).toBe(true);
     expect(persistedAssistantContent).toEqual(assistantContent);
   });
 

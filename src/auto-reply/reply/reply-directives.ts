@@ -4,7 +4,11 @@ import {
   parseInlineDirectives,
   stripInlineDirectiveTagsForDelivery,
 } from "../../utils/directive-tags.js";
-import { appendReplyMediaFailures, type ReplyMediaFailure } from "../reply-payload.js";
+import {
+  appendReplyMediaFailures,
+  setReplyPayloadMetadata,
+  type ReplyMediaFailure,
+} from "../reply-payload.js";
 
 export type ReplyDirectiveParseResult = {
   text: string;
@@ -55,7 +59,7 @@ export function parseReplyDirectives(
     }),
   );
 
-  return {
+  const result: ReplyDirectiveParseResult = {
     text: appendReplyMediaFailures(text, mediaFailures) ?? "",
     // Keep native path conversion outside the browser-shared parser and before reply policy.
     mediaUrls: split.mediaUrls?.map((source) => trySafeFileURLToPath(source) ?? source),
@@ -65,4 +69,15 @@ export function parseReplyDirectives(
     replyToTag: replyParsed?.hasReplyTag ?? false,
     audioAsVoice: split.audioAsVoice,
   };
+  // Keep display-only ordering private; external channels still receive text/mediaUrls.
+  if (split.mediaUrls?.length && split.segments) {
+    setReplyPayloadMetadata(result, {
+      replyMediaOutputSegments: split.segments.map((segment) =>
+        segment.type === "media"
+          ? { type: "media" as const, url: trySafeFileURLToPath(segment.url) ?? segment.url }
+          : segment,
+      ),
+    });
+  }
+  return result;
 }

@@ -3,7 +3,9 @@ import {
   addReplyPayloadMediaFailures,
   copyReplyPayloadMetadata,
   formatBtwTextForExternalDelivery,
+  getReplyPayloadMetadata,
   isRenderablePayload,
+  setReplyPayloadMetadata,
   shouldSuppressReasoningPayload,
 } from "../../auto-reply/reply-payload.js";
 import { parseReplyDirectives } from "../../auto-reply/reply/reply-directives.js";
@@ -168,6 +170,15 @@ function normalizeRawOutboundPayload(
       audioAsVoice: Boolean(payload.audioAsVoice || parsed.audioAsVoice),
     }),
   );
+  const parsedSegments = getReplyPayloadMetadata(parsed)?.replyMediaOutputSegments;
+  if (
+    parsedSegments?.some((segment) => segment.type === "media") &&
+    payload.mediaUrls === undefined &&
+    payload.mediaUrl === undefined &&
+    strippedParsed === parsed
+  ) {
+    setReplyPayloadMetadata(normalizedPayload, { replyMediaOutputSegments: parsedSegments });
+  }
   addReplyPayloadMediaFailures(normalizedPayload, [
     ...(parsed.mediaFailures ?? []),
     ...(strippedParsed === parsed ? [] : (strippedParsed.mediaFailures ?? [])),

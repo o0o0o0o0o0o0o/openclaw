@@ -40,30 +40,46 @@ function directoryAccountConfig(accountIds = ["default"]) {
   };
 }
 
+function outboundRoute(
+  channel: string,
+  target: string,
+  kind: "direct" | "group" | "channel" = "direct",
+  to = target,
+) {
+  const key = `agent:main:${channel}:${kind}:${target}`;
+  return {
+    sessionKey: key,
+    baseSessionKey: key,
+    peer: { kind, id: target },
+    chatType: kind,
+    from: `${channel}:${target}`,
+    to,
+  };
+}
+
+const reefDelivery = {
+  kind: "external" as const,
+  route: {
+    channel: "reef",
+    accountId: "default",
+    target: { to: "reef:room", chatType: "channel" as const },
+  },
+  context: { channel: "reef", accountId: "default", to: "reef:room" },
+  origin: { provider: "reef", accountId: "default" },
+};
+
 describe("runGatewayConversationList", () => {
   it("filters persisted routes before applying the result limit", async () => {
-    const rows = [
-      {
-        conversationRef: "conv_11111111111111111111111111111111",
-        channel: "reef",
-        accountId: "finance",
-        kind: "direct" as const,
-        peerId: "finance-peer",
-        target: "reef:finance-peer",
-        firstSeenAt: 200,
-        lastSeenAt: 200,
-      },
-      {
-        conversationRef: "conv_22222222222222222222222222222222",
-        channel: "reef",
-        accountId: "personal",
-        kind: "direct" as const,
-        peerId: "personal-peer",
-        target: "reef:personal-peer",
-        firstSeenAt: 100,
-        lastSeenAt: 100,
-      },
-    ];
+    const rows = ["finance", "personal"].map((accountId, index) => ({
+      conversationRef: `conv_${String(index + 1).repeat(32)}`,
+      channel: "reef",
+      accountId,
+      kind: "direct" as const,
+      peerId: `${accountId}-peer`,
+      target: `reef:${accountId}-peer`,
+      firstSeenAt: 200 - index * 100,
+      lastSeenAt: 200 - index * 100,
+    }));
     const listPersisted = vi.fn((_scope, options: { limit?: number }) =>
       options.limit === undefined ? rows : rows.slice(0, options.limit),
     );
@@ -110,14 +126,9 @@ describe("runGatewayConversationList", () => {
     const listPeers = vi.fn(async () => [
       { kind: "user" as const, id: "peer-id-123", name: "Friendly Lobster", handle: "@molty" },
     ]);
-    const resolveOutboundSessionRoute = vi.fn(async () => ({
-      sessionKey: "agent:main:reef:direct:canonical-peer",
-      baseSessionKey: "agent:main:reef:direct:canonical-peer",
-      peer: { kind: "direct" as const, id: "canonical-peer" },
-      chatType: "direct" as const,
-      from: "reef:canonical-peer",
-      to: "reef:peer-id-123",
-    }));
+    const resolveOutboundSessionRoute = vi.fn(async () =>
+      outboundRoute("reef", "canonical-peer", "direct", "reef:peer-id-123"),
+    );
     const deps = {
       resolveOutboundChannelPlugin: vi.fn(() => ({
         id: "reef",
@@ -197,12 +208,8 @@ describe("runGatewayConversationList", () => {
     let discovered: ConversationIdentity[] = [];
     const channelId = "private-room-123";
     const resolveOutboundSessionRoute = vi.fn(async () => ({
-      sessionKey: `agent:main:reef:group:${channelId}`,
-      baseSessionKey: `agent:main:reef:group:${channelId}`,
-      peer: { kind: "group" as const, id: channelId },
-      chatType: "group" as const,
+      ...outboundRoute("reef", channelId, "group", `channel:${channelId}`),
       from: `reef:group:${channelId}`,
-      to: `channel:${channelId}`,
     }));
     const deps = {
       resolveOutboundChannelPlugin: vi.fn(() => ({
@@ -275,14 +282,7 @@ describe("runGatewayConversationList", () => {
       resolveOutboundSessionRoute: vi.fn(async ({ target }: { target: string }) => {
         resolvedTargets.push(target);
         const direct = target.endsWith("-peer");
-        return {
-          sessionKey: `agent:main:discord:${direct ? "direct" : "channel"}:${target}`,
-          baseSessionKey: `agent:main:discord:${direct ? "direct" : "channel"}:${target}`,
-          peer: { kind: direct ? ("direct" as const) : ("channel" as const), id: target },
-          chatType: direct ? ("direct" as const) : ("channel" as const),
-          from: `discord:${target}`,
-          to: target,
-        };
+        return outboundRoute("discord", target, direct ? "direct" : "channel");
       }),
       registerConversationAddresses: vi.fn(),
       listConversations: vi.fn(() => []),
@@ -329,14 +329,7 @@ describe("runGatewayConversationList", () => {
       })),
       resolveOutboundSessionRoute: vi.fn(async ({ target }: { target: string }) => {
         resolvedTargets.push(target);
-        return {
-          sessionKey: `agent:main:discord:direct:${target}`,
-          baseSessionKey: `agent:main:discord:direct:${target}`,
-          peer: { kind: "direct" as const, id: target },
-          chatType: "direct" as const,
-          from: `discord:${target}`,
-          to: target,
-        };
+        return outboundRoute("discord", target);
       }),
       registerConversationAddresses: vi.fn(),
       listConversations: vi.fn(() => []),
@@ -384,16 +377,7 @@ describe("worker conversation reads", () => {
       sessionId,
       updatedAt: 100,
       chatType: "channel",
-      delivery: {
-        kind: "external",
-        route: {
-          channel: "reef",
-          accountId: "default",
-          target: { to: "reef:room", chatType: "channel" },
-        },
-        context: { channel: "reef", accountId: "default", to: "reef:room" },
-        origin: { provider: "reef", accountId: "default" },
-      },
+      delivery: reefDelivery,
     });
   });
   afterEach(() => vi.restoreAllMocks());
@@ -526,16 +510,7 @@ describe("worker conversation reads", () => {
       sessionId: memory.sessionId,
       updatedAt: 100,
       chatType: "channel",
-      delivery: {
-        kind: "external",
-        route: {
-          channel: "reef",
-          accountId: "default",
-          target: { to: "reef:room", chatType: "channel" },
-        },
-        context: { channel: "reef", accountId: "default", to: "reef:room" },
-        origin: { provider: "reef", accountId: "default" },
-      },
+      delivery: reefDelivery,
     });
     const worker = vi.spyOn(historyLane.pool, "run");
     const prepared = await prepareConversationRegistryScope({

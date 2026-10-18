@@ -9,6 +9,7 @@ import {
   githubJson,
   pullListItem,
   routedFetch,
+  testGitContext,
 } from "./control-ui-session-prs.test-support.js";
 
 const fixture = createSessionPullRequestsFixture();
@@ -26,6 +27,55 @@ function localGitReads() {
         operation.type !== "checkout.revision" &&
         operation.type !== "pull-request.branch-comparison",
     );
+}
+
+function mockCheckout({
+  revision,
+  branch,
+  facts = () => undefined,
+}: {
+  revision: () => string | null;
+  branch: (root: string) => string | null;
+  facts?: () =>
+    | { creatable: boolean; stats: { additions: number; deletions: number; changedFiles: number } }
+    | undefined;
+}) {
+  vi.mocked(runGitWorkerOperation).mockImplementation(async (operation) => {
+    switch (operation.type) {
+      case "pull-request.branch-comparison":
+        return { statsBase: null, creatable: false, equalPushedTips: false, complete: true };
+      case "checkout.revision":
+        return revision();
+      case "checkout.context": {
+        const selected = branch(operation.input.root);
+        return selected
+          ? {
+              ...testGitContext,
+              branch: selected,
+              root: operation.input.root,
+              defaultBranch: "main",
+            }
+          : null;
+      }
+      case "pull-request.branch-facts":
+        return facts();
+      default:
+        throw new Error("Unexpected local Git operation");
+    }
+  });
+}
+
+function subscribe(
+  options: Pick<
+    Parameters<typeof createControlUiSessionPullRequestSubscriptions>[0],
+    "load" | "broadcastToConnIds"
+  >,
+) {
+  return createControlUiSessionPullRequestSubscriptions({
+    scheduler: createTestGatewayScheduler("fake-timers"),
+    prepareRead: fixture.prepareRead,
+    ...options,
+  });
 }
 
 beforeEach(() => {
@@ -52,31 +102,13 @@ describe("watched session PR retention", () => {
       { match: "/repos/openclaw/openclaw", response: () => githubJson({ fork: false }) },
     ]);
     vi.stubGlobal("fetch", fetchImpl);
-    vi.mocked(runGitWorkerOperation).mockImplementation(async (operation) => {
-      if (operation.type === "pull-request.branch-comparison") {
-        return { statsBase: null, creatable: false, equalPushedTips: false, complete: true };
-      }
-      if (operation.type === "checkout.revision") {
-        return revision;
-      }
-      if (operation.type === "checkout.context") {
-        return {
-          owner: "openclaw",
-          repo: "openclaw",
-          branch: "shared-feature",
-          root: operation.input.root,
-          defaultBranch: "main",
-        };
-      }
-      if (operation.type === "pull-request.branch-facts") {
-        return { creatable: true, stats: { additions, deletions: 0, changedFiles: 1 } };
-      }
-      throw new Error("Unexpected local Git operation");
+    mockCheckout({
+      revision: () => revision,
+      branch: () => "shared-feature",
+      facts: () => ({ creatable: true, stats: { additions, deletions: 0, changedFiles: 1 } }),
     });
     const broadcastToConnIds = vi.fn();
-    const subscriptions = createControlUiSessionPullRequestSubscriptions({
-      scheduler: createTestGatewayScheduler("fake-timers"),
-      prepareRead: fixture.prepareRead,
+    const subscriptions = subscribe({
       broadcastToConnIds,
       load: (params, cacheSignal) =>
         loadControlUiSessionPullRequests(params, {
@@ -155,9 +187,7 @@ describe("watched session PR retention", () => {
       string,
       { rateLimited: boolean; pullRequests: unknown[]; repository: unknown }
     >();
-    const subscriptions = createControlUiSessionPullRequestSubscriptions({
-      scheduler: createTestGatewayScheduler("fake-timers"),
-      prepareRead: fixture.prepareRead,
+    const subscriptions = subscribe({
       broadcastToConnIds: (_event, payload) => {
         if (!isRecord(payload) || !isRecord(payload.sessions)) {
           throw new Error("invalid subscription event");
@@ -235,30 +265,11 @@ describe("watched session PR retention", () => {
     ]);
     vi.stubGlobal("fetch", fetchImpl);
     const signals = new Set<AbortSignal>();
-    vi.mocked(runGitWorkerOperation).mockImplementation(async (operation) => {
-      if (operation.type === "pull-request.branch-comparison") {
-        return { statsBase: null, creatable: false, equalPushedTips: false, complete: true };
-      }
-      if (operation.type === "checkout.revision") {
-        return "unchanged";
-      }
-      if (operation.type === "checkout.context") {
-        return {
-          owner: "openclaw",
-          repo: "openclaw",
-          branch: operation.input.root.slice("/watched/".length),
-          root: operation.input.root,
-          defaultBranch: "main",
-        };
-      }
-      if (operation.type === "pull-request.branch-facts") {
-        return undefined;
-      }
-      throw new Error("Unexpected local Git operation");
+    mockCheckout({
+      revision: () => "unchanged",
+      branch: (root) => root.slice("/watched/".length),
     });
-    const subscriptions = createControlUiSessionPullRequestSubscriptions({
-      scheduler: createTestGatewayScheduler("fake-timers"),
-      prepareRead: fixture.prepareRead,
+    const subscriptions = subscribe({
       broadcastToConnIds: vi.fn(),
       load: (params, cacheSignal) => {
         if (cacheSignal) {
@@ -323,29 +334,7 @@ describe("watched session PR retention", () => {
       { match: "/repos/openclaw/openclaw", response: () => githubJson({ fork: false }) },
     ]);
     vi.stubGlobal("fetch", fetchImpl);
-    vi.mocked(runGitWorkerOperation).mockImplementation(async (operation) => {
-      if (operation.type === "pull-request.branch-comparison") {
-        return { statsBase: null, creatable: false, equalPushedTips: false, complete: true };
-      }
-      if (operation.type === "checkout.revision") {
-        return branch;
-      }
-      if (operation.type === "checkout.context") {
-        return branch
-          ? {
-              owner: "openclaw",
-              repo: "openclaw",
-              branch,
-              root: operation.input.root,
-              defaultBranch: "main",
-            }
-          : null;
-      }
-      if (operation.type === "pull-request.branch-facts") {
-        return undefined;
-      }
-      throw new Error("Unexpected local Git operation");
-    });
+    mockCheckout({ revision: () => branch, branch: () => branch });
     const load = () =>
       loadControlUiSessionPullRequests(
         { sessionKey: "retained", refresh: true },

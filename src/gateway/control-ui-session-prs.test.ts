@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runGitWorkerOperation } from "../infra/git-worker.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import {
   createSessionPullRequestsFixture,
   githubJson,
@@ -15,7 +16,41 @@ const { load: loadControlUiSessionPullRequests } = createSessionPullRequestsFixt
 vi.mock("../infra/git-worker.js", () => ({ runGitWorkerOperation: vi.fn() }));
 
 const resolveGitContext = async () => context;
+const load = (refresh = false) =>
+  loadControlUiSessionPullRequests(
+    { sessionKey: "agent:main:main", refresh },
+    { resolveGitContext },
+  );
 let cacheEpochMs = Date.now();
+
+function mockChecks(
+  checks: Record<string, unknown>[],
+  details: Record<string, number> = { additions: 4, deletions: 3, changed_files: 2 },
+) {
+  const fetchImpl = routedFetch([
+    { match: "/pulls?head=", response: () => githubJson([pullListItem()]) },
+    {
+      match: "/pulls/103469",
+      response: () => githubJson(details),
+    },
+    {
+      match: "/check-runs",
+      response: () => githubJson({ total_count: checks.length, check_runs: checks }),
+    },
+  ]);
+  vi.stubGlobal("fetch", fetchImpl);
+}
+
+const expectedChip = {
+  number: 103469,
+  owner: "openclaw",
+  repo: "openclaw",
+  branch: context.branch,
+  headSha: "a".repeat(40),
+  title: "fix(macos): tighten the link-browser tab header",
+  url: "https://github.com/openclaw/openclaw/pull/103469",
+  state: "open",
+};
 
 function localGitReads() {
   return vi
@@ -95,43 +130,17 @@ describe("loadControlUiSessionPullRequests", () => {
   });
 
   it("returns chips with diff counts and check rollup for open PRs", async () => {
-    const fetchImpl = routedFetch([
-      { match: "/pulls?head=", response: () => githubJson([pullListItem()]) },
-      {
-        match: "/pulls/103469",
-        response: () => githubJson({ additions: 4, deletions: 3, changed_files: 2 }),
-      },
-      {
-        match: "/check-runs",
-        response: () =>
-          githubJson({
-            total_count: 2,
-            check_runs: [
-              { status: "completed", conclusion: "success" },
-              { status: "completed", conclusion: "skipped" },
-            ],
-          }),
-      },
+    mockChecks([
+      { status: "completed", conclusion: "success" },
+      { status: "completed", conclusion: "skipped" },
     ]);
-    vi.stubGlobal("fetch", fetchImpl);
-
-    const result = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const result = await load();
 
     expect(result).toEqual({
       repository: { owner: "openclaw", repo: "openclaw" },
       pullRequests: [
         {
-          number: 103469,
-          owner: "openclaw",
-          repo: "openclaw",
-          branch: context.branch,
-          headSha: "a".repeat(40),
-          title: "fix(macos): tighten the link-browser tab header",
-          url: "https://github.com/openclaw/openclaw/pull/103469",
-          state: "open",
+          ...expectedChip,
           additions: 4,
           deletions: 3,
           changedFiles: 2,
@@ -198,20 +207,9 @@ describe("loadControlUiSessionPullRequests", () => {
       { status: "in_progress", conclusion: null },
       { status: "completed", conclusion: "success" },
     ];
-    const fetchImpl = routedFetch([
-      { match: "/pulls?head=", response: () => githubJson([pullListItem()]) },
-      { match: "/pulls/103469", response: () => githubJson({ additions: 1, deletions: 1 }) },
-      {
-        match: "/check-runs",
-        response: () => githubJson({ total_count: checkRuns.length, check_runs: checkRuns }),
-      },
-    ]);
-    vi.stubGlobal("fetch", fetchImpl);
+    mockChecks(checkRuns, { additions: 1, deletions: 1 });
 
-    const pending = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const pending = await load();
     expect(pending.pullRequests[0]?.checks).toEqual({
       state: "pending",
       passed: 1,
@@ -222,10 +220,7 @@ describe("loadControlUiSessionPullRequests", () => {
 
     vi.advanceTimersByTime(10 * 60_000);
     checkRuns[0] = { status: "completed", conclusion: "timed_out" };
-    const failing = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const failing = await load();
     expect(failing.pullRequests[0]?.checks).toEqual({
       state: "failing",
       passed: 1,
@@ -238,10 +233,7 @@ describe("loadControlUiSessionPullRequests", () => {
     // rolled up as green.
     vi.advanceTimersByTime(10 * 60_000);
     checkRuns[0] = { status: "completed", conclusion: "stale" };
-    const stale = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const stale = await load();
     expect(stale.pullRequests[0]?.checks).toEqual({
       state: "pending",
       passed: 1,
@@ -263,10 +255,7 @@ describe("loadControlUiSessionPullRequests", () => {
     );
     vi.stubGlobal("fetch", fetchImpl);
 
-    const result = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const result = await load();
 
     expect(result.pullRequests[0]?.checks).toEqual({
       state: "failing",
@@ -288,10 +277,7 @@ describe("loadControlUiSessionPullRequests", () => {
     );
     vi.stubGlobal("fetch", fetchImpl);
 
-    const result = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const result = await load();
 
     expect(result.pullRequests[0]?.number).toBe(103469);
     expect(result.pullRequests[0]?.checks).toBeUndefined();
@@ -315,10 +301,7 @@ describe("loadControlUiSessionPullRequests", () => {
       );
       vi.stubGlobal("fetch", fetchImpl);
 
-      const result = await loadControlUiSessionPullRequests(
-        { sessionKey: "agent:main:main" },
-        { resolveGitContext },
-      );
+      const result = await load();
 
       expect(result.pullRequests[0]?.checks?.passed).toBe(passed);
       expect(
@@ -383,36 +366,24 @@ describe("loadControlUiSessionPullRequests", () => {
     ]);
     vi.stubGlobal("fetch", fetchImpl);
 
-    const fresh = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const fresh = await load();
     expect(fresh.rateLimited).toBe(false);
     expect(fresh.repository).toEqual({ owner: "openclaw", repo: "openclaw" });
 
     limited = true;
     vi.advanceTimersByTime(91_000);
-    const stale = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const stale = await load();
     expect(stale.rateLimited).toBe(true);
     expect(stale.pullRequests).toEqual(fresh.pullRequests);
     expect(stale.repository).toEqual(fresh.repository);
 
     const callsDuringBackoff = fetchImpl.mock.calls.length;
-    const explicitRefresh = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main", refresh: true },
-      { resolveGitContext },
-    );
+    const explicitRefresh = await load(true);
     expect(explicitRefresh).toEqual(stale);
     expect(fetchImpl.mock.calls).toHaveLength(callsDuringBackoff);
 
     vi.advanceTimersByTime(61_000);
-    const stillBackedOff = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const stillBackedOff = await load();
     expect(stillBackedOff).toEqual(stale);
     expect(fetchImpl.mock.calls).toHaveLength(callsDuringBackoff);
   });
@@ -455,7 +426,7 @@ describe("loadControlUiSessionPullRequests", () => {
         },
       };
     });
-    const load = (sessionKey: string, refresh = false) =>
+    const loadSession = (sessionKey: string, refresh = false) =>
       loadControlUiSessionPullRequests(
         { sessionKey, ...(refresh ? { refresh: true } : {}) },
         {
@@ -468,11 +439,11 @@ describe("loadControlUiSessionPullRequests", () => {
         },
       );
 
-    expect((await load("agent:main:a")).branch?.additions).toBe(1);
+    expect((await loadSession("agent:main:a")).branch?.additions).toBe(1);
     additions = 2;
-    expect((await load("agent:main:a")).branch?.additions).toBe(1);
+    expect((await loadSession("agent:main:a")).branch?.additions).toBe(1);
     expect(localGitReads()).toHaveLength(1);
-    expect((await load("agent:main:a", true)).branch?.additions).toBe(1);
+    expect((await loadSession("agent:main:a", true)).branch?.additions).toBe(1);
     expect(localGitReads()).toHaveLength(1);
     expect(
       fetchImpl.mock.calls.filter((call) =>
@@ -482,22 +453,22 @@ describe("loadControlUiSessionPullRequests", () => {
 
     pulls = [pullListItem({ merged_at: "2026-07-09T10:00:00Z" })];
     additions = 4;
-    expect((await load("agent:main:a", true)).branch?.additions).toBe(4);
+    expect((await loadSession("agent:main:a", true)).branch?.additions).toBe(4);
     expect(localGitReads()).toHaveLength(2);
 
     const githubRequests = fetchImpl.mock.calls.length;
     vi.advanceTimersByTime(60_000);
     additions = 5;
-    expect((await load("agent:main:a")).branch?.additions).toBe(4);
+    expect((await loadSession("agent:main:a")).branch?.additions).toBe(4);
     expect(localGitReads()).toHaveLength(2);
     expect(fetchImpl.mock.calls).toHaveLength(githubRequests);
 
     vi.advanceTimersByTime(240_001);
     additions = 5;
-    expect((await load("agent:main:a")).branch?.additions).toBe(5);
+    expect((await loadSession("agent:main:a")).branch?.additions).toBe(5);
     expect(localGitReads()).toHaveLength(3);
 
-    expect((await load("agent:main:b")).branch?.additions).toBe(3);
+    expect((await loadSession("agent:main:b")).branch?.additions).toBe(3);
     expect(localGitReads()).toHaveLength(4);
   });
 
@@ -524,7 +495,7 @@ describe("loadControlUiSessionPullRequests", () => {
       }
       throw new Error("Unexpected local Git operation");
     });
-    const load = (refresh = false) =>
+    const loadContext = (refresh = false) =>
       loadControlUiSessionPullRequests(
         { sessionKey: "agent:main:context-refresh", ...(refresh ? { refresh: true } : {}) },
         {
@@ -532,31 +503,25 @@ describe("loadControlUiSessionPullRequests", () => {
         },
       );
 
-    expect((await load()).branch?.branch).toBe("feature-a");
+    expect((await loadContext()).branch?.branch).toBe("feature-a");
     branch = "feature-b";
-    expect((await load()).branch?.branch).toBe("feature-a");
-    expect((await load(true)).branch?.branch).toBe("feature-a");
+    expect((await loadContext()).branch?.branch).toBe("feature-a");
+    expect((await loadContext(true)).branch?.branch).toBe("feature-a");
     revision = "changed-head";
-    expect((await load()).branch?.branch).toBe("feature-b");
+    expect((await loadContext()).branch?.branch).toBe("feature-b");
     expect(
       localGitReads().filter(([operation]) => operation.type === "checkout.context"),
     ).toHaveLength(2);
     // Unsupported layouts retain immediate explicit branch discovery.
     revision = null;
-    expect((await load()).branch?.branch).toBe("feature-b");
+    expect((await loadContext()).branch?.branch).toBe("feature-b");
     branch = "feature-c";
-    expect((await load(true)).branch?.branch).toBe("feature-c");
+    expect((await loadContext(true)).branch?.branch).toBe("feature-c");
   });
 
   it("queues one forced refresh behind an ordinary in-flight lookup", async () => {
-    let resolveInitialPulls!: (response: Response) => void;
-    let signalInitialPullStarted!: () => void;
-    const initialPulls = new Promise<Response>((resolve) => {
-      resolveInitialPulls = resolve;
-    });
-    const initialPullStarted = new Promise<void>((resolve) => {
-      signalInitialPullStarted = resolve;
-    });
+    const initialPulls = createDeferredCore<Response>();
+    const initialPullStarted = createDeferredCore();
     let pullListCalls = 0;
     const fetchImpl = routedFetch([
       {
@@ -564,8 +529,8 @@ describe("loadControlUiSessionPullRequests", () => {
         response: () => {
           pullListCalls += 1;
           if (pullListCalls === 1) {
-            signalInitialPullStarted();
-            return initialPulls;
+            initialPullStarted.resolve();
+            return initialPulls.promise;
           }
           return githubJson([pullListItem({ merged_at: "2026-07-09T10:00:00Z" })]);
         },
@@ -574,26 +539,14 @@ describe("loadControlUiSessionPullRequests", () => {
     ]);
     vi.stubGlobal("fetch", fetchImpl);
 
-    const initial = loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
-    await initialPullStarted;
-    const forcedRefresh = loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main", refresh: true },
-      { resolveGitContext },
-    );
+    const initial = load();
+    await initialPullStarted.promise;
+    const forcedRefresh = load(true);
     await Promise.resolve();
-    const ordinaryFollower = loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
-    const duplicateForcedRefresh = loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main", refresh: true },
-      { resolveGitContext },
-    );
+    const ordinaryFollower = load();
+    const duplicateForcedRefresh = load(true);
 
-    resolveInitialPulls(githubJson([]));
+    initialPulls.resolve(githubJson([]));
     expect((await initial).pullRequests).toEqual([]);
     expect(
       (await Promise.all([forcedRefresh, ordinaryFollower, duplicateForcedRefresh])).map((result) =>
@@ -623,31 +576,18 @@ describe("loadControlUiSessionPullRequests", () => {
     const fetchImpl = routedFetch(routes);
     vi.stubGlobal("fetch", fetchImpl);
 
-    const beforePublication = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const beforePublication = await load();
     expect(beforePublication.pullRequests).toEqual([]);
     expect(beforePublication.branch).toBeDefined();
     hasPull = true;
 
-    const result = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main", refresh: true },
-      { resolveGitContext },
-    );
+    const result = await load(true);
 
     expect(result.rateLimited).toBe(true);
     expect(result.branch).toBeUndefined();
     expect(result.pullRequests).toEqual([
       {
-        number: 103469,
-        owner: "openclaw",
-        repo: "openclaw",
-        branch: context.branch,
-        headSha: "a".repeat(40),
-        title: "fix(macos): tighten the link-browser tab header",
-        url: "https://github.com/openclaw/openclaw/pull/103469",
-        state: "open",
+        ...expectedChip,
         // The list fetch succeeded, so its author survives the degraded chip.
         author: { login: "octocat" },
       },
@@ -658,10 +598,7 @@ describe("loadControlUiSessionPullRequests", () => {
     routes.length = 0;
     routes.push({ match: "/pulls?head=", response: rateLimitedResponse });
     vi.advanceTimersByTime(5 * 60_000 + 1_000);
-    const stillLimited = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { resolveGitContext },
-    );
+    const stillLimited = await load();
     expect(stillLimited.rateLimited).toBe(true);
     expect(stillLimited.pullRequests.map((item) => item.number)).toEqual([103469]);
   });

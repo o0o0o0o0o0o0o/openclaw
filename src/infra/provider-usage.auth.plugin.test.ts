@@ -65,29 +65,27 @@ vi.mock("../plugins/manifest-contract-eligibility.js", () => ({
   }),
 }));
 
-vi.mock("../secrets/provider-env-vars.js", () => ({
-  listKnownProviderAuthEnvVarNamesCore: () => [
-    "ANTHROPIC_API_KEY",
-    "MINIMAX_CODE_PLAN_KEY",
-    "OPENAI_API_KEY",
-  ],
-  resolveProviderAuthEnvVarCandidatesCore: () => ({
+vi.mock("../secrets/provider-env-vars.js", () => {
+  const envCandidateMap = {
     anthropic: ["ANTHROPIC_API_KEY"],
     minimax: ["MINIMAX_CODE_PLAN_KEY"],
     openai: ["OPENAI_API_KEY"],
     zai: ["ZAI_API_KEY"],
-  }),
-  resolveProviderAuthLookupMaps: () => ({
-    aliasMap: {},
-    envCandidateMap: {
-      anthropic: ["ANTHROPIC_API_KEY"],
-      minimax: ["MINIMAX_CODE_PLAN_KEY"],
-      openai: ["OPENAI_API_KEY"],
-      zai: ["ZAI_API_KEY"],
-    },
-    authEvidenceMap: {},
-  }),
-}));
+  };
+  return {
+    listKnownProviderAuthEnvVarNamesCore: () => [
+      "ANTHROPIC_API_KEY",
+      "MINIMAX_CODE_PLAN_KEY",
+      "OPENAI_API_KEY",
+    ],
+    resolveProviderAuthEnvVarCandidatesCore: () => envCandidateMap,
+    resolveProviderAuthLookupMaps: () => ({
+      aliasMap: {},
+      envCandidateMap,
+      authEvidenceMap: {},
+    }),
+  };
+});
 
 const resolve = (providers: string[], env: NodeJS.ProcessEnv = {}) =>
   resolveProviderAuths({ providers, env, config: {}, agentDir: "/tmp/openclaw-agent" });
@@ -99,6 +97,15 @@ function seed(profiles: AuthProfileStore["profiles"], orders: Record<string, str
   order.mockImplementation(({ provider }) => orders[provider] ?? []);
   return store;
 }
+const apiProfile = (key: string) => ({ type: "api_key" as const, provider: "anthropic", key });
+const oauthProfile = (provider: string, access: string, authFlow?: string) => ({
+  type: "oauth" as const,
+  provider,
+  access,
+  refresh: "refresh",
+  expires: 1_900_000_000_000,
+  ...(authFlow ? { authFlow } : {}),
+});
 
 describe("provider usage auth boundary", () => {
   beforeEach(() => {
@@ -129,14 +136,14 @@ describe("provider usage auth boundary", () => {
     const store: AuthProfileStore = {
       version: 1,
       profiles: {
-        [profileId]: { type: "api_key", provider: "anthropic", key: "scoped-key" },
+        [profileId]: apiProfile("scoped-key"),
       },
     };
     const getStore = vi.fn(async () => store);
     loadStore.mockReturnValue({
       version: 1,
       profiles: {
-        [profileId]: { type: "api_key", provider: "anthropic", key: "ambient-key" },
+        [profileId]: apiProfile("ambient-key"),
       },
     });
     order.mockImplementation(({ provider }) => (provider === "anthropic" ? [profileId] : []));
@@ -198,21 +205,8 @@ describe("provider usage auth boundary", () => {
   it("excludes native profiles while preserving the selected OAuth flow", async () => {
     seed(
       {
-        "anthropic:claude-cli": {
-          type: "oauth",
-          provider: "anthropic",
-          access: "native-access",
-          refresh: "native-refresh",
-          expires: 1_900_000_000_000,
-        },
-        "anthropic:managed": {
-          type: "oauth",
-          provider: "anthropic",
-          access: "managed-access",
-          refresh: "managed-refresh",
-          expires: 1_900_000_000_000,
-          authFlow: "external-flow",
-        },
+        "anthropic:claude-cli": oauthProfile("anthropic", "native-access"),
+        "anthropic:managed": oauthProfile("anthropic", "managed-access", "external-flow"),
       },
       { anthropic: ["anthropic:claude-cli", "anthropic:managed"] },
     );
@@ -236,13 +230,7 @@ describe("provider usage auth boundary", () => {
   it("finds credentials through owned aliases without importing unrelated providers", async () => {
     seed(
       {
-        "minimax-portal:default": {
-          type: "oauth",
-          provider: "minimax-portal",
-          access: "portal-token",
-          refresh: "refresh",
-          expires: 1_900_000_000_000,
-        },
+        "minimax-portal:default": oauthProfile("minimax-portal", "portal-token"),
       },
       { "minimax-portal": ["minimax-portal:default"] },
     );

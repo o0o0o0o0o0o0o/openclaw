@@ -94,21 +94,22 @@ type DestroyableConnection = {
   destroy: () => void;
 };
 
-function createDirectApnsSendFixture(params: {
-  nodeId: string;
-  environment: "sandbox" | "production";
-  sendResult?: { status: number; apnsId: string; body: string };
-}) {
+function createDirectApnsSendFixture(
+  nodeId: string,
+  environment: "sandbox" | "production" = "sandbox",
+  sendResult = { status: 200, apnsId: "test-apns-id", body: "" },
+) {
+  const send = vi.fn().mockResolvedValue(sendResult);
   return {
-    send: vi
-      .fn()
-      .mockResolvedValue(params.sendResult ?? { status: 200, apnsId: "test-apns-id", body: "" }),
+    send,
+    requestSender: send,
+    nodeId,
     registration: {
-      nodeId: params.nodeId,
+      nodeId,
       transport: "direct" as const,
       token: "ABCD1234ABCD1234ABCD1234ABCD1234",
       topic: "ai.openclaw.ios",
-      environment: params.environment,
+      environment,
       updatedAtMs: 1,
     },
     auth: {
@@ -211,6 +212,40 @@ function requireSendRequest(send: ReturnType<typeof vi.fn>, label = "APNs send r
 
 function requirePayload(sendRequest: Record<string, unknown>) {
   return requireRecord(sendRequest.payload, "APNs payload");
+}
+
+function expectOpenClaw(payload: Record<string, unknown>, fields: Record<string, unknown>) {
+  const metadata = requireRecord(payload.openclaw, "openclaw payload");
+  expectRecordFields(metadata, fields);
+  expect(typeof metadata.ts).toBe("number");
+  return metadata;
+}
+
+async function withProxiedApns(
+  response: Parameters<typeof startFakeApnsServer>[0],
+  check: (
+    server: Awaited<ReturnType<typeof startFakeApnsServer>>,
+    proxy: Awaited<ReturnType<typeof startConnectProxy>>,
+  ) => Promise<void>,
+) {
+  const server = await startFakeApnsServer(response);
+  const proxy = await startConnectProxy(server.port);
+  let handle: ProxyHandle | null | undefined;
+  const previous = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  try {
+    handle = await startProxy({ proxyUrl: proxy.proxyUrl });
+    await check(server, proxy);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+    } else {
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = previous;
+    }
+    await stopProxy(handle ?? null);
+    await proxy.stop();
+    await server.stop();
+  }
 }
 
 async function startFakeApnsServer(params?: { responseBody?: string; status?: number }): Promise<{
@@ -331,23 +366,8 @@ describe("push APNs send semantics", () => {
   });
 
   it("routes direct APNs HTTP/2 requests through the active managed proxy", async () => {
-    const apnsServer = await startFakeApnsServer();
-    const proxy = await startConnectProxy(apnsServer.port);
-    let proxyHandle: ProxyHandle | null | undefined;
-    const previousTlsRejectUnauthorized = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
-    try {
-      proxyHandle = await startProxy({ proxyUrl: proxy.proxyUrl });
-      const { registration, auth } = createDirectApnsSendFixture({
-        nodeId: "ios-node-proxied-alert",
-        environment: "sandbox",
-        sendResult: {
-          status: 200,
-          apnsId: "unused",
-          body: "",
-        },
-      });
+    await withProxiedApns(undefined, async (apnsServer, proxy) => {
+      const { registration, auth } = createDirectApnsSendFixture("ios-node-proxied-alert");
 
       const result = await sendApnsAlert({
         registration,
@@ -383,81 +403,46 @@ describe("push APNs send semantics", () => {
         nodeId: "ios-node-proxied-alert",
       });
       expect(typeof openclawPayload.ts).toBe("number");
-    } finally {
-      if (previousTlsRejectUnauthorized === undefined) {
-        delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-      } else {
-        process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsRejectUnauthorized;
-      }
-      await stopProxy(proxyHandle ?? null);
-      await proxy.stop();
-      await apnsServer.stop();
-    }
+    });
   });
 
   it("bounds oversized direct APNs error bodies while preserving parseable reasons", async () => {
-    const apnsServer = await startFakeApnsServer({
-      status: 400,
-      responseBody: '{"reason":"BadDeviceToken"}' + " ".repeat(20_000),
-    });
-    const proxy = await startConnectProxy(apnsServer.port);
-    let proxyHandle: ProxyHandle | null | undefined;
-    const previousTlsRejectUnauthorized = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-
-    try {
-      proxyHandle = await startProxy({ proxyUrl: proxy.proxyUrl });
-      const { registration, auth } = createDirectApnsSendFixture({
-        nodeId: "ios-node-proxied-error-body",
-        environment: "sandbox",
-        sendResult: {
-          status: 200,
-          apnsId: "unused",
-          body: "",
-        },
-      });
-
-      const result = await sendApnsAlert({
-        registration,
-        nodeId: "ios-node-proxied-error-body",
-        title: "Wake",
-        body: "Ping",
-        auth,
-        timeoutMs: 2_500,
-      });
-
-      expectRecordFields(requireRecord(result, "APNs result"), {
-        ok: false,
+    await withProxiedApns(
+      {
         status: 400,
-        apnsId: "proxied-apns-id",
-        reason: "BadDeviceToken",
-        transport: "direct",
-      });
-    } finally {
-      if (previousTlsRejectUnauthorized === undefined) {
-        delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-      } else {
-        process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsRejectUnauthorized;
-      }
-      await stopProxy(proxyHandle ?? null);
-      await proxy.stop();
-      await apnsServer.stop();
-    }
+        responseBody: '{"reason":"BadDeviceToken"}' + " ".repeat(20_000),
+      },
+      async () => {
+        const { registration, auth } = createDirectApnsSendFixture("ios-node-proxied-error-body");
+
+        const result = await sendApnsAlert({
+          registration,
+          nodeId: "ios-node-proxied-error-body",
+          title: "Wake",
+          body: "Ping",
+          auth,
+          timeoutMs: 2_500,
+        });
+
+        expectRecordFields(requireRecord(result, "APNs result"), {
+          ok: false,
+          status: 400,
+          apnsId: "proxied-apns-id",
+          reason: "BadDeviceToken",
+          transport: "direct",
+        });
+      },
+    );
   });
 
   it("guards direct wake transport with current ownership and lifecycle", async () => {
-    const { send, registration, auth } = createDirectApnsSendFixture({
-      nodeId: "ios-node-guarded-wake",
-      environment: "production",
-    });
+    const fixture = createDirectApnsSendFixture("ios-node-guarded-wake", "production");
+    const { send } = fixture;
     const controller = new AbortController();
     const isCurrent = vi.fn().mockResolvedValue(true);
 
     await sendApnsBackgroundWake({
-      registration,
-      nodeId: "ios-node-guarded-wake",
-      auth,
-      requestSender: send,
+      ...fixture,
       signal: controller.signal,
       isCurrent,
     });
@@ -470,21 +455,16 @@ describe("push APNs send semantics", () => {
     expect(sent.priority).toBe("5");
     const payload = requirePayload(sent);
     expect(payload.aps).toEqual({ "content-available": 1 });
-    const openclawPayload = requireRecord(payload.openclaw, "openclaw payload");
-    expectRecordFields(openclawPayload, {
+    expectOpenClaw(payload, {
       kind: "node.wake",
       reason: "node.invoke",
       nodeId: "ios-node-guarded-wake",
     });
-    expect(typeof openclawPayload.ts).toBe("number");
 
     await expect(
       sendApnsBackgroundWake({
-        registration,
-        nodeId: "ios-node-guarded-wake",
+        ...fixture,
         wakeReason: "node.invoke",
-        auth,
-        requestSender: send,
         isCurrent: vi.fn().mockResolvedValue(false),
       }),
     ).rejects.toThrow("APNs send invalidated");
@@ -510,18 +490,18 @@ describe("push APNs send semantics", () => {
         checkingCurrentness.resolve();
         return currentness.promise;
       });
-    const { registration, auth } = createDirectApnsSendFixture({
-      nodeId: "ios-node-session-error",
-      environment: "production",
-      sendResult: { status: 200, apnsId: "unused", body: "" },
-    });
+    const { registration, auth } = createDirectApnsSendFixture(
+      "ios-node-session-error",
+      "production",
+      { status: 200, apnsId: "unused", body: "" },
+    );
 
     try {
       const sending = sendApnsBackgroundWake({
         registration,
+        auth,
         nodeId: "ios-node-session-error",
         wakeReason: "node.invoke",
-        auth,
         isCurrent,
       });
       await withTestTimeout(
@@ -545,196 +525,133 @@ describe("push APNs send semantics", () => {
     }
   });
 
-  it("sends exec approval alert pushes with generic modal-only metadata", async () => {
-    const { send, registration, auth } = createDirectApnsSendFixture({
-      nodeId: "ios-node-approval-alert",
-      environment: "sandbox",
-    });
-
-    const result = await sendApnsExecApprovalAlert({
-      registration,
+  it.each([
+    {
+      name: "exec approval alert with generic modal-only metadata",
       nodeId: "ios-node-approval-alert",
       approvalId: "approval-123",
-      gatewayDeviceId: "gateway-device-123",
-      auth,
-      requestSender: send,
-    });
-
-    expect(send).toHaveBeenCalledTimes(1);
-    const sent = requireSendRequest(send);
-    expect(sent.pushType).toBe("alert");
-    const payload = requirePayload(sent);
-    expect(payload.aps).toEqual({
-      alert: {
-        title: "Exec approval required",
-        body: "Open OpenClaw to review this request.",
-      },
-      sound: "default",
-      category: "openclaw.exec-approval",
-      "content-available": 1,
-    });
-    const openclawPayload = requireRecord(payload.openclaw, "openclaw payload");
-    expectRecordFields(openclawPayload, {
+      invoke: sendApnsExecApprovalAlert,
       kind: "exec.approval.requested",
-      approvalId: "approval-123",
-      gatewayDeviceId: "gateway-device-123",
-    });
-    expect(typeof openclawPayload.ts).toBe("number");
-    expectNoProperties(openclawPayload, [
-      "host",
-      "nodeId",
-      "agentId",
-      "commandText",
-      "allowedDecisions",
-      "expiresAtMs",
-    ]);
-    expect(result.ok).toBe(true);
-    expect(result.transport).toBe("direct");
-  });
-
-  it("sends exec approval cleanup pushes as silent background notifications", async () => {
-    const { send, registration, auth } = createDirectApnsSendFixture({
-      nodeId: "ios-node-approval-cleanup",
-      environment: "sandbox",
-      sendResult: { status: 200, apnsId: "apns-timeout-cap-id", body: "{}" },
-    });
-
-    const result = await sendApnsExecApprovalResolvedWake({
-      registration,
-      nodeId: "ios-node-approval-cleanup",
-      approvalId: "approval-123",
-      gatewayDeviceId: "gateway-device-123",
-      auth,
-      requestSender: send,
-      timeoutMs: Number.MAX_SAFE_INTEGER,
-    });
-
-    expect(send).toHaveBeenCalledTimes(1);
-    const sent = requireSendRequest(send);
-    expect(sent.timeoutMs).toBe(MAX_TIMER_TIMEOUT_MS);
-    expect(sent.pushType).toBe("background");
-    const payload = requirePayload(sent);
-    expect(payload.aps).toEqual({
-      "content-available": 1,
-    });
-    const openclawPayload = requireRecord(payload.openclaw, "openclaw payload");
-    expectRecordFields(openclawPayload, {
-      kind: "exec.approval.resolved",
-      approvalId: "approval-123",
-      gatewayDeviceId: "gateway-device-123",
-    });
-    expect(typeof openclawPayload.ts).toBe("number");
-    expect(result.ok).toBe(true);
-    expect(result.transport).toBe("direct");
-  });
-
-  it("builds plugin approval alerts with request copy and a bounded body", async () => {
-    const { send, registration, auth } = createDirectApnsSendFixture({
-      nodeId: "ios-node-plugin-approval-alert",
-      environment: "sandbox",
-    });
-    const description = `${"x".repeat(255)}😀${"y".repeat(300)}`;
-
-    await sendApnsPluginApprovalAlert({
-      registration,
-      nodeId: "ios-node-plugin-approval-alert",
-      approvalId: "plugin:approval-123",
-      gatewayDeviceId: "gateway-device-123",
-      title: "Install plugin update",
-      description,
-      auth,
-      requestSender: send,
-    });
-
-    const payload = requirePayload(requireSendRequest(send));
-    expect(payload.aps).toEqual({
-      alert: {
-        title: "Install plugin update",
-        body: `${"x".repeat(255)}…`,
+      pushType: "alert",
+      aps: {
+        alert: { title: "Exec approval required", body: "Open OpenClaw to review this request." },
+        sound: "default",
+        category: "openclaw.exec-approval",
+        "content-available": 1,
       },
-      sound: "default",
-      category: "openclaw.plugin-approval",
-      "content-available": 1,
-    });
-    const openclawPayload = requireRecord(payload.openclaw, "openclaw payload");
-    expectRecordFields(openclawPayload, {
-      kind: "plugin.approval.requested",
+      forbidden: ["host", "nodeId", "agentId", "commandText", "allowedDecisions", "expiresAtMs"],
+    },
+    {
+      name: "silent exec approval cleanup with a capped timeout",
+      nodeId: "ios-node-approval-cleanup",
+      approvalId: "approval-123",
+      invoke: sendApnsExecApprovalResolvedWake,
+      kind: "exec.approval.resolved",
+      pushType: "background",
+      aps: { "content-available": 1 },
+      timeoutMs: Number.MAX_SAFE_INTEGER,
+      sendResult: { status: 200, apnsId: "apns-timeout-cap-id", body: "{}" },
+    },
+    {
+      name: "plugin approval alert with bounded request copy",
+      nodeId: "ios-node-plugin-approval-alert",
       approvalId: "plugin:approval-123",
-      gatewayDeviceId: "gateway-device-123",
-    });
-    expect(typeof openclawPayload.ts).toBe("number");
-    expectNoProperties(openclawPayload, [
-      "title",
-      "description",
-      "toolName",
-      "agentId",
-      "sessionKey",
-    ]);
-  });
+      invoke: (params: Parameters<typeof sendApnsExecApprovalAlert>[0]) =>
+        sendApnsPluginApprovalAlert({
+          ...params,
+          title: "Install plugin update",
+          description: `${"x".repeat(255)}😀${"y".repeat(300)}`,
+        }),
+      kind: "plugin.approval.requested",
+      pushType: "alert",
+      aps: {
+        alert: { title: "Install plugin update", body: `${"x".repeat(255)}…` },
+        sound: "default",
+        category: "openclaw.plugin-approval",
+        "content-available": 1,
+      },
+      forbidden: ["title", "description", "toolName", "agentId", "sessionKey"],
+    },
+    {
+      name: "silent plugin approval cleanup",
+      nodeId: "ios-node-plugin-approval-cleanup",
+      approvalId: "plugin:approval-123",
+      invoke: sendApnsPluginApprovalResolvedWake,
+      kind: "plugin.approval.resolved",
+      pushType: "background",
+      aps: { "content-available": 1 },
+      sendResult: { status: 200, apnsId: "apns-plugin-approval-cleanup-id", body: "" },
+    },
+  ])(
+    "sends $name",
+    async ({
+      nodeId,
+      approvalId,
+      invoke,
+      kind,
+      pushType,
+      aps,
+      forbidden,
+      timeoutMs,
+      sendResult,
+    }) => {
+      const fixture = createDirectApnsSendFixture(nodeId, "sandbox", sendResult);
+      const result = await invoke({
+        ...fixture,
+        approvalId,
+        gatewayDeviceId: "gateway-device-123",
+        timeoutMs,
+      });
+      expect(fixture.send).toHaveBeenCalledTimes(1);
+      const sent = requireSendRequest(fixture.send);
+      expect(sent.pushType).toBe(pushType);
+      if (timeoutMs !== undefined) {
+        expect(sent.timeoutMs).toBe(MAX_TIMER_TIMEOUT_MS);
+      }
+      const payload = requirePayload(sent);
+      expect(payload.aps).toEqual(aps);
+      const metadata = expectOpenClaw(payload, {
+        kind,
+        approvalId,
+        gatewayDeviceId: "gateway-device-123",
+      });
+      expectNoProperties(metadata, forbidden ?? []);
+      expect(result.ok).toBe(true);
+      expect(result.transport).toBe("direct");
+    },
+  );
 
   it("falls back to the generic plugin approval title", async () => {
-    const { send, registration, auth } = createDirectApnsSendFixture({
-      nodeId: "ios-node-plugin-approval-fallback",
-      environment: "sandbox",
-      sendResult: { status: 200, apnsId: "apns-plugin-approval-fallback-id", body: "" },
+    const fixture = createDirectApnsSendFixture("ios-node-plugin-approval-fallback", "sandbox", {
+      status: 200,
+      apnsId: "apns-plugin-approval-fallback-id",
+      body: "",
     });
+    const { send } = fixture;
 
     await sendApnsPluginApprovalAlert({
-      registration,
-      nodeId: "ios-node-plugin-approval-fallback",
+      ...fixture,
       approvalId: "plugin:fallback",
       gatewayDeviceId: "gateway-device-123",
       title: "   ",
       description: "Review this request.",
-      auth,
-      requestSender: send,
     });
 
     const aps = requireRecord(requirePayload(requireSendRequest(send)).aps, "APNs aps payload");
     expect(requireRecord(aps.alert, "APNs alert").title).toBe("Approval required");
   });
 
-  it("builds plugin approval cleanup pushes as silent background notifications", async () => {
-    const { send, registration, auth } = createDirectApnsSendFixture({
-      nodeId: "ios-node-plugin-approval-cleanup",
-      environment: "sandbox",
-      sendResult: { status: 200, apnsId: "apns-plugin-approval-cleanup-id", body: "" },
-    });
-
-    await sendApnsPluginApprovalResolvedWake({
-      registration,
-      nodeId: "ios-node-plugin-approval-cleanup",
-      approvalId: "plugin:approval-123",
-      gatewayDeviceId: "gateway-device-123",
-      auth,
-      requestSender: send,
-    });
-
-    const payload = requirePayload(requireSendRequest(send));
-    expect(payload.aps).toEqual({ "content-available": 1 });
-    const openclawPayload = requireRecord(payload.openclaw, "openclaw payload");
-    expectRecordFields(openclawPayload, {
-      kind: "plugin.approval.resolved",
-      approvalId: "plugin:approval-123",
-      gatewayDeviceId: "gateway-device-123",
-    });
-    expect(typeof openclawPayload.ts).toBe("number");
-  });
-
   it("fails closed before sending when direct registrations carry invalid topics", async () => {
-    const { send, registration, auth } = createDirectApnsSendFixture({
-      nodeId: "ios-node-invalid-topic",
-      environment: "sandbox",
-    });
+    const fixture = createDirectApnsSendFixture("ios-node-invalid-topic");
+    const { send } = fixture;
 
     await expect(
       sendApnsAlert({
-        registration: { ...registration, topic: "   " },
+        ...fixture,
+        registration: { ...fixture.registration, topic: "   " },
         nodeId: "ios-node-invalid-topic",
         title: "Wake",
         body: "Ping",
-        auth,
-        requestSender: send,
       }),
     ).rejects.toThrow("topic required");
 
@@ -774,13 +691,11 @@ describe("push APNs send semantics", () => {
     });
     const payload = requirePayload(sent);
     expect(payload.aps).toEqual({ "content-available": 1 });
-    const openclawPayload = requireRecord(payload.openclaw, "openclaw payload");
-    expectRecordFields(openclawPayload, {
+    expectOpenClaw(payload, {
       kind: "node.wake",
       reason: "queue.retry",
       nodeId: "ios-node-relay-wake",
     });
-    expect(typeof openclawPayload.ts).toBe("number");
     expectRecordFields(requireRecord(result, "APNs result"), {
       ok: false,
       status: 429,
@@ -792,23 +707,16 @@ describe("push APNs send semantics", () => {
   });
 
   it("keeps bounded non-JSON error reasons UTF-16 well-formed", async () => {
-    const { send, registration, auth } = createDirectApnsSendFixture({
-      nodeId: "ios-node-utf16-reason",
-      environment: "sandbox",
-      sendResult: {
-        status: 400,
-        apnsId: "apns-utf16-reason-id",
-        body: `${"x".repeat(199)}🚀tail`,
-      },
+    const fixture = createDirectApnsSendFixture("ios-node-utf16-reason", "sandbox", {
+      status: 400,
+      apnsId: "apns-utf16-reason-id",
+      body: `${"x".repeat(199)}🚀tail`,
     });
 
     const result = await sendApnsAlert({
-      registration,
-      nodeId: "ios-node-utf16-reason",
+      ...fixture,
       title: "Wake",
       body: "Ping",
-      auth,
-      requestSender: send,
     });
 
     expect(requireRecord(result, "APNs result").reason).toBe("x".repeat(199));
@@ -898,48 +806,30 @@ describe("push APNs auth and helper coverage", () => {
   });
 
   it("clears only direct registrations without an environment override mismatch", () => {
+    const { registration } = createDirectApnsSendFixture("ios-node-direct");
+    const result = { status: 400, reason: "BadDeviceToken" };
     expect(
       shouldClearStoredApnsRegistration({
-        registration: {
-          nodeId: "ios-node-direct",
-          transport: "direct",
-          token: "ABCD1234ABCD1234ABCD1234ABCD1234",
-          topic: "ai.openclaw.ios",
-          environment: "sandbox",
-          updatedAtMs: 1,
-        },
-        result: { status: 400, reason: "BadDeviceToken" },
+        registration,
+        result,
       }),
     ).toBe(true);
 
     expect(
       shouldClearStoredApnsRegistration({
-        registration: {
+        registration: createRelayApnsSendFixture({
           nodeId: "ios-node-relay",
-          transport: "relay",
           relayHandle: "relay-handle-123",
-          sendGrant: "send-grant-123",
-          installationId: "install-123",
-          topic: "ai.openclaw.ios",
-          environment: "production",
-          distribution: "official",
-          updatedAtMs: 1,
-        },
+          sendResult: { ok: true, status: 200, environment: "production" },
+        }).registration,
         result: { status: 410, reason: "Unregistered" },
       }),
     ).toBe(false);
 
     expect(
       shouldClearStoredApnsRegistration({
-        registration: {
-          nodeId: "ios-node-direct",
-          transport: "direct",
-          token: "ABCD1234ABCD1234ABCD1234ABCD1234",
-          topic: "ai.openclaw.ios",
-          environment: "sandbox",
-          updatedAtMs: 1,
-        },
-        result: { status: 400, reason: "BadDeviceToken" },
+        registration,
+        result,
         overrideEnvironment: "production",
       }),
     ).toBe(false);

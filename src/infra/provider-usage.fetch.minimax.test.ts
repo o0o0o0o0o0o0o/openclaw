@@ -15,6 +15,18 @@ const model = (fields: Record<string, unknown>) => ({
   end_time: end,
   ...fields,
 });
+const counts = (total: number, remaining: number, model_name: string) =>
+  model({
+    model_name,
+    current_interval_total_count: total,
+    current_interval_usage_count: remaining,
+  });
+const modelData = (...model_remains: Record<string, unknown>[]) => ({ model_remains });
+const emptySpeechQuota = {
+  model_name: "speech-hd",
+  current_interval_total_count: 0,
+  current_interval_usage_count: 0,
+};
 async function fetchUsage(payload: unknown, baseUrl?: string) {
   const fetch = createProviderUsageFetch(async (_url, init) => {
     expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer key");
@@ -120,96 +132,64 @@ describe("fetchMinimaxUsage", () => {
     },
     {
       name: "chat model ahead of empty speech quotas",
-      data: {
-        model_remains: [
-          {
-            model_name: "speech-hd",
-            current_interval_total_count: 0,
-            current_interval_usage_count: 0,
-          },
-          model({
-            model_name: "MiniMax-M*",
-            current_interval_total_count: 600,
-            current_interval_usage_count: 595,
-          }),
-        ],
-      },
+      data: modelData(emptySpeechQuota, counts(600, 595, "MiniMax-M*")),
       plan: "Coding Plan · MiniMax-M*",
       windows: [window(0.8333333333333334, "4h", end)],
     },
     {
       name: "authoritative current and weekly remaining percentages",
       root: true,
-      data: {
-        model_remains: [
-          model({
-            start_time: String(start),
-            end_time: String(end),
-            current_interval_total_count: 100,
-            current_interval_usage_count: 90,
-            current_interval_remaining_percent: 97,
-            current_interval_status: 1,
-            current_weekly_total_count: 0,
-            current_weekly_usage_count: 0,
-            current_weekly_remaining_percent: 77,
-            current_weekly_status: 1,
-            weekly_end_time: String(end),
-          }),
-        ],
-      },
+      data: modelData(
+        model({
+          start_time: String(start),
+          end_time: String(end),
+          current_interval_total_count: 100,
+          current_interval_usage_count: 90,
+          current_interval_remaining_percent: 97,
+          current_interval_status: 1,
+          current_weekly_total_count: 0,
+          current_weekly_usage_count: 0,
+          current_weekly_remaining_percent: 77,
+          current_weekly_status: 1,
+          weekly_end_time: String(end),
+        }),
+      ),
       plan: "Coding Plan · general",
       windows: [window(3, "4h", end), window(23, "Week", end)],
     },
     {
       name: "unlimited windows yield a valid empty snapshot",
-      data: {
-        model_remains: [
-          model({
-            current_interval_remaining_percent: 100,
-            current_interval_status: 3,
-            current_weekly_remaining_percent: 100,
-            current_weekly_status: 3,
-          }),
-        ],
-      },
+      data: modelData(
+        model({
+          current_interval_remaining_percent: 100,
+          current_interval_status: 3,
+          current_weekly_remaining_percent: 100,
+          current_weekly_status: 3,
+        }),
+      ),
       plan: "Coding Plan · general",
       windows: [],
     },
     {
       name: "exhausted bounded row ahead of unlimited fallback",
-      data: {
-        model_remains: [
-          {
-            model_name: "video",
-            current_interval_remaining_percent: 100,
-            current_interval_status: 3,
-          },
-          model({
-            model_name: "other-bounded-model",
-            current_interval_remaining_percent: 0,
-            current_interval_status: 2,
-          }),
-        ],
-      },
+      data: modelData(
+        {
+          model_name: "video",
+          current_interval_remaining_percent: 100,
+          current_interval_status: 3,
+        },
+        model({
+          model_name: "other-bounded-model",
+          current_interval_remaining_percent: 0,
+          current_interval_status: 2,
+        }),
+      ),
       plan: "Coding Plan · other-bounded-model",
       windows: [window(100, "4h", end)],
     },
     {
       name: "first nonzero record without a chat or bounded model",
-      data: {
-        model_remains: [
-          {
-            model_name: "speech-hd",
-            current_interval_total_count: 0,
-            current_interval_usage_count: 0,
-          },
-          model({
-            model_name: "video-01",
-            current_interval_total_count: 200,
-            current_interval_usage_count: 150,
-          }),
-        ],
-      },
+      data: modelData(emptySpeechQuota, counts(200, 150, "video-01")),
       plan: "Coding Plan · video-01",
       windows: [window(25, "4h", end)],
     },

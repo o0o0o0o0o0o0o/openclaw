@@ -16,6 +16,13 @@ import type { ProviderUsageSnapshot, UsageSummary } from "./provider-usage.types
 
 const resolveProviderUsageAuthWithPluginMock = getProviderUsageAuthWithPluginMock();
 const resolveProviderUsageSnapshotWithPluginMock = getProviderUsageSnapshotWithPluginMock();
+const loadSummary = (options: Parameters<typeof loadProviderUsageSummary>[0]) =>
+  loadProviderUsageSummary({ config: {}, env: {}, ...options });
+const snapshot = (provider: string, displayName: string, label: string, usedPercent: number) => ({
+  provider,
+  displayName,
+  windows: [{ label, usedPercent }],
+});
 
 describe("provider-usage.load", () => {
   beforeEach(() => {
@@ -27,9 +34,8 @@ describe("provider-usage.load", () => {
   it("does not dispatch auth or fetch for an exhausted budget", async () => {
     const fetch = vi.fn(async () => new Response("{}"));
     resolveProviderUsageAuthWithPluginMock.mockResolvedValue({ token: "fixture-token" });
-    const result = await loadProviderUsageSummary({
+    const result = await loadSummary({
       providers: ["anthropic"],
-      config: {},
       env: { ANTHROPIC_API_KEY: "fixture-token" },
       now: usageNow,
       timeoutMs: 0,
@@ -77,10 +83,8 @@ describe("provider-usage.load", () => {
         return { provider: "anthropic", displayName: "Claude", windows: [] };
       });
       const pending = scope.track(() =>
-        loadProviderUsageSummary({
+        loadSummary({
           auth: [{ provider: "anthropic", token: "fixture-token" }],
-          config: {},
-          env: {},
           timeoutMs: 1,
           fetch,
         }),
@@ -125,9 +129,8 @@ describe("provider-usage.load", () => {
         return { handled: true };
       });
       const pending = scope.track(() =>
-        loadProviderUsageSummary({
+        loadSummary({
           providers: ["anthropic"],
-          config: {},
           env: { ANTHROPIC_API_KEY: "fixture-token" },
           timeoutMs: 1,
         }),
@@ -191,11 +194,12 @@ describe("provider-usage.load", () => {
 
   it("keeps window and balance-only snapshots with injected auth", async () => {
     const snapshots: ProviderUsageSnapshot[] = [
-      { provider: "anthropic", displayName: "Claude", windows: [{ label: "5h", usedPercent: 20 }] },
+      snapshot("anthropic", "Claude", "5h", 20),
       { provider: "deepseek", displayName: "DeepSeek", windows: [], summary: "Balance ¥42.50" },
     ];
+    const expected = structuredClone(snapshots);
     resolveProviderUsageSnapshotWithPluginMock.mockImplementation(
-      async ({ provider }) => snapshots.find((snapshot) => snapshot.provider === provider) ?? null,
+      async ({ provider }) => snapshots.find((entry) => entry.provider === provider) ?? null,
     );
     const mockFetch = createProviderUsageFetch(async () => {
       throw new Error("legacy fetch should not run");
@@ -210,19 +214,7 @@ describe("provider-usage.load", () => {
       mockFetch,
     );
 
-    expect(summary.providers).toEqual([
-      {
-        provider: "anthropic",
-        displayName: "Claude",
-        windows: [{ label: "5h", usedPercent: 20 }],
-      },
-      {
-        provider: "deepseek",
-        displayName: "DeepSeek",
-        windows: [],
-        summary: "Balance ¥42.50",
-      },
-    ]);
+    expect(summary.providers).toEqual(expected);
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
@@ -230,11 +222,7 @@ describe("provider-usage.load", () => {
     vi.useFakeTimers();
     const scope = new AsyncWorkScope();
     const heldSnapshot = createDeferredCore<ProviderUsageSnapshot>();
-    const lateSnapshot: ProviderUsageSnapshot = {
-      provider: "anthropic",
-      displayName: "Claude",
-      windows: [{ label: "5h", usedPercent: 20 }],
-    };
+    const lateSnapshot = snapshot("anthropic", "Claude", "5h", 20);
     let summaryPromise: Promise<UsageSummary> | undefined;
     let draining: Promise<void> | undefined;
     try {
@@ -242,20 +230,14 @@ describe("provider-usage.load", () => {
         if (provider === "anthropic") {
           return await heldSnapshot.promise;
         }
-        return {
-          provider,
-          displayName: "Codex",
-          windows: [{ label: "3h", usedPercent: 12 }],
-        };
+        return snapshot(provider, "Codex", "3h", 12);
       });
       summaryPromise = scope.track(() =>
-        loadProviderUsageSummary({
+        loadSummary({
           auth: [
             { provider: "anthropic", token: "token-a" },
             { provider: "openai", token: "token-codex" },
           ],
-          config: {},
-          env: {},
           timeoutMs: 5_000,
         }),
       );
@@ -274,11 +256,7 @@ describe("provider-usage.load", () => {
       expect(settledAtDeadline).toBe(true);
       expect(summary.providers).toEqual([
         { provider: "anthropic", displayName: "Claude", windows: [], error: "Timeout" },
-        {
-          provider: "openai",
-          displayName: "Codex",
-          windows: [{ label: "3h", usedPercent: 12 }],
-        },
+        snapshot("openai", "Codex", "3h", 12),
       ]);
       let drained = false;
       draining = scope.drain().then(() => {
@@ -308,15 +286,12 @@ describe("provider-usage.load", () => {
       }
       return { token: `${provider}-token` };
     });
-    resolveProviderUsageSnapshotWithPluginMock.mockImplementation(async ({ provider }) => ({
-      provider,
-      displayName: provider,
-      windows: [{ label: "5h", usedPercent: 12 }],
-    }));
+    resolveProviderUsageSnapshotWithPluginMock.mockImplementation(async ({ provider }) =>
+      snapshot(provider, provider, "5h", 12),
+    );
 
-    const summary = await loadProviderUsageSummary({
+    const summary = await loadSummary({
       providers: ["anthropic", "openai"],
-      config: {},
       // Credential sources keep both providers past the plugin-auth gate so the
       // sibling-isolation behavior under test is actually exercised.
       env: { ANTHROPIC_API_KEY: "sk-ant-test", OPENAI_API_KEY: "sk-openai-test" },
@@ -324,11 +299,7 @@ describe("provider-usage.load", () => {
 
     expect(summary.providers).toEqual([
       { provider: "anthropic", displayName: "Claude", windows: [], error: "auth failed" },
-      {
-        provider: "openai",
-        displayName: "openai",
-        windows: [{ label: "5h", usedPercent: 12 }],
-      },
+      snapshot("openai", "openai", "5h", 12),
     ]);
   });
 
@@ -337,7 +308,7 @@ describe("provider-usage.load", () => {
     vi.stubGlobal("fetch", undefined);
     try {
       await expect(
-        loadProviderUsageSummary({
+        loadSummary({
           now: usageNow,
           auth: [{ provider: "xiaomi", token: "token-x" }],
           env: {},

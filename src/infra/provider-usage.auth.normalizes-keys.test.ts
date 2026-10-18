@@ -127,14 +127,6 @@ describe("resolveProviderAuths key normalization", () => {
     vi.restoreAllMocks();
   });
 
-  async function withSuiteHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
-    return await fn(await suiteRootTracker.make("case"));
-  }
-
-  function agentDirForHome(home: string): string {
-    return path.join(home, ".openclaw", "agents", "main", "agent");
-  }
-
   function buildSuiteEnv(
     home: string,
     env: Record<string, string | undefined> = {},
@@ -159,15 +151,14 @@ describe("resolveProviderAuths key normalization", () => {
     config: OpenClawConfig = {},
     env: NodeJS.ProcessEnv = {},
   ) {
-    return withSuiteHome(async (home) =>
-      resolveProviderAuths({
-        providers,
-        config,
-        env: buildSuiteEnv(home, env),
-        store: authProfileMocks.store,
-        agentDir: agentDirForHome(home),
-      }),
-    );
+    const home = await suiteRootTracker.make("case");
+    return resolveProviderAuths({
+      providers,
+      config,
+      env: buildSuiteEnv(home, env),
+      store: authProfileMocks.store,
+      agentDir: path.join(home, ".openclaw", "agents", "main", "agent"),
+    });
   }
 
   it("strips embedded CR/LF from env credentials", async () => {
@@ -175,10 +166,7 @@ describe("resolveProviderAuths key normalization", () => {
       await resolve(
         ["zai", "minimax"],
         {},
-        {
-          ZAI_API_KEY: "zai-\r\nkey",
-          MINIMAX_API_KEY: "mini-\r\nmax",
-        },
+        { ZAI_API_KEY: "zai-\r\nkey", MINIMAX_API_KEY: "mini-\r\nmax" },
       ),
     ).toEqual([
       { provider: "zai", token: "zai-key" },

@@ -27,6 +27,7 @@ const { pairing, work, wakeState, wake } = vi.hoisted(() => ({
 vi.mock("../node-pending-work.js", () => work);
 // mock-isolation: Pairing generations are synthetic and must not read host pairings.
 vi.mock("../../infra/device-pairing-node-state.js", () => pairing);
+// mock-isolation: Wake lifecycle state is synthetic and must not read or change host nodes.
 vi.mock("../node-wake-state.js", () => wakeState);
 // mock-isolation: Exercise wake decisions without sending APNs or waking real nodes.
 vi.mock("./nodes.wake.js", () => wake);

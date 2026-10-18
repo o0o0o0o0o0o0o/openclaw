@@ -7,10 +7,8 @@ import {
   readAgentDeletionJournal as readJournal,
   removeAgentDeletionJournal as removeJournal,
 } from "../test-utils/agent-deletion-journal.js";
-import {
-  completeAgentDeletionJournalInDatabase,
-  retireAgentDeletionJournalInDatabase as retireJournal,
-} from "./agent-deletion-journal-authority.worker.js";
+import { retireAgentDeletionJournalInDatabase as retireJournal } from "./agent-deletion-journal-authority.worker.js";
+import { completeAgentDeletionJournalInDatabase } from "./agent-deletion-journal.js";
 import type { AgentDeletionJournalInput } from "./agent-deletion-journal.types.js";
 import {
   assertNoOpenClawAgentDatabaseLeases as assertDrained,

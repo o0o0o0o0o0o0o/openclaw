@@ -341,8 +341,8 @@ describe("node.invoke caller cancellation", () => {
 
   it("cancels paired-node work without breaking pairing lifecycle identity", async () => {
     const controller = new AbortController();
-    const invoke = vi.fn(
-      (params: { signal?: AbortSignal }) =>
+    const invoke = vi.fn<NodeRegistry["invoke"]>(
+      (params) =>
         new Promise((resolve) => {
           params.signal?.addEventListener(
             "abort",

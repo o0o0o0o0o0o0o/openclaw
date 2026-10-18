@@ -7,13 +7,12 @@ import {
   withAgentRunLifecycleGeneration,
 } from "../infra/agent-events.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../infra/agent-run-registry.js";
-import { registerChatRun, subscribeAgentEvents } from "./server-chat.agent-events.test-helpers.js";
 import {
-  createAgentEventHandler,
-  createChatRunState,
-  createSessionEventSubscriberRegistry,
-  createSessionMessageSubscriberRegistry,
-} from "./server-chat.js";
+  createChatEventFixture,
+  registerChatRun,
+  subscribeAgentEvents,
+} from "./server-chat.agent-events.test-helpers.js";
+import { createAgentEventHandler } from "./server-chat.js";
 import { createSessionRowProjectionFixture } from "./session-row-projection.test-support.js";
 
 const sessionFixture = vi.hoisted(() => ({ updatedAt: 50 }));
@@ -32,12 +31,17 @@ describe("retired execution event projection", () => {
     sessionFixture.updatedAt = 50;
   });
 
-  async function withReceiver(emit: (chatRunState: ReturnType<typeof createChatRunState>) => void) {
-    const broadcast = vi.fn();
-    const broadcastToConnIds = vi.fn();
-    const nodeSendToSession = vi.fn();
-    const chatRunState = createChatRunState();
-    const sessionMessageSubscribers = createSessionMessageSubscriberRegistry();
+  async function withReceiver(
+    emit: (chatRunState: ReturnType<typeof createChatEventFixture>["chatRunState"]) => void,
+  ) {
+    const fixture = createChatEventFixture();
+    const {
+      broadcast,
+      broadcastToConnIds,
+      nodeSendToSession,
+      chatRunState,
+      sessionMessageSubscribers,
+    } = fixture;
     sessionMessageSubscribers.subscribe("selected", "agent:delivery:late");
     const entry = {
       sessionId: "session",
@@ -50,15 +54,7 @@ describe("retired execution event projection", () => {
       store: { global: entry, "agent:delivery:late": entry },
     });
     const handler = createAgentEventHandler({
-      broadcast,
-      broadcastToConnIds,
-      nodeHasSessionSubscribers: () => true,
-      nodeSendToSession,
-      chatRunState,
-      agentRunSeq: new Map(),
-      toolEventRecipients: chatRunState.toolEventRecipients,
-      sessionMessageSubscribers,
-      sessionEventSubscribers: createSessionEventSubscriberRegistry(),
+      ...fixture,
       clearAgentRunContext,
       resolveSessionKeyForRun: () => {
         throw new Error("Event lost its producer route");
@@ -67,9 +63,7 @@ describe("retired execution event projection", () => {
       persistGatewaySessionLifecycleEventForEvent: async () => {},
       getSessionRowProjection: () => projection,
     });
-    const unsubscribe = subscribeAgentEvents(async (event) => {
-      await handler(event);
-    });
+    const unsubscribe = subscribeAgentEvents(handler);
     try {
       withAgentRunLifecycleGeneration(getAgentEventLifecycleGeneration(), () => emit(chatRunState));
     } finally {

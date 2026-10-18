@@ -17,31 +17,18 @@ import {
   resolveOpenClawAgentSqlitePath,
 } from "../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import {
-  createChatRunState,
-  createSessionEventSubscriberRegistry,
-  createSessionMessageSubscriberRegistry,
-} from "./server-chat-state.js";
-import { emitAgentEvent } from "./server-chat.agent-events.test-helpers.js";
+import { createChatEventFixture, emitAgentEvent } from "./server-chat.agent-events.test-helpers.js";
 import { createAgentEventHandler } from "./server-chat.js";
 import { createSessionRowProjection, type SessionRowProjection } from "./session-row-projection.js";
 
 function createLineageHarness(projection: SessionRowProjection, key: string) {
-  const broadcast = vi.fn();
-  const chatRunState = createChatRunState();
+  const fixture = createChatEventFixture();
+  const { broadcast, chatRunState } = fixture;
   const runId = "prepared-lineage-run";
   const handler = createAgentEventHandler({
-    broadcast,
-    broadcastToConnIds: vi.fn(),
-    nodeSendToSession: vi.fn(),
+    ...fixture,
     nodeHasSessionSubscribers: () => false,
-    agentRunSeq: new Map(),
-    chatRunState,
     resolveSessionKeyForRun: () => key,
-    clearAgentRunContext: vi.fn(),
-    toolEventRecipients: chatRunState.toolEventRecipients,
-    sessionEventSubscribers: createSessionEventSubscriberRegistry(),
-    sessionMessageSubscribers: createSessionMessageSubscriberRegistry(),
     getSessionRowProjection: () => projection,
   });
   let seq = 0;

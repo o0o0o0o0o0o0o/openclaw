@@ -90,15 +90,19 @@ it.each([
       [...gateway.agent(), ...gateway.targetedAgent()].flatMap(([, event]) =>
         event.stream === "thinking" && event.data.phase === "persisted" ? [event.data] : [],
       );
+    const receipt = (itemId: string) => ({
+      phase: "persisted",
+      itemId,
+      messageId: `${itemId}-message`,
+      messageRunId: runId,
+    });
     try {
       const firstClaim = claim();
       thinking(firstClaim, "first");
       await unlisten.drain();
       commit("first", 2);
       await unlisten.drain();
-      expect(receipts()).toEqual([
-        { phase: "persisted", itemId: "first", messageId: "first-message", messageRunId: runId },
-      ]);
+      expect(receipts()).toEqual([receipt("first")]);
       commit("first", 2, { sessionKey: "agent:main:unrelated" });
       commit("first", 2, { sessionId: "replaced-session" });
       await unlisten.drain();
@@ -119,10 +123,7 @@ it.each([
       await unlisten.drain();
       commit("second", 5);
       await unlisten.drain();
-      expect(receipts()).toEqual([
-        { phase: "persisted", itemId: "first", messageId: "first-message", messageRunId: runId },
-        { phase: "persisted", itemId: "second", messageId: "second-message", messageRunId: runId },
-      ]);
+      expect(receipts()).toEqual([receipt("first"), receipt("second")]);
       gateway.chatRunState.clearRun(runId);
       commit("second", 5);
       await unlisten.drain();
@@ -189,22 +190,13 @@ it("hands paced native reasoning to stable durable identity despite rewritten po
       messageSeq: 18,
     });
     await unlisten.drain();
-    expect(thoughts().map((event) => ({ runId: event.runId, data: event.data }))).toEqual([
-      { runId: clientRunId, data: { text: "Checking", delta: "Checking", itemId: source.itemId } },
-      {
-        runId: clientRunId,
-        data: { text: "Checking facts", delta: " facts", itemId: source.itemId },
-      },
-      {
-        runId: clientRunId,
-        data: {
-          phase: "persisted",
-          itemId: source.itemId,
-          messageId,
-          messageRunId: runId,
-        },
-      },
-    ]);
+    expect(thoughts().map((event) => ({ runId: event.runId, data: event.data }))).toEqual(
+      [
+        { text: "Checking", delta: "Checking", itemId: source.itemId },
+        { text: "Checking facts", delta: " facts", itemId: source.itemId },
+        { phase: "persisted", itemId: source.itemId, messageId, messageRunId: runId },
+      ].map((data) => ({ runId: clientRunId, data })),
+    );
     // Live ownership is remapped; durable identity survives rewritten display positions.
     const durable = projectSessionMessagePayload({
       sessionKey,

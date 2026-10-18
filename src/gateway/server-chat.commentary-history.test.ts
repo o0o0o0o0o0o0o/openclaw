@@ -85,6 +85,12 @@ it("restores only the unowned tail with bounded commentary replay and continues 
   const deliver = (stream: AgentEventPayload["stream"], data: AgentEventPayload["data"]) =>
     emitAgentEvent({ runId, sessionKey: "main", stream, data });
   const { emit, subscription } = createSubscribedSessionHarness({ runId });
+  const drain = async () => {
+    await subscription.waitForPendingEvents();
+    await unsubscribe.drain();
+  };
+  const snapshot = () =>
+    projectInFlightRunSnapshot({ chatRunState: gateway.chatRunState, runId, startedAtMs });
   const tool = (toolCallId: string, completed: boolean) => {
     deliver("tool", { phase: "start", toolCallId, name: "exec", args: {} });
     if (completed) {
@@ -123,8 +129,7 @@ it("restores only the unowned tail with bounded commentary replay and continues 
       vi.advanceTimersByTime(250);
       emit({ type: "message_start", message: textMessage("") });
       updateText(text, text);
-      await subscription.waitForPendingEvents();
-      await unsubscribe.drain();
+      await drain();
       const itemId = `commentary-0-step-${index}`;
       const commentary = {
         ...textMessage(text),
@@ -144,8 +149,7 @@ it("restores only the unowned tail with bounded commentary replay and continues 
         assistantMessageEvent: { type: "toolcall_start", contentIndex: 1, partial: commentary },
       });
       emit({ type: "message_end", message: commentary });
-      await subscription.waitForPendingEvents();
-      await unsubscribe.drain();
+      await drain();
       expect
         .soft(renderedOrder(live))
         .toEqual(Array.from({ length: index + 1 }, (_, step) => step + 1));
@@ -187,11 +191,7 @@ it("restores only the unowned tail with bounded commentary replay and continues 
     history.hasMore = true;
     history.nextOffset = 40;
     history.totalMessages = 220;
-    history.inFlightRun = projectInFlightRunSnapshot({
-      chatRunState: gateway.chatRunState,
-      runId,
-      startedAtMs,
-    });
+    history.inFlightRun = snapshot();
     expect(history.messages).toHaveLength(40);
     expect(history.inFlightRun.events).toHaveLength(49);
     expect(
@@ -209,13 +209,8 @@ it("restores only the unowned tail with bounded commentary replay and continues 
     vi.advanceTimersByTime(250);
     emit({ type: "message_start", message: textMessage("") });
     updateText(pending, pending);
-    await subscription.waitForPendingEvents();
-    await unsubscribe.drain();
-    history.inFlightRun = projectInFlightRunSnapshot({
-      chatRunState: gateway.chatRunState,
-      runId,
-      startedAtMs,
-    });
+    await drain();
+    history.inFlightRun = snapshot();
     const restored = createState(history);
     clients.push(restored);
     await loadChatHistory(restored);
@@ -224,8 +219,7 @@ it("restores only the unowned tail with bounded commentary replay and continues 
 
     vi.advanceTimersByTime(250);
     updateText(`${pending} Continuing after switch-back.`, " Continuing after switch-back.");
-    await subscription.waitForPendingEvents();
-    await unsubscribe.drain();
+    await drain();
     vi.advanceTimersByTime(250);
     expect(renderedOrder(live)).toEqual(Array.from({ length: 23 }, (_, index) => index + 1));
     expect(renderedOrder(restored)).toEqual([19, 20, 21, 22, 23]);
@@ -242,43 +236,24 @@ it("restores only the unowned tail with bounded commentary replay and continues 
 });
 
 it.each([
-  {
-    name: "without steer",
-    reload: false,
-    tail: "Live B.",
-    persistTail: false,
-    canvas: false,
-    includeSteer: false,
-  },
-  {
-    name: "saved after steer",
-    reload: false,
-    tail: "Live B.",
-    persistTail: false,
-    canvas: false,
-    steerFirst: true,
-  },
-  { name: "live", reload: false, tail: "Live B.", persistTail: false, canvas: false },
-  { name: "restored", reload: true, tail: "Live B.", persistTail: false, canvas: false },
-  {
-    name: "identical later occurrence",
-    reload: false,
-    tail: "Saved A.",
-    persistTail: false,
-    canvas: false,
-  },
-  { name: "literal terminal tail", reload: false, tail: "[", persistTail: false, canvas: false },
-  { name: "fully committed", reload: false, tail: "Live B.", persistTail: true, canvas: false },
-  {
-    name: "canvas-only display tail",
-    reload: false,
-    tail: "Live B.",
-    persistTail: true,
-    canvas: true,
-  },
+  { name: "without steer", includeSteer: false },
+  { name: "saved after steer", steerFirst: true },
+  { name: "live" },
+  { name: "restored", reload: true },
+  { name: "identical later occurrence", tail: "Saved A." },
+  { name: "literal terminal tail", tail: "[" },
+  { name: "fully committed", persistTail: true },
+  { name: "canvas-only display tail", persistTail: true, canvas: true },
 ])(
   "displays each occurrence once when a run finishes ($name)",
-  async ({ reload, tail, persistTail, canvas, includeSteer = true, steerFirst = false }) => {
+  async ({
+    reload = false,
+    tail = "Live B.",
+    persistTail = false,
+    canvas = false,
+    includeSteer = true,
+    steerFirst = false,
+  }) => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     vi.setSystemTime(new Date("2026-05-09T00:00:00.000Z"));
     vi.stubGlobal("window", globalThis);
@@ -325,6 +300,14 @@ it.each([
         kind: "live",
         activeRunId: runId,
       });
+    const expectedText = (...suffix: string[]) =>
+      [
+        "Original prompt",
+        ...(includeSteer && steerFirst ? ["Steer prompt"] : []),
+        "Saved A.",
+        ...suffix,
+      ].join("\n");
+    const afterSteer = includeSteer && !steerFirst ? ["Steer prompt"] : [];
     try {
       await loadChatHistory(state);
       if (includeSteer && steerFirst) {
@@ -355,13 +338,7 @@ it.each([
         activeRunId: runId,
       });
       expect(state.chatRunId).toBe(runId);
-      expect(renderedText(state, false)).toBe(
-        [
-          "Original prompt",
-          ...(includeSteer && steerFirst ? ["Steer prompt"] : []),
-          "Saved A.",
-        ].join("\n"),
-      );
+      expect(renderedText(state, false)).toBe(expectedText());
       if (includeSteer && !steerFirst) {
         applySteer();
       }
@@ -381,13 +358,7 @@ it.each([
         await loadChatHistory(state);
       }
       expect(renderedText(state)).toBe(
-        [
-          "Original prompt",
-          ...(includeSteer && steerFirst ? ["Steer prompt"] : []),
-          "Saved A.",
-          ...(includeSteer && !steerFirst ? ["Steer prompt"] : []),
-          ...(tail === "[" ? [] : [tail]),
-        ].join("\n"),
+        expectedText(...afterSteer, ...(tail === "[" ? [] : [tail])),
       );
       if (persistTail) {
         const savedTail = {
@@ -428,15 +399,7 @@ it.each([
           content: expect.arrayContaining([{ type: "text", text: `Saved A.\n\n${tail}` }]),
         },
       });
-      expect(renderedText(state)).toBe(
-        [
-          "Original prompt",
-          ...(includeSteer && steerFirst ? ["Steer prompt"] : []),
-          "Saved A.",
-          ...(includeSteer && !steerFirst ? ["Steer prompt"] : []),
-          tail,
-        ].join("\n"),
-      );
+      expect(renderedText(state)).toBe(expectedText(...afterSteer, tail));
       if (canvas) {
         const widget = expect.objectContaining({
           type: "canvas",
@@ -452,16 +415,7 @@ it.each([
           renderedItems(state).flatMap((item) =>
             item.kind === "group" ? item.messages.map(({ message }) => message) : [],
           ),
-        ).toContainEqual(
-          expect.objectContaining({
-            content: expect.arrayContaining([
-              expect.objectContaining({
-                type: "canvas",
-                preview: expect.objectContaining({ title: "final-widget" }),
-              }),
-            ]),
-          }),
-        );
+        ).toContainEqual(expect.objectContaining({ content: expect.arrayContaining([widget]) }));
       }
       expect(state.chatRunId).toBeNull();
     } finally {

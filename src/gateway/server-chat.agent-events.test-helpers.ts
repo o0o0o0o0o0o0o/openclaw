@@ -9,8 +9,13 @@ import {
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
-import { createChatRunState } from "./server-chat-state.js";
+import {
+  createChatRunState,
+  createSessionEventSubscriberRegistry,
+  createSessionMessageSubscriberRegistry,
+} from "./server-chat-state.js";
 import type { ChatRunRegistration, ChatRunState } from "./server-chat-state.js";
+import type { AgentEventHandlerOptions } from "./server-chat.js";
 import type { GatewayRequestContext, RespondFn } from "./server-methods/shared-types.js";
 import { agentDiscoveryMock } from "./test-helpers.runtime-state.js";
 
@@ -38,6 +43,23 @@ type TextTranscriptEventOptions = {
   timestamp?: number;
   message?: Record<string, unknown>;
 };
+
+export function createChatEventFixture() {
+  const chatRunState = createChatRunState();
+  return {
+    chatRunState,
+    broadcast: vi.fn(),
+    broadcastToConnIds: vi.fn(),
+    nodeSendToSession: vi.fn(),
+    nodeHasSessionSubscribers: () => true,
+    agentRunSeq: new Map<string, number>(),
+    resolveSessionKeyForRun: () => undefined,
+    clearAgentRunContext: vi.fn(),
+    toolEventRecipients: chatRunState.toolEventRecipients,
+    sessionEventSubscribers: createSessionEventSubscriberRegistry(),
+    sessionMessageSubscribers: createSessionMessageSubscriberRegistry(),
+  } satisfies AgentEventHandlerOptions;
+}
 
 export function emitAgentEvent(
   handler: AgentEventHandler,
@@ -275,64 +297,42 @@ export function registerChatConnectionIdentityTest(harness: {
         expect(context.removeChatRun).toHaveBeenCalledTimes(removeCount + 1);
       };
 
-      await send({
-        authenticatedUserId: "alice@example.com",
-        authenticatedUserProfile: {
-          profileId: ensureProfileForEmail("alice@example.com").id,
-          displayName: "Alice",
-          hasAvatar: false,
-        },
-        idempotencyKey: "idem-attributed-alice",
-        message: "prompt from alice",
-      });
-      await send({
-        authenticatedUserId: "bob@example.com",
-        authenticatedUserProfile: {
-          profileId: ensureProfileForEmail("bob@example.com").id,
-          displayName: "Bob",
-          hasAvatar: true,
-        },
-        idempotencyKey: "idem-attributed-bob",
-        message: "prompt from bob",
-      });
+      const sendAs = (name: string, hasAvatar: boolean) => {
+        const login = name.toLowerCase();
+        const authenticatedUserId = `${login}@example.com`;
+        return send({
+          authenticatedUserId,
+          authenticatedUserProfile: {
+            profileId: ensureProfileForEmail(authenticatedUserId).id,
+            displayName: name,
+            hasAvatar,
+          },
+          idempotencyKey: `idem-attributed-${login}`,
+          message: `prompt from ${login}`,
+        });
+      };
+      await sendAs("Alice", false);
+      await sendAs("Bob", true);
       await send({
         idempotencyKey: "idem-unattributed",
         message: "prompt without identity",
       });
 
-      const transcriptEvents = harness.readTranscript();
-      expect(transcriptEvents).toEqual(
+      const userMessage = (content: string, identity: unknown) =>
+        expect.objectContaining({
+          type: "message",
+          message: expect.objectContaining({ role: "user", content, __openclaw: identity }),
+        });
+      const sender = (email: string, senderName: string) =>
+        expect.objectContaining({ senderId: ensureProfileForEmail(email).id, senderName });
+      expect(harness.readTranscript()).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({
-            type: "message",
-            message: expect.objectContaining({
-              role: "user",
-              content: "prompt from alice",
-              __openclaw: expect.objectContaining({
-                senderId: ensureProfileForEmail("alice@example.com").id,
-                senderName: "Alice",
-              }),
-            }),
-          }),
-          expect.objectContaining({
-            type: "message",
-            message: expect.objectContaining({
-              role: "user",
-              content: "prompt from bob",
-              __openclaw: expect.objectContaining({
-                senderId: ensureProfileForEmail("bob@example.com").id,
-                senderName: "Bob",
-              }),
-            }),
-          }),
-          expect.objectContaining({
-            type: "message",
-            message: expect.objectContaining({
-              role: "user",
-              content: "prompt without identity",
-              __openclaw: expect.not.objectContaining({ senderId: expect.anything() }),
-            }),
-          }),
+          userMessage("prompt from alice", sender("alice@example.com", "Alice")),
+          userMessage("prompt from bob", sender("bob@example.com", "Bob")),
+          userMessage(
+            "prompt without identity",
+            expect.not.objectContaining({ senderId: expect.anything() }),
+          ),
         ]),
       );
     });
@@ -361,12 +361,7 @@ export function registerBoundedWidgetSnapshotsTest({
       h.emit(
         "run-widgets",
         "tool",
-        {
-          phase: "result",
-          name: "show_widget",
-          result,
-          isError,
-        },
+        { phase: "result", name: "show_widget", result, isError },
         { seq: ++seq },
       );
     const publishWidget = async (index: number, titleChars = 1_700) => {

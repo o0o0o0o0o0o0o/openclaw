@@ -1,4 +1,3 @@
-import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { resetAgentEventsForTest } from "../infra/agent-events.js";
 import { registerAgentRunContext } from "../infra/agent-run-registry.js";
@@ -99,12 +98,7 @@ describe("chat run registration lifecycle", () => {
     );
     await h.emit("run-stale-abort", "lifecycle", { phase: "end" }, { seq: 2, ts: 2_200 });
 
-    const chatCalls = h.chat();
-    expect(chatCalls).toHaveLength(2);
-    const deltaPayload = expectDefined(chatCalls[0], "chatCalls[0] test invariant")[1];
-    const finalPayload = expectDefined(chatCalls[1], "chatCalls[1] test invariant")[1];
-    expect(deltaPayload.state).toBe("delta");
-    expect(finalPayload.state).toBe("final");
+    expect(h.chat().map(([, payload]) => payload.state)).toEqual(["delta", "final"]);
     expect(h.nodeChat()).toHaveLength(2);
     expect(h.chatRunState.runs.get("client-stale-abort")?.abortMarker).toBeDefined();
     expect(h.chatRunState.registry.peek("run-stale-abort")).toBeUndefined();
@@ -141,16 +135,18 @@ describe("chat run registration lifecycle", () => {
       lifecycleErrorRetryGraceMs: 100,
     });
     h.register("run-fallback-retry", "session-fallback", "run-fallback-client");
+    const expectRegistration = () =>
+      expect(h.chatRunState.registry.peek("run-fallback-retry")).toMatchObject({
+        sessionKey: "session-fallback",
+        clientRunId: "run-fallback-client",
+      });
 
     await h.emitMany("run-fallback-retry", [
       ["assistant", { text: "draft" }],
       ["lifecycle", { phase: "error", error: "provider failed" }],
     ]);
 
-    expect(h.chatRunState.registry.peek("run-fallback-retry")).toMatchObject({
-      sessionKey: "session-fallback",
-      clientRunId: "run-fallback-client",
-    });
+    expectRegistration();
     expect(h.clearAgentRunContext).not.toHaveBeenCalled();
     expect(h.agentRunSeq.get("run-fallback-retry")).toBe(2);
 
@@ -166,24 +162,16 @@ describe("chat run registration lifecycle", () => {
       },
       { seq: 3, sessionKey: "session-fallback" },
     );
-    const agentCalls = h.broadcast.mock.calls.filter(([event]) => event === "agent");
-    const fallbackPayload = agentCalls.at(-1)?.[1] as {
-      runId?: string;
-      data?: Record<string, unknown>;
-    };
-    expect(fallbackPayload.runId).toBe("run-fallback-client");
-    expect(fallbackPayload.data?.phase).toBe("fallback");
-    expect(h.nodeAgent().at(-1)?.[2]).toMatchObject({
+    const fallback = {
       runId: "run-fallback-client",
       data: { phase: "fallback" },
-    });
+    };
+    expect(h.agent().at(-1)?.[1]).toMatchObject(fallback);
+    expect(h.nodeAgent().at(-1)?.[2]).toMatchObject(fallback);
 
     vi.advanceTimersByTime(100);
 
-    expect(h.chatRunState.registry.peek("run-fallback-retry")).toMatchObject({
-      sessionKey: "session-fallback",
-      clientRunId: "run-fallback-client",
-    });
+    expectRegistration();
     expect(h.chat().map(([, payload]) => payload.state)).not.toContain("error");
     expect(h.clearAgentRunContext).not.toHaveBeenCalled();
     expect(h.agentRunSeq.get("run-fallback-retry")).toBe(3);
@@ -191,12 +179,7 @@ describe("chat run registration lifecycle", () => {
     await h.end("run-fallback-retry", 4);
 
     expect(h.chat().map(([, payload]) => payload.state)).not.toContain("error");
-    const finalPayload = h.chat().at(-1)?.[1] as {
-      state?: string;
-      runId?: string;
-    };
-    expect(finalPayload.state).toBe("final");
-    expect(finalPayload.runId).toBe("run-fallback-client");
+    expect(h.chat().at(-1)?.[1]).toMatchObject({ state: "final", runId: "run-fallback-client" });
     expect(h.clearAgentRunContext).toHaveBeenCalledWith("run-fallback-retry");
     expect(h.agentRunSeq.has("run-fallback-retry")).toBe(false);
   });

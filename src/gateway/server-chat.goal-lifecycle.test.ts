@@ -9,13 +9,11 @@ import {
 } from "../infra/agent-events.js";
 import { registerAgentRunContext } from "../infra/agent-run-registry.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import { emitAgentEvents } from "./server-chat.agent-events.test-helpers.js";
 import {
-  createAgentEventHandler,
-  createChatRunState,
-  createSessionEventSubscriberRegistry,
-  createSessionMessageSubscriberRegistry,
-} from "./server-chat.js";
+  createChatEventFixture,
+  emitAgentEvents,
+} from "./server-chat.agent-events.test-helpers.js";
+import { createAgentEventHandler } from "./server-chat.js";
 import { persistGatewaySessionLifecycleEvent } from "./session-lifecycle-state.js";
 
 vi.mock("../config/io.js", () => ({ getRuntimeConfig: vi.fn(() => ({})) }));
@@ -43,29 +41,6 @@ afterEach(() => {
   vi.useRealTimers();
   resetAgentEventsForTest({ preserveListeners: true });
 });
-
-function createHarness(params: { resolveSessionKeyForRun: () => string }) {
-  const broadcast = vi.fn();
-  const broadcastToConnIds = vi.fn();
-  const chatRunState = createChatRunState();
-  const sessionEventSubscribers = createSessionEventSubscriberRegistry();
-  const handler = createAgentEventHandler({
-    broadcast,
-    broadcastToConnIds,
-    nodeSendToSession: vi.fn(),
-    nodeHasSessionSubscribers: () => true,
-    agentRunSeq: new Map(),
-    chatRunState,
-    resolveSessionKeyForRun: params.resolveSessionKeyForRun,
-    clearAgentRunContext: vi.fn(),
-    toolEventRecipients: chatRunState.toolEventRecipients,
-    sessionEventSubscribers,
-    sessionMessageSubscribers: createSessionMessageSubscriberRegistry(),
-    loadGatewaySessionLifecycleSnapshotForEvent: () => ({ row: loadGatewaySessionRow() }),
-    persistGatewaySessionLifecycleEventForEvent: persistGatewaySessionLifecycleEventMock,
-  });
-  return { broadcast, broadcastToConnIds, sessionEventSubscribers, handler };
-}
 
 describe("agent event goal lifecycle", () => {
   it.each([
@@ -128,9 +103,18 @@ describe("agent event goal lifecycle", () => {
       persistGatewaySessionLifecycleEventMock.mockImplementation(
         persistGatewaySessionLifecycleEvent,
       );
-      const { broadcast, broadcastToConnIds, sessionEventSubscribers, handler } = createHarness({
+      const fixture = createChatEventFixture();
+      const { broadcast, broadcastToConnIds, sessionEventSubscribers } = fixture;
+      const handler = createAgentEventHandler({
+        ...fixture,
         resolveSessionKeyForRun: () => sessionKey,
+        loadGatewaySessionLifecycleSnapshotForEvent: () => ({ row: loadGatewaySessionRow() }),
+        persistGatewaySessionLifecycleEventForEvent: persistGatewaySessionLifecycleEventMock,
       });
+      const drainPersistence = () =>
+        Promise.all(
+          persistGatewaySessionLifecycleEventMock.mock.results.map((result) => result.value),
+        );
       try {
         vi.useFakeTimers();
         vi.setSystemTime(2_000);
@@ -149,9 +133,7 @@ describe("agent event goal lifecycle", () => {
         await emitAgentEvents(handler, "run-terminal-final-failure", [
           ["lifecycle", { phase: "error", startedAt: 1_000, endedAt: 2_000, ...terminal }],
         ]);
-        await Promise.all(
-          persistGatewaySessionLifecycleEventMock.mock.results.map((result) => result.value),
-        );
+        await drainPersistence();
 
         const stoppedGoal = {
           id: "terminal-goal",
@@ -179,9 +161,7 @@ describe("agent event goal lifecycle", () => {
             { lifecycleGeneration },
           ],
         ]);
-        await Promise.all(
-          persistGatewaySessionLifecycleEventMock.mock.results.map((result) => result.value),
-        );
+        await drainPersistence();
         await vi.advanceTimersByTimeAsync(15_000);
         expect(read()).toMatchObject({ status: "done", startedAt: 3_000, endedAt: 4_000 });
         expect(read()?.lastRunError).toBeUndefined();

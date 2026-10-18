@@ -1,5 +1,3 @@
-// Tool schema quarantine tests cover diagnostic logging for unreadable runtime
-// tool entries without touching the broken tool object again.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import {
@@ -25,6 +23,15 @@ import {
 } from "./tool-schema-quarantine.js";
 import type { AnyAgentTool } from "./tools/common.js";
 
+const quarantine = (toolName: string, reason = "unsupported schema") => ({
+  toolName,
+  reason,
+  failedAt: new Date(123),
+});
+const logQuarantine = (
+  params: Omit<Parameters<typeof logRuntimeToolSchemaQuarantine>[0], "runId" | "agentId">,
+) => logRuntimeToolSchemaQuarantine({ runId: "run-quarantine", agentId: "main", ...params });
+
 afterEach(() => {
   resetPluginStateStoreForTests();
 });
@@ -44,17 +51,11 @@ describe("runtime tool schema quarantine logging", () => {
 
     try {
       await expect(
-        logRuntimeToolSchemaQuarantine({
+        logQuarantine({
           diagnostics: [
-            {
-              toolName: "tool[0]",
-              toolIndex: 0,
-              violations: ["tool[0] is unreadable"],
-            },
+            { toolName: "tool[0]", toolIndex: 0, violations: ["tool[0] is unreadable"] },
           ],
           tools,
-          runId: "run-fuzzplugin-unreadable-tool",
-          agentId: "main",
         }),
       ).resolves.toBeUndefined();
     } finally {
@@ -63,7 +64,7 @@ describe("runtime tool schema quarantine logging", () => {
     expect(events).toMatchObject([
       {
         type: "tool.execution.blocked",
-        runId: "run-fuzzplugin-unreadable-tool",
+        runId: "run-quarantine",
         agentId: "main",
         toolName: "tool[0]",
       },
@@ -74,20 +75,14 @@ describe("runtime tool schema quarantine logging", () => {
     await withStateDirEnv("openclaw-tool-schema-quarantine-recovery-", async () => {
       const observation = observeHostDataSql();
       try {
-        await recordPersistedRuntimeToolSchemaQuarantine({
-          toolName: "recovered_tool",
-          reason: 'recovered_tool.parameters.type must be "object"',
-          failedAt: new Date(123),
-        });
-
-        expect(await listPersistedRuntimeToolSchemaQuarantines()).toEqual([
-          {
-            toolName: "recovered_tool",
-            reason: 'recovered_tool.parameters.type must be "object"',
-            failedAt: new Date(123),
-          },
-        ]);
-        await logRuntimeToolSchemaQuarantine({
+        const record = quarantine(
+          "recovered_tool",
+          'recovered_tool.parameters.type must be "object"',
+        );
+        const expectedRecord = structuredClone(record);
+        await recordPersistedRuntimeToolSchemaQuarantine(record);
+        expect(await listPersistedRuntimeToolSchemaQuarantines()).toEqual([expectedRecord]);
+        await logQuarantine({
           diagnostics: [],
           tools: [
             {
@@ -98,8 +93,6 @@ describe("runtime tool schema quarantine logging", () => {
               execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
             },
           ],
-          runId: "run-recovered-tool",
-          agentId: "main",
         });
 
         expect(await listPersistedRuntimeToolSchemaQuarantines()).toEqual([]);
@@ -111,11 +104,7 @@ describe("runtime tool schema quarantine logging", () => {
   });
   it("settles recovery submitted while the first record is opening the store", async () => {
     await withStateDirEnv("openclaw-tool-quarantine-opening-", async () => {
-      const recording = recordPersistedRuntimeToolSchemaQuarantine({
-        toolName: "opening_tool",
-        reason: "unsupported schema",
-        failedAt: new Date(123),
-      });
+      const recording = recordPersistedRuntimeToolSchemaQuarantine(quarantine("opening_tool"));
       const recovering = clearRecoveredPersistedRuntimeToolSchemaQuarantines(() => [
         { toolName: "opening_tool" },
       ]);

@@ -1,5 +1,3 @@
-// Tool schema projection tests cover runtime/provider filtering for plugin tool
-// schemas before they are exposed to model providers.
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import {
@@ -9,30 +7,35 @@ import {
 } from "./tool-schema-projection.js";
 import type { AnyAgentTool } from "./tools/common.js";
 
+const objectSchema = (properties: Record<string, unknown>) => ({ type: "object", properties });
+function expectInvalid(schema: unknown, path: string) {
+  expect(projectRuntimeToolInputSchema(schema)).toEqual({
+    schema: {},
+    violations: [`parameters.${path} is not JSON-serializable`],
+  });
+}
+function expectFiniteDefault(value: unknown) {
+  expect(projectRuntimeToolInputSchema(objectSchema({ score: { default: value } }))).toEqual({
+    schema: objectSchema({ score: { default: { value: "finite" } } }),
+    violations: [],
+  });
+}
+
 describe("runtime tool input schema projection", () => {
   it("reports dynamic JSON Schema keywords in traversal order with exact paths", () => {
-    expect(
-      projectRuntimeToolInputSchema({
-        type: "object",
-        $dynamicAnchor: "root",
-        $dynamicRef: "#root",
-        anyOf: [{ $dynamicAnchor: "branch" }, { properties: { "": { $dynamicRef: "#empty" } } }],
-        properties: {
-          target: { $dynamicRef: "#target" },
-          "literal.dot[0]": { $dynamicAnchor: "literal" },
-        },
-      }),
-    ).toEqual({
-      schema: {
-        type: "object",
-        $dynamicAnchor: "root",
-        $dynamicRef: "#root",
-        anyOf: [{ $dynamicAnchor: "branch" }, { properties: { "": { $dynamicRef: "#empty" } } }],
-        properties: {
-          target: { $dynamicRef: "#target" },
-          "literal.dot[0]": { $dynamicAnchor: "literal" },
-        },
+    const schema = {
+      type: "object",
+      $dynamicAnchor: "root",
+      $dynamicRef: "#root",
+      anyOf: [{ $dynamicAnchor: "branch" }, { properties: { "": { $dynamicRef: "#empty" } } }],
+      properties: {
+        target: { $dynamicRef: "#target" },
+        "literal.dot[0]": { $dynamicAnchor: "literal" },
       },
+    };
+    const expectedSchema = structuredClone(schema);
+    expect(projectRuntimeToolInputSchema(schema)).toEqual({
+      schema: expectedSchema,
       violations: [
         "parameters.$dynamicRef",
         "parameters.$dynamicAnchor",
@@ -45,17 +48,10 @@ describe("runtime tool input schema projection", () => {
   });
 
   it("keeps empty property names in non-finite diagnostic paths", () => {
-    expect(
-      projectRuntimeToolInputSchema({
-        type: "object",
-        properties: {
-          "": { type: "number", maximum: Number.POSITIVE_INFINITY },
-        },
-      }),
-    ).toEqual({
-      schema: {},
-      violations: ["parameters.properties..maximum is not JSON-serializable"],
-    });
+    expectInvalid(
+      objectSchema({ "": { type: "number", maximum: Infinity } }),
+      "properties..maximum",
+    );
   });
 
   it("tracks repeated descendants through each toJSON replacement without rereading getters", () => {
@@ -75,74 +71,30 @@ describe("runtime tool input schema projection", () => {
       },
     };
 
-    expect(
-      projectRuntimeToolInputSchema({
-        type: "object",
-        properties: { first: replacement, second: replacement },
-      }),
-    ).toEqual({
-      schema: {},
-      violations: ["parameters.properties.second.items[0].maximum is not JSON-serializable"],
-    });
+    expectInvalid(
+      objectSchema({ first: replacement, second: replacement }),
+      "properties.second.items[0].maximum",
+    );
     expect(reads).toEqual(["first", "maximum", "second", "maximum"]);
   });
 
   it("reports boxed non-finite numeric schema values", () => {
-    expect(
-      projectRuntimeToolInputSchema({
-        type: "object",
-        properties: {
-          score: { type: "number", maximum: Object(Number.POSITIVE_INFINITY) },
-        },
-      }),
-    ).toEqual({
-      schema: {},
-      violations: ["parameters.properties.score.maximum is not JSON-serializable"],
-    });
+    expectInvalid(
+      objectSchema({ score: { type: "number", maximum: Object(Infinity) } }),
+      "properties.score.maximum",
+    );
   });
 
   it("does not treat a spoofed Number tag as a boxed number", () => {
-    const taggedValue = { [Symbol.toStringTag]: "Number", value: "finite" };
-    expect(
-      projectRuntimeToolInputSchema({
-        type: "object",
-        properties: {
-          score: { default: taggedValue },
-        },
-      }),
-    ).toEqual({
-      schema: {
-        type: "object",
-        properties: {
-          score: { default: { value: "finite" } },
-        },
-      },
-      violations: [],
-    });
+    expectFiniteDefault({ [Symbol.toStringTag]: "Number", value: "finite" });
   });
 
   it("ignores an unreadable Number tag that JSON serialization does not use", () => {
-    const taggedValue = {
+    expectFiniteDefault({
       get [Symbol.toStringTag](): string {
         throw new Error("unreadable tag");
       },
       value: "finite",
-    };
-    expect(
-      projectRuntimeToolInputSchema({
-        type: "object",
-        properties: {
-          score: { default: taggedValue },
-        },
-      }),
-    ).toEqual({
-      schema: {
-        type: "object",
-        properties: {
-          score: { default: { value: "finite" } },
-        },
-      },
-      violations: [],
     });
   });
 
@@ -187,18 +139,11 @@ describe("runtime tool input schema projection", () => {
   it("quarantines unreadable runtime tool fields without dropping healthy siblings", () => {
     const unreadable = {
       name: "fuzzplugin_unreadable",
-      parameters: { type: "object", properties: {} },
-    };
-    Object.defineProperty(unreadable, "parameters", {
-      enumerable: true,
-      get() {
+      get parameters(): Record<string, unknown> {
         throw new Error("fuzzplugin parameters getter exploded");
       },
-    });
-    const healthy = {
-      name: "healthy",
-      parameters: { type: "object", properties: {} },
     };
+    const healthy = { name: "healthy", parameters: objectSchema({}) };
 
     expect(filterRuntimeCompatibleTools([unreadable, healthy])).toEqual({
       tools: [healthy],

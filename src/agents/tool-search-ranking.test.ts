@@ -62,36 +62,34 @@ function runtime(catalog = CATALOG): ToolSearchRuntime {
   });
 }
 
+async function names(
+  search: ToolSearchRuntime,
+  query: string,
+  options?: Parameters<ToolSearchRuntime["search"]>[1],
+) {
+  return (await search.search(query, options)).map((hit) => hit.name);
+}
+
 describe("tokenizeQuery", () => {
-  it.each([["running", "run"]])(
-    "undoes the consonant English doubles before a suffix: %s",
-    (inflected, root) => {
-      // Without undoubling, "running" stems to "runn" and can never meet "run".
-      expect(tokenizeDocument(inflected)).toEqual(tokenizeDocument(root));
-    },
-  );
+  it("undoes the consonant English doubles before a suffix", () => {
+    expect(tokenizeDocument("running")).toEqual(tokenizeDocument("run"));
+  });
 
   it.each(["call", "process"])("keeps doubles that belong to the root: %s", (word) => {
     expect(tokenizeDocument(`${word}ing`)).toEqual(tokenizeDocument(word));
   });
 
   it("fires expansions for -ies plurals of a trigger word", () => {
-    // "directories" must reach the directory/folder group, not stall at
-    // "directorie" and expand nothing.
     expect(tokenizeQuery("list directories").map((term) => term.term)).toContain(
       tokenizeDocument("file")[0],
     );
   });
 
   it("keeps capability verbs that name real operations", () => {
-    // "get" looks like filler but names operations ("get_weather"); dropping it
-    // would reduce "get issue" to "issue" and let delete/update entries win.
     expect(tokenizeQuery("get").map((term) => term.term)).not.toEqual([]);
   });
 
   it("expands intent words toward the vocabulary descriptions use", () => {
-    // "look up the price" shares no word with "Search the web", so without
-    // expansion a lexical index cannot connect them at all.
     const terms = tokenizeQuery("look up the price");
     const search = terms.find((term) => term.term === tokenizeDocument("search")[0]);
 
@@ -101,15 +99,11 @@ describe("tokenizeQuery", () => {
     expect(terms.find((term) => term.term === tokenizeDocument("price")[0])?.weight).toBe(1);
   });
 
-  it.each(["news"])("keeps %s distinct from the word left by stripping its s", (word) => {
-    // "news" -> "new" would literal-match every "Create a new ..." tool, and
-    // literal matches are ranked ahead of the web tool the query meant.
-    expect(tokenizeDocument(word)).toEqual([word]);
+  it("keeps news distinct from new", () => {
+    expect(tokenizeDocument("news")).toEqual(["news"]);
   });
 
   it("does not let a singular/plural collision invent an intent", () => {
-    // "news" must not normalize to "new", or "open a new issue" acquires a
-    // web-search intent it never asked for.
     expect(tokenizeQuery("open a new issue").map((term) => term.term)).not.toContain(
       tokenizeDocument("search")[0],
     );
@@ -124,8 +118,7 @@ describe("scoreLexical", () => {
       { value: { id: "empty" }, terms: [] },
     ]);
 
-    expect(index.documentCount).toBe(2);
-    expect(index.averageLength).toBe(1);
+    expect(index).toMatchObject({ documentCount: 2, averageLength: 1 });
     const hits = scoreLexical(index, [{ term: "needle", weight: 1 }]);
     expect(hits).toHaveLength(1);
     expect(hits[0]?.value).toBe(value);
@@ -134,18 +127,12 @@ describe("scoreLexical", () => {
   });
 
   it("indexes non-Latin text rather than discarding it", () => {
-    // The English-query instruction is guidance for the model, not a filter: a
-    // catalog may legitimately describe a tool in another script, and dropping
-    // those terms would make it permanently unreachable.
     const index = buildLexicalIndex([{ value: "jp", terms: tokenizeDocument("価格 lookup") }]);
 
     expect(scoreLexical(index, tokenizeQuery("価格")).map((hit) => hit.value)).toEqual(["jp"]);
   });
 
   it("marks literal overlap so callers can rank it ahead of expansion-only hits", () => {
-    // A common literal term carries little IDF, so a short document collecting
-    // two rare expansions can outscore it. The tier, not the weight, is what
-    // keeps a tool matching the typed word from being dropped by the limit.
     const index = buildLexicalIndex([
       { value: "weather-a", terms: tokenizeDocument("weather_now Report the weather") },
       { value: "weather-b", terms: tokenizeDocument("weather_hourly Hourly weather") },
@@ -165,10 +152,7 @@ describe("untrusted schemas", () => {
   it.each(["client", "mcp"] as const)(
     "never traverses parameters from the untrusted %s source",
     async (source) => {
-      // compactToolSearchCatalogEntry already reports non-first-party parameters
-      // as "unknown"; indexing must respect the same boundary. A client can hand
-      // us a lazy object that throws on property access, and MCP-authored text
-      // must not become ranking input.
+      // Untrusted parameter getters must remain deferred, even while indexing.
       const hostile = entry({
         source,
         name: "client_pick_file",
@@ -189,9 +173,7 @@ describe("untrusted schemas", () => {
 
       // Reaching the schema at all throws, so surviving the query is the proof.
       await expect(search.search("pick a file")).resolves.toBeDefined();
-      expect((await search.search("client_pick_file")).map((hit) => hit.name)).toContain(
-        "client_pick_file",
-      );
+      expect(await names(search, "client_pick_file")).toContain("client_pick_file");
     },
   );
 });
@@ -226,11 +208,11 @@ describe("ToolSearchRuntime.search", () => {
       );
 
       for (const query of ["asteroids", "orchard", "apples"]) {
-        expect((await search.search(query)).map((hit) => hit.name)).toEqual(["indexed_resource"]);
+        expect(await names(search, query)).toEqual(["indexed_resource"]);
       }
       branch.properties.orchard.description = "Observe meteors";
       registerHeadlessToolSearchCatalog({ catalogRef, tools });
-      expect((await search.search("meteors")).map((hit) => hit.name)).toEqual(["indexed_resource"]);
+      expect(await names(search, "meteors")).toEqual(["indexed_resource"]);
       expect(await search.search("apples")).toEqual([]);
       expect(await search.search("orchard", { allowedIds: new Set() })).toEqual([]);
     },
@@ -257,7 +239,7 @@ describe("ToolSearchRuntime.search", () => {
       }),
     ]);
 
-    expect((await search.search("meteors")).map((hit) => hit.name)).toEqual(["indexed_resource"]);
+    expect(await names(search, "meteors")).toEqual(["indexed_resource"]);
   });
 
   it("prepares search text and its revision once across warm searches and runtimes", async () => {
@@ -267,21 +249,15 @@ describe("ToolSearchRuntime.search", () => {
     const allowedIds = new Set(catalog.map(({ id }) => id));
     for (let turn = 0; turn < 3; turn++) {
       const search = runtime(catalog);
-      expect((await search.search("repository", { allowedIds })).map(({ name }) => name)).toEqual([
-        "issue_create",
-      ]);
-      expect((await search.search("read", { allowedIds })).map(({ name }) => name)).toEqual([
-        "read_file",
-      ]);
+      expect(await names(search, "repository", { allowedIds })).toEqual(["issue_create"]);
+      expect(await names(search, "read", { allowedIds })).toEqual(["read_file"]);
     }
     expect(render).toHaveBeenCalledTimes(catalog.length);
     expect(build).toHaveBeenCalledTimes(1);
     allowedIds.delete(catalog[4]!.id);
     expect(await runtime(catalog).search("repository", { allowedIds })).toEqual([]);
     allowedIds.add(catalog[4]!.id);
-    expect(
-      (await runtime(catalog).search("repository", { allowedIds })).map(({ name }) => name),
-    ).toEqual(["issue_create"]);
+    expect(await names(runtime(catalog), "repository", { allowedIds })).toEqual(["issue_create"]);
     expect(render).toHaveBeenCalledTimes(catalog.length);
     expect(build).toHaveBeenCalledTimes(2);
   });
@@ -315,9 +291,7 @@ describe("ToolSearchRuntime.search", () => {
       // The spy retains built indexes, as another active catalog view would.
       const build = vi.spyOn(ranking, "buildLexicalIndex");
       for (let turn = 0; turn < 2; turn++) {
-        expect((await runtime(catalog).search("retention")).map(({ name }) => name)).toEqual([
-          "oversized_revision",
-        ]);
+        expect(await names(runtime(catalog), "retention")).toEqual(["oversized_revision"]);
       }
       expect(build).toHaveBeenCalledTimes(1);
     },
@@ -359,13 +333,9 @@ describe("ToolSearchRuntime.search", () => {
     expect((await search.search("harvest", { limit: 2 })).map((hit) => hit.id)).toEqual(["a", "m"]);
   });
 
-  it.each([{ query: "reminder", expected: "cron_create", why: "expanded toward schedule/cron" }])(
-    "finds $expected for $query ($why)",
-    async ({ query, expected }) => {
-      const hits = await runtime().search(query);
-      expect(hits.map((hit) => hit.name)).toContain(expected);
-    },
-  );
+  it("expands reminder toward schedule/cron", async () => {
+    expect(await names(runtime(), "reminder")).toContain("cron_create");
+  });
 
   it.each([
     ["cookies", "cookie"],

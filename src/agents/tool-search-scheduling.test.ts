@@ -45,6 +45,16 @@ function gated(name: string, executionMode: AnyAgentTool["executionMode"], event
   return { tool, started: started.promise, release: () => release.resolve() };
 }
 
+async function cleanup(
+  ctx: ToolSearchToolContext,
+  gates: ReturnType<typeof gated>[],
+  calls: Promise<unknown>[],
+) {
+  gates.forEach((gate) => gate.release());
+  await Promise.allSettled(calls);
+  clearToolSearchCatalog(ctx);
+}
+
 async function hostTurn() {
   await new Promise<void>((resolve) => {
     setImmediate(resolve);
@@ -87,9 +97,7 @@ describe("Tool Search execution scheduling", () => {
       await Promise.all(calls);
       expect(catalogRef.onDispose?.size ?? 0).toBe(0);
     } finally {
-      gates.forEach((g) => g.release());
-      await Promise.allSettled(calls);
-      clearToolSearchCatalog(ctx);
+      await cleanup(ctx, gates, calls);
     }
   });
 
@@ -126,11 +134,7 @@ describe("Tool Search execution scheduling", () => {
         await Promise.all([first, tail]);
         expect(b.tool.execute).not.toHaveBeenCalled();
       } finally {
-        a.release();
-        b.release();
-        c.release();
-        await Promise.allSettled([first, queued, tail]);
-        clearToolSearchCatalog(ctx);
+        await cleanup(ctx, [a, b, c], [first, queued, tail]);
       }
     },
   );
@@ -158,11 +162,7 @@ describe("Tool Search execution scheduling", () => {
       expect(queued.tool.execute).not.toHaveBeenCalled();
       expect(catalogRef.onDispose?.size ?? 0).toBe(0);
     } finally {
-      old.release();
-      queued.release();
-      fresh.release();
-      await Promise.allSettled([active, waiting, replacement]);
-      clearToolSearchCatalog(ctx);
+      await cleanup(ctx, [old, queued, fresh], [active, waiting, replacement]);
     }
   });
 
@@ -196,11 +196,7 @@ describe("Tool Search execution scheduling", () => {
         await Promise.all([active, result]);
         expect(b.tool.execute).toHaveBeenCalledTimes(change === "append" ? 1 : 0);
       } finally {
-        a.release();
-        b.release();
-        other.release();
-        await Promise.allSettled([active, queued]);
-        clearToolSearchCatalog(ctx);
+        await cleanup(ctx, [a, b, other], [active, queued]);
       }
     },
   );
@@ -240,11 +236,8 @@ describe("Tool Search execution scheduling", () => {
       b.release();
       await Promise.all([first, second]);
     } finally {
-      a.release();
-      b.release();
       releaseAcceptance.resolve();
-      await Promise.allSettled([first, second]);
-      clearToolSearchCatalog(ctx);
+      await cleanup(ctx, [a, b], [first, second]);
     }
   });
 });

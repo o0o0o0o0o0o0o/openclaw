@@ -1,18 +1,16 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { expectDefined } from "@openclaw/normalization-core";
-import {
-  createAssistantMessageEventStream,
-  type AssistantMessage,
-  type Message,
-  type Model,
-} from "openclaw/plugin-sdk/llm";
+import type { Message } from "openclaw/plugin-sdk/llm";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { runAgentLoop, type AgentEvent, type AgentMessage } from "../plugin-sdk/agent-core.js";
+import { runAgentLoop, type AgentEvent } from "../plugin-sdk/agent-core.js";
 import { materializeBundleMcpToolsForRun } from "./agent-bundle-mcp-materialize.js";
 import type { SessionMcpRuntime } from "./agent-bundle-mcp-types.js";
-import { createZeroUsageFixture } from "./test-helpers/usage-fixtures.js";
 import { isToolResultError } from "./tool-result-error.js";
+import {
+  singleToolCallStreamFn,
+  toolSearchTestModel as model,
+} from "./tool-search-loop.test-support.js";
 import {
   applyToolSearchCatalog,
   createToolSearchCatalogRef,
@@ -20,21 +18,6 @@ import {
   TOOL_CALL_RAW_TOOL_NAME,
 } from "./tool-search.js";
 import { jsonResult, type AnyAgentTool } from "./tools/common.js";
-
-const model: Model = {
-  id: "test-model",
-  name: "Test Model",
-  api: "test-api",
-  provider: "test-provider",
-  baseUrl: "https://example.test",
-  reasoning: false,
-  input: ["text"],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  contextWindow: 1000,
-  maxTokens: 1000,
-};
-
-const testUsage = createZeroUsageFixture();
 
 function makeMcpRuntime(result: CallToolResult): SessionMcpRuntime {
   const tool = {
@@ -91,19 +74,6 @@ async function createDeferredMcpCall(result: CallToolResult) {
   return { callTool: createDeferredCall(target), target };
 }
 
-function assistantMessage(content: AssistantMessage["content"]): AssistantMessage {
-  return {
-    role: "assistant",
-    content,
-    api: model.api,
-    provider: model.provider,
-    model: model.id,
-    usage: testUsage,
-    stopReason: content.some((item) => item.type === "toolCall") ? "toolUse" : "stop",
-    timestamp: 1,
-  };
-}
-
 describe("Tool Search MCP failures", () => {
   it("keeps deferred MCP images model-visible beside their text", async () => {
     const image = { type: "image" as const, data: "aW1hZ2U=", mimeType: "image/png" };
@@ -156,31 +126,11 @@ describe("Tool Search MCP failures", () => {
       isError: true,
     });
     const events: AgentEvent[] = [];
-    let turn = 0;
-    const streamFn = () => {
-      turn += 1;
-      const stream = createAssistantMessageEventStream();
-      queueMicrotask(() => {
-        const message =
-          turn === 1
-            ? assistantMessage([
-                {
-                  type: "toolCall",
-                  id: "deferred-mcp-call",
-                  name: callTool.name,
-                  arguments: { id: target.name, args: {} },
-                },
-              ])
-            : assistantMessage([{ type: "text", text: "done" }]);
-        stream.push({
-          type: "done",
-          reason: message.stopReason === "toolUse" ? "toolUse" : "stop",
-          message,
-        });
-        stream.end();
-      });
-      return stream;
-    };
+    const streamFn = singleToolCallStreamFn({
+      id: "deferred-mcp-call",
+      name: callTool.name,
+      arguments: { id: target.name, args: {} },
+    });
 
     const messages = await runAgentLoop(
       [{ role: "user", content: "query the backend", timestamp: 1 }],
@@ -194,23 +144,20 @@ describe("Tool Search MCP failures", () => {
           isError: isError || isToolResultError(result),
         }),
       },
-      (event) => {
-        events.push(event);
-      },
+      (event) => events.push(event),
       undefined,
       streamFn,
     );
 
     expect(
       events.find(
-        (event): event is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+        (event) =>
           event.type === "tool_execution_end" && event.toolName === TOOL_CALL_RAW_TOOL_NAME,
       ),
     ).toMatchObject({ isError: true, result: { details: { status: "failed" } } });
     expect(
       messages.find(
-        (message): message is Extract<AgentMessage, { role: "toolResult" }> =>
-          message.role === "toolResult" && message.toolName === TOOL_CALL_RAW_TOOL_NAME,
+        (message) => message.role === "toolResult" && message.toolName === TOOL_CALL_RAW_TOOL_NAME,
       ),
     ).toMatchObject({ isError: true, details: { status: "failed" } });
   });

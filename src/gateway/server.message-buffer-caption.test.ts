@@ -1,12 +1,14 @@
 import fs from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
+import { json } from "node:stream/consumers";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, it } from "vitest";
 import type {
   ArtifactsDownloadResult,
   ArtifactsListResult,
 } from "../../packages/gateway-protocol/src/schema/artifacts.js";
+import { createOpenAiResponsesModelConfig } from "../../test/helpers/openai-responses-model-fixture.js";
 import {
   writeOpenAiResponsesSse,
   writeOpenAiResponsesText,
@@ -57,60 +59,45 @@ it(
       bytes?: Buffer;
       finalText?: string;
     };
+    const makeScenario = (
+      name: string,
+      expected: Scenario["expected"],
+      fields: Partial<Scenario> = {},
+    ): Scenario => ({ name, expected, caption: captionCases[1].caption, ...fields });
+    const data = { buffer: attachment.toString("base64"), bytes: attachment };
+    const buffered = (caption: (typeof captionCases)[number]) =>
+      makeScenario(caption.name, "attachment", { ...caption, ...data });
     const cases: [Scenario, ...Scenario[]] = [
-      {
-        ...captionCases[0],
-        buffer: attachment.toString("base64"),
-        expected: "attachment",
-        bytes: attachment,
-      },
-      ...captionCases.slice(1).map((scenario) => ({
-        name: scenario.name,
-        caption: scenario.caption,
-        buffer: attachment.toString("base64"),
-        expected: "attachment" as const,
-        bytes: attachment,
-      })),
-      ...[undefined, "", "  "].map((buffer, index) => ({
-        name: `empty-${index}`,
-        caption: captionCases[1].caption,
-        buffer,
-        expected: "suppressed" as const,
-        finalText: "No attachment was provided, so nothing was sent.",
-      })),
-      { name: "text-only", caption: "Attached proof.", expected: "text" },
-      {
-        name: "invalid",
-        caption: captionCases[1].caption,
+      buffered(captionCases[0]),
+      ...captionCases.slice(1).map(buffered),
+      ...[undefined, "", "  "].map((buffer, index) =>
+        makeScenario(`empty-${index}`, "suppressed", {
+          buffer,
+          finalText: "No attachment was provided, so nothing was sent.",
+        }),
+      ),
+      makeScenario("text-only", "text", { caption: "Attached proof." }),
+      makeScenario("invalid", "error", {
         buffer: "%%%",
-        expected: "error",
         error: /invalid base64 data/,
         finalText: "The attachment data is invalid, so it was not sent.",
-      },
-      {
-        name: "oversized",
+      }),
+      makeScenario("oversized", "error", {
         caption: captionCases[2].caption,
         buffer: Buffer.alloc(2048).toString("base64"),
-        expected: "error",
         error: /Media too large/,
         finalText: "The attachment exceeds the size limit, so it was not sent.",
-      },
-      {
-        name: "explicit",
-        caption: captionCases[1].caption,
+      }),
+      makeScenario("explicit", "attachment", {
         buffer: "%%%",
         media: explicitMedia,
-        expected: "attachment",
         bytes: explicitBytes,
-      },
-      {
-        name: "denied",
-        caption: captionCases[1].caption,
+      }),
+      makeScenario("denied", "error", {
         media: deniedMedia,
-        expected: "error",
         error: /allowed directory|could not be staged/,
         finalText: "The attachment could not be accessed, so it was not sent.",
-      },
+      }),
     ];
     const configPath = path.join(state, "openclaw.json");
     const environment = {
@@ -135,15 +122,11 @@ it(
     const primaryRequests = () => requests.filter((request) => request.model === "buffer-proof");
     const provider = createServer((request, response) => {
       void (async () => {
-        const chunks: Buffer[] = [];
-        for await (const chunk of request) {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-        }
         if (request.method !== "POST" || request.url !== "/v1/responses") {
           response.writeHead(404).end();
           return;
         }
-        const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        const body: unknown = await json(request);
         if (!isRecord(body)) {
           throw new Error("Invalid completion request");
         }
@@ -214,6 +197,19 @@ it(
       if (!address || typeof address === "string") {
         throw new Error("Missing completion endpoint address");
       }
+      const { models } = createOpenAiResponsesModelConfig({
+        baseUrl: `http://127.0.0.1:${address.port}`,
+        providerId: "openai",
+        modelId: "buffer-proof",
+        reasoning: false,
+        toolProfile: "messaging",
+      });
+      const modelProvider = models!.providers!.openai;
+      modelProvider.apiKey = "test";
+      for (const model of modelProvider.models!) {
+        model.contextWindow = 16000;
+        model.maxTokens = 256;
+      }
       gateway = await startGatewayWithClient({
         cfg: {
           agents: {
@@ -227,29 +223,7 @@ it(
             },
             entries: { main: {} },
           },
-          models: {
-            mode: "replace",
-            providers: {
-              openai: {
-                baseUrl: `http://127.0.0.1:${address.port}/v1`,
-                apiKey: "test",
-                api: "openai-responses",
-                request: { allowPrivateNetwork: true },
-                models: [
-                  {
-                    id: "buffer-proof",
-                    name: "buffer-proof",
-                    api: "openai-responses",
-                    reasoning: false,
-                    input: ["text"],
-                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                    contextWindow: 16000,
-                    maxTokens: 256,
-                  },
-                ],
-              },
-            },
-          },
+          models,
           // This provider scripts direct message calls to prove buffer handling, not discovery.
           tools: { profile: "messaging", toolSearch: false },
           plugins: {
@@ -323,8 +297,10 @@ it(
             "artifacts.download",
             { sessionKey, artifactId: artifact.id },
           );
-          expect.soft(downloaded.artifact.mimeType, scenario.name).toBe("text/plain");
-          expect.soft(downloaded.artifact.title, scenario.name).toBe("proof.txt");
+          expect.soft(downloaded.artifact, scenario.name).toMatchObject({
+            mimeType: "text/plain",
+            title: "proof.txt",
+          });
           if (!downloaded.url) {
             throw new Error("Managed artifact URL missing");
           }

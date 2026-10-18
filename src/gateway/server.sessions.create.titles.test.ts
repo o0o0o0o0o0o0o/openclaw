@@ -37,6 +37,19 @@ const { createSessionStoreDir } = setupGatewaySessionsHandlerTestHarness();
 const adminClient = { client: { connect: { scopes: ["operator.admin"] } } as never };
 const sessionTitle = (storePath: string, sessionKey: string) =>
   loadSessionEntry({ agentId: "main", sessionKey, storePath })?.displayName;
+async function create(
+  params: Record<string, unknown>,
+  options: Parameters<typeof directSessionReq>[2] = adminClient,
+) {
+  const result = await directSessionReq<{
+    key: string;
+    runId: string;
+    sessionId: string;
+    runStarted: boolean;
+  }>("sessions.create", { agentId: "main", ...params }, options);
+  expect(result.ok, JSON.stringify(result.error)).toBe(true);
+  return result.payload!;
+}
 
 async function prepareWorkspace(prefix: string) {
   const workspace = await initializeRepository(tempDirs.make(prefix), "workspace");
@@ -80,18 +93,15 @@ test.for(["keep", "delete"] as const)(
     };
     let key: string | undefined;
     try {
-      const created = await directSessionReq<{ key: string; runStarted: boolean }>(
-        "sessions.create",
+      const created = await create(
         {
-          agentId: "main",
           repository: { url: "https://github.com/openclaw/openclaw.git" },
           titleSource: "Explain how the updater safely rolls back a failed release",
         },
         { ...controlUiClient, context },
       );
-      expect(created.ok, JSON.stringify(created.error)).toBe(true);
-      expect(created.payload?.runStarted).toBe(false);
-      key = created.payload!.key;
+      expect(created.runStarted).toBe(false);
+      key = created.key;
       await racePromiseWithAbortSignal(namingStarted.promise, signal);
       expect(titleMocks.generate).toHaveBeenCalledOnce();
       expect(sessionTitle(storePath, key)).toBeUndefined();
@@ -140,19 +150,17 @@ test.each(["adopted", "incognito"] as const)(
   async (kind) => {
     const { storePath } = await createSessionStoreDir();
     const key = "agent:main:dashboard:adopted-title";
-    const params = { agentId: "main", ...(kind === "incognito" ? { incognito: true } : { key }) };
+    const params = kind === "incognito" ? { incognito: true } : { key };
     if (kind === "adopted") {
-      expect((await directSessionReq("sessions.create", params, adminClient)).ok).toBe(true);
+      await create(params);
     }
-    const result = await directSessionReq<{ key: string }>(
-      "sessions.create",
-      { ...params, titleSource: "A different task must not name this existing conversation" },
-      adminClient,
-    );
-    expect(result.ok, JSON.stringify(result.error)).toBe(true);
+    const result = await create({
+      ...params,
+      titleSource: "A different task must not name this existing conversation",
+    });
     await settleWorkspaceRuns({}, storePath, key);
     expect(titleMocks.generate).not.toHaveBeenCalled();
-    expect(sessionTitle(storePath, result.payload!.key)).toBeUndefined();
+    expect(sessionTitle(storePath, result.key)).toBeUndefined();
   },
 );
 
@@ -179,23 +187,12 @@ test("successful naming survives setup failure and is shared with discussion ope
   });
   let key: string | undefined;
   try {
-    const created = await directSessionReq<{
-      key: string;
-      runId: string;
-      sessionId: string;
-      runStarted: boolean;
-    }>(
-      "sessions.create",
-      {
-        agentId: "main",
-        message: "Start work in the checkout",
-        worktree: true,
-      },
+    const created = await create(
+      { message: "Start work in the checkout", worktree: true },
       { ...adminClient, context },
     );
-    expect(created.ok, JSON.stringify(created.error)).toBe(true);
-    expect(created.payload?.runStarted).toBe(true);
-    key = created.payload!.key;
+    expect(created.runStarted).toBe(true);
+    key = created.key;
     await settleWorkspaceRuns(context, storePath, key);
     await vi.waitFor(() => expect(titleMocks.generate).toHaveBeenCalledOnce());
     const discussion = directSessionReq(
@@ -212,7 +209,7 @@ test("successful naming survives setup failure and is shared with discussion ope
     expect(context.broadcast).toHaveBeenCalledWith(
       "chat",
       expect.objectContaining({
-        runId: created.payload!.runId,
+        runId: created.runId,
         state: "error",
         errorMessage: expect.stringContaining("worktree setup failed"),
       }),
@@ -243,7 +240,7 @@ test("successful naming survives setup failure and is shared with discussion ope
     expect(dispatchInboundMessageMock).toHaveBeenCalledOnce();
     const entry = loadSessionEntry({ agentId: "main", sessionKey: key, storePath });
     expect(entry).toMatchObject({
-      sessionId: created.payload!.sessionId,
+      sessionId: created.sessionId,
       worktree: { canonicalWorkspaceDir: workspace },
     });
     expect(entry).not.toHaveProperty("pendingWorktree");
@@ -260,6 +257,7 @@ test.each(["generator error", "delayed title"])(
     const { storePath } = await prepareWorkspace("openclaw-session-worktree-recovery-");
     const key = "agent:main:dashboard:worktree-title-fallback";
     const target = { sessionKey: key, storePath };
+    const read = () => loadSessionEntry(target);
     const title = createDeferredCore<string>();
     const titleStarted = createDeferredCore();
     const dispatchStarted = createDeferredCore();
@@ -295,40 +293,28 @@ test.each(["generator error", "delayed title"])(
       return { queuedFinal: false, counts: { block: 0, final: 0, tool: 0 } };
     });
     try {
-      const created = await directSessionReq<{ runStarted: boolean }>(
-        "sessions.create",
-        {
-          agentId: "main",
-          key,
-          worktree: true,
-          message: "Investigate the raw fallback title",
-        },
+      const created = await create(
+        { key, worktree: true, message: "Investigate the raw fallback title" },
         { ...adminClient, context },
       );
-
-      expect(created.ok, JSON.stringify(created.error)).toBe(true);
-      expect(created.payload?.runStarted).toBe(true);
+      expect(created.runStarted).toBe(true);
       await waitForPreparation(dispatchStarted.promise);
       await waitForPreparation(titleStarted.promise);
-      const branch = loadSessionEntry(target)?.worktree?.branch;
+      const branch = read()?.worktree?.branch;
       expect(branch).toMatch(/^openclaw\/[a-z]+-[a-z]+$/);
       expect(titleMocks.generate).toHaveBeenCalledOnce();
       dispatchFinished.resolve();
       await settleWorkspaceRuns(context, storePath, key);
       if (delayed) {
-        expect(loadSessionEntry(target)?.displayName).toBeUndefined();
+        expect(read()?.displayName).toBeUndefined();
         title.resolve("Late investigation title");
-        await vi.waitFor(
-          () => expect(loadSessionEntry(target)?.displayName).toBe("Late investigation title"),
-          { interval: 1 },
-        );
-        expect(loadSessionEntry(target)?.worktree?.branch).toBe(branch);
+        await vi.waitFor(() => expect(read()?.displayName).toBe("Late investigation title"), {
+          interval: 1,
+        });
       } else {
-        await vi.waitFor(() =>
-          expect(loadSessionEntry(target)?.displayName).toMatch(/^[a-z]+-[a-z]+$/),
-        );
+        await vi.waitFor(() => expect(read()?.displayName).toMatch(/^[a-z]+-[a-z]+$/));
       }
-      expect(loadSessionEntry(target)?.worktree?.branch).toBe(branch);
+      expect(read()?.worktree?.branch).toBe(branch);
       expect(titleMocks.generate).toHaveBeenCalledTimes(delayed ? 1 : 2);
     } finally {
       title.resolve("Fixture cleanup");
@@ -388,12 +374,7 @@ test("sessions.create rejects another plugin's session before naming or worktree
     connect: { scopes: ["operator.admin"] },
     internal: { pluginRuntimeOwnerId: "synthetic-owner" },
   };
-  const created = await directSessionReq(
-    "sessions.create",
-    { agentId: "main", key: sessionKey },
-    { client: client as never },
-  );
-  expect(created.ok, JSON.stringify(created.error)).toBe(true);
+  await create({ key: sessionKey }, { client: client as never });
   const entry = loadSessionEntry(scope);
   expect(entry?.pluginOwnerId).toBe("synthetic-owner");
   titleMocks.generate.mockResolvedValue("Protected title");

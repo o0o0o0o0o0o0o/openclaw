@@ -1,7 +1,9 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
+import type { WebSocket } from "ws";
 import { getRuntimeConfig } from "../config/io.js";
+import type { InternalSessionEntry } from "../config/sessions.js";
 import { loadCombinedSessionStoreForGatewayCore } from "../config/sessions/combined-store-gateway.native.js";
 import { loadSessionEntry, upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
 import { memorySessionActorOwners } from "../config/sessions/session-actor-memory-owner.js";
@@ -33,23 +35,40 @@ import {
 
 const { createSessionStoreDir, openClient } = setupSessionCreateTestHarness();
 
-type IncognitoResult = {
-  key: string;
-  entry: {
-    incognito?: true;
-    parentSessionKey?: string;
-    parentSessionId?: string;
-    sessionFile?: string;
-    sessionId: string;
-  };
-};
+type IncognitoResult = { key: string; sessionId: string; entry: InternalSessionEntry };
 type SessionList = { sessions: Array<{ key: string; incognito?: true }> };
+
+async function createSession(params: Record<string, unknown>, ws?: WebSocket) {
+  const result = ws
+    ? await rpcReq<IncognitoResult>(ws, "sessions.create", params)
+    : await directSessionReq<IncognitoResult>("sessions.create", params);
+  expect(result.ok, JSON.stringify(result)).toBe(true);
+  return {
+    ...result.payload,
+    key: requireNonEmptyString(result.payload?.key, "created session key"),
+  };
+}
+
+function durableRow(storePath: string, sessionKey: string, agentId = "main") {
+  return openOpenClawAgentDatabase({
+    agentId,
+    path: resolveSqliteTargetFromSessionStorePath(storePath, { agentId }).path,
+  })
+    .db.prepare("SELECT current_session_id FROM session_nodes WHERE session_key = ?")
+    .get(sessionKey);
+}
 
 async function expectInvalidCreate(params: Record<string, unknown>, message: string) {
   expect(await directSessionReq("sessions.create", params)).toMatchObject({
     ok: false,
     error: { code: "INVALID_REQUEST", message },
   });
+}
+
+async function expectNotListed(ws: WebSocket, key: string) {
+  const listed = await rpcReq<SessionList>(ws, "sessions.list", {});
+  expect(listed.ok).toBe(true);
+  expect(listed.payload?.sessions.some((session) => session.key === key)).toBe(false);
 }
 
 function closeIncognitoSessions() {
@@ -62,20 +81,10 @@ test("sessions.create keeps incognito rows process-local through list, spawn, re
   const { storePath } = await createSessionStoreDir();
   try {
     const durableParentKey = "main";
-    await writeSessionStore({
-      entries: {
-        main: sessionStoreEntry("durable-parent"),
-      },
-    });
-    const created = await directSessionReq<IncognitoResult>("sessions.create", {
-      agentId: "main",
-      incognito: true,
-    });
-    expect(created.ok).toBe(true);
-    const key = requireNonEmptyString(created.payload?.key, "incognito session key");
+    await writeSessionStore({ entries: { main: sessionStoreEntry("durable-parent") } });
+    const { key, entry } = await createSession({ agentId: "main", incognito: true });
     expect(key).toMatch(/^agent:main:dashboard:incognito-/u);
     expect(peekSystemEvents("agent:main:main")).toEqual([]);
-    const entry = created.payload?.entry;
     expect(entry?.incognito).toBe(true);
     expect(entry?.parentSessionKey).toBeUndefined();
     expect(entry).not.toHaveProperty("sessionFile");
@@ -86,15 +95,7 @@ test("sessions.create keeps incognito rows process-local through list, spawn, re
       true,
     );
     expect(loadSessionEntry({ agentId: "main", sessionKey: key, storePath })?.incognito).toBe(true);
-    const persistentDatabase = openOpenClawAgentDatabase({
-      agentId: "main",
-      path: resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "main" }).path,
-    });
-    expect(
-      persistentDatabase.db
-        .prepare("SELECT session_key FROM session_nodes WHERE session_key = ?")
-        .get(key),
-    ).toBeUndefined();
+    expect(durableRow(storePath, key)).toBeUndefined();
 
     await expectInvalidCreate(
       { agentId: "main", incognito: true, parentSessionKey: durableParentKey },
@@ -114,18 +115,14 @@ test("sessions.create keeps incognito rows process-local through list, spawn, re
       entry?.sessionId,
     );
 
-    const child = await directSessionReq<IncognitoResult>("sessions.create", {
-      agentId: "main",
-      parentSessionKey: key,
-    });
-    expect(child.ok).toBe(true);
-    const childKey = requireNonEmptyString(child.payload?.key, "incognito child key");
-    expect(child.payload?.entry).toMatchObject({
+    const child = await createSession({ agentId: "main", parentSessionKey: key });
+    const childKey = child.key;
+    expect(child.entry).toMatchObject({
       incognito: true,
       parentSessionKey: key,
       parentSessionId: entry?.sessionId,
     });
-    expect(child.payload?.entry).not.toHaveProperty("sessionFile");
+    expect(child.entry).not.toHaveProperty("sessionFile");
 
     const durableSubagentKey = "agent:main:subagent:durable-existing";
     await upsertSessionEntryCore(
@@ -136,11 +133,9 @@ test("sessions.create keeps incognito rows process-local through list, spawn, re
       { agentId: "main", key: durableSubagentKey, parentSessionKey: key },
       "incognito sessions are web-only",
     );
-    expect(
-      persistentDatabase.db
-        .prepare("SELECT current_session_id FROM session_nodes WHERE session_key = ?")
-        .get(durableSubagentKey),
-    ).toEqual({ current_session_id: "durable-subagent" });
+    expect(durableRow(storePath, durableSubagentKey)).toEqual({
+      current_session_id: "durable-subagent",
+    });
 
     const deleted = await directSessionReq<{ archived: string[]; deleted: boolean }>(
       "sessions.delete",
@@ -159,14 +154,15 @@ test("sessions.create keeps incognito rows process-local through list, spawn, re
     const afterReset = await directSessionReq<SessionList>("sessions.list", {});
     expect(afterReset.payload?.sessions.some((session) => session.key === key)).toBe(false);
 
-    await expectInvalidCreate(
-      { agentId: "main", key: "agent:main:discord:channel:123", incognito: true },
-      "incognito sessions are web-only",
-    );
-    await expectInvalidCreate(
-      { agentId: "main", key: "agent:main:subagent:incognito-client-key", incognito: true },
-      "incognito sessions are web-only",
-    );
+    for (const rejectedKey of [
+      "agent:main:discord:channel:123",
+      "agent:main:subagent:incognito-client-key",
+    ]) {
+      await expectInvalidCreate(
+        { agentId: "main", key: rejectedKey, incognito: true },
+        "incognito sessions are web-only",
+      );
+    }
     await expectInvalidCreate(
       { agentId: "main", key: "agent:work:dashboard:incognito-client-key", incognito: true },
       'agent "main" does not match session key agent "work"',
@@ -190,13 +186,15 @@ test("incognito webchat rejects a vanished non-default-agent session before disp
     },
   });
   try {
-    const created = await rpcReq<{ key?: string; sessionId?: string }>(ws, "sessions.create", {
-      agentId: "work",
-      incognito: true,
-    });
-    expect(created.ok, JSON.stringify(created)).toBe(true);
-    const sessionKey = requireNonEmptyString(created.payload?.key, "incognito webchat key");
-    const sessionId = requireNonEmptyString(created.payload?.sessionId, "incognito webchat id");
+    const created = await createSession(
+      {
+        agentId: "work",
+        incognito: true,
+      },
+      ws,
+    );
+    const sessionKey = created.key;
+    const sessionId = requireNonEmptyString(created.sessionId, "incognito webchat id");
 
     closeIncognitoSessions();
     dispatchInboundMessageMock.mockClear();
@@ -206,23 +204,17 @@ test("incognito webchat rejects a vanished non-default-agent session before disp
       message: "this must not persist after restart",
       idempotencyKey: "stale-incognito-webchat-send",
     });
-    expect(stale.ok).toBe(false);
-    expect(stale.error).toMatchObject({
-      code: "INVALID_REQUEST",
-      message: `Incognito session "${sessionKey}" was not found.`,
+    expect(stale).toMatchObject({
+      ok: false,
+      error: {
+        code: "INVALID_REQUEST",
+        message: `Incognito session "${sessionKey}" was not found.`,
+      },
     });
     expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
     expect(memorySessionActorOwners.list()).toEqual([]);
 
-    const persistentDatabase = openOpenClawAgentDatabase({
-      agentId: "work",
-      path: resolveSqliteTargetFromSessionStorePath(storePath, { agentId: "work" }).path,
-    });
-    expect(
-      persistentDatabase.db
-        .prepare("SELECT session_key FROM session_nodes WHERE session_key = ?")
-        .get(sessionKey),
-    ).toBeUndefined();
+    expect(durableRow(storePath, sessionKey, "work")).toBeUndefined();
   } finally {
     ws.close();
     closeIncognitoSessions();
@@ -233,11 +225,7 @@ test("createGatewaySession rechecks admin scope after incognito inheritance reso
   await createSessionStoreDir();
   try {
     const { createGatewaySession } = await import("./session-create-service.js");
-    const parent = await directSessionReq<{ key?: string }>("sessions.create", {
-      agentId: "main",
-      incognito: true,
-    });
-    const parentSessionKey = requireNonEmptyString(parent.payload?.key, "incognito parent key");
+    const { key: parentSessionKey } = await createSession({ agentId: "main", incognito: true });
     const base = {
       cfg: getRuntimeConfig(),
       agentId: "main",
@@ -274,44 +262,19 @@ test("incognito operator RPCs treat identityless connections as owner-equivalent
   const reader = await connect("reader", "operator.read");
   const writer = await connect("writer", "operator.write");
   try {
-    const created = await rpcReq<{ key?: string; sessionId?: string }>(
-      admin.ws,
-      "sessions.create",
-      { agentId: "main", incognito: true },
-    );
-    expect(created.ok, JSON.stringify(created.error)).toBe(true);
-    const sessionKey = requireNonEmptyString(created.payload?.key, "admin incognito key");
+    const { key: sessionKey } = await createSession({ agentId: "main", incognito: true }, admin.ws);
 
-    const adminList = await rpcReq<{ sessions?: Array<{ key?: string }> }>(
-      admin.ws,
-      "sessions.list",
-      {},
-    );
-    expect(adminList.ok).toBe(true);
-    expect(adminList.payload?.sessions?.some((session) => session.key === sessionKey)).toBe(false);
+    await expectNotListed(admin.ws, sessionKey);
 
     for (const ws of [admin.ws, reader.ws, writer.ws]) {
       await expect(rpcReq(ws, "sessions.subscribe", {})).resolves.toMatchObject({ ok: true });
     }
     for (const ws of [reader.ws, writer.ws]) {
-      const listed = await rpcReq<{ path?: string; sessions?: Array<{ key?: string }> }>(
-        ws,
-        "sessions.list",
-        {},
-      );
-      expect(listed.ok).toBe(true);
-      expect(listed.payload?.sessions?.some((session) => session.key === sessionKey)).toBe(false);
+      await expectNotListed(ws, sessionKey);
     }
 
-    const deniedCreate = await rpcReq(writer.ws, "sessions.create", {
-      agentId: "main",
-      incognito: true,
-    });
-    expect(deniedCreate).toMatchObject({
-      ok: false,
-      error: { message: "missing scope: operator.admin" },
-    });
     for (const params of [
+      { agentId: "main", incognito: true },
       { parentSessionKey: sessionKey },
       { parentSessionKey: sessionKey, fork: true },
       { parentSessionKey: sessionKey, spawnDepth: 1 },
@@ -346,9 +309,9 @@ test("incognito operator RPCs treat identityless connections as owner-equivalent
     expect(patched.ok, JSON.stringify(patched.error)).toBe(true);
     await Promise.all(changedEvents);
   } finally {
-    admin.ws.close();
-    reader.ws.close();
-    writer.ws.close();
+    for (const { ws } of [admin, reader, writer]) {
+      ws.close();
+    }
     closeIncognitoSessions();
   }
 });

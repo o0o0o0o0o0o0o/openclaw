@@ -32,8 +32,7 @@ vi.mock("../infra/device-pairing-node-state.js", async (importOriginal) => {
   return {
     ...actual,
     resolveCurrentPairedDeviceNodeBinding: async (nodeId: string) => {
-      // Connect notifications also resolve nodes in the background; the synchronous
-      // caller identifies the dispatch path under test before the first await.
+      // Capture before awaiting to distinguish dispatch from background notifications.
       const caller = new Error().stack ?? "";
       const current = await actual.resolveCurrentPairedDeviceNodeBinding(nodeId);
       // Interleave after the real lookup, before the registry's synchronous authority check.
@@ -84,6 +83,11 @@ afterEach(async () => {
 });
 
 type InvokeFrame = { id: string; nodeId: string; command: string };
+const nodeSurface = {
+  platform: "macos",
+  deviceFamily: "Mac",
+  commands: ["canvas.snapshot"],
+};
 
 async function connectPairedNode(displayName: string) {
   const { identity } = await pairDeviceIdentity({
@@ -96,11 +100,9 @@ async function connectPairedNode(displayName: string) {
     deviceFamily: "Mac",
   });
   const pairing = await requestNodePairing({
+    ...nodeSurface,
     nodeId: identity.deviceId,
     displayName,
-    platform: "macos",
-    deviceFamily: "Mac",
-    commands: ["canvas.snapshot"],
   });
   await approveNodePairing(pairing.request.requestId, {
     callerScopes: ["operator.admin", "operator.write"],
@@ -108,16 +110,14 @@ async function connectPairedNode(displayName: string) {
   const invokeFrame = createDeferred<InvokeFrame>();
   const received: InvokeFrame[] = [];
   const client = await connectGatewayClient({
+    ...nodeSurface,
     url: `ws://127.0.0.1:${port}`,
     token: "secret",
     role: "node",
     clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,
     clientDisplayName: displayName,
     mode: GATEWAY_CLIENT_MODES.NODE,
-    platform: "macos",
-    deviceFamily: "Mac",
     scopes: [],
-    commands: ["canvas.snapshot"],
     deviceIdentity: identity,
     onEvent: (event) => {
       if (event.event === "node.invoke.request") {
@@ -329,10 +329,8 @@ test.each(["token revoke", "token rotate", "unpair", "node reapproval"] as const
         const previous = await captureNodePairingGeneration(node.nodeId);
         expect(previous).not.toBeNull();
         const pending = await requestNodePairing({
+          ...nodeSurface,
           nodeId: node.nodeId,
-          platform: "macos",
-          deviceFamily: "Mac",
-          commands: ["canvas.snapshot"],
           permissions: { accessibility: true },
         });
         const changed = await rpcReq(ws, "node.pair.approve", {

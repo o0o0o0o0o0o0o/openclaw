@@ -214,6 +214,14 @@ function fixture(
   };
 }
 
+function reviewedFixture() {
+  const f = fixture();
+  expect(f.refresh().status).toBe(0);
+  expect(f.run("prepare_correction_review_init 42").status).toBe(0);
+  f.approve();
+  return f;
+}
+
 describePosix("native correction baseline refresh", () => {
   beforeAll(() => {
     const root = keys.make("openclaw-pr-baseline-key-");
@@ -255,10 +263,7 @@ describePosix("native correction baseline refresh", () => {
   });
 
   it("revalidates both correction callers under native supervision and rejects authority mutation", () => {
-    const f = fixture();
-    expect(f.refresh().status).toBe(0);
-    expect(f.run("prepare_correction_review_init 42").status).toBe(0);
-    f.approve();
+    const f = reviewedFixture();
     // The baseline fixture uses a synthetic lock during setup. Retire only that
     // fixture ref before letting the actual supervisor acquire its own owner.
     f.git("update-ref", "-d", "refs/openclaw/pr-operation-locks/42", f.incoming);
@@ -654,10 +659,7 @@ fs.renameSync = (from, to) => {
     },
   );
   it("rejects mismatched successor source, tree, review, predecessor and selected main without changing authority", () => {
-    const f = fixture();
-    expect(f.refresh().status).toBe(0);
-    expect(f.run("prepare_correction_review_init 42").status).toBe(0);
-    f.approve();
+    const f = reviewedFixture();
     const next = f.nextBaseline();
     const source = f.git("rev-parse", "HEAD");
     const binding = readFileSync(join(f.root, ".local/prepare-baseline.json"));
@@ -682,10 +684,7 @@ fs.renameSync = (from, to) => {
   });
 
   it.each(["review", "lock"])("rejects successor %s drift after signing", (change) => {
-    const f = fixture();
-    expect(f.refresh().status).toBe(0);
-    expect(f.run("prepare_correction_review_init 42").status).toBe(0);
-    f.approve();
+    const f = reviewedFixture();
     const source = f.git("rev-parse", "HEAD");
     const binding = readFileSync(join(f.root, ".local/prepare-baseline.json"));
     const next = f.nextBaseline();
@@ -707,10 +706,7 @@ fs.renameSync = (from, to) => {
   it.each(["binding", "CAS"])(
     "recovers only the admitted successor after %s interruption",
     (phase) => {
-      const f = fixture();
-      expect(f.refresh().status).toBe(0);
-      expect(f.run("prepare_correction_review_init 42").status).toBe(0);
-      f.approve();
+      const f = reviewedFixture();
       const source = f.git("rev-parse", "HEAD");
       const predecessor = readFileSync(join(f.root, ".local/prepare-baseline.json"));
       const next = f.nextBaseline();
@@ -755,10 +751,7 @@ fs.renameSync=(from,to)=>{if(to==='.local/prep-context.env') throw new Error('fi
   );
 
   it("rechecks live PR identity after restoring a successor and before its branch CAS", () => {
-    const f = fixture();
-    expect(f.refresh().status).toBe(0);
-    expect(f.run("prepare_correction_review_init 42").status).toBe(0);
-    f.approve();
+    const f = reviewedFixture();
     const source = f.git("rev-parse", "HEAD");
     const next = f.nextBaseline();
     const result = f.successor(

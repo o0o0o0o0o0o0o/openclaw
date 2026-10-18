@@ -133,6 +133,17 @@ if (args[0] === 'api' && args[1] === 'user') {
     files: product.map((path) => ({ path })),
   };
   const local = (name: string) => join(worktree, ".local", name);
+  const prepGit = (...args: string[]) => git(worktree, ...args);
+  const readLocal = (name: string) => readFileSync(local(name));
+  const writeLocal = (name: string, bytes: string | Uint8Array) =>
+    writeFileSync(local(name), bytes);
+  const snapshot = (names: string[]) =>
+    Object.fromEntries(names.map((name) => [name, readLocal(name)]));
+  const expectSnapshot = (files: Record<string, Buffer>) => {
+    for (const [name, bytes] of Object.entries(files)) {
+      expect(readLocal(name)).toEqual(bytes);
+    }
+  };
   writeFileSync(local("pr-meta.json"), JSON.stringify(meta));
   writeFileSync(
     local("pr-meta.env"),
@@ -272,6 +283,11 @@ if (args[0] === 'api' && args[1] === 'user') {
     repo,
     worktree,
     local,
+    prepGit,
+    readLocal,
+    writeLocal,
+    snapshot,
+    expectSnapshot,
     git,
     pass,
     run,

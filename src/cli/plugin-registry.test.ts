@@ -9,33 +9,12 @@ const logger = {
   debug: vi.fn(),
 };
 
-function withActivatedPluginIdsForTest<T extends Record<string, unknown>>(
-  config: T,
-  pluginIds: string[],
-): T & {
-  plugins: {
-    allow: string[];
-    entries: Record<string, { enabled: true }>;
-  };
-} {
-  return {
-    ...config,
-    plugins: {
-      ...(typeof config.plugins === "object" && config.plugins ? config.plugins : {}),
-      allow: pluginIds,
-      entries: Object.fromEntries(pluginIds.map((pluginId) => [pluginId, { enabled: true }])),
-    },
-  };
-}
-
 function expectConfiguredChannelPluginIdsParams(expected: {
   config: unknown;
   workspaceDir?: string;
 }) {
   expect(mocks.resolveConfiguredChannelPluginIds).toHaveBeenCalledTimes(1);
-  const params = mocks.resolveConfiguredChannelPluginIds.mock.calls[0]?.[0] as
-    | { config?: unknown; env?: NodeJS.ProcessEnv; workspaceDir?: string }
-    | undefined;
+  const params = mocks.resolveConfiguredChannelPluginIds.mock.calls[0]?.[0];
   expect(params?.config).toBe(expected.config);
   // Compare identity without exposing ambient credentials in failure output.
   expect(params?.env === process.env).toBe(true);
@@ -44,38 +23,11 @@ function expectConfiguredChannelPluginIdsParams(expected: {
 
 function expectLoadOpenClawPluginsCall(
   callIndex: number,
-  expected: {
-    config?: unknown;
-    activationSourceConfig?: unknown;
-    autoEnabledReasons?: unknown;
-    onlyPluginIds: string[];
-    throwOnLoadError: boolean;
-    workspaceDir?: string;
-  },
+  expected: Partial<Parameters<typeof mocks.loadAndActivateRootPluginRegistry>[0]>,
 ) {
-  const params = mocks.loadAndActivateRootPluginRegistry.mock.calls[callIndex]?.[0] as
-    | {
-        config?: unknown;
-        activationSourceConfig?: unknown;
-        autoEnabledReasons?: unknown;
-        onlyPluginIds?: string[];
-        throwOnLoadError?: boolean;
-        workspaceDir?: string;
-      }
-    | undefined;
-  if ("config" in expected) {
-    expect(params?.config).toEqual(expected.config);
-  }
-  if ("activationSourceConfig" in expected) {
-    expect(params?.activationSourceConfig).toEqual(expected.activationSourceConfig);
-  }
-  if ("autoEnabledReasons" in expected) {
-    expect(params?.autoEnabledReasons).toEqual(expected.autoEnabledReasons);
-  }
-  expect(params?.onlyPluginIds).toEqual(expected.onlyPluginIds);
-  expect(params?.throwOnLoadError).toBe(expected.throwOnLoadError);
-  if ("workspaceDir" in expected) {
-    expect(params?.workspaceDir).toBe(expected.workspaceDir);
+  const params = mocks.loadAndActivateRootPluginRegistry.mock.calls[callIndex]?.[0];
+  for (const key of Object.keys(expected)) {
+    expect(params && Reflect.get(params, key)).toEqual(Reflect.get(expected, key));
   }
 }
 
@@ -95,9 +47,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../plugins/loader.js", () => ({
-  loadAndActivateRootPluginRegistry: (
-    ...args: Parameters<typeof mocks.loadAndActivateRootPluginRegistry>
-  ) => mocks.loadAndActivateRootPluginRegistry(...args),
+  loadAndActivateRootPluginRegistry: mocks.loadAndActivateRootPluginRegistry,
 }));
 
 // mock-isolation: Registry selection uses fixture channel ids without persisted channel discovery.
@@ -105,8 +55,7 @@ vi.mock("../plugins/channel-plugin-ids.js", () => ({
   resolveConfiguredChannelPluginIdsAsync: async (
     ...args: Parameters<typeof mocks.resolveConfiguredChannelPluginIds>
   ) => mocks.resolveConfiguredChannelPluginIds(...args),
-  resolveChannelPluginIds: (...args: Parameters<typeof mocks.resolveChannelPluginIds>) =>
-    mocks.resolveChannelPluginIds(...args),
+  resolveChannelPluginIds: mocks.resolveChannelPluginIds,
 }));
 
 // mock-isolation: Registry selection uses fixture plugin ids without installed-plugin discovery.
@@ -117,31 +66,7 @@ vi.mock("../plugins/effective-plugin-ids.js", () => ({
 }));
 
 vi.mock("../plugins/runtime/load-context.resolve.js", () => ({
-  resolvePluginRuntimeLoadContext: (
-    ...args: Parameters<typeof mocks.resolvePluginRuntimeLoadContext>
-  ) => mocks.resolvePluginRuntimeLoadContext(...args),
-}));
-
-vi.mock("../plugins/runtime/load-context.js", () => ({
-  buildPluginRuntimeLoadOptions: (
-    values: {
-      config: unknown;
-      activationSourceConfig: unknown;
-      autoEnabledReasons: Readonly<Record<string, string[]>>;
-      workspaceDir: string | undefined;
-      env: NodeJS.ProcessEnv;
-      logger: typeof logger;
-    },
-    overrides?: Record<string, unknown>,
-  ) => ({
-    config: values.config,
-    activationSourceConfig: values.activationSourceConfig,
-    autoEnabledReasons: values.autoEnabledReasons,
-    workspaceDir: values.workspaceDir,
-    env: values.env,
-    logger: values.logger,
-    ...overrides,
-  }),
+  resolvePluginRuntimeLoadContext: mocks.resolvePluginRuntimeLoadContext,
 }));
 
 describe("ensurePluginRegistryLoaded", () => {
@@ -178,7 +103,10 @@ describe("ensurePluginRegistryLoaded", () => {
         },
       },
     };
-    const autoEnabledConfig = withActivatedPluginIdsForTest(baseConfig, ["demo-chat"]);
+    const autoEnabledConfig = {
+      ...baseConfig,
+      plugins: { allow: ["demo-chat"], entries: { "demo-chat": { enabled: true } } },
+    };
 
     mocks.resolvePluginRuntimeLoadContext.mockReturnValue({
       rawConfig: baseConfig,

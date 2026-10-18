@@ -17,6 +17,13 @@ import {
 const successfulRun = async () => {};
 const ignoreError = () => {};
 const proxyChildTempDir = useAutoCleanupTempDirTracker(afterAll).make("openclaw-proxy-child-tmp-");
+const moduleUrl = (relative: string) => JSON.stringify(new URL(relative, import.meta.url).href);
+
+function expectChildExit(result: ReturnType<typeof runCliChild>, status: number) {
+  expect(result.error).toBeUndefined();
+  expect(result.status).toBe(status);
+  expect(result.signal).toBeNull();
+}
 
 function runCliChild(script: string, envOverrides: NodeJS.ProcessEnv = {}, maxBuffer?: number) {
   const env = { ...process.env, ...envOverrides };
@@ -186,19 +193,16 @@ describe("one-shot CLI completion", () => {
     expect(process.exitCode).toBe(6);
   });
 
-  it.each([{ recorded: undefined, expected: 0 }])(
-    "preserves recorded outcome $recorded",
-    async ({ recorded, expected }) => {
-      await runCliWithExitFinalization({
-        run: async () => {
-          requestExitAfterOneShotOutput();
-          process.exitCode = recorded;
-        },
-        onError: ignoreError,
-      });
-      expect(process.exitCode).toBe(expected);
-    },
-  );
+  it("defaults an unrecorded outcome to success", async () => {
+    await runCliWithExitFinalization({
+      run: async () => {
+        requestExitAfterOneShotOutput();
+        process.exitCode = undefined;
+      },
+      onError: ignoreError,
+    });
+    expect(process.exitCode).toBe(0);
+  });
 
   it.each(["before cleanup", "during cleanup"])(
     "retains terminal signal outcome %s",
@@ -222,12 +226,10 @@ describe("one-shot CLI completion", () => {
   );
 
   it("drains large piped JSON before a deferred ExitError without reporting another error", () => {
-    const oneShotExitUrl = new URL("./one-shot-exit.ts", import.meta.url).href;
-    const runtimeUrl = new URL("../runtime.ts", import.meta.url).href;
     const payloadBytes = 1024 * 1024;
     const script = `
-      import { runCliWithExitFinalization } from ${JSON.stringify(oneShotExitUrl)};
-      import { defaultRuntime, ExitError } from ${JSON.stringify(runtimeUrl)};
+      import { runCliWithExitFinalization } from ${moduleUrl("./one-shot-exit.ts")};
+      import { defaultRuntime, ExitError } from ${moduleUrl("../runtime.ts")};
       await runCliWithExitFinalization({
         run: async () => {
           defaultRuntime.writeJson({ ok: false, payload: "x".repeat(${payloadBytes}) });
@@ -242,9 +244,7 @@ describe("one-shot CLI completion", () => {
 
     const result = runCliChild(script, {}, 2 * payloadBytes);
 
-    expect(result.error).toBeUndefined();
-    expect(result.status).toBe(7);
-    expect(result.signal).toBeNull();
+    expectChildExit(result, 7);
     expect(result.stderr).toBe("");
     expect(result.stdout).toBe(
       `${JSON.stringify({ ok: false, payload: "x".repeat(payloadBytes) }, null, 2)}\n`,
@@ -252,16 +252,12 @@ describe("one-shot CLI completion", () => {
   });
 
   it("keeps the real proxy command exit truthful when --help is consumed as a proxy URL", () => {
-    const oneShotExitUrl = new URL("./one-shot-exit.ts", import.meta.url).href;
-    const runtimeSnapshotUrl = new URL("../config/runtime-snapshot.ts", import.meta.url).href;
-    const argvInvocationUrl = new URL("./argv-invocation.ts", import.meta.url).href;
-    const proxyCliUrl = new URL("./proxy-cli.ts", import.meta.url).href;
     const script = `
       import { Command, CommanderError } from "commander";
-      import { setRuntimeConfigSnapshot } from ${JSON.stringify(runtimeSnapshotUrl)};
-      import { resolveCliArgvInvocation } from ${JSON.stringify(argvInvocationUrl)};
-      import { registerProxyCli } from ${JSON.stringify(proxyCliUrl)};
-      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${JSON.stringify(oneShotExitUrl)};
+      import { setRuntimeConfigSnapshot } from ${moduleUrl("../config/runtime-snapshot.ts")};
+      import { resolveCliArgvInvocation } from ${moduleUrl("./argv-invocation.ts")};
+      import { registerProxyCli } from ${moduleUrl("./proxy-cli.ts")};
+      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${moduleUrl("./one-shot-exit.ts")};
 
       setRuntimeConfigSnapshot({});
       const argv = ["node", "openclaw", "proxy", "validate", ...${JSON.stringify(["--proxy-url", "--help", "--json"])}];
@@ -294,17 +290,13 @@ describe("one-shot CLI completion", () => {
       NODE_DISABLE_COMPILE_CACHE: "1",
     });
 
-    expect(result.error).toBeUndefined();
-    expect(result.signal).toBeNull();
-    expect(result.status).toBe(1);
-    expect(JSON.parse(result.stdout)).toEqual(
-      expect.objectContaining({
-        ok: false,
-        config: expect.objectContaining({
-          errors: ["proxyUrl must use http:// or https://"],
-        }),
-      }),
-    );
+    expectChildExit(result, 1);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: false,
+      config: {
+        errors: ["proxyUrl must use http:// or https://"],
+      },
+    });
   });
 
   it.each([
@@ -315,13 +307,10 @@ describe("one-shot CLI completion", () => {
       explicitRequest: false,
     },
   ])("keeps real dual-TTY JSON clean for $name", ({ exitCode, explicitRequest }) => {
-    const oneShotExitUrl = new URL("./one-shot-exit.ts", import.meta.url).href;
-    const runtimeUrl = new URL("../runtime.ts", import.meta.url).href;
-    const loggingStateUrl = new URL("../logging/state.ts", import.meta.url).href;
     const script = `
-      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${JSON.stringify(oneShotExitUrl)};
-      import { defaultRuntime } from ${JSON.stringify(runtimeUrl)};
-      import { loggingState } from ${JSON.stringify(loggingStateUrl)};
+      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${moduleUrl("./one-shot-exit.ts")};
+      import { defaultRuntime } from ${moduleUrl("../runtime.ts")};
+      import { loggingState } from ${moduleUrl("../logging/state.ts")};
       Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
       Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });
       loggingState.forceConsoleToStderr = true;
@@ -340,9 +329,7 @@ describe("one-shot CLI completion", () => {
 
     const result = runCliChild(script);
 
-    expect(result.error).toBeUndefined();
-    expect(result.status).toBe(exitCode);
-    expect(result.signal).toBeNull();
+    expectChildExit(result, exitCode);
     expect(JSON.parse(result.stdout)).toEqual({ ok: exitCode === 0 });
     expect(result.stderr.startsWith("finalized\n")).toBe(true);
     if (explicitRequest) {
@@ -353,14 +340,10 @@ describe("one-shot CLI completion", () => {
   });
 
   it("keeps real dual-TTY JSON clean after a fatal unhandled rejection", () => {
-    const runtimeUrl = new URL("../runtime.ts", import.meta.url).href;
-    const loggingStateUrl = new URL("../logging/state.ts", import.meta.url).href;
-    const unhandledRejectionsUrl = new URL("../infra/unhandled-rejections.ts", import.meta.url)
-      .href;
     const script = `
-      import { defaultRuntime } from ${JSON.stringify(runtimeUrl)};
-      import { loggingState } from ${JSON.stringify(loggingStateUrl)};
-      import { installUnhandledRejectionHandler } from ${JSON.stringify(unhandledRejectionsUrl)};
+      import { defaultRuntime } from ${moduleUrl("../runtime.ts")};
+      import { loggingState } from ${moduleUrl("../logging/state.ts")};
+      import { installUnhandledRejectionHandler } from ${moduleUrl("../infra/unhandled-rejections.ts")};
       Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
       Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });
       loggingState.forceConsoleToStderr = true;
@@ -374,9 +357,7 @@ describe("one-shot CLI completion", () => {
 
     const result = runCliChild(script);
 
-    expect(result.error).toBeUndefined();
-    expect(result.status).toBe(1);
-    expect(result.signal).toBeNull();
+    expectChildExit(result, 1);
     expect(JSON.parse(result.stdout)).toEqual({ ok: false });
     expect(result.stderr).toContain("\x1b[?25h");
   });

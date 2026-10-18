@@ -37,9 +37,44 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
   }),
 );
 
-it("backfills a nested requested workspace once instead of using the agent default", async () => {
-  const root = tempDirs.make("openclaw-worktree-workspace-migration-");
+function registerWorktree(
+  env: NodeJS.ProcessEnv,
+  id: string,
+  repoRoot: string,
+  worktreeRoot: string,
+  sessionKey: string,
+) {
+  return insertRegistryWorktree(env, {
+    id,
+    name: id,
+    repoFingerprint: "0123456789abcdef",
+    repoRoot,
+    path: worktreeRoot,
+    branch: `openclaw/${id}`,
+    baseRef: "HEAD",
+    ownerKind: "session",
+    ownerId: sessionKey,
+    createdAt: 1,
+    lastActiveAt: 1,
+  });
+}
+function migration(
+  cfg: OpenClawConfig,
+  env: NodeJS.ProcessEnv,
+  storePath: string,
+  agentId = "main",
+) {
+  return () =>
+    migrateManagedWorktreeCanonicalWorkspaces({ agentId, cfg, env, storePath, mode: "doctor-fix" });
+}
+function createFixture(prefix: string) {
+  const root = tempDirs.make(prefix);
   const stateDir = path.join(root, "state");
+  return { root, stateDir, env: { ...process.env, OPENCLAW_STATE_DIR: stateDir } };
+}
+
+it("backfills a nested requested workspace once instead of using the agent default", async () => {
+  const { root, stateDir, env } = createFixture("openclaw-worktree-workspace-migration-");
   const repoRoot = path.join(root, "repo");
   const agentWorkspace = path.join(repoRoot, "agent-default");
   const requestedWorkspace = path.join(repoRoot, "packages", "app");
@@ -50,7 +85,6 @@ it("backfills a nested requested workspace once instead of using the agent defau
     fs.mkdir(requestedWorkspace, { recursive: true }),
     fs.mkdir(spawnedCwd, { recursive: true }),
   ]);
-  const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
   const storePath = path.join(stateDir, "agents", "main", "sessions", "sessions.json");
   const sessionKey = "agent:main:dashboard:legacy-worktree";
   const ordinarySessionKey = "agent:main:dashboard:ordinary";
@@ -58,19 +92,7 @@ it("backfills a nested requested workspace once instead of using the agent defau
     agents: { entries: { main: { workspace: agentWorkspace } } },
     session: { store: storePath },
   };
-  await insertRegistryWorktree(env, {
-    id: "legacy",
-    name: "legacy",
-    repoFingerprint: "0123456789abcdef",
-    repoRoot,
-    path: worktreeRoot,
-    branch: "openclaw/legacy",
-    baseRef: "HEAD",
-    ownerKind: "session",
-    ownerId: sessionKey,
-    createdAt: 1,
-    lastActiveAt: 1,
-  });
+  await registerWorktree(env, "legacy", repoRoot, worktreeRoot, sessionKey);
   await replaceSessionEntry(
     { agentId: "main", env, sessionKey, storePath },
     {
@@ -84,38 +106,26 @@ it("backfills a nested requested workspace once instead of using the agent defau
     { agentId: "main", env, sessionKey: ordinarySessionKey, storePath },
     { sessionId: "ordinary-session", updatedAt: 20 },
   );
-  const ordinaryBefore = loadSessionEntry({
-    agentId: "main",
-    env,
-    sessionKey: ordinarySessionKey,
-    storePath,
+  const scope = { agentId: "main", env, sessionKey, storePath };
+  const ordinaryScope = { ...scope, sessionKey: ordinarySessionKey };
+  const ordinaryBefore = loadSessionEntry(ordinaryScope);
+
+  const runMigration = migration(cfg, env, storePath);
+
+  await runMigration();
+  const first = loadSessionEntry(scope);
+  expect(first).toMatchObject({
+    worktree: { canonicalWorkspaceDir: requestedWorkspace },
+    updatedAt: 10,
   });
 
-  const runMigration = async () =>
-    await migrateManagedWorktreeCanonicalWorkspaces({
-      agentId: "main",
-      cfg,
-      env,
-      storePath,
-      mode: "doctor-fix",
-    });
-
   await runMigration();
-  const first = loadSessionEntry({ agentId: "main", env, sessionKey, storePath });
-  expect(first?.worktree?.canonicalWorkspaceDir).toBe(requestedWorkspace);
-  expect(first?.updatedAt).toBe(10);
-
-  await runMigration();
-  expect(loadSessionEntry({ agentId: "main", env, sessionKey, storePath })).toEqual(first);
-  expect(
-    loadSessionEntry({ agentId: "main", env, sessionKey: ordinarySessionKey, storePath }),
-  ).toEqual(ordinaryBefore);
+  expect(loadSessionEntry(scope)).toEqual(first);
+  expect(loadSessionEntry(ordinaryScope)).toEqual(ordinaryBefore);
 });
 
 it("repairs a foreign logical row in its source partition without changing a same-key sibling", async () => {
-  const root = tempDirs.make("openclaw-worktree-source-partition-");
-  const stateDir = path.join(root, "state");
-  const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+  const { root, stateDir, env } = createFixture("openclaw-worktree-source-partition-");
   const storePath = path.join(stateDir, "shared.json");
   const workspace = path.join(root, "ops-workspace");
   const cfg: OpenClawConfig = {
@@ -152,14 +162,7 @@ it("repairs a foreign logical row in its source partition without changing a sam
     },
   });
   const siblingBefore = loadSessionEntry(scope);
-  const runMigration = () =>
-    migrateManagedWorktreeCanonicalWorkspaces({
-      agentId: "main",
-      cfg,
-      env,
-      storePath,
-      mode: "doctor-fix",
-    });
+  const runMigration = migration(cfg, env, storePath);
 
   await expect(runMigration()).resolves.toEqual({ found: 1, repaired: 1 });
   expect(loadSessionEntry(sourceScope)).toMatchObject({
@@ -178,9 +181,7 @@ it("repairs a foreign logical row in its source partition without changing a sam
 });
 
 it("backfills each logical owner's workspace in a shared SQLite store", async () => {
-  const root = tempDirs.make("openclaw-shared-worktree-workspace-migration-");
-  const stateDir = path.join(root, "state");
-  const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+  const { root, stateDir, env } = createFixture("openclaw-shared-worktree-workspace-migration-");
   const storePath = path.join(stateDir, "shared.sqlite");
   const agents = ["main", "ops"].map((id) => ({ id, workspace: path.join(root, id) }));
   const cfg: OpenClawConfig = {
@@ -216,14 +217,7 @@ it("backfills each logical owner's workspace in a shared SQLite store", async ()
   expect(readEntries().map((entry) => entry?.sessionId)).toEqual(
     agents.map((agent) => `${agent.id}-session`),
   );
-  const runMigration = () =>
-    migrateManagedWorktreeCanonicalWorkspaces({
-      agentId: "ops",
-      cfg,
-      env,
-      storePath,
-      mode: "doctor-fix",
-    });
+  const runMigration = migration(cfg, env, storePath, "ops");
   await expect(runMigration()).resolves.toEqual({ found: 2, repaired: 2 });
   const migrated = readEntries();
   expect(migrated).toEqual(
@@ -245,8 +239,9 @@ it("backfills each logical owner's workspace in a shared SQLite store", async ()
 });
 
 async function createRegisteredProjectMigrationFixture() {
-  const root = tempDirs.make("openclaw-registered-worktree-workspace-migration-");
-  const stateDir = path.join(root, "state");
+  const { root, stateDir, env } = createFixture(
+    "openclaw-registered-worktree-workspace-migration-",
+  );
   const repoRoot = path.join(root, "registered-project");
   const otherRepoRoot = path.join(root, "other-project");
   const agentWorkspace = path.join(root, "agent-default");
@@ -258,7 +253,6 @@ async function createRegisteredProjectMigrationFixture() {
       fs.mkdir(directory, { recursive: true }),
     ),
   );
-  const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
   const storePath = path.join(stateDir, "agents", "main", "sessions", "sessions.json");
   const sessionKey = "agent:main:dashboard:legacy-project-worktree";
   const scope = { agentId: "main", env, sessionKey, storePath };
@@ -283,19 +277,7 @@ async function createRegisteredProjectMigrationFixture() {
     }),
     { env },
   );
-  await insertRegistryWorktree(env, {
-    id: "legacy-project",
-    name: "legacy-project",
-    repoFingerprint: "0123456789abcdef",
-    repoRoot,
-    path: worktreeRoot,
-    branch: "openclaw/legacy-project",
-    baseRef: "HEAD",
-    ownerKind: "session",
-    ownerId: sessionKey,
-    createdAt: 1,
-    lastActiveAt: 1,
-  });
+  await registerWorktree(env, "legacy-project", repoRoot, worktreeRoot, sessionKey);
   const entry = {
     sessionId: "legacy-project-session",
     updatedAt: 10,
@@ -311,14 +293,7 @@ async function createRegisteredProjectMigrationFixture() {
     otherProject,
     otherRepoRoot,
     otherSpawnedCwd,
-    runMigration: () =>
-      migrateManagedWorktreeCanonicalWorkspaces({
-        agentId: "main",
-        cfg,
-        env,
-        storePath,
-        mode: "doctor-fix",
-      }),
+    runMigration: migration(cfg, env, storePath),
   };
 }
 

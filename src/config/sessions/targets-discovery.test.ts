@@ -23,6 +23,19 @@ import {
   resolveRealStorePath,
 } from "./targets.test-support.js";
 
+async function writeLegacyStore(storePath: string, entries: Record<string, unknown>) {
+  await fs.mkdir(path.dirname(storePath), { recursive: true });
+  await fs.writeFile(storePath, JSON.stringify(entries), "utf8");
+}
+
+async function writeSession(storePath: string, sessionId: string, agentId?: string) {
+  await fs.mkdir(path.dirname(storePath), { recursive: true });
+  await replaceSessionEntry(
+    { agentId, storePath, sessionKey: "main" },
+    { sessionId, updatedAt: Date.now() },
+  );
+}
+
 describe("resolveAgentSessionStoreTargetsSync", () => {
   it("resolves one requested agent store from the direct path", async () => {
     await withTempHome(async (home) => {
@@ -35,10 +48,7 @@ describe("resolveAgentSessionStoreTargetsSync", () => {
       const enumerateAgentDirs = vi.spyOn(sessionDirs, "resolveAgentSessionDirsFromAgentsDirSync");
       try {
         expect(resolveAgentSessionStoreTargetsSync(cfg, "codex", { env: process.env })).toEqual([
-          {
-            agentId: "codex",
-            storePath: storePaths.codex,
-          },
+          { agentId: "codex", storePath: storePaths.codex },
         ]);
         expect(enumerateAgentDirs).not.toHaveBeenCalled();
       } finally {
@@ -55,12 +65,7 @@ describe("resolveAgentSessionStoreTargetsSync", () => {
 
       expect(
         resolveAgentSessionStoreTargetsSync(cfg, "retired-agent", { env: process.env }),
-      ).toEqual([
-        {
-          agentId: "retired-agent",
-          storePath: storePaths["Retired Agent"],
-        },
-      ]);
+      ).toEqual([{ agentId: "retired-agent", storePath: storePaths["Retired Agent"] }]);
     });
   });
 });
@@ -89,14 +94,16 @@ describe("resolveExistingAgentSessionStoreTargetsSync", () => {
   it("requires agent-specific rows instead of fixed-store file existence", async () => {
     await withTempHome(async (home) => {
       const storePath = path.join(home, "shared", "sessions.json");
-      await fs.mkdir(path.dirname(storePath), { recursive: true });
-      await fs.writeFile(storePath, "{}\n", "utf8");
+      await writeLegacyStore(storePath, {
+        "agent:ghost:existing": { sessionId: "legacy-ghost", updatedAt: 42 },
+      });
       const cfg: OpenClawConfig = {
         agents: { entries: { main: {} } },
         session: { store: storePath },
       };
 
       expect(resolveExistingAgentSessionStoreTargetsSync(cfg, "ghost")).toEqual([]);
+      expect(await fs.readdir(path.dirname(storePath))).toEqual(["sessions.json"]);
 
       await replaceSessionEntry(
         { agentId: "ghost", sessionKey: "agent:ghost:existing", storePath },
@@ -106,29 +113,6 @@ describe("resolveExistingAgentSessionStoreTargetsSync", () => {
       expect(resolveExistingAgentSessionStoreTargetsSync(cfg, "ghost")).toEqual([
         { agentId: "ghost", storePath },
       ]);
-    });
-  });
-
-  it("ignores matching rows in a fixed legacy store without creating SQLite", async () => {
-    await withTempHome(async (home) => {
-      const storePath = path.join(home, "shared", "sessions.json");
-      await fs.mkdir(path.dirname(storePath), { recursive: true });
-      await fs.writeFile(
-        storePath,
-        JSON.stringify({
-          "agent:retired:existing": { sessionId: "legacy-retired", updatedAt: 42 },
-          "agent:other:existing": { sessionId: "legacy-other", updatedAt: 41 },
-        }),
-        "utf8",
-      );
-      const cfg: OpenClawConfig = {
-        agents: { entries: { main: {} } },
-        session: { store: storePath },
-      };
-
-      expect(resolveExistingAgentSessionStoreTargetsSync(cfg, "retired")).toEqual([]);
-      expect(resolveExistingAgentSessionStoreTargetsSync(cfg, "ghost")).toEqual([]);
-      expect(await fs.readdir(path.dirname(storePath))).toEqual(["sessions.json"]);
     });
   });
 
@@ -145,14 +129,9 @@ describe("resolveExistingAgentSessionStoreTargetsSync", () => {
       const sqliteStorePath = resolveSessionStorePathCore(storeTemplate, {
         agentId: "retired-sqlite",
       });
-      await fs.mkdir(path.dirname(legacyStorePath), { recursive: true });
-      await fs.writeFile(
-        legacyStorePath,
-        JSON.stringify({
-          "agent:retired-legacy:existing": { sessionId: "legacy-retired", updatedAt: 42 },
-        }),
-        "utf8",
-      );
+      await writeLegacyStore(legacyStorePath, {
+        "agent:retired-legacy:existing": { sessionId: "legacy-retired", updatedAt: 42 },
+      });
       await replaceSessionEntry(
         {
           agentId: "retired-sqlite",
@@ -188,13 +167,9 @@ describe("resolveExistingAgentSessionStoreTargetsSync", () => {
       const outsideStorePath = path.join(home, "outside-sessions.json");
       const escapedStorePath = path.join(escapedSessionsDir, "sessions.json");
       await fs.mkdir(escapedSessionsDir, { recursive: true });
-      await fs.writeFile(
-        outsideStorePath,
-        JSON.stringify({
-          "agent:escaped:secret": { sessionId: "outside-session", updatedAt: 42 },
-        }),
-        "utf8",
-      );
+      await writeLegacyStore(outsideStorePath, {
+        "agent:escaped:secret": { sessionId: "outside-session", updatedAt: 42 },
+      });
       await fs.symlink(outsideStorePath, escapedStorePath);
 
       const cfg = createCustomRootCfg(customRoot, "main");
@@ -208,35 +183,14 @@ describe("resolveExistingAgentSessionStoreTargetsSync", () => {
 });
 
 describe("resolveAllAgentSessionStoreTargetsSync", () => {
-  it("includes discovered on-disk agent stores alongside configured targets", async () => {
-    await withTempHome(async (home) => {
-      const stateDir = path.join(home, ".openclaw");
-      const storePaths = await createAgentSessionStores(stateDir, ["ops", "retired"]);
-
-      const cfg: OpenClawConfig = {
-        agents: {
-          entries: { ops: {} },
-        },
-      };
-
-      const targets = resolveAllAgentSessionStoreTargetsSync(cfg, { env: process.env });
-
-      expectTargetsToContainStores(targets, storePaths);
-      expect(countMatching(targets, (target) => target.storePath === storePaths.ops)).toBe(1);
-    });
-  });
-
   it("includes legacy JSON stores before an agent SQLite database exists", async () => {
     await withTempHome(async (home) => {
       const stateDir = path.join(home, ".openclaw");
       const sessionsDir = path.join(stateDir, "agents", "legacy", "sessions");
       const storePath = path.join(sessionsDir, "sessions.json");
-      await fs.mkdir(sessionsDir, { recursive: true });
-      await fs.writeFile(
-        storePath,
-        JSON.stringify({ main: { sessionId: "legacy-session", updatedAt: Date.now() } }),
-        "utf8",
-      );
+      await writeLegacyStore(storePath, {
+        main: { sessionId: "legacy-session", updatedAt: Date.now() },
+      });
 
       const targets = resolveAllAgentSessionStoreTargetsSync(
         { agents: { entries: { legacy: {} } } },
@@ -260,9 +214,7 @@ describe("resolveAllAgentSessionStoreTargetsSync", () => {
             target.agentId === "retired-agent" && target.storePath === storePaths["Retired Agent"],
         ),
       ).toBe(true);
-      expect(targets).toContainEqual(
-        expect.objectContaining({ agentId: "ops", storePath: storePaths.ops }),
-      );
+      expectTargetsToContainStores(targets, { ops: storePaths.ops });
       expect(countMatching(targets, (target) => target.storePath === storePaths.ops)).toBe(1);
       const scoped = resolveAllAgentSessionStoreTargetsSync(
         createCustomRootCfg(path.join(home, "custom-state")),
@@ -279,21 +231,10 @@ describe("resolveAllAgentSessionStoreTargetsSync", () => {
       const envStateDir = path.join(home, "env-state");
       const mainSessionsDir = path.join(envStateDir, "agents", "main", "sessions");
       const retiredSessionsDir = path.join(envStateDir, "agents", "retired", "sessions");
-      await fs.mkdir(mainSessionsDir, { recursive: true });
-      await fs.mkdir(retiredSessionsDir, { recursive: true });
-      await replaceSessionEntry(
-        { storePath: path.join(mainSessionsDir, "sessions.json"), sessionKey: "main" },
-        { sessionId: "sid-main", updatedAt: Date.now() },
-      );
-      await replaceSessionEntry(
-        { storePath: path.join(retiredSessionsDir, "sessions.json"), sessionKey: "main" },
-        { sessionId: "sid-retired", updatedAt: Date.now() },
-      );
+      await writeSession(path.join(mainSessionsDir, "sessions.json"), "sid-main");
+      await writeSession(path.join(retiredSessionsDir, "sessions.json"), "sid-retired");
 
-      const env = {
-        ...process.env,
-        OPENCLAW_STATE_DIR: envStateDir,
-      };
+      const env = { ...process.env, OPENCLAW_STATE_DIR: envStateDir };
       const cfg: OpenClawConfig = EXPLICIT_MAIN_CONFIG;
       const mainStorePath = await resolveRealStorePath(mainSessionsDir);
       const retiredStorePath = await resolveRealStorePath(retiredSessionsDir);
@@ -320,10 +261,7 @@ describe("resolveAllAgentSessionStoreTargetsSync", () => {
       const envStateDir = path.join(home, "env-state");
       const storePaths = await createAgentSessionStores(envStateDir, ["main", "retired"]);
       const cfg = createCustomRootCfg(customRoot, "main");
-      const env = {
-        ...process.env,
-        OPENCLAW_STATE_DIR: envStateDir,
-      };
+      const env = { ...process.env, OPENCLAW_STATE_DIR: envStateDir };
 
       const targets = resolveAllAgentSessionStoreTargetsSync(cfg, { env });
       expect(
@@ -367,62 +305,20 @@ describe("resolveAllAgentSessionStoreTargetsSync", () => {
       const junkSessionsDir = path.join(stateDir, "agents", "###", "sessions");
       const collisionSessionsDir = path.join(stateDir, "agents", "main!", "sessions");
       const whitespaceSessionsDir = path.join(stateDir, "agents", "main ", "sessions");
-      await fs.mkdir(mainSessionsDir, { recursive: true });
-      await fs.mkdir(junkSessionsDir, { recursive: true });
-      await fs.mkdir(collisionSessionsDir, { recursive: true });
-      await fs.mkdir(whitespaceSessionsDir, { recursive: true });
-      await replaceSessionEntry(
-        { storePath: path.join(mainSessionsDir, "sessions.json"), sessionKey: "main" },
-        { sessionId: "sid-main", updatedAt: Date.now() },
-      );
-      await replaceSessionEntry(
-        {
-          agentId: "main",
-          storePath: path.join(junkSessionsDir, "sessions.json"),
-          sessionKey: "main",
-        },
-        { sessionId: "sid-junk", updatedAt: Date.now() },
-      );
-      await replaceSessionEntry(
-        {
-          agentId: "main",
-          storePath: path.join(collisionSessionsDir, "sessions.json"),
-          sessionKey: "main",
-        },
-        { sessionId: "sid-collision", updatedAt: Date.now() },
-      );
-      await replaceSessionEntry(
-        {
-          agentId: "main",
-          storePath: path.join(whitespaceSessionsDir, "sessions.json"),
-          sessionKey: "main",
-        },
-        { sessionId: "sid-whitespace", updatedAt: Date.now() },
-      );
+      for (const [directory, id] of [
+        [mainSessionsDir, "main"],
+        [junkSessionsDir, "junk"],
+        [collisionSessionsDir, "collision"],
+        [whitespaceSessionsDir, "whitespace"],
+      ]) {
+        await writeSession(path.join(directory, "sessions.json"), `sid-${id}`, "main");
+      }
 
       const cfg: OpenClawConfig = EXPLICIT_MAIN_CONFIG;
       const mainStorePath = await resolveRealStorePath(mainSessionsDir);
       const targets = resolveAllAgentSessionStoreTargetsSync(cfg, { env: process.env });
 
-      expect(targets).toEqual([
-        {
-          agentId: "main",
-          storePath: mainStorePath,
-        },
-      ]);
-      expect(
-        targets.some((target) => target.storePath === path.join(junkSessionsDir, "sessions.json")),
-      ).toBe(false);
-      expect(
-        targets.some(
-          (target) => target.storePath === path.join(collisionSessionsDir, "sessions.json"),
-        ),
-      ).toBe(false);
-      expect(
-        targets.some(
-          (target) => target.storePath === path.join(whitespaceSessionsDir, "sessions.json"),
-        ),
-      ).toBe(false);
+      expect(targets).toEqual([{ agentId: "main", storePath: mainStorePath }]);
     });
   });
 });

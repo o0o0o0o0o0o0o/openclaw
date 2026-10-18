@@ -15,16 +15,22 @@ afterEach(async () => {
 });
 
 function createController(
-  params: Omit<
-    Parameters<typeof createDiscordAutoPresenceController>[0],
-    "scheduler" | "accountId"
-  >,
+  params: Partial<Parameters<typeof createDiscordAutoPresenceController>[0]> = {},
 ) {
   const clock = createGatewaySchedulerClock(Date.now());
   const scheduler = createTestPluginServiceScheduler(createTestGatewayScheduler(clock.clock));
   schedulers.add(scheduler);
+  const updatePresence = vi.fn();
   return {
-    ...createDiscordAutoPresenceController({ accountId: "default", ...params, scheduler }),
+    ...createDiscordAutoPresenceController({
+      accountId: "default",
+      discordConfig: { autoPresence: { enabled: true } },
+      gateway: { isConnected: true, updatePresence },
+      loadAuthStore: () => createStore(),
+      ...params,
+      scheduler,
+    }),
+    updatePresence,
     advance: clock.advanceBy,
   };
 }
@@ -73,14 +79,11 @@ describe("discord auto presence", () => {
   });
 
   it("reports degraded availability when no auth profiles exist", async () => {
-    const updatePresence = vi.fn();
     const controller = createController({
-      discordConfig: { autoPresence: { enabled: true } },
-      gateway: { isConnected: true, updatePresence },
       loadAuthStore: () => ({ version: 1, profiles: {} }),
     });
     await controller.start();
-    expect(updatePresence).toHaveBeenCalledWith(
+    expect(controller.updatePresence).toHaveBeenCalledWith(
       presenceUpdate("idle", [{ name: "Custom Status", type: 4, state: "runtime degraded" }]),
     );
   });
@@ -90,7 +93,6 @@ describe("discord auto presence", () => {
     const store = createStore({ cooldownUntil: now - 1, failureCounts: { rate_limit: 1 } });
     const updatePresence = vi.fn();
     const controller = createController({
-      discordConfig: { autoPresence: { enabled: true } },
       gateway: { isConnected: false, updatePresence },
       loadAuthStore: () => store,
     });
@@ -102,7 +104,6 @@ describe("discord auto presence", () => {
   it("recovers from exhausted to online once a profile becomes usable", async () => {
     const now = Date.now();
     let store = createStore({ cooldownUntil: now + 60_000, failureCounts: { rate_limit: 1 } });
-    const updatePresence = vi.fn();
     const controller = createController({
       discordConfig: {
         activity: "working",
@@ -113,7 +114,6 @@ describe("discord auto presence", () => {
           minUpdateIntervalMs: 1_000,
         },
       },
-      gateway: { isConnected: true, updatePresence },
       loadAuthStore: () => store,
     });
 
@@ -122,16 +122,13 @@ describe("discord auto presence", () => {
     store = createStore();
     await controller.advance(5_000);
 
-    expect(updatePresence.mock.calls).toEqual([
+    expect(controller.updatePresence.mock.calls).toEqual([
       [presenceUpdate("dnd", [{ name: "Custom Status", type: 4, state: "token exhausted" }])],
       [presenceUpdate("online", [{ name: "working", type: 0 }])],
     ]);
   });
 
   it("re-applies presence on refresh even when signature is unchanged", async () => {
-    const store = createStore();
-    const updatePresence = vi.fn();
-
     const controller = createController({
       discordConfig: {
         autoPresence: {
@@ -140,25 +137,20 @@ describe("discord auto presence", () => {
           minUpdateIntervalMs: 60_000,
         },
       },
-      gateway: { isConnected: true, updatePresence },
-      loadAuthStore: () => store,
     });
 
     await controller.start();
     await controller.advance(60_000);
-    expect(updatePresence).toHaveBeenCalledTimes(1);
+    expect(controller.updatePresence).toHaveBeenCalledTimes(1);
     await controller.refresh();
 
     const expected = presenceUpdate("online");
-    expect(updatePresence.mock.calls).toEqual([[expected], [expected]]);
+    expect(controller.updatePresence.mock.calls).toEqual([[expected], [expected]]);
   });
 
   it("does nothing when auto presence is disabled", async () => {
-    const updatePresence = vi.fn();
     const controller = createController({
       discordConfig: { autoPresence: { enabled: false } },
-      gateway: { isConnected: true, updatePresence },
-      loadAuthStore: () => createStore(),
     });
 
     await controller.start();
@@ -166,6 +158,6 @@ describe("discord auto presence", () => {
     await controller.stop();
 
     expect(controller.enabled).toBe(false);
-    expect(updatePresence).not.toHaveBeenCalled();
+    expect(controller.updatePresence).not.toHaveBeenCalled();
   });
 });

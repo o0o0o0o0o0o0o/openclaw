@@ -44,7 +44,7 @@ function TerminalPanel(props: Props) {
   return (
     <openclaw-terminal-panel
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:embedded={true}
       prop:tabsInHeader={props.terminalTabsInHeader}
       prop:onClose={props.onCloseTerminal}
@@ -64,7 +64,7 @@ function BrowserPanel(props: Props) {
   return (
     <openclaw-browser-panel
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:embedded={true}
       data-chat-autotype-exempt
       prop:client={props.state.connected ? props.state.client : null}
@@ -90,7 +90,7 @@ function CompanionPanel(props: Props) {
   return (
     <openclaw-chat-session-rail
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:presented={presented()}
       prop:focusRequest={props.companionFocusRequest}
       prop:sessionKey={props.state.sessionKey}
@@ -115,7 +115,7 @@ function DesktopPanel(props: Props) {
   return (
     <openclaw-desktop-panel
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:embedded={true}
       data-chat-autotype-exempt
       prop:client={props.state.connected ? props.state.client : null}
@@ -133,7 +133,7 @@ function DiscussionPanel(props: Props) {
   return (
     <openclaw-session-discussion
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:sessionKey={props.discussion!.sessionKey}
       prop:canOpen={props.discussion!.canOpen}
       prop:sourceGeneration={props.discussionSourceGeneration}
@@ -153,7 +153,7 @@ function PortalPanel(props: Props) {
   return (
     <openclaw-portals-page
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:embedded={true}
       prop:presented={presented()}
       prop:requestedPortalId={portal()?.portalId ?? null}
@@ -171,7 +171,7 @@ function WorkspacePanel(props: Props & { workspaceState: SessionWorkspaceState }
   return (
     <openclaw-chat-files-panel
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:tabsInHeader={sidebarMainPanel(props.state.sidebarLayout)?.slot !== "workspace"}
       prop:previews={presented() ? props.workspaceState.previews : []}
       prop:activeId={presented() ? props.workspaceState.activePreviewId : null}
@@ -188,7 +188,7 @@ function SubagentsPanel(props: Props) {
   return (
     <openclaw-chat-subagents-panel
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:sessionKey={props.state.sessionKey}
       prop:agentId={props.agentId ?? "main"}
       prop:paneId={props.paneId}
@@ -206,7 +206,7 @@ function ProcessesPanel(props: Props) {
   return (
     <openclaw-chat-processes-panel
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:sessionKey={props.state.sessionKey}
       prop:agentId={props.agentId ?? "main"}
       prop:presented={presented()}
@@ -219,7 +219,7 @@ function LinkReaderPanel(props: Props) {
   return (
     <openclaw-link-reader-panel
       data-sidebar-panel-host
-      ref={panelHostRef(props.registerPanelHost)}
+      ref={[panelHostRef(props.registerPanelHost)]}
       prop:embedded={true}
       data-chat-autotype-exempt
       prop:client={props.state.client}

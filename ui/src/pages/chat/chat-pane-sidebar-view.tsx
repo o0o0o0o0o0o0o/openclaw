@@ -65,7 +65,7 @@ export function SidebarRegionView(props: SidebarRegionViewProps) {
     (props.availableWidth > 0 && props.availableWidth < SIDEBAR_NARROW_BREAKPOINT_PX);
   return (
     <div
-      ref={regionRef(props.onRegionElementRef)}
+      ref={[regionRef(props.onRegionElementRef)]}
       class={[
         "sidebar-region",
         `sidebar-region--${sidebarDock(props.layout)}`,
@@ -126,7 +126,7 @@ export function SidebarRegionView(props: SidebarRegionViewProps) {
         }
       >
         <openclaw-chat-sidebar-region
-          ref={regionRef(props.onRegionViewRef)}
+          ref={[regionRef(props.onRegionViewRef)]}
           prop:panelIdPrefix={props.panelIdPrefix}
           prop:conversationTab={props.conversationTab}
           prop:layout={props.layout}

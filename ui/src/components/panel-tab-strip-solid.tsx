@@ -137,9 +137,15 @@ function TabGroupView<T extends SolidPanelTabStripTab>(props: PanelTabStripProps
     () => props.tabs.map((tab) => ({ value: tab.id })),
     () => group,
   );
-  const onFocusActiveReady = props.onFocusActiveReady;
-  onFocusActiveReady?.((options) => tabs.element(props.activeId)?.focus(options));
+  let onFocusActiveReady: PanelTabStripProps<T>["onFocusActiveReady"];
   onCleanup(() => onFocusActiveReady?.(null));
+  const groupRef = (notify: PanelTabStripProps<T>["onFocusActiveReady"]) => {
+    onFocusActiveReady = notify;
+    return (element: HTMLDivElement) => {
+      group = element;
+      notify?.((options) => tabs.element(props.activeId)?.focus(options));
+    };
+  };
   let scheduleMeasurement = () => {};
   const controlsFor = (tab: T) =>
     typeof props.ariaControls === "string" ? props.ariaControls : props.ariaControls(tab);
@@ -276,9 +282,7 @@ function TabGroupView<T extends SolidPanelTabStripTab>(props: PanelTabStripProps
   return (
     <>
       <div
-        ref={(element) => {
-          group = element;
-        }}
+        ref={[groupRef(props.onFocusActiveReady)]}
         class="oc-tabs tabstrip"
         role="tablist"
         aria-orientation="horizontal"

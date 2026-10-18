@@ -61,6 +61,15 @@ function Region(props: RegionProps, host: RegionElement) {
   // Child panels publish hosted tabs synchronously while their parent commits.
   const [hostedRevision, setHostedRevision] = createSignal(0, { ownedWrite: true });
   const refreshHostedTabs = () => setHostedRevision((value) => value + 1);
+  const panelHostRegistration = (initialSlot: SidebarSlotId) => (element: SidebarPanelHost) => {
+    panelHosts.set(initialSlot, element);
+    refreshHostedTabs();
+    return () => {
+      if (panelHosts.get(initialSlot) === element) {
+        panelHosts.delete(initialSlot);
+      }
+    };
+  };
   const trackFocus = (event: Event): void => {
     const surface = event
       .composedPath()
@@ -334,16 +343,7 @@ function Region(props: RegionProps, host: RegionElement) {
             >
               <SidebarPanelView
                 definition={sidebarPanelType(props.panelDefinitions, panel().slot)}
-                registerPanelHost={(element) => {
-                  const slot = panel().slot;
-                  panelHosts.set(slot, element);
-                  refreshHostedTabs();
-                  return () => {
-                    if (panelHosts.get(slot) === element) {
-                      panelHosts.delete(slot);
-                    }
-                  };
-                }}
+                registerPanelHost={panelHostRegistration(panel().slot)}
               />
               <Show
                 when={

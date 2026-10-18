@@ -21,15 +21,10 @@ import { agentDiscoveryMock } from "./test-helpers.runtime-state.js";
 
 type AgentEventHandler = (event: AgentEventPayload) => void | Promise<void>;
 
-type AgentEventOverrideKey =
-  | "agentId"
-  | "lifecycleGeneration"
-  | "seq"
-  | "sessionId"
-  | "sessionKey"
-  | "ts";
 type AgentEventOverrides = {
-  [Key in AgentEventOverrideKey]?: AgentEventPayload[Key] | undefined;
+  [Key in "agentId" | "lifecycleGeneration" | "seq" | "sessionId" | "sessionKey" | "ts"]?:
+    | AgentEventPayload[Key]
+    | undefined;
 };
 type AgentEventCase = readonly [
   stream: AgentEventStream,
@@ -78,9 +73,7 @@ export function emitAgentEvents(
 ) {
   return Promise.all(
     events.map(([stream, data, overrides], index) =>
-      Promise.resolve(
-        emitAgentEvent(handler, runId, stream, data, { seq: index + 1, ...overrides }),
-      ),
+      emitAgentEvent(handler, runId, stream, data, { seq: index + 1, ...overrides }),
     ),
   );
 }
@@ -212,12 +205,7 @@ export function createTextTranscriptEvent(
   return {
     ...(id ? { id } : {}),
     ...(parentId !== undefined ? { parentId } : {}),
-    message: {
-      role,
-      content: [{ type: "text", text }],
-      timestamp,
-      ...message,
-    },
+    message: { role, content: [{ type: "text", text }], timestamp, ...message },
   };
 }
 
@@ -279,13 +267,11 @@ export function registerChatConnectionIdentityTest(harness: {
           return undefined;
         });
         const respond = vi.fn<RespondFn>();
-        await harness.sendControlUiChat({
-          context,
-          ...params,
-          respond,
+        await harness.sendControlUiChat({ context, ...params, respond });
+        expect(respond.mock.calls[0], JSON.stringify(respond.mock.calls)).toMatchObject({
+          0: true,
+          1: { status: "started" },
         });
-        expect(respond.mock.calls[0]?.[0], JSON.stringify(respond.mock.calls)).toBe(true);
-        expect(respond.mock.calls[0]?.[1]).toMatchObject({ status: "started" });
         expect(await removed.promise).toEqual([
           params.idempotencyKey,
           params.idempotencyKey,
@@ -357,13 +343,10 @@ export function registerBoundedWidgetSnapshotsTest({
     h.registerNamed("widgets");
     let seq = 0;
     const id = (index: number) => `cv_${index.toString(16).padStart(32, "0")}`;
+    const emit: typeof h.emit = (runId, stream, data) =>
+      h.emit(runId, stream, data, { seq: ++seq });
     const publish = (result: ReturnType<typeof widgetResult>, isError = false) =>
-      h.emit(
-        "run-widgets",
-        "tool",
-        { phase: "result", name: "show_widget", result, isError },
-        { seq: ++seq },
-      );
+      emit("run-widgets", "tool", { phase: "result", name: "show_widget", result, isError });
     const publishWidget = async (index: number, titleChars = 1_700) => {
       const result = widgetResult(id(index), "assistant_message", "a".repeat(titleChars));
       // These fixtures survive embedded and default Codex tool-result text caps.
@@ -371,7 +354,7 @@ export function registerBoundedWidgetSnapshotsTest({
       await publish(result);
     };
     const snapshot = async () => {
-      await h.emit("run-widgets", "assistant", { text: `Widgets ready: ${seq}.` }, { seq: ++seq });
+      await emit("run-widgets", "assistant", { text: `Widgets ready: ${seq}.` });
       vi.advanceTimersByTime(75);
       return h
         .chat()
@@ -415,7 +398,7 @@ export function registerBoundedWidgetSnapshotsTest({
           "Live chat canvas preview omitted: display descriptors exceed the 64 KiB limit.",
         ]),
       );
-    await h.emit("run-widgets", "lifecycle", { phase: "end" }, { seq: ++seq });
+    await emit("run-widgets", "lifecycle", { phase: "end" });
     expect(h.chat().at(-1)?.[1].message.content).toHaveLength(2);
     await h.handler.dispose();
   });

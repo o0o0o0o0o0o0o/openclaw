@@ -22,13 +22,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-it.each([
-  "direct",
-  "registry alias",
-  "stale registry alias",
-  "aborted registry alias",
-  "hidden worker",
-])(
+it.each(["direct", "alias", "stale", "aborted", "hidden"])(
   "publishes exclusive-claim receipts without borrowing a successor's authority (%s)",
   async (route) => {
     vi.useFakeTimers();
@@ -36,17 +30,14 @@ it.each([
     const sessionKey = "agent:main:worker-reasoning";
     const sessionId = "worker-reasoning-session";
     const gateway = createAgentEventTestHarness();
-    gateway.register(
-      runId,
-      sessionKey,
-      route === "direct" || route === "hidden worker" ? runId : "client-alias",
-    );
-    if (route === "hidden worker") {
+    const aliased = route !== "direct" && route !== "hidden";
+    gateway.register(runId, sessionKey, aliased ? "client-alias" : runId);
+    if (route === "hidden") {
       gateway.sessionMessageSubscribers.subscribe("selected-viewer", sessionKey);
     }
-    if (route === "stale registry alias") {
+    if (route === "stale") {
       gateway.chatRunState.getOrCreate("client-alias").bufferIsCurrent = () => false;
-    } else if (route === "aborted registry alias") {
+    } else if (route === "aborted") {
       gateway.chatRunState.getOrCreate("client-alias").abortMarker = createChatAbortMarker(
         Date.now(),
       );
@@ -55,7 +46,7 @@ it.each([
     const claim = () => {
       const id = claimAgentRunContext(
         runId,
-        { sessionKey, sessionId, agentId: "main", isControlUiVisible: route !== "hidden worker" },
+        { sessionKey, sessionId, agentId: "main", isControlUiVisible: route !== "hidden" },
         { exclusive: true, trackOwner: true },
       );
       if (!id) {
@@ -63,29 +54,38 @@ it.each([
       }
       return id;
     };
-    const thinking = (claimId: string, itemId: string) =>
-      emitAgentEventForOwner(
-        { runId, stream: "thinking", data: { itemId, text: "Checking", delta: "Checking" } },
-        claimId,
-      );
-    const commit = (
+    const thinking = async (claimId: string, ...itemIds: string[]) => {
+      for (const itemId of itemIds) {
+        emitAgentEventForOwner(
+          { runId, stream: "thinking", data: { itemId, text: "Checking", delta: "Checking" } },
+          claimId,
+        );
+      }
+      await unlisten.drain();
+    };
+    const commit = async (
       itemId: string,
       messageSeq: number,
-      target?: { sessionKey?: string; sessionId?: string },
-    ) =>
-      gateway.handler.retireTranscript({
-        sessionKey,
-        sessionId,
-        ...target,
-        messageId: `${itemId}-message`,
-        messageSeq,
-        assistantItemIds: [itemId],
-        message: {
-          role: "assistant",
-          content: [{ type: "thinking", thinking: "Checking" }],
-          __openclaw: { runId },
-        },
-      });
+      targets: { sessionKey?: string; sessionId?: string }[] = [{}],
+    ) => {
+      for (const target of targets) {
+        gateway.handler.retireTranscript({
+          sessionKey,
+          sessionId,
+          ...target,
+          messageId: `${itemId}-message`,
+          messageSeq,
+          assistantItemIds: [itemId],
+          message: {
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "Checking" }],
+            __openclaw: { runId },
+          },
+        });
+      }
+      await unlisten.drain();
+      return receipts();
+    };
     const receipts = () =>
       [...gateway.agent(), ...gateway.targetedAgent()].flatMap(([, event]) =>
         event.stream === "thinking" && event.data.phase === "persisted" ? [event.data] : [],
@@ -98,36 +98,24 @@ it.each([
     });
     try {
       const firstClaim = claim();
-      thinking(firstClaim, "first");
-      await unlisten.drain();
-      commit("first", 2);
-      await unlisten.drain();
-      expect(receipts()).toEqual([receipt("first")]);
-      commit("first", 2, { sessionKey: "agent:main:unrelated" });
-      commit("first", 2, { sessionId: "replaced-session" });
-      await unlisten.drain();
-      expect(receipts()).toHaveLength(1);
-      thinking(firstClaim, "revoked-old");
-      thinking(firstClaim, "replaced-old");
-      await unlisten.drain();
+      await thinking(firstClaim, "first");
+      expect(await commit("first", 2)).toEqual([receipt("first")]);
+      expect(
+        await commit("first", 2, [
+          { sessionKey: "agent:main:unrelated" },
+          { sessionId: "replaced-session" },
+        ]),
+      ).toHaveLength(1);
+      await thinking(firstClaim, "revoked-old", "replaced-old");
       releaseAgentRunContext(runId, firstClaim);
-      commit("revoked-old", 3);
-      await unlisten.drain();
-      expect(receipts()).toHaveLength(1);
+      expect(await commit("revoked-old", 3)).toHaveLength(1);
 
       const secondClaim = claim();
-      commit("replaced-old", 4);
-      await unlisten.drain();
-      expect(receipts()).toHaveLength(1);
-      thinking(secondClaim, "second");
-      await unlisten.drain();
-      commit("second", 5);
-      await unlisten.drain();
-      expect(receipts()).toEqual([receipt("first"), receipt("second")]);
+      expect(await commit("replaced-old", 4)).toHaveLength(1);
+      await thinking(secondClaim, "second");
+      expect(await commit("second", 5)).toEqual([receipt("first"), receipt("second")]);
       gateway.chatRunState.clearRun(runId);
-      commit("second", 5);
-      await unlisten.drain();
-      expect(receipts()).toHaveLength(2);
+      expect(await commit("second", 5)).toHaveLength(2);
       releaseAgentRunContext(runId, secondClaim);
     } finally {
       await unlisten();

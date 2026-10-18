@@ -16,6 +16,23 @@ import { createAgentEventHandler } from "./server-chat.js";
 import { createSessionRowProjectionFixture } from "./session-row-projection.test-support.js";
 
 const sessionFixture = vi.hoisted(() => ({ updatedAt: 50 }));
+const sessionKey = "agent:delivery:late";
+
+function registerRun(
+  runId: string,
+  overrides: Partial<Parameters<typeof registerAgentRunContext>[1]> = {},
+) {
+  registerAgentRunContext(runId, {
+    agentId: "delivery",
+    sessionKey,
+    sessionId: "session",
+    ...overrides,
+  });
+}
+
+function publish(runId: string, stream: "assistant" | "lifecycle", data: Record<string, unknown>) {
+  emitAgentEvent({ runId, stream, data });
+}
 
 // mock-isolation: Session owners are synthetic; the fixture must not load operator configuration.
 vi.mock("../config/io.js", () => ({
@@ -35,14 +52,8 @@ describe("retired execution event projection", () => {
     emit: (chatRunState: ReturnType<typeof createChatEventFixture>["chatRunState"]) => void,
   ) {
     const fixture = createChatEventFixture();
-    const {
-      broadcast,
-      broadcastToConnIds,
-      nodeSendToSession,
-      chatRunState,
-      sessionMessageSubscribers,
-    } = fixture;
-    sessionMessageSubscribers.subscribe("selected", "agent:delivery:late");
+    const { broadcast, broadcastToConnIds, nodeSendToSession, chatRunState } = fixture;
+    fixture.sessionMessageSubscribers.subscribe("selected", sessionKey);
     const entry = {
       sessionId: "session",
       verboseLevel: "off" as const,
@@ -51,7 +62,7 @@ describe("retired execution event projection", () => {
     const projection = createSessionRowProjectionFixture({
       cfg: getRuntimeConfig(),
       agentId: "delivery",
-      store: { global: entry, "agent:delivery:late": entry },
+      store: { global: entry, [sessionKey]: entry },
     });
     const handler = createAgentEventHandler({
       ...fixture,
@@ -85,45 +96,46 @@ describe("retired execution event projection", () => {
     });
   }
 
-  it.each([false, true])(
-    "preserves hidden heartbeat tool suppression (%s)",
-    async (isHeartbeat) => {
-      const receiver = await withReceiver(() => {
-        registerAgentRunContext("late", {
-          agentId: "delivery",
-          sessionKey: "agent:delivery:late",
-          sessionId: "session",
-          isControlUiVisible: false,
-          projectSessionMessages: true,
-          isHeartbeat,
-          verboseLevel: "full",
-          registeredAt: 100,
-        });
-        clearAgentRunContext("late");
-        emitToolResult("late");
-      });
-      const delivered = receiver.broadcastToConnIds.mock.calls.filter(([name]) => name === "agent");
-      expect(delivered).toHaveLength(isHeartbeat ? 0 : 1);
-      expect(receiver.broadcast).not.toHaveBeenCalled();
-    },
-  );
-
-  it("preserves run verbosity until a newer session preference replaces it", async () => {
+  it.each([false, true])("suppresses hidden heartbeat tools (%s)", async (isHeartbeat) => {
     const receiver = await withReceiver(() => {
-      registerAgentRunContext("verbose", {
-        agentId: "delivery",
-        sessionKey: "agent:delivery:late",
-        sessionId: "session",
+      registerRun("late", {
+        isControlUiVisible: false,
+        projectSessionMessages: true,
+        isHeartbeat,
         verboseLevel: "full",
         registeredAt: 100,
       });
-      clearAgentRunContext("verbose");
-      emitToolResult("verbose");
+      clearAgentRunContext("late");
+      emitToolResult("late");
     });
-    const delivered = receiver.nodeSendToSession.mock.calls.filter(([, name]) => name === "agent");
-    expect(delivered).toHaveLength(1);
-    expect(delivered[0]?.[2]).toMatchObject({ data: { result: { value: "retained" } } });
+    const delivered = receiver.broadcastToConnIds.mock.calls.filter(([name]) => name === "agent");
+    expect(delivered).toHaveLength(isHeartbeat ? 0 : 1);
+    expect(receiver.broadcast).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])(
+    "uses newer session verbosity, including global aliases (%s)",
+    async (newer) => {
+      sessionFixture.updatedAt = newer ? 200 : 50;
+      const receiver = await withReceiver(() => {
+        registerRun("verbose", {
+          sessionKey: newer ? "global" : sessionKey,
+          sessionId: newer ? undefined : "session",
+          verboseLevel: "full",
+          registeredAt: 100,
+        });
+        clearAgentRunContext("verbose");
+        emitToolResult("verbose", newer ? "late" : "finished");
+      });
+      const delivered = receiver.nodeSendToSession.mock.calls.filter(
+        ([, name]) => name === "agent",
+      );
+      expect(delivered).toHaveLength(newer ? 0 : 1);
+      if (!newer) {
+        expect(delivered[0]?.[2]).toMatchObject({ data: { result: { value: "retained" } } });
+      }
+    },
+  );
 
   const alert = `Service outage requires action. ${"Repair is still required. ".repeat(20)}`;
   it.each([
@@ -133,15 +145,10 @@ describe("retired execution event projection", () => {
     "preserves heartbeat final ACK/alert policy after cleanup ($text)",
     async ({ text, expected }) => {
       const receiver = await withReceiver(() => {
-        registerAgentRunContext("heartbeat", {
-          agentId: "delivery",
-          sessionKey: "agent:delivery:late",
-          sessionId: "session",
-          isHeartbeat: true,
-        });
+        registerRun("heartbeat", { isHeartbeat: true });
         clearAgentRunContext("heartbeat");
-        emitAgentEvent({ runId: "heartbeat", stream: "assistant", data: { text, delta: text } });
-        emitAgentEvent({ runId: "heartbeat", stream: "lifecycle", data: { phase: "end" } });
+        publish("heartbeat", "assistant", { text, delta: text });
+        publish("heartbeat", "lifecycle", { phase: "end" });
       });
       const chat = receiver.broadcast.mock.calls.filter(([name]) => name === "chat");
       expect(chat.filter(([, payload]) => payload.state === "delta")).toEqual([]);
@@ -157,53 +164,20 @@ describe("retired execution event projection", () => {
 
   it("keeps heartbeat alias suppression separate from explicit source flags", async () => {
     const receiver = await withReceiver((chatRunState) => {
-      registerAgentRunContext("client", {
-        agentId: "delivery",
-        sessionKey: "agent:delivery:late",
-        isHeartbeat: true,
-      });
-      registerAgentRunContext("source", {
-        agentId: "delivery",
-        sessionKey: "agent:delivery:late",
-        isHeartbeat: false,
-        verboseLevel: "full",
-      });
-      registerChatRun(chatRunState, "source", "agent:delivery:late", "client", {
-        agentId: "delivery",
-      });
-      emitAgentEvent({
-        runId: "source",
-        stream: "assistant",
-        data: { text: "A source event", delta: "A source event" },
-      });
+      registerRun("client", { isHeartbeat: true, sessionId: undefined });
+      registerRun("source", { isHeartbeat: false, verboseLevel: "full", sessionId: undefined });
+      registerChatRun(chatRunState, "source", sessionKey, "client", { agentId: "delivery" });
+      publish("source", "assistant", { text: "A source event", delta: "A source event" });
       emitToolResult("source", "late");
     });
     const source = receiver.broadcast.mock.calls.find(
       ([name, payload]) => name === "agent" && payload.stream === "assistant",
     )?.[1];
-    expect(source).toBeDefined();
-    expect(source).toHaveProperty("isHeartbeat", false);
+    expect(source).toMatchObject({ isHeartbeat: false });
     expect(
       receiver.nodeSendToSession.mock.calls.filter(
         ([, name, payload]) => name === "agent" && payload.stream === "tool",
       ),
     ).toEqual([]);
-  });
-
-  it("uses the selected agent for newer global-session verbosity", async () => {
-    sessionFixture.updatedAt = 200;
-    const receiver = await withReceiver(() => {
-      registerAgentRunContext("global-run", {
-        agentId: "delivery",
-        sessionKey: "global",
-        verboseLevel: "full",
-        registeredAt: 100,
-      });
-      clearAgentRunContext("global-run");
-      emitToolResult("global-run", "late");
-    });
-    expect(receiver.nodeSendToSession.mock.calls.filter(([, name]) => name === "agent")).toEqual(
-      [],
-    );
   });
 });

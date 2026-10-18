@@ -1,4 +1,5 @@
 import { channel } from "node:diagnostics_channel";
+import fs from "node:fs/promises";
 import { totalmem } from "node:os";
 import { getHeapSpaceStatistics, getHeapStatistics } from "node:v8";
 import {
@@ -36,6 +37,40 @@ type MemoryPressure = Omit<DiagnosticMemoryPressureEvent, "seq" | "ts" | "type">
   thresholdBytes: number;
 };
 const lastPressureAtByKey = new Map<string, number>();
+
+type ProcessFootprint = Pick<DiagnosticMemoryUsage, "anonymousRssBytes" | "anonymousSwapBytes">;
+
+/** The heartbeat owns this asynchronous OS sample; unavailable counters stay absent. */
+export async function emitDiagnosticMemorySampleWithProcessFootprint(
+  emitSample: boolean,
+  isCurrent: () => boolean,
+  emitMemorySample?: EmitDiagnosticMemorySample,
+): Promise<void> {
+  if (emitMemorySample) {
+    emitMemorySample({ emitSample });
+    return;
+  }
+  const processFootprint: ProcessFootprint = {};
+  if (emitSample && process.platform === "linux") {
+    try {
+      const status = await fs.readFile("/proc/self/status", "utf8");
+      for (const [counter, field] of [
+        ["RssAnon", "anonymousRssBytes"],
+        ["VmSwap", "anonymousSwapBytes"],
+      ] as const) {
+        const value = status.match(new RegExp(`^${counter}:\\s+(\\d+)\\s+kB$`, "m"))?.[1];
+        if (value !== undefined) {
+          processFootprint[field] = Number(value) * 1024;
+        }
+      }
+    } catch {
+      // Other platforms and restricted proc mounts provide no anonymous-page counters.
+    }
+  }
+  if (isCurrent()) {
+    emitDiagnosticMemorySample({ emitSample, processFootprint });
+  }
+}
 
 function isPositiveMemoryLimit(value: number | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -230,6 +265,7 @@ export function emitDiagnosticMemorySample(
     uptimeMs?: number;
     thresholds?: DiagnosticMemoryThresholds;
     emitSample?: boolean;
+    processFootprint?: ProcessFootprint;
   },
   collectDiagnostics = true,
 ): DiagnosticMemoryUsage {
@@ -238,6 +274,7 @@ export function emitDiagnosticMemorySample(
     options?.memoryUsage ?? process.memoryUsage(),
     collectDiagnostics,
   );
+  Object.assign(memory, options?.processFootprint);
   const isBun = options?.isBunRuntime ?? DEFAULT_IS_BUN_RUNTIME;
   const heapLimitBytes = isBun
     ? undefined

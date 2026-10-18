@@ -1,4 +1,3 @@
-// Channel ingress runtime tests cover inbound message normalization and runtime contracts.
 import { describe, expect, it, vi } from "vitest";
 import {
   fanInChannelIngressLifecycles,
@@ -9,8 +8,25 @@ import {
   type ResolveChannelMessageIngressParams,
 } from "./channel-ingress-runtime.js";
 
-/** The lifecycle shape fan-in accepts, taken from the exported signature. */
 type FanInLifecycle = NonNullable<Parameters<typeof fanInChannelIngressLifecycles>[0][number]>;
+
+function createLifecycle() {
+  return {
+    abortSignal: new AbortController().signal,
+    onAdopted: vi.fn(async () => {}),
+    onDeferred: vi.fn(),
+    onAdoptionFinalizing: vi.fn(),
+    onAbandoned: vi.fn(async () => {}),
+  };
+}
+
+function createCancellableLifecycle() {
+  return {
+    ...createLifecycle(),
+    onFailed: vi.fn<NonNullable<FanInLifecycle["onFailed"]>>(async () => {}),
+    onCancelled: vi.fn(async () => {}),
+  };
+}
 
 const identity = {
   primary: { normalize: (value) => value.trim().toLowerCase(), sensitivity: "pii" },
@@ -43,19 +59,8 @@ describe("plugin-sdk/channel-ingress-runtime", () => {
   });
 
   it("fans one logical turn lifecycle across every durable claim", async () => {
-    const createLifecycle = () => ({
-      abortSignal: new AbortController().signal,
-      onAdopted: vi.fn(async () => {}),
-      onDeferred: vi.fn(),
-      deferredHeartbeatIntervalMs: 3_000,
-      onAdoptionFinalizing: vi.fn(),
-      onFailed: vi.fn(async () => {}),
-      onCancelled: vi.fn(async () => {}),
-      onAbandoned: vi.fn(async () => {}),
-    });
-    const first = createLifecycle();
-    const second = createLifecycle();
-    second.deferredHeartbeatIntervalMs = 1_000;
+    const first = { ...createCancellableLifecycle(), deferredHeartbeatIntervalMs: 3_000 };
+    const second = { ...createCancellableLifecycle(), deferredHeartbeatIntervalMs: 1_000 };
     const cancellation = fanInChannelIngressLifecycles([first, second]);
     await cancellation.lifecycle?.onCancelled?.();
     const combined = fanInChannelIngressLifecycles([undefined, first, second]);
@@ -77,71 +82,41 @@ describe("plugin-sdk/channel-ingress-runtime", () => {
   });
 
   it("settles or abandons claims that no reply lane adopted", async () => {
-    const adopted = vi.fn(async () => {});
-    const failed = vi.fn(async () => {});
-    const abandoned = vi.fn(async () => {});
-    const lifecycle = {
-      abortSignal: new AbortController().signal,
-      onAdopted: adopted,
-      onDeferred: vi.fn(),
-      onAdoptionFinalizing: vi.fn(),
-      onFailed: failed,
-      onAbandoned: abandoned,
-    };
+    const lifecycle = { ...createLifecycle(), onFailed: vi.fn(async () => {}) };
 
     await fanInChannelIngressLifecycles([lifecycle]).settle();
     await fanInChannelIngressLifecycles([lifecycle]).abandon();
 
-    expect(adopted).toHaveBeenCalledOnce();
-    expect(abandoned).toHaveBeenCalledOnce();
-    expect(failed).not.toHaveBeenCalled();
+    expect(lifecycle.onAdopted).toHaveBeenCalledOnce();
+    expect(lifecycle.onAbandoned).toHaveBeenCalledOnce();
+    expect(lifecycle.onFailed).not.toHaveBeenCalled();
     expect(fanInChannelIngressLifecycles([]).lifecycle).toBeUndefined();
   });
 
   it("cancellation-settles every source in mixed capable and legacy fan-in", async () => {
-    const adopted = vi.fn(async () => {});
-    const cancelled = vi.fn(async () => {});
-    const legacyAbandoned = vi.fn(async () => {});
-    const createLifecycle = (
-      onCancelled?: () => Promise<void>,
-      onAbandoned = vi.fn(async () => {}),
-    ) => ({
-      abortSignal: new AbortController().signal,
-      onAdopted: adopted,
-      onDeferred: vi.fn(),
-      onAdoptionFinalizing: vi.fn(),
-      onFailed: vi.fn(async () => {}),
-      onAbandoned,
-      ...(onCancelled ? { onCancelled } : {}),
-    });
-    const combined = fanInChannelIngressLifecycles([
-      createLifecycle(cancelled),
-      createLifecycle(undefined, legacyAbandoned),
-    ]);
+    const modern = createCancellableLifecycle();
+    const legacy = { ...createLifecycle(), onFailed: vi.fn(async () => {}) };
+    const combined = fanInChannelIngressLifecycles([modern, legacy]);
 
     expect(combined.lifecycle).not.toHaveProperty("onCancelled");
     await combined.cancel();
 
-    expect(adopted).not.toHaveBeenCalled();
-    expect(cancelled).toHaveBeenCalledOnce();
-    expect(legacyAbandoned).toHaveBeenCalledOnce();
+    expect(modern.onAdopted).not.toHaveBeenCalled();
+    expect(legacy.onAdopted).not.toHaveBeenCalled();
+    expect(modern.onCancelled).toHaveBeenCalledOnce();
+    expect(legacy.onAbandoned).toHaveBeenCalledOnce();
   });
 
   it("preserves lifecycle receivers while fanning in cancellation", async () => {
-    const createLifecycle = () => ({
-      abortSignal: new AbortController().signal,
+    const withReceiver = () => ({
+      ...createCancellableLifecycle(),
       cancellationCount: 0,
-      onAdopted: vi.fn(async () => {}),
-      onDeferred: vi.fn(),
-      onAdoptionFinalizing: vi.fn(),
-      onFailed: vi.fn(async () => {}),
       async onCancelled() {
         this.cancellationCount += 1;
       },
-      onAbandoned: vi.fn(async () => {}),
     });
-    const first = createLifecycle();
-    const second = createLifecycle();
+    const first = withReceiver();
+    const second = withReceiver();
 
     await fanInChannelIngressLifecycles([first, second]).lifecycle?.onCancelled?.();
 
@@ -155,20 +130,15 @@ describe("plugin-sdk/channel-ingress-runtime", () => {
     const legacyAbandoned = vi.fn(async () => {});
     const combined = fanInChannelIngressLifecycles([
       {
-        abortSignal: new AbortController().signal,
+        ...createLifecycle(),
         onAdopted: async () => {
           throw new Error("adoption failed");
         },
-        onDeferred: vi.fn(),
-        onAdoptionFinalizing: vi.fn(),
         onFailed: failed,
         onAbandoned: abandoned,
       },
       {
-        abortSignal: new AbortController().signal,
-        onAdopted: vi.fn(async () => {}),
-        onDeferred: vi.fn(),
-        onAdoptionFinalizing: vi.fn(),
+        ...createLifecycle(),
         onAbandoned: legacyAbandoned,
       },
     ]);
@@ -186,12 +156,10 @@ describe("plugin-sdk/channel-ingress-runtime", () => {
     const abandoned = vi.fn(async () => {});
     const combined = fanInChannelIngressLifecycles([
       {
-        abortSignal: new AbortController().signal,
+        ...createLifecycle(),
         onAdopted: async () => {
           throw new Error("adoption failed");
         },
-        onDeferred: vi.fn(),
-        onAdoptionFinalizing: vi.fn(),
         onAbandoned: abandoned,
       },
     ]);
@@ -207,10 +175,8 @@ describe("plugin-sdk/channel-ingress-runtime", () => {
   it("releases the claims a rejected adoption never reached", async () => {
     const order: string[] = [];
     const lifecycleFor = (name: string, onAdopted: () => Promise<void>) => ({
-      abortSignal: new AbortController().signal,
+      ...createLifecycle(),
       onAdopted,
-      onDeferred: vi.fn(),
-      onAdoptionFinalizing: vi.fn(),
       onFailed: vi.fn(async () => {
         order.push(`failed:${name}`);
       }),

@@ -1,6 +1,3 @@
-/**
- * Tests core plugin SDK exports and channel plugin construction.
- */
 import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import type { PluginRuntime } from "../plugins/runtime/types.js";
@@ -40,6 +37,23 @@ function createApi(registrationMode: PluginRegistrationMode): OpenClawPluginApi 
   } as unknown as OpenClawPluginApi;
 }
 
+function createEntry() {
+  const hooks = {
+    setRuntime: vi.fn<(runtime: PluginRuntime) => void>(),
+    registerCliMetadata: vi.fn<(api: OpenClawPluginApi) => void>(),
+    registerCapabilities: vi.fn<(api: OpenClawPluginApi) => void>(),
+    registerFull: vi.fn<(api: OpenClawPluginApi) => void>(),
+  };
+  const entry = defineChannelPluginEntry({
+    id: "runtime-test",
+    name: "Runtime Test",
+    description: "registration test",
+    plugin: createChannelPlugin("runtime-test"),
+    ...hooks,
+  });
+  return { entry, ...hooks };
+}
+
 describe("defineChannelPluginEntry", () => {
   it("defers and memoizes config schema factories", () => {
     const configSchema = {
@@ -61,10 +75,9 @@ describe("defineChannelPluginEntry", () => {
   });
 
   it("runs tool registrations without channel runtime wiring during tool discovery", () => {
-    const setRuntime = vi.fn<(runtime: PluginRuntime) => void>();
-    const registerCliMetadata = vi.fn<(api: OpenClawPluginApi) => void>();
-    const registerCapabilities = vi.fn<(api: OpenClawPluginApi) => void>();
-    const registerFull = vi.fn<(api: OpenClawPluginApi) => void>((api) => {
+    const { entry, setRuntime, registerCliMetadata, registerCapabilities, registerFull } =
+      createEntry();
+    registerFull.mockImplementation((api) => {
       api.registerTool(
         {
           name: "channel_tool",
@@ -76,17 +89,6 @@ describe("defineChannelPluginEntry", () => {
         { name: "channel_tool" },
       );
     });
-    const entry = defineChannelPluginEntry({
-      id: "runtime-tool-discovery",
-      name: "Runtime Tool Discovery",
-      description: "runtime tool discovery test",
-      plugin: createChannelPlugin("runtime-tool-discovery"),
-      setRuntime,
-      registerCliMetadata,
-      registerFull,
-      registerCapabilities,
-    });
-
     const api = createApi("tool-discovery");
     entry.register(api);
 
@@ -99,21 +101,8 @@ describe("defineChannelPluginEntry", () => {
   });
 
   it("wires runtime helpers during discovery registration", () => {
-    const setRuntime = vi.fn<(runtime: PluginRuntime) => void>();
-    const registerCliMetadata = vi.fn<(api: OpenClawPluginApi) => void>();
-    const registerFull = vi.fn<(api: OpenClawPluginApi) => void>();
-    const registerCapabilities = vi.fn<(api: OpenClawPluginApi) => void>();
-    const entry = defineChannelPluginEntry({
-      id: "runtime-discovery",
-      name: "Runtime Discovery",
-      description: "runtime discovery test",
-      plugin: createChannelPlugin("runtime-discovery"),
-      setRuntime,
-      registerCliMetadata,
-      registerFull,
-      registerCapabilities,
-    });
-
+    const { entry, setRuntime, registerCliMetadata, registerCapabilities, registerFull } =
+      createEntry();
     const api = createApi("discovery");
     entry.register(api);
 
@@ -125,21 +114,8 @@ describe("defineChannelPluginEntry", () => {
   });
 
   it("keeps setup-runtime and full registration wired to runtime helpers", () => {
-    const setRuntime = vi.fn<(runtime: PluginRuntime) => void>();
-    const registerCliMetadata = vi.fn<(api: OpenClawPluginApi) => void>();
-    const registerFull = vi.fn<(api: OpenClawPluginApi) => void>();
-    const registerCapabilities = vi.fn<(api: OpenClawPluginApi) => void>();
-    const entry = defineChannelPluginEntry({
-      id: "runtime-activation",
-      name: "Runtime Activation",
-      description: "runtime activation test",
-      plugin: createChannelPlugin("runtime-activation"),
-      setRuntime,
-      registerCliMetadata,
-      registerFull,
-      registerCapabilities,
-    });
-
+    const { entry, setRuntime, registerCliMetadata, registerCapabilities, registerFull } =
+      createEntry();
     const cliApi = createApi("cli-metadata");
     entry.register(cliApi);
     expect(registerCliMetadata).toHaveBeenCalledWith(cliApi);

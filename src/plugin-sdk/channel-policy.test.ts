@@ -1,6 +1,3 @@
-/**
- * Tests channel policy helper exports and policy decisions.
- */
 import { describe, expect, it } from "vitest";
 import { formatPairingApproveHint } from "../channels/plugins/helpers.js";
 import type { GroupPolicy } from "../config/types.base.js";
@@ -18,102 +15,47 @@ import {
 
 describe("retained group policy helpers", () => {
   it.each([
-    {
-      name: "preserves disabled policy",
-      input: { groupPolicy: "disabled" as const, groupAllowFrom: ["a"] },
-      expected: "disabled",
-    },
-    {
-      name: "keeps allowlist policy when sender allowlist is present",
-      input: { groupPolicy: "allowlist" as const, groupAllowFrom: ["a"] },
-      expected: "allowlist",
-    },
-    {
-      name: "maps allowlist to open when sender allowlist is empty",
-      input: { groupPolicy: "allowlist" as const, groupAllowFrom: [] },
-      expected: "open",
-    },
-  ])("$name", ({ input, expected }) => {
-    expect(resolveSenderScopedGroupPolicy(input)).toBe(expected);
+    ["disabled", ["a"], "disabled"],
+    ["allowlist", ["a"], "allowlist"],
+    ["allowlist", [], "open"],
+  ] as const)("resolves %s with senders %j to %s", (groupPolicy, groupAllowFrom, expected) => {
+    expect(
+      resolveSenderScopedGroupPolicy({ groupPolicy, groupAllowFrom: [...groupAllowFrom] }),
+    ).toBe(expected);
   });
 
   it.each([
-    {
-      name: "blocks disabled sender policy",
-      input: {
-        groupPolicy: "disabled" as const,
-        groupAllowFrom: ["123"],
+    ["disabled", ["123"], "disabled"],
+    ["allowlist", [], "empty_allowlist"],
+  ] as const)("blocks sender policy %s with %j", (groupPolicy, groupAllowFrom, reason) => {
+    expect(
+      evaluateSenderGroupAccessForPolicy({
+        groupPolicy,
+        groupAllowFrom: [...groupAllowFrom],
         senderId: "123",
-        isSenderAllowed: (): boolean => true,
-      },
-      expected: {
-        allowed: false,
-        reason: "disabled",
-        groupPolicy: "disabled",
-        providerMissingFallbackApplied: false,
-      },
-    },
-    {
-      name: "blocks sender allowlist with an empty list",
-      input: {
-        groupPolicy: "allowlist" as const,
-        groupAllowFrom: [],
-        senderId: "123",
-        isSenderAllowed: (): boolean => true,
-      },
-      expected: {
-        allowed: false,
-        reason: "empty_allowlist",
-        groupPolicy: "allowlist",
-        providerMissingFallbackApplied: false,
-      },
-    },
-  ])("$name", ({ input, expected }) => {
-    expect(evaluateSenderGroupAccessForPolicy(input)).toEqual(expected);
+        isSenderAllowed: () => true,
+      }),
+    ).toEqual({ allowed: false, reason, groupPolicy, providerMissingFallbackApplied: false });
   });
 
   it.each([
-    {
-      name: "blocks disabled route policy",
-      input: {
-        groupPolicy: "disabled" as const,
-        routeAllowlistConfigured: true,
-        routeMatched: true,
-        routeEnabled: true,
-      },
-      reason: "disabled",
+    ["disabled", true, true, true, "disabled"],
+    ["allowlist", false, false, undefined, "empty_allowlist"],
+    ["allowlist", true, false, undefined, "route_not_allowlisted"],
+    ["open", true, true, false, "route_disabled"],
+  ] as const)(
+    "blocks route %s (%s/%s/%s): %s",
+    (groupPolicy, routeAllowlistConfigured, routeMatched, routeEnabled, reason) => {
+      expect(
+        evaluateGroupRouteAccessForPolicy({
+          groupPolicy,
+          routeAllowlistConfigured,
+          routeMatched,
+          routeEnabled,
+        }),
+      ).toMatchObject({ allowed: false, reason });
     },
-    {
-      name: "blocks an empty route allowlist",
-      input: {
-        groupPolicy: "allowlist" as const,
-        routeAllowlistConfigured: false,
-        routeMatched: false,
-      },
-      reason: "empty_allowlist",
-    },
-    {
-      name: "blocks an unmatched allowlisted route",
-      input: {
-        groupPolicy: "allowlist" as const,
-        routeAllowlistConfigured: true,
-        routeMatched: false,
-      },
-      reason: "route_not_allowlisted",
-    },
-    {
-      name: "blocks a disabled matched route",
-      input: {
-        groupPolicy: "open" as const,
-        routeAllowlistConfigured: true,
-        routeMatched: true,
-        routeEnabled: false,
-      },
-      reason: "route_disabled",
-    },
-  ])("$name", ({ input, reason }) => {
-    expect(evaluateGroupRouteAccessForPolicy(input)).toMatchObject({ allowed: false, reason });
-  });
+  );
 });
 
 describe("mutable allowlist table helpers", () => {
@@ -182,7 +124,7 @@ describe("createRestrictSendersChannelSecurity", () => {
 
     expect(
       security.resolveDmPolicy?.({
-        cfg: { channels: {} } as never,
+        cfg: { channels: {} },
         accountId: "default",
         account: {
           accountId: "default",
@@ -212,12 +154,9 @@ describe("createRestrictSendersChannelSecurity", () => {
 
     expect(
       security.collectWarnings?.({
-        cfg: { channels: { line: {} } } as never,
+        cfg: { channels: { line: {} } },
         accountId: "default",
-        account: {
-          accountId: "default",
-          groupPolicy: "open",
-        },
+        account: { accountId: "default", groupPolicy: "open" },
       }),
     ).toEqual([
       {
@@ -246,13 +185,7 @@ describe("createDangerousNameMatchingMutableAllowlistWarningCollector", () => {
   it("collects mutable entries while dangerous matching is disabled", () => {
     expect(
       collectWarnings({
-        cfg: {
-          channels: {
-            irc: {
-              allowFrom: ["charlie"],
-            },
-          },
-        } as never,
+        cfg: { channels: { irc: { allowFrom: ["charlie"] } } } as never,
       }),
     ).toEqual([
       "- Found 1 mutable allowlist entry across irc while name matching is disabled by default.",
@@ -266,12 +199,7 @@ describe("createDangerousNameMatchingMutableAllowlistWarningCollector", () => {
     expect(
       collectWarnings({
         cfg: {
-          channels: {
-            irc: {
-              dangerouslyAllowNameMatching: true,
-              allowFrom: ["charlie"],
-            },
-          },
+          channels: { irc: { dangerouslyAllowNameMatching: true, allowFrom: ["charlie"] } },
         } as never,
       }),
     ).toStrictEqual([]);

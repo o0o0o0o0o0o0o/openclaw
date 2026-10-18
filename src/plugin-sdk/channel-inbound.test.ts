@@ -1,6 +1,3 @@
-/**
- * Tests channel inbound context and dispatch helper behavior.
- */
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { withinTest } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
@@ -25,6 +22,7 @@ import {
   buildChannelTurnContext,
   dispatchChannelInboundReply,
   runChannelInboundEvent,
+  type AssembledInboundReply,
   type BuildChannelInboundEventContextParams,
 } from "./channel-inbound.js";
 import * as channelIngressRuntime from "./channel-ingress-runtime.js";
@@ -37,21 +35,10 @@ function createInboundParams(
     messageId: "msg-1",
     from: "test:user:u1",
     sender: { id: "u1" },
-    conversation: {
-      kind: "group",
-      id: "room-1",
-    },
-    route: {
-      agentId: "main",
-      routeSessionKey: "agent:main:test:group:room-1",
-    },
-    reply: {
-      to: "test:room:room-1",
-    },
-    message: {
-      rawBody: "side chatter",
-      inboundEventKind: "room_event",
-    },
+    conversation: { kind: "group", id: "room-1" },
+    route: { agentId: "main", routeSessionKey: "agent:main:test:group:room-1" },
+    reply: { to: "test:room:room-1" },
+    message: { rawBody: "side chatter", inboundEventKind: "room_event" },
     ...overrides,
   };
 }
@@ -89,20 +76,14 @@ describe("channel-inbound public helpers", () => {
         recordInboundSession: async () => {},
         delivery: { deliver: async () => {} },
         replyOptions,
-        dispatchReplyWithBufferedBlockDispatcher: async (
-          params: Parameters<
-            Parameters<
-              typeof dispatchChannelInboundReply
-            >[0]["dispatchReplyWithBufferedBlockDispatcher"]
-          >[0],
-        ) => {
+        dispatchReplyWithBufferedBlockDispatcher: async (params) => {
           dispatched = true;
           expect(params.replyOptions).not.toHaveProperty("internalEventExecution");
           expect(params.replyOptions).not.toHaveProperty("onReplyOperationOwned");
           expect(params.replyOptions?.isHeartbeat).toBe(true);
           return { queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } };
         },
-      };
+      } satisfies AssembledInboundReply;
       const result =
         surface === "assembled"
           ? await dispatchChannelInboundReply(turn)
@@ -242,10 +223,7 @@ describe("channel-inbound public helpers", () => {
     });
     const ctx = buildChannelTurnContext({
       ...createInboundParams({ channelIngress }),
-      message: {
-        rawBody: "hello",
-        inboundTurnKind: "user_request",
-      },
+      message: { rawBody: "hello", inboundTurnKind: "user_request" },
     });
 
     expect(ctx.InboundTurnKind).toBe("user_request");

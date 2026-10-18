@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferredCore } from "../shared/deferred.js";
 import {
   createAccountStatusSink,
@@ -12,19 +12,23 @@ import {
   startAccountAndTrackLifecycle,
 } from "./test-helpers/start-account-lifecycle.js";
 
-type FakeServer = EventEmitter & {
-  close: (callback?: () => void) => void;
-};
-
-function createFakeServer(): FakeServer {
-  const server = new EventEmitter() as FakeServer;
-  server.close = (callback) => {
+class FakeServer extends EventEmitter {
+  close(callback?: () => void) {
     queueMicrotask(() => {
-      server.emit("close");
+      this.emit("close");
       callback?.();
     });
-  };
-  return server;
+  }
+}
+
+function startPassiveAccount<Handle>(
+  start: () => Promise<Handle>,
+  stop?: (handle: Handle) => void,
+) {
+  return startAccountAndTrackLifecycle({
+    account: { accountId: "default" },
+    startAccount: ({ abortSignal }) => runPassiveAccountLifecycle({ abortSignal, start, stop }),
+  });
 }
 
 async function expectTaskPending(task: Promise<unknown>) {
@@ -38,21 +42,9 @@ async function expectTaskPending(task: Promise<unknown>) {
 }
 
 describe("plugin-sdk channel lifecycle helpers", () => {
-  beforeEach(() => {
-    vi.useRealTimers();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
   it("binds account id onto status patches", () => {
     const setStatus = vi.fn();
-    const statusSink = createAccountStatusSink({
-      accountId: "default",
-      setStatus,
-    });
-
+    const statusSink = createAccountStatusSink({ accountId: "default", setStatus });
     statusSink({ running: true, lastStartAt: 123 });
 
     expect(setStatus).toHaveBeenCalledWith({
@@ -111,15 +103,10 @@ describe("plugin-sdk channel lifecycle helpers", () => {
       const startup = createDeferredCore<() => void>();
       const stop = vi.fn();
       const failure = new Error(`${failurePhase} failed`);
-      const { abort, task, isSettled } = startAccountAndTrackLifecycle({
-        account: { accountId: "default" },
-        startAccount: ({ abortSignal }) =>
-          runPassiveAccountLifecycle({
-            abortSignal,
-            start: () => startup.promise,
-            stop: (unregister) => unregister(),
-          }),
-      });
+      const { abort, task, isSettled } = startPassiveAccount(
+        () => startup.promise,
+        (unregister) => unregister(),
+      );
       try {
         await expect(
           expectPendingUntilAbort({
@@ -152,15 +139,8 @@ describe("plugin-sdk channel lifecycle helpers", () => {
     const readiness = createDeferredCore();
     const failure = new Error("account startup failed");
     const assertAfterAbort = vi.fn();
-    const { abort, task, isSettled } = startAccountAndTrackLifecycle({
-      account: { accountId: "default" },
-      startAccount: ({ abortSignal }) =>
-        runPassiveAccountLifecycle({
-          abortSignal,
-          start: async () => {
-            throw failure;
-          },
-        }),
+    const { abort, task, isSettled } = startPassiveAccount(async () => {
+      throw failure;
     });
     const accountRejection = expect(task).rejects.toBe(failure);
     const check = expectPendingUntilAbort({
@@ -184,7 +164,7 @@ describe("plugin-sdk channel lifecycle helpers", () => {
   });
 
   it.each([false, true])("keeps server task pending until close (abort=%s)", async (useAbort) => {
-    const server = createFakeServer();
+    const server = new FakeServer();
     const abort = new AbortController();
     const onAbort = vi.fn(async () => {
       server.close();

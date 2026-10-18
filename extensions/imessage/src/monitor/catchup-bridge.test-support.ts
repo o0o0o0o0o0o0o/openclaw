@@ -52,6 +52,18 @@ function chat(id: number, last_message_at = "2026-05-08T11:55:00.000Z") {
   return { id, last_message_at };
 }
 
+function historyClient(chats: ReturnType<typeof chat>[], history: (chatId: number) => unknown[]) {
+  return makeFakeClient(({ method, params }) => {
+    if (method === "chats.list") {
+      return { chats };
+    }
+    if (method === "messages.history") {
+      return { messages: history((params as { chat_id: number }).chat_id) };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+}
+
 function seedCatchupCursor(
   accountId: string,
   cursor: Omit<IMessageCatchupCursor, "updatedAt">,
@@ -103,65 +115,32 @@ describe("runIMessageCatchup", () => {
   });
 
   it("fetches chats then per-chat history and dispatches each row in rowid order", async () => {
-    const dispatched: IMessagePayload[] = [];
-    const { client, calls } = makeFakeClient(({ method, params }) => {
-      if (method === "chats.list") {
-        return {
-          chats: [chat(1), chat(2, "2026-05-08T11:50:00.000Z")],
-        };
-      }
-      if (method === "messages.history") {
-        const p = params as { chat_id: number };
-        if (p.chat_id === 1) {
-          return {
-            messages: [makeRow(102), makeRow(100, 1, "2026-05-08T11:50:00Z")],
-          };
-        }
-        return {
-          messages: [makeRow(101, 2, "2026-05-08T11:51:00Z")],
-        };
-      }
-      throw new Error(`unexpected method ${method}`);
-    });
+    const dispatched: string[] = [];
+    const { client, calls } = historyClient([chat(1), chat(2, "2026-05-08T11:50:00.000Z")], (id) =>
+      id === 1
+        ? [makeRow(102), makeRow(100, 1, "2026-05-08T11:50:00Z")]
+        : [makeRow(101, 2, "2026-05-08T11:51:00Z")],
+    );
 
-    const summary = await run(client, {
-      dispatchPayload: async (msg) => {
-        dispatched.push(msg);
-      },
-    });
+    const summary = await run(client, { dispatchPayload: collectGuids(dispatched) });
 
     expect(summary).toMatchObject({ querySucceeded: true, fullyCaughtUp: true, replayed: 3 });
-    expect(dispatched.map((m) => m.guid)).toEqual(["g-100", "g-101", "g-102"]);
+    expect(dispatched).toEqual(["g-100", "g-101", "g-102"]);
     expect(calls[0]?.method).toBe("chats.list");
     expect(calls.filter((c) => c.method === "messages.history")).toHaveLength(2);
   });
 
   it("skips chats whose last_message_at is older than the catchup window", async () => {
     let historyCalls = 0;
-    const { client } = makeFakeClient(({ method, params }) => {
-      if (method === "chats.list") {
-        return {
-          chats: [
-            chat(1),
-            chat(99, "2025-12-01T00:00:00.000Z"), // ancient
-          ],
-        };
-      }
-      if (method === "messages.history") {
-        historyCalls += 1;
-        const p = params as { chat_id: number };
-        return {
-          messages: [makeRow(200, p.chat_id, "2026-05-08T11:55:00Z", `g-${p.chat_id}`)],
-        };
-      }
-      throw new Error(`unexpected method ${method}`);
+    const { client } = historyClient([chat(1), chat(99, "2025-12-01T00:00:00.000Z")], (id) => {
+      historyCalls += 1;
+      return [makeRow(200, id, "2026-05-08T11:55:00Z", `g-${id}`)];
     });
 
     const summary = await run(client);
 
-    expect(summary.querySucceeded).toBe(true);
+    expect(summary).toMatchObject({ querySucceeded: true, replayed: 1 });
     expect(historyCalls).toBe(1);
-    expect(summary.replayed).toBe(1);
   });
 
   it("does not crash on Date-invalid persisted cursor timestamps", async () => {
@@ -202,22 +181,11 @@ describe("runIMessageCatchup", () => {
 
   it("continues across chats when a single messages.history call throws", async () => {
     const dispatched: string[] = [];
-    const { client } = makeFakeClient(({ method, params }) => {
-      if (method === "chats.list") {
-        return {
-          chats: [chat(1), chat(2, "2026-05-08T11:50:00.000Z")],
-        };
+    const { client } = historyClient([chat(1), chat(2, "2026-05-08T11:50:00.000Z")], (id) => {
+      if (id === 1) {
+        throw new Error("permission denied");
       }
-      if (method === "messages.history") {
-        const p = params as { chat_id: number };
-        if (p.chat_id === 1) {
-          throw new Error("permission denied");
-        }
-        return {
-          messages: [makeRow(300, 2, "2026-05-08T11:51:00Z")],
-        };
-      }
-      throw new Error(`unexpected method ${method}`);
+      return [makeRow(300, 2, "2026-05-08T11:51:00Z")];
     });
 
     const summary = await run(client, { dispatchPayload: collectGuids(dispatched) });
@@ -228,21 +196,9 @@ describe("runIMessageCatchup", () => {
 
   it("caps cross-chat results at perRunLimit, oldest first", async () => {
     const dispatched: string[] = [];
-    const { client } = makeFakeClient(({ method, params }) => {
-      if (method === "chats.list") {
-        return {
-          chats: [chat(1), chat(2)],
-        };
-      }
-      if (method === "messages.history") {
-        const p = params as { chat_id: number };
-        const base = p.chat_id * 100;
-        return {
-          messages: Array.from({ length: 4 }, (_, i) => makeRow(base + i, p.chat_id)),
-        };
-      }
-      throw new Error(`unexpected method ${method}`);
-    });
+    const { client } = historyClient([chat(1), chat(2)], (id) =>
+      Array.from({ length: 4 }, (_, i) => makeRow(id * 100 + i, id)),
+    );
 
     const summary = await run(client, {
       config: resolveCatchupConfig({ enabled: true, perRunLimit: 5, maxAgeMinutes: 60 }),
@@ -256,14 +212,7 @@ describe("runIMessageCatchup", () => {
   });
 
   it("treats a dispatch throw as a failure and holds the cursor", async () => {
-    const { client } = makeFakeClient(({ method }) => {
-      if (method === "chats.list") {
-        return { chats: [chat(1)] };
-      }
-      return {
-        messages: [makeRow(500)],
-      };
-    });
+    const { client } = historyClient([chat(1)], () => [makeRow(500)]);
 
     const summary = await run(client, {
       config: resolveCatchupConfig({
@@ -283,24 +232,17 @@ describe("runIMessageCatchup", () => {
 
   it("emits a high-watermark even when every row fails payload validation", async () => {
     // Invalid payloads still supply raw watermarks, preventing replay stalls.
-    const { client } = makeFakeClient(({ method }) => {
-      if (method === "chats.list") {
-        return { chats: [chat(1)] };
-      }
-      return {
-        messages: [
-          {
-            id: 999,
-            guid: 42, // wrong type
-            chat_id: "x", // wrong type
-            sender: false, // wrong type
-            is_from_me: "no", // wrong type
-            text: 7, // wrong type
-            created_at: "2026-05-08T11:55:00.000Z",
-          },
-        ],
-      };
-    });
+    const { client } = historyClient([chat(1)], () => [
+      {
+        id: 999,
+        guid: 42, // wrong type
+        chat_id: "x", // wrong type
+        sender: false, // wrong type
+        is_from_me: "no", // wrong type
+        text: 7, // wrong type
+        created_at: "2026-05-08T11:55:00.000Z",
+      },
+    ]);
 
     const summary = await run(client);
 
@@ -310,24 +252,17 @@ describe("runIMessageCatchup", () => {
 
   it("filters rows that fail payload validation", async () => {
     const dispatched: string[] = [];
-    const { client } = makeFakeClient(({ method }) => {
-      if (method === "chats.list") {
-        return { chats: [chat(1)] };
-      }
-      return {
-        messages: [
-          // Valid row.
-          makeRow(600),
-          // Junk row — wrong types — must be dropped silently.
-          { id: "not-a-number", guid: 42, chat_id: "x" },
-          // Missing guid.
-          {
-            ...makeRow(601, 1, "2026-05-08T11:55:00Z", ""),
-            guid: undefined,
-          },
-        ],
-      };
-    });
+    const { client } = historyClient([chat(1)], () => [
+      // Valid row.
+      makeRow(600),
+      // Junk row — wrong types — must be dropped silently.
+      { id: "not-a-number", guid: 42, chat_id: "x" },
+      // Missing guid.
+      {
+        ...makeRow(601, 1, "2026-05-08T11:55:00Z", ""),
+        guid: undefined,
+      },
+    ]);
 
     const summary = await run(client, { dispatchPayload: collectGuids(dispatched) });
 

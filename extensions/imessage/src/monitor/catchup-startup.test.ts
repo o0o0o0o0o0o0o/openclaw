@@ -10,6 +10,7 @@ import * as runtimeEnv from "openclaw/plugin-sdk/runtime-env";
 import * as sqliteRuntime from "openclaw/plugin-sdk/sqlite-runtime";
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { IMessageAccountConfig } from "../account-types.js";
 import { resolveIMessageAccount } from "../accounts.js";
 import { imessagePlugin } from "../channel.js";
 import { IMessageRpcClient, type createIMessageRpcClient } from "../client.js";
@@ -60,14 +61,10 @@ describe("registered iMessage account startup", () => {
   });
 
   function seedChatDb() {
-    const database = new DatabaseSync(dbPath);
-    try {
-      database.exec(
-        "CREATE TABLE message (text TEXT); INSERT INTO message(rowid, text) VALUES (5000, 'watermark');",
-      );
-    } finally {
-      database.close();
-    }
+    using database = new DatabaseSync(dbPath);
+    database.exec(
+      "CREATE TABLE message (text TEXT); INSERT INTO message(rowid, text) VALUES (5000, 'watermark');",
+    );
   }
 
   const catchupStore = () =>
@@ -76,27 +73,40 @@ describe("registered iMessage account startup", () => {
       maxEntries: IMESSAGE_CATCHUP_CURSOR_MAX_ENTRIES,
     });
 
-  const makeConfig = (
-    overrides: NonNullable<NonNullable<OpenClawConfig["channels"]>["imessage"]>,
-  ): OpenClawConfig => ({
-    channels: {
-      imessage: {
-        cliPath: path.join(stateDir, "synthetic-imsg"),
-        dmPolicy: "disabled",
-        ...overrides,
-      },
-    },
-  });
-
-  function launch(
-    cfg: OpenClawConfig,
-    client: IMessageRpcClient,
-    runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn<(code: number) => void>() },
+  function startAccount(
+    overrides: IMessageAccountConfig = { dbPath },
+    bridge?: (...args: Parameters<IMessageRpcClient["request"]>) => Promise<unknown>,
   ) {
+    const imessage: IMessageAccountConfig = {
+      cliPath: path.join(stateDir, "synthetic-imsg"),
+      dmPolicy: "disabled",
+      ...overrides,
+    };
+    const cfg: OpenClawConfig = { channels: { imessage } };
     const account = resolveIMessageAccount({ cfg, accountId: "default" });
+    const client = new IMessageRpcClient(account.config);
+    const request = vi.spyOn(client, "request").mockImplementation(async (method, ...args) => {
+      if (method === "watch.subscribe") {
+        return { subscription: 1 };
+      }
+      if (bridge) {
+        return await bridge(method, ...args);
+      }
+      if (method === "chats.list") {
+        return { chats: [] };
+      }
+      throw new Error(`unexpected bridge method ${method}`);
+    });
+    const runtime = {
+      log: vi.fn(),
+      error: vi.fn(),
+      exit: vi.fn((code: number) => {
+        throw new Error(`unexpected exit ${code}`);
+      }),
+    };
     vi.spyOn(client, "waitForClose").mockResolvedValue(undefined);
     createClient.mockResolvedValue(client);
-    return imessagePlugin.gateway!.startAccount!({
+    const starting = imessagePlugin.gateway!.startAccount!({
       scheduler: createTestPluginServiceScheduler(),
       cfg,
       accountId: account.accountId,
@@ -106,6 +116,7 @@ describe("registered iMessage account startup", () => {
       getStatus: () => ({ accountId: account.accountId }),
       setStatus: vi.fn(),
     });
+    return { request, runtime, starting };
   }
 
   function expectSubscription(request: ReturnType<typeof startAccount>["request"], rowid?: number) {
@@ -118,22 +129,6 @@ describe("registered iMessage account startup", () => {
     );
   }
 
-  function startAccount(catchupEnabled = false) {
-    const cfg = makeConfig({ dbPath, ...(catchupEnabled ? { catchup: { enabled: true } } : {}) });
-    const account = resolveIMessageAccount({ cfg, accountId: "default" });
-    const client = new IMessageRpcClient({ cliPath: account.config.cliPath, dbPath });
-    const request = vi.spyOn(client, "request").mockImplementation(async (method) => {
-      if (method === "watch.subscribe") {
-        return { subscription: 1 };
-      }
-      if (method === "chats.list") {
-        return { chats: [] };
-      }
-      throw new Error(`unexpected bridge method ${method}`);
-    });
-    return { request, starting: launch(cfg, client) };
-  }
-
   it("reads the startup watermark off the caller thread before subscribing", async () => {
     seedChatDb();
     const prepare = vi.spyOn(DatabaseSync.prototype, "prepare");
@@ -141,13 +136,11 @@ describe("registered iMessage account startup", () => {
       prepare.mock.calls.filter(([sql]) =>
         /\bMAX\s*\([\s\S]*\bROWID\b[\s\S]*\bFROM\s+"?message"?\b/iu.test(sql),
       );
-    const calibration = new DatabaseSync(dbPath, { readOnly: true });
-    try {
+    {
+      using calibration = new DatabaseSync(dbPath, { readOnly: true });
       expect(calibration.prepare("SELECT MAX(ROWID) AS maxRowid FROM message").get()).toMatchObject(
         { maxRowid: 5000 },
       );
-    } finally {
-      calibration.close();
     }
     expect(watermarkQueries()).toHaveLength(1);
     prepare.mockClear();
@@ -191,12 +184,7 @@ describe("registered iMessage account startup", () => {
             kind === "current" ? "imessage.recovery-cursor" : IMESSAGE_CATCHUP_CURSOR_NAMESPACE;
           if (options.namespace === namespace) {
             const read = store[method].bind(store);
-            store[method] = async (key) => {
-              if (failReads) {
-                throw failure;
-              }
-              return await read(key);
-            };
+            store[method] = (key) => (failReads ? Promise.reject(failure) : read(key));
           }
           return store;
         },
@@ -226,7 +214,7 @@ describe("registered iMessage account startup", () => {
       },
     );
 
-    const { request, starting } = startAccount(true);
+    const { request, starting } = startAccount({ dbPath, catchup: { enabled: true } });
     await starting;
 
     expectSubscription(request);
@@ -300,7 +288,6 @@ describe("registered iMessage account startup", () => {
         created_at: new Date(backlogStartMs + (index + 1) * 1_000).toISOString(),
       }));
       // Disabled DMs complete ingress admission without unrelated agent turns.
-      const cfg = makeConfig({ catchup: { enabled: true, perRunLimit: 50, maxAgeMinutes: 60 } });
       const cursorStore = catchupStore();
       const cursorKey = resolveIMessageCatchupCursorKey("default");
       cursorStore.register(cursorKey, {
@@ -308,16 +295,13 @@ describe("registered iMessage account startup", () => {
         lastSeenRowid: 0,
         updatedAt: Date.now(),
       });
-      const database = new DatabaseSync(path.join(stateDir, "state", "openclaw.sqlite"), {
+      using database = new DatabaseSync(path.join(stateDir, "state", "openclaw.sqlite"), {
         readOnly: true,
       });
-      try {
-        for (let end = 50; end <= total; end += 50) {
-          const client = new IMessageRpcClient({ cliPath: cfg.channels?.imessage?.cliPath });
-          const request = vi.spyOn(client, "request").mockImplementation(async (method, params) => {
-            if (method === "watch.subscribe") {
-              return { subscription: 1 };
-            }
+      for (let end = 50; end <= total; end += 50) {
+        const { request, runtime, starting } = startAccount(
+          { catchup: { enabled: true, perRunLimit: 50, maxAgeMinutes: 60 } },
+          async (method, params) => {
             if (method === "chats.list") {
               return {
                 chats: (twoChats ? [1, 2] : [1]).map((id) => ({
@@ -338,47 +322,33 @@ describe("registered iMessage account startup", () => {
                     (row) =>
                       row.chat_id === chat_id && Date.parse(row.created_at) >= Date.parse(start),
                   )
-                  .toSorted(
-                    (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id,
-                  )
+                  .toReversed()
                   .slice(0, limit),
               };
             }
             throw new Error(`unexpected bridge method ${method}`);
-          });
-          const runtime = {
-            log: vi.fn(),
-            error: vi.fn(),
-            exit: vi.fn((code: number) => {
-              throw new Error(`unexpected exit ${code}`);
-            }),
-          };
-          await launch(cfg, client, runtime);
+          },
+        );
+        await starting;
 
-          const admitted = database
-            .prepare(
-              "SELECT event_id, status FROM channel_ingress_events WHERE channel_id = 'imessage' AND account_id = 'default' ORDER BY rowid",
-            )
-            .all();
-          expect(admitted.map((row) => row.event_id)).toEqual(
-            Array.from({ length: end }, (_, index) => `catchup-startup-${index + 1}`),
-          );
-          expect(admitted.every((row) => row.status === "completed")).toBe(true);
-          expect(cursorStore.lookup(cursorKey)).toMatchObject({
-            lastSeenRowid: end,
-            lastSeenMs: backlogStartMs + end * 1_000,
-          });
-          const historyCalls = request.mock.calls.filter(
-            ([method]) => method === "messages.history",
-          );
-          expect(historyCalls).toHaveLength(twoChats ? 2 : 1);
-          for (const [, params] of historyCalls) {
-            expect(params).toMatchObject({ limit: 500 });
-          }
-          expect(runtime.error).not.toHaveBeenCalled();
-        }
-      } finally {
-        database.close();
+        const admitted = database
+          .prepare(
+            "SELECT event_id, status FROM channel_ingress_events WHERE channel_id = 'imessage' AND account_id = 'default' ORDER BY rowid",
+          )
+          .all();
+        expect(admitted.map((row) => row.event_id)).toEqual(
+          rows.slice(0, end).map((row) => row.guid),
+        );
+        expect(admitted.every((row) => row.status === "completed")).toBe(true);
+        expect(cursorStore.lookup(cursorKey)).toMatchObject({
+          lastSeenRowid: end,
+          lastSeenMs: backlogStartMs + end * 1_000,
+        });
+        const limits = request.mock.calls
+          .filter(([method]) => method === "messages.history")
+          .map(([, params]) => params?.limit);
+        expect(limits).toEqual(twoChats ? [500, 500] : [500]);
+        expect(runtime.error).not.toHaveBeenCalled();
       }
     },
   );

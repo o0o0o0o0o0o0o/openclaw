@@ -1,6 +1,10 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { loadFreshIMessageReplyCacheForTest } from "../test-support/runtime.js";
+import {
+  createInboundDecisionParams,
+  type InboundDecisionParams,
+} from "./inbound-decision.test-support.js";
 import { createSelfChatCache } from "./self-chat-cache.js";
 
 type ReplyCacheModule = typeof import("../monitor-reply-cache.js");
@@ -10,9 +14,7 @@ let buildIMessageInboundContext: InboundProcessingModule["buildIMessageInboundCo
 let resolveIMessageReactionContext: InboundProcessingModule["resolveIMessageReactionContext"];
 let resolveIMessageInboundDecision: InboundProcessingModule["resolveIMessageInboundDecision"];
 const cfg = {} as OpenClawConfig;
-type InboundDecisionParams = Parameters<
-  InboundProcessingModule["resolveIMessageInboundDecision"]
->[0];
+type EchoHas = NonNullable<InboundDecisionParams["echoCache"]>["has"];
 
 beforeAll(async () => {
   ({ rememberIMessageReplyCache } = await loadFreshIMessageReplyCacheForTest());
@@ -20,40 +22,17 @@ beforeAll(async () => {
     await import("./inbound-processing.js"));
 });
 
-function resolveDecision(
-  overrides: Omit<Partial<InboundDecisionParams>, "message"> & {
-    message?: Partial<InboundDecisionParams["message"]>;
-  } = {},
-) {
-  const { message: messageOverrides, ...restOverrides } = overrides;
-  const message = {
-    ...directMessage(42, "ok"),
-    ...messageOverrides,
-  };
-  const messageText = restOverrides.messageText ?? message.text ?? "";
-  const bodyText = restOverrides.bodyText ?? messageText;
-  return resolveIMessageInboundDecision({
-    cfg,
-    accountId: "default",
-    allowFrom: ["*"],
-    groupAllowFrom: [],
-    groupPolicy: "open",
-    dmPolicy: "open",
-    storeAllowFrom: [],
-    historyLimit: 0,
-    groupHistories: new Map(),
-    isKnownFromMeMessageId: () => false,
-    ...restOverrides,
-    message,
-    messageText,
-    bodyText,
-  });
+function resolveDecision(overrides: Parameters<typeof createInboundDecisionParams>[0] = {}) {
+  return resolveIMessageInboundDecision(createInboundDecisionParams(overrides));
 }
 
 async function buildContext(
   message: InboundDecisionParams["message"],
-  overrides: Partial<Parameters<typeof buildIMessageInboundContext>[0]> = {},
+  overrides: Partial<Parameters<typeof buildIMessageInboundContext>[0]> & {
+    agentBodyText?: string;
+  } = {},
 ) {
+  const { agentBodyText, ...contextOverrides } = overrides;
   const decision = overrides.decision ?? (await resolveDecision({ message }));
   expect(decision.kind).toBe("dispatch");
   if (decision.kind !== "dispatch") {
@@ -62,11 +41,11 @@ async function buildContext(
   return buildIMessageInboundContext({
     cfg,
     accountService: undefined,
-    decision,
+    decision: { ...decision, agentBodyText: agentBodyText ?? decision.agentBodyText },
     message,
     historyLimit: 0,
     groupHistories: new Map(),
-    ...overrides,
+    ...contextOverrides,
   });
 }
 
@@ -81,16 +60,11 @@ const directMessage = (id: number, text: string, guid?: string) => ({
 
 describe("resolveIMessageInboundDecision echo detection", () => {
   it("drops inbound messages when outbound message id matches echo cache", async () => {
-    const echoHas = vi.fn((_scope: string, lookup: { text?: string; messageId?: string }) => {
-      return lookup.messageId === "42";
-    });
+    const echoHas = vi.fn<EchoHas>((_scope, lookup) => lookup.messageId === "42");
     const logVerbose = vi.fn();
 
     const decision = await resolveDecision({
-      message: {
-        id: 42,
-        text: "Reasoning:\n_step_",
-      },
+      message: { text: "Reasoning:\n_step_" },
       echoCache: { has: echoHas },
       logVerbose,
     });
@@ -105,20 +79,12 @@ describe("resolveIMessageInboundDecision echo detection", () => {
   });
 
   it("matches attachment-only echoes by structured media fact", async () => {
-    const echoHas = vi.fn(
-      (
-        _scope: string,
-        lookup: { text?: string; media?: { kind?: string | null }; messageId?: string },
-      ) => {
-        return lookup.media?.kind === "image" && lookup.messageId === "42";
-      },
+    const echoHas = vi.fn<EchoHas>(
+      (_scope, lookup) => lookup.media?.kind === "image" && lookup.messageId === "42",
     );
 
     const decision = await resolveDecision({
-      message: {
-        id: 42,
-        text: "",
-      },
+      message: { text: "" },
       mediaFacts: [{ contentType: "image/png", kind: "image" }],
       echoCache: { has: echoHas },
     });
@@ -147,39 +113,27 @@ describe("resolveIMessageInboundDecision echo detection", () => {
     const groupedCfg = {
       channels: { imessage: { groups: { "123": {}, "456": {} } } },
     } as OpenClawConfig;
-    const createdAt = "2026-03-02T20:58:10.649Z";
-
-    expect(
-      await resolveDecision({
+    const resolveGroup = (id: number, chat_id: number, is_from_me = false) =>
+      resolveDecision({
         cfg: groupedCfg,
         message: {
-          id: 9701,
-          chat_id: 123,
+          id,
+          chat_id,
+          is_from_me,
           text: "same text",
-          created_at: createdAt,
-          is_from_me: true,
+          created_at: "2026-03-02T20:58:10.649Z",
         },
         selfChatCache,
-      }),
-    ).toEqual({ kind: "drop", reason: "from me" });
+      });
 
-    const decision = await resolveDecision({
-      cfg: groupedCfg,
-      message: {
-        id: 9702,
-        chat_id: 456,
-        text: "same text",
-        created_at: createdAt,
-      },
-      selfChatCache,
-    });
-
+    expect(await resolveGroup(9701, 123, true)).toEqual({ kind: "drop", reason: "from me" });
+    const decision = await resolveGroup(9702, 456);
     expect(decision.kind).toBe("dispatch");
   });
 
   it("does not drop a group inbound when echo cache holds an unrelated chat_guid", async () => {
-    const echoHas = vi.fn(
-      (scope: string, lookup: { text?: string; messageId?: string }) =>
+    const echoHas = vi.fn<EchoHas>(
+      (scope, lookup) =>
         scope === "default:chat_guid:iMessage;+;OTHER" && lookup.messageId === "9001",
     );
 
@@ -189,7 +143,6 @@ describe("resolveIMessageInboundDecision echo detection", () => {
         chat_id: 42,
         chat_guid: "iMessage;+;chat0000",
         chat_identifier: "chat0000",
-        sender: "+15555550123",
         text: "fresh inbound",
         is_group: true,
       },
@@ -202,44 +155,31 @@ describe("resolveIMessageInboundDecision echo detection", () => {
   it("logs reflected duplicate drops without message content", async () => {
     const selfChatCache = createSelfChatCache();
     const logVerbose = vi.fn();
-    const createdAt = "2026-03-02T20:58:10.649Z";
     const bodyText = "line-1\nline-2\t\u001b[31mred";
-
-    await resolveDecision({
-      message: {
-        id: 9801,
-        sender: "+15555550123",
-        chat_identifier: "+15555550123",
-        destination_caller_id: "+15555550123",
-        text: bodyText,
-        created_at: createdAt,
-        is_from_me: true,
-      },
-      selfChatCache,
-      logVerbose,
+    const resolveReflection = (message: Partial<InboundDecisionParams["message"]>) =>
+      resolveDecision({
+        selfChatCache,
+        logVerbose,
+        message: {
+          chat_identifier: "+15555550123",
+          text: bodyText,
+          created_at: "2026-03-02T20:58:10.649Z",
+          ...message,
+        },
+      });
+    await resolveReflection({
+      id: 9801,
+      destination_caller_id: "+15555550123",
+      is_from_me: true,
     });
-
-    const reflection = await resolveDecision({
-      message: {
-        id: 9802,
-        sender: "+15555550123",
-        chat_identifier: "+15555550123",
-        text: bodyText,
-        created_at: createdAt,
-      },
-      selfChatCache,
-      logVerbose,
-    });
-
+    const reflection = await resolveReflection({ id: 9802 });
     expect(reflection).toEqual({ kind: "drop", reason: "self-chat echo" });
     expect(logVerbose).toHaveBeenCalledWith("imessage: dropping self-chat reflected duplicate");
     expect(logVerbose.mock.calls.flat().join("\n")).not.toContain("line-1");
   });
 
   it("returns a reaction decision for tapbacks on bot-authored messages by default", async () => {
-    const echoHas = vi.fn((_scope: string, lookup: { text?: string; messageId?: string }) => {
-      return lookup.messageId === "target-guid";
-    });
+    const echoHas = vi.fn<EchoHas>((_scope, lookup) => lookup.messageId === "target-guid");
 
     const decision = await resolveDecision({
       message: {
@@ -380,17 +320,12 @@ describe("resolveIMessageReactionContext", () => {
 
 describe("buildIMessageInboundContext", () => {
   it("keeps generated media notices out of command input", async () => {
-    const message = directMessage(12347, "/reset", "p:0/GUID-media-failure");
-    const decision = await resolveDecision({ message });
-    if (decision.kind !== "dispatch") {
-      throw new Error("expected dispatch decision");
-    }
-    const { ctxPayload } = await buildContext(message, {
-      decision: {
-        ...decision,
+    const { ctxPayload } = await buildContext(
+      directMessage(12347, "/reset", "p:0/GUID-media-failure"),
+      {
         agentBodyText: "/reset\n\n[imessage attachment unavailable]",
       },
-    });
+    );
     expect(ctxPayload).toMatchObject({
       RawBody: "/reset",
       CommandBody: "/reset",

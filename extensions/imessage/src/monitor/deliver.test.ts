@@ -30,28 +30,21 @@ vi.mock("../send.js", () => ({
     sendMessageIMessageMock(to, message, opts),
 }));
 
-vi.mock("openclaw/plugin-sdk/markdown-table-runtime", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("openclaw/plugin-sdk/markdown-table-runtime")>()),
-  resolveMarkdownTableMode: vi.fn(() => "code"),
-}));
 vi.mock("openclaw/plugin-sdk/reply-chunking", async (importOriginal) => ({
   ...(await importOriginal<typeof import("openclaw/plugin-sdk/reply-chunking")>()),
   chunkMarkdownTextWithMode: (text: string) => chunkTextWithModeMock(text),
   resolveChunkMode: vi.fn(() => "length"),
-}));
-vi.mock("openclaw/plugin-sdk/text-chunking", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("openclaw/plugin-sdk/text-chunking")>()),
-  convertMarkdownTables: (text: string) => text,
 }));
 
 let deliverIMessageReply: typeof import("./deliver.js").deliverIMessageReply;
 let createIMessageEchoCachingSend: typeof import("./deliver.js").createIMessageEchoCachingSend;
 
 describe("deliverIMessageReply", () => {
-  const IMESSAGE_TEST_CFG = { channels: { imessage: { accounts: { default: {} } } } };
+  const cfg = { channels: { imessage: { accounts: { default: {} } } } };
   const runtime = { log: vi.fn(), error: vi.fn() } as unknown as RuntimeEnv;
   const remember = vi.fn();
-  const deliveryDefaults = { cfg: IMESSAGE_TEST_CFG, runtime, textLimit: 4000, maxBytes: 2048 };
+  const destination = { target: "chat_id:20", accountId: "acct-2" };
+  const deliveryDefaults = { cfg, runtime, textLimit: 4000, maxBytes: 2048, ...destination };
 
   beforeAll(async () => {
     ({ createIMessageEchoCachingSend, deliverIMessageReply } = await import("./deliver.js"));
@@ -64,9 +57,7 @@ describe("deliverIMessageReply", () => {
 
   afterAll(() => {
     vi.doUnmock("../send.js");
-    vi.doUnmock("openclaw/plugin-sdk/markdown-table-runtime");
     vi.doUnmock("openclaw/plugin-sdk/reply-chunking");
-    vi.doUnmock("openclaw/plugin-sdk/text-chunking");
     vi.resetModules();
   });
 
@@ -74,8 +65,6 @@ describe("deliverIMessageReply", () => {
     await deliverIMessageReply({
       ...deliveryDefaults,
       payload: { mediaUrl: "https://example.com/voice.caf", audioAsVoice: true },
-      target: "chat_id:20",
-      accountId: "acct-2",
       maxBytes: 8192,
     });
 
@@ -98,20 +87,18 @@ describe("deliverIMessageReply", () => {
     sendMessageIMessageMock.mockResolvedValueOnce(sentText("imsg-durable-2", "Visible reply"));
 
     await send("chat_id:60", "<thinking>hidden</thinking>\nVisible reply\nassistant:", {
-      config: IMESSAGE_TEST_CFG,
+      config: cfg,
       accountId: "acct-ignored",
     });
 
-    expect(sendMessageIMessageMock.mock.calls).toStrictEqual([
-      [
-        "chat_id:60",
-        "Visible reply",
-        expect.objectContaining({
-          config: IMESSAGE_TEST_CFG,
-          accountId: "acct-ignored",
-        }),
-      ],
-    ]);
+    expect(sendMessageIMessageMock).toHaveBeenCalledExactlyOnceWith(
+      "chat_id:60",
+      "Visible reply",
+      expect.objectContaining({
+        config: cfg,
+        accountId: "acct-ignored",
+      }),
+    );
     expect(remember).toHaveBeenCalledWith("acct-6:chat_id:60", {
       text: "Visible reply",
       messageId: "imsg-durable-2",
@@ -119,8 +106,7 @@ describe("deliverIMessageReply", () => {
   });
 
   it("records outbound text and message ids in sent-message cache after send", async () => {
-    // Fix for #47830: monitor cache population remains per chunk, never the
-    // full un-chunked text before sending begins.
+    // #47830: cache sent chunks, never the full pre-send text.
     chunkTextWithModeMock.mockImplementation((text: string) => text.split("|"));
     sendMessageIMessageMock
       .mockResolvedValueOnce(sentText("imsg-1", "first"))
@@ -129,14 +115,12 @@ describe("deliverIMessageReply", () => {
     await deliverIMessageReply({
       ...deliveryDefaults,
       payload: { text: "first|second" },
-      target: "chat_id:30",
-      accountId: "acct-3",
       sentMessageCache: { remember },
     });
 
     expect(remember.mock.calls).toStrictEqual([
-      ["acct-3:chat_id:30", { text: "first", messageId: "imsg-1" }],
-      ["acct-3:chat_id:30", { text: "second", messageId: "imsg-2" }],
+      ["acct-2:chat_id:20", { text: "first", messageId: "imsg-1" }],
+      ["acct-2:chat_id:20", { text: "second", messageId: "imsg-2" }],
     ]);
   });
 
@@ -151,12 +135,10 @@ describe("deliverIMessageReply", () => {
     await deliverIMessageReply({
       ...deliveryDefaults,
       payload: { mediaUrls: ["https://example.com/a.jpg"] },
-      target: "chat_id:40",
-      accountId: "acct-4",
       sentMessageCache: { remember },
     });
 
-    expect(remember).toHaveBeenCalledWith("acct-4:chat_id:40", {
+    expect(remember).toHaveBeenCalledWith("acct-2:chat_id:20", {
       media: { contentType: "image/jpeg", kind: "image" },
       messageId: "imsg-media-1",
     });
@@ -164,7 +146,6 @@ describe("deliverIMessageReply", () => {
 
   it("preserves earlier media receipts when a later native caption fails", async () => {
     const firstReceipt = createTestIMessageReceipt(["first-attachment", "first-caption"], "media");
-    const lastReceipt = createTestIMessageReceipt("second-attachment", "media");
     sendMessageIMessageMock
       .mockResolvedValueOnce({
         messageId: "first-attachment",
@@ -174,7 +155,7 @@ describe("deliverIMessageReply", () => {
       .mockRejectedValueOnce(
         createChannelPartialDeliveryError(new Error("caption rejected"), {
           messageIds: ["second-attachment"],
-          receipt: lastReceipt,
+          receipt: createTestIMessageReceipt("second-attachment", "media"),
           visibleReplySent: true,
           content: "",
         }),
@@ -187,12 +168,9 @@ describe("deliverIMessageReply", () => {
         mediaUrls: ["https://example.com/first.jpg", "https://example.com/second.jpg"],
         replyToId: "unsupported-thread",
       },
-      target: "chat_id:80",
-      accountId: "default",
       maxBytes: 4096,
     }).catch((error: unknown) => error);
 
-    expect(isChannelPartialDeliveryError(observed)).toBe(true);
     if (!isChannelPartialDeliveryError(observed)) {
       throw new Error("expected canonical partial delivery error");
     }
@@ -211,8 +189,6 @@ describe("deliverIMessageReply", () => {
     const delivered = await deliverIMessageReply({
       ...deliveryDefaults,
       payload: { text: "<thinking>private reasoning</thinking>" },
-      target: "chat_id:90",
-      accountId: "default",
       maxBytes: 4096,
     });
 

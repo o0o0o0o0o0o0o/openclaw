@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { repairIMessageConversationAnchor } from "./conversation-repair.js";
+import { createInboundDecisionParams } from "./inbound-decision.test-support.js";
 import type { IMessagePayload } from "./types.js";
 
 function anchorlessMessage(overrides: Partial<IMessagePayload> = {}): IMessagePayload {
@@ -134,20 +135,9 @@ describe("repairIMessageConversationAnchor", () => {
     expect(repaired?.sender).toBe("+15550000002");
     expect(repaired?.destination_caller_id ?? null).toBeNull();
 
-    const decision = await resolveIMessageInboundDecision({
-      cfg: {} as never,
-      accountId: "default",
-      message: repaired!,
-      messageText: repaired!.text ?? "",
-      bodyText: repaired!.text ?? "",
-      allowFrom: ["*"],
-      groupAllowFrom: [],
-      groupPolicy: "open",
-      dmPolicy: "open",
-      storeAllowFrom: [],
-      historyLimit: 0,
-      groupHistories: new Map(),
-    });
+    const decision = await resolveIMessageInboundDecision(
+      createInboundDecisionParams({ message: repaired!, isKnownFromMeMessageId: undefined }),
+    );
     expect(decision.kind).toBe("dispatch");
     if (decision.kind !== "dispatch") {
       return;

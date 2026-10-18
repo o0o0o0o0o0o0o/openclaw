@@ -1,4 +1,3 @@
-// Metadata registry loader tests cover metadata-only plugin registry assembly.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createInfoWarnErrorLogger } from "../../../test/helpers/mock-logger.js";
 import type { PluginLoadOptions } from "../loader.js";
@@ -62,10 +61,9 @@ function expectLoadOptions(overrides: Partial<PluginLoadOptions> = {}): PluginLo
 
 describe("loadPluginMetadataRegistrySnapshot", () => {
   beforeEach(() => {
-    loadConfigMock.mockReset();
+    loadConfigMock.mockReset().mockReturnValue(config);
     applyPluginAutoEnableMock.mockReset();
     loadOpenClawPluginsMock.mockReset();
-    loadConfigMock.mockReturnValue({ plugins: {} });
     applyPluginAutoEnableMock.mockImplementation((params: { config: unknown }) => ({
       config: params.config,
       changes: [],
@@ -91,12 +89,14 @@ describe("loadPluginMetadataRegistrySnapshot", () => {
     });
   });
 
-  it("forwards explicit manifest-only requests", () => {
-    loadPluginMetadataRegistrySnapshot({ config, loadModules: false });
-
-    const loadOptions = expectLoadOptions({ loadModules: false });
-    expect(loadOptions.env === process.env).toBe(true);
-  });
+  it.each([{ loadModules: false }, { onlyPluginIds: [] }])(
+    "preserves explicit metadata scope options: %j",
+    (options) => {
+      loadPluginMetadataRegistrySnapshot({ config, ...options });
+      const loadOptions = expectLoadOptions(options);
+      expect(loadOptions.env === process.env).toBe(true);
+    },
+  );
 
   it("forwards an explicit logger through metadata snapshots", () => {
     const logger = createInfoWarnErrorLogger();
@@ -146,12 +146,5 @@ describe("loadPluginMetadataRegistrySnapshot", () => {
       installRecords: undefined,
     } satisfies PluginLoadOptions;
     expect(expectLoadOptions(expected)).toEqual(expected);
-  });
-
-  it("preserves explicit empty plugin scopes on metadata snapshots", () => {
-    loadPluginMetadataRegistrySnapshot({ config, onlyPluginIds: [] });
-
-    const loadOptions = expectLoadOptions({ onlyPluginIds: [] });
-    expect(loadOptions.env === process.env).toBe(true);
   });
 });

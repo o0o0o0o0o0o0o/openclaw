@@ -1,4 +1,3 @@
-// Gateway request scope tests cover request-local plugin runtime context propagation.
 import assert from "node:assert/strict";
 import { AsyncResource } from "node:async_hooks";
 import { setImmediate } from "node:timers/promises";
@@ -22,26 +21,26 @@ const TEST_SCOPE: PluginRuntimeGatewayRequestScope = {
   isWebchatConnect: (() => false) as PluginRuntimeGatewayRequestScope["isWebchatConnect"],
 };
 
-function serviceRegistry(
-  service: { id: string; start(): void },
-  pluginId = service.id,
-  source = service.id,
-) {
+function serviceRegistry(service: { id: string; start(): void }) {
   const registry = createEmptyPluginRegistry();
-  registry.services.push({ id: service.id, pluginId, source, origin: "config", service });
+  const { id } = service;
+  registry.services.push({ id, pluginId: id, source: id, origin: "config", service });
   return registry;
 }
 
 function expectExpiredRegistry() {
-  expect(() => requireActivePluginRegistry()).toThrow(
-    "Plugin registry scope is no longer available",
-  );
+  expect(requireActivePluginRegistry).toThrow("Plugin registry scope is no longer available");
+}
+
+function serviceType(id: string) {
+  return class {
+    id = id;
+    start() {}
+  };
 }
 
 describe("gateway request scope", () => {
-  afterEach(() => {
-    resetPluginRuntimeStateForTest();
-  });
+  afterEach(resetPluginRuntimeStateForTest);
   async function withTestGatewayScope<T>(run: () => Promise<T>) {
     return await runtimeScope.withPluginRuntimeGatewayRequestScope(TEST_SCOPE, run);
   }
@@ -101,7 +100,6 @@ describe("gateway request scope", () => {
   });
 
   it("matches nested Gateway bindings without invoking execution resolvers", async () => {
-    const runtimeScope = await importGatewayRequestScopeModule();
     const gateway = vi.fn(() => TEST_SCOPE.context);
     const first = vi.fn(() => undefined);
     const second = vi.fn(() => undefined);
@@ -202,11 +200,8 @@ describe("gateway request scope", () => {
 
   it("keeps an empty prepared selection through collection instead of selecting active plugins", async () => {
     const generation = await import("./generation-scope.js");
-    class ActiveService {
-      id = "active-service";
-      start() {}
-    }
-    const active = serviceRegistry(new ActiveService(), "active-plugin", "prepared-selection-test");
+    const ActiveService = serviceType("active-service");
+    const active = serviceRegistry(new ActiveService());
     setActivePluginRegistry(active);
     await generation.withPluginRuntimeGenerationScope(
       { metadataSnapshot: createPluginMetadataSnapshotFixture() },
@@ -224,10 +219,7 @@ describe("gateway request scope", () => {
   it.each(["fulfilled", "rejected", "thenable"] as const)(
     "owns the registry only until a direct async callback settles: %s",
     async (outcome) => {
-      class PendingService {
-        id = "pending-scope";
-        start() {}
-      }
+      const PendingService = serviceType("pending-scope");
       const gate = createDeferredCore();
       const failure = new Error("scope callback failed");
       const resources: AsyncResource[] = [];
@@ -273,15 +265,13 @@ describe("gateway request scope", () => {
         } else {
           expect(await pending).toBe(resources[0]);
         }
-        expect(thenReads).toBe(outcome === "thenable" ? 1 : 0);
-        expect(thenCalls).toBe(outcome === "thenable" ? 1 : 0);
+        const expectedThenAccesses = outcome === "thenable" ? 1 : 0;
+        expect([thenReads, thenCalls]).toEqual([expectedThenAccesses, expectedThenAccesses]);
         await setImmediate();
         expect(queryObjects(PendingService)).toBe(0);
         const resource = resources[0];
         assert.ok(resource);
-        resource.runInAsyncScope(() => {
-          expectExpiredRegistry();
-        });
+        resource.runInAsyncScope(expectExpiredRegistry);
         // Keep the settled completion reachable through the post-settlement collection.
         expect(pending).toBeDefined();
       } finally {
@@ -297,10 +287,7 @@ describe("gateway request scope", () => {
   it.each(["registry", "resolver-copy", "plugin-copy"] as const)(
     "releases retired registries inherited by native async resources through %s",
     async (copy) => {
-      class RetainedService {
-        id = "runtime-scope-retention";
-        start() {}
-      }
+      const RetainedService = serviceType("runtime-scope-retention");
       const resources = Array.from({ length: 4 }, () => {
         const registry = serviceRegistry(new RetainedService());
         const capture = () => new AsyncResource("plugin-runtime-retention");
@@ -323,9 +310,7 @@ describe("gateway request scope", () => {
         for (const resource of resources) {
           resource.runInAsyncScope(() => {
             expectExpiredRegistry();
-            runtimeScope.withPluginRuntimeGatewayContextResolver(undefined, () => {
-              expectExpiredRegistry();
-            });
+            runtimeScope.withPluginRuntimeGatewayContextResolver(undefined, expectExpiredRegistry);
             runtimeScope.withPluginRuntimeRegistryScope(replacement, () => {
               expect(requireActivePluginRegistry()).toBe(replacement);
               expect(

@@ -1,4 +1,3 @@
-// Plugin runtime index tests cover runtime entrypoint exports and registry setup.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   resetConfigRuntimeState,
@@ -25,9 +24,7 @@ import { createPluginRuntime } from "./index.js";
 describe("plugin runtime command execution", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
-    runtimeModelAuthMocks.getApiKeyForModel.mockReset();
-    runtimeModelAuthMocks.getRuntimeAuthForModelCore.mockReset();
-    runtimeModelAuthMocks.resolveProviderRuntimeApiKey.mockReset();
+    Object.values(runtimeModelAuthMocks).forEach((mock) => mock.mockReset());
     resetConfigRuntimeState();
   });
 

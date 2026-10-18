@@ -1,4 +1,3 @@
-// Runtime channel tests cover channel plugin runtime send, reply, and capability behavior.
 import { getEventListeners } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.js";
@@ -14,8 +13,8 @@ vi.mock("../../channels/turn/lifecycle.js", async (importOriginal) => ({
   dispatchRoutedChannelTurn,
 }));
 
-function expectWatcherEvent(mock: ReturnType<typeof vi.fn>, index: number, type: string) {
-  expect(mock.mock.calls[index]?.[0]).toMatchObject({ type });
+function expectWatcherEvents(mock: ReturnType<typeof vi.fn>, ...types: string[]) {
+  expect(mock.mock.calls.map(([event]) => event.type)).toEqual(types);
 }
 
 it("warns about synchronous runtime timestamps while preserving the shipped result", async () => {
@@ -98,7 +97,7 @@ describe("runtimeContexts", () => {
   const scope = { channelId: "matrix", accountId: "default", capability: "approval.native" };
 
   it("removes the stale lease abort listener after a replacement registration", () => {
-    const channel = createRuntimeChannel();
+    const contexts = createRuntimeChannel().runtimeContexts;
     const connectionScope = {
       channelId: "whatsapp",
       accountId: "default",
@@ -106,12 +105,12 @@ describe("runtimeContexts", () => {
     };
     const controller = new AbortController();
     const initialListenerCount = getEventListeners(controller.signal, "abort").length;
-    const staleLease = channel.runtimeContexts.register({
+    const staleLease = contexts.register({
       ...connectionScope,
       context: { token: "stale" },
       abortSignal: controller.signal,
     });
-    channel.runtimeContexts.register({
+    contexts.register({
       ...connectionScope,
       context: { token: "replacement" },
       abortSignal: controller.signal,
@@ -119,61 +118,57 @@ describe("runtimeContexts", () => {
 
     expect(getEventListeners(controller.signal, "abort")).toHaveLength(initialListenerCount + 2);
 
-    // Channel plugins dispose the previous lease after registering its replacement,
-    // so the stale token check must not skip listener cleanup.
+    // Plugins dispose the old lease only after its replacement is registered.
     staleLease.dispose();
 
     expect(getEventListeners(controller.signal, "abort")).toHaveLength(initialListenerCount + 1);
-    expect(channel.runtimeContexts.get(connectionScope)).toEqual({ token: "replacement" });
+    expect(contexts.get(connectionScope)).toEqual({ token: "replacement" });
   });
 
   it("does not register contexts when the abort signal is already aborted", () => {
-    const channel = createRuntimeChannel();
+    const contexts = createRuntimeChannel().runtimeContexts;
     const onEvent = vi.fn();
     const controller = new AbortController();
     controller.abort();
-    channel.runtimeContexts.watch({ ...scope, onEvent });
+    contexts.watch({ ...scope, onEvent });
 
-    const lease = channel.runtimeContexts.register({
+    const lease = contexts.register({
       ...scope,
       context: { client: "stale" },
       abortSignal: controller.signal,
     });
 
-    expect(channel.runtimeContexts.get(scope)).toBeUndefined();
+    expect(contexts.get(scope)).toBeUndefined();
     expect(onEvent).not.toHaveBeenCalled();
     lease.dispose();
   });
 
   it("isolates watcher exceptions so registration and disposal still complete", () => {
-    const channel = createRuntimeChannel();
+    const contexts = createRuntimeChannel().runtimeContexts;
     const badWatcher = vi.fn((event) => {
       throw new Error(`boom:${event.type}`);
     });
     const goodWatcher = vi.fn();
 
-    channel.runtimeContexts.watch({ ...scope, onEvent: badWatcher });
-    const unsubscribe = channel.runtimeContexts.watch({ ...scope, onEvent: goodWatcher });
+    contexts.watch({ ...scope, onEvent: badWatcher });
+    const unsubscribe = contexts.watch({ ...scope, onEvent: goodWatcher });
 
-    const lease = channel.runtimeContexts.register({
-      ...scope,
-      context: { client: "ok" },
-    });
+    const lease = contexts.register({ ...scope, context: { client: "ok" } });
 
-    expect(channel.runtimeContexts.get(scope)).toEqual({ client: "ok" });
-    expectWatcherEvent(badWatcher, 0, "registered");
-    expectWatcherEvent(goodWatcher, 0, "registered");
+    expect(contexts.get(scope)).toEqual({ client: "ok" });
+    expectWatcherEvents(badWatcher, "registered");
+    expectWatcherEvents(goodWatcher, "registered");
 
     lease.dispose();
 
-    expect(channel.runtimeContexts.get(scope)).toBeUndefined();
-    expectWatcherEvent(badWatcher, 1, "unregistered");
-    expectWatcherEvent(goodWatcher, 1, "unregistered");
+    expect(contexts.get(scope)).toBeUndefined();
+    expectWatcherEvents(badWatcher, "registered", "unregistered");
+    expectWatcherEvents(goodWatcher, "registered", "unregistered");
     unsubscribe();
   });
 
   it("auto-disposes when a watcher aborts during the registered event", () => {
-    const channel = createRuntimeChannel();
+    const contexts = createRuntimeChannel().runtimeContexts;
     const controller = new AbortController();
     const onEvent = vi.fn((event) => {
       if (event.type === "registered") {
@@ -181,17 +176,16 @@ describe("runtimeContexts", () => {
       }
     });
 
-    channel.runtimeContexts.watch({ ...scope, onEvent });
+    contexts.watch({ ...scope, onEvent });
 
-    const lease = channel.runtimeContexts.register({
+    const lease = contexts.register({
       ...scope,
       context: { client: "ok" },
       abortSignal: controller.signal,
     });
 
-    expect(channel.runtimeContexts.get(scope)).toBeUndefined();
-    expectWatcherEvent(onEvent, 0, "registered");
-    expectWatcherEvent(onEvent, 1, "unregistered");
+    expect(contexts.get(scope)).toBeUndefined();
+    expectWatcherEvents(onEvent, "registered", "unregistered");
 
     lease.dispose();
   });

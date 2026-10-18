@@ -1,4 +1,3 @@
-// Load context tests cover agent and workspace context resolution for plugin runtimes.
 import { inspect } from "node:util";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -30,6 +29,8 @@ const metadataSnapshot = {
   workspaceDir: "/resolved-workspace",
 };
 const { manifestRegistry } = metadataSnapshot;
+const config = { plugins: {} };
+const env = { HOME: "/tmp/openclaw-home" };
 const resolvePluginMetadataSnapshotMock = vi.hoisted(() => vi.fn(() => metadataSnapshot));
 const resolveConfigWidePluginMetadataSnapshotMock = vi.hoisted(() => vi.fn(() => metadataSnapshot));
 
@@ -60,12 +61,11 @@ vi.mock("../plugin-metadata-snapshot.js", async (importOriginal) => ({
 
 describe("resolvePluginRuntimeLoadContext", () => {
   beforeEach(() => {
-    loadConfigMock.mockReset();
+    loadConfigMock.mockReset().mockReturnValue(config);
     applyPluginAutoEnableMock.mockReset();
     resolvePluginMetadataSnapshotMock.mockReset().mockReturnValue(metadataSnapshot);
     resolveConfigWidePluginMetadataSnapshotMock.mockReset().mockReturnValue(metadataSnapshot);
 
-    loadConfigMock.mockReturnValue({ plugins: {} });
     applyPluginAutoEnableMock.mockImplementation((params) => ({
       config: params.config ?? {},
       changes: [],
@@ -76,27 +76,15 @@ describe("resolvePluginRuntimeLoadContext", () => {
   });
 
   it("uses the source runtime snapshot for plugin activation source config", () => {
-    const env = { HOME: "/tmp/openclaw-home" };
-    const runtimeConfig = { plugins: {} };
     const sourceConfig = { plugins: { allow: ["trusted-plugin"] } };
-
-    setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
-    loadConfigMock.mockReturnValue(runtimeConfig);
-
+    setRuntimeConfigSnapshot(config, sourceConfig);
     const context = resolvePluginRuntimeLoadContext({ env });
-
-    expect(context.rawConfig).toBe(runtimeConfig);
+    expect(context.rawConfig).toBe(config);
     expect(context.activationSourceConfig).toBe(sourceConfig);
-    expect(applyPluginAutoEnableMock).toHaveBeenCalledWith({
-      config: runtimeConfig,
-      env,
-      manifestRegistry,
-    });
+    expect(applyPluginAutoEnableMock).toHaveBeenCalledWith({ config, env, manifestRegistry });
   });
 
   it("applies auto-enable against each operation's exact prepared metadata", () => {
-    const env = { HOME: "/tmp/openclaw-home" };
-    const config = { plugins: {} };
     const firstRegistry = { diagnostics: [], plugins: [] };
     const secondRegistry = { diagnostics: [], plugins: [] };
     const firstSnapshot = { ...metadataSnapshot, manifestRegistry: firstRegistry };
@@ -128,9 +116,6 @@ describe("resolvePluginRuntimeLoadContext", () => {
     { scope: "explicit empty", pluginIds: [] },
     { scope: "explicit owner", pluginIds: ["demo"] },
   ])("projects $scope metadata from the prepared config-wide inventory", ({ pluginIds }) => {
-    const config = { plugins: {} };
-    const env = { HOME: "/tmp/openclaw-home" } as NodeJS.ProcessEnv;
-
     const context = resolvePluginRuntimeLoadContext({ config, env, onlyPluginIds: pluginIds });
 
     expect(context.metadataSnapshot?.pluginIds).toEqual(pluginIds);
@@ -145,24 +130,24 @@ describe("resolvePluginRuntimeLoadContext", () => {
   it("keeps private load facts out of diagnostics while preserving registry copies", () => {
     const configSentinel = "synthetic-private-config-sentinel";
     const envSentinel = "synthetic-private-env-sentinel";
-    const config: OpenClawConfig = {
+    const privateConfig: OpenClawConfig = {
       plugins: { entries: { demo: { config: { sentinel: configSentinel } } } },
     };
-    const env = { HOME: "/tmp/openclaw-home", PRIVATE_CONTEXT_TEST: envSentinel };
-    const context = resolvePluginRuntimeLoadContext({ config, env });
+    const privateEnv = { ...env, PRIVATE_CONTEXT_TEST: envSentinel };
+    const context = resolvePluginRuntimeLoadContext({ config: privateConfig, env: privateEnv });
     const registry = createEmptyPluginRegistry();
     setPluginRuntimeLoadContext(registry, context, "original-registration");
     const bound = getPluginRuntimeLoadContext(registry);
     expect(bound).toMatchObject(context);
-    expect(bound?.config).toBe(config);
-    expect(bound?.env).toBe(env);
+    expect(bound?.config).toBe(privateConfig);
+    expect(bound?.env).toBe(privateEnv);
 
     const copy = { ...registry };
     expect(getPluginRuntimeLoadContext(copy)).toBe(bound);
     const reboundContext = {
       ...context,
       workspaceDir: "/rebound-workspace",
-      env: { ...env, PRIVATE_CONTEXT_TEST: `${envSentinel}-rebound` },
+      env: { ...privateEnv, PRIVATE_CONTEXT_TEST: `${envSentinel}-rebound` },
     };
     setPluginRuntimeLoadContext(copy, reboundContext, "replacement-registration");
     expect(getPluginRuntimeLoadContext(copy)).toMatchObject({
@@ -185,25 +170,25 @@ describe("resolvePluginRuntimeLoadContext", () => {
     const entries = Object.fromEntries(
       Array.from({ length: 200 }, (_, i) => [`agent-${i}`, { name: `${i}` }]),
     );
-    const config = freezeJsonSnapshot({ agents: { entries } });
-    const env = { HOME: "/tmp/openclaw-activation-fleet" };
-    const context = resolvePluginRuntimeLoadContext({ config, env });
+    const fleetConfig = freezeJsonSnapshot({ agents: { entries } });
+    const fleetEnv = { HOME: "/tmp/openclaw-activation-fleet" };
+    const context = resolvePluginRuntimeLoadContext({ config: fleetConfig, env: fleetEnv });
     const registry = createEmptyPluginRegistry();
     const keys = vi.spyOn(Object, "keys");
     try {
       setPluginRuntimeLoadContext(registry, context);
       for (let attempt = 0; attempt < 200; attempt += 1) {
         const activation = getReusablePluginRuntimeActivation(registry, {
-          config,
-          env,
+          config: fleetConfig,
+          env: fleetEnv,
           workspaceDir: context.workspaceDir,
           metadataSnapshot,
         });
-        expect(activation?.config).toBe(config);
-        expect(activation?.activationSourceConfig).toBe(config);
+        expect(activation?.config).toBe(fleetConfig);
+        expect(activation?.activationSourceConfig).toBe(fleetConfig);
         setPluginRuntimeLoadContext(registry, context);
       }
-      expect(keys.mock.calls.filter(([value]) => value === config.agents.entries)).toHaveLength(1);
+      expect(keys.mock.calls.filter(([value]) => value === entries)).toHaveLength(1);
     } finally {
       keys.mockRestore();
     }
@@ -211,8 +196,8 @@ describe("resolvePluginRuntimeLoadContext", () => {
 
   it("builds plugin load options from the shared runtime context", () => {
     const context = resolvePluginRuntimeLoadContext({
-      config: { plugins: {} },
-      env: { HOME: "/tmp/openclaw-home" } as NodeJS.ProcessEnv,
+      config,
+      env,
       preferBuiltPluginArtifacts: true,
       workspaceDir: "/explicit-workspace",
     });

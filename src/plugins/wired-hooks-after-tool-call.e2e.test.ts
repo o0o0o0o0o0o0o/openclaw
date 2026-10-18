@@ -2,15 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createBaseToolHandlerState } from "../agents/agent-tool-handler-state.test-helpers.js";
 import { handleToolExecutionStart } from "../agents/embedded-agent-subscribe.handlers.tools.start.js";
 import { endTool } from "../agents/embedded-agent-subscribe.handlers.tools.test-support.js";
-import type { createHookRunner } from "./hooks.js";
+import type { HookRunner } from "./hooks.js";
 
 const hookMocks = vi.hoisted(() => ({
   runner: {
     hasHooks: vi.fn(() => false),
     runBeforeToolCall: vi.fn(async () => {}),
-    runAfterToolCall: vi.fn<ReturnType<typeof createHookRunner>["runAfterToolCall"]>(
-      async () => {},
-    ),
+    runAfterToolCall: vi.fn<HookRunner["runAfterToolCall"]>(async () => {}),
   },
 }));
 
@@ -35,11 +33,8 @@ function createToolHandlerCtx(params: {
 }) {
   return {
     params: {
-      runId: params.runId,
+      ...params,
       session: { messages: [] },
-      agentId: params.agentId,
-      sessionKey: params.sessionKey,
-      sessionId: params.sessionId,
     },
     hookRunner: hookMocks.runner,
     state: createBaseToolHandlerState(),
@@ -106,12 +101,7 @@ function expectAfterToolCallPayload(
 
 describe("after_tool_call hook wiring", () => {
   beforeEach(() => {
-    hookMocks.runner.hasHooks.mockClear();
-    hookMocks.runner.hasHooks.mockReturnValue(false);
-    hookMocks.runner.runBeforeToolCall.mockClear();
-    hookMocks.runner.runBeforeToolCall.mockResolvedValue(undefined);
-    hookMocks.runner.runAfterToolCall.mockClear();
-    hookMocks.runner.runAfterToolCall.mockResolvedValue(undefined);
+    vi.resetAllMocks();
   });
 
   it("calls runAfterToolCall in handleToolExecutionEnd when hook is registered", async () => {

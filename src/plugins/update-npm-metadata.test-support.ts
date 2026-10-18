@@ -74,27 +74,26 @@ export function registerNpmUpdateMetadataTests({
       updateNpmInstalledPlugins({ logger: silentLogger, onCapabilityConsent: consent, ...params }),
     );
   }
+  function npmPackage(
+    spec: string,
+    version: string,
+    overrides: Partial<NpmFixturePackage> = {},
+  ): NpmFixturePackage {
+    return { spec, version, npmRoot: getNpmRoot(), packageName: spec, ...overrides };
+  }
   it.each(["spec", "trust"])(
     "rejects prepared fallback facts after %s changes",
     async (changed) => {
       const spec = "@openclaw/voice-call";
-      const npmRoot = getNpmRoot();
       mockNpmViewAndInstallMany([
-        {
-          spec,
-          npmRoot,
-          packageName: spec,
-          version: "3.0.0-beta.1",
+        npmPackage(spec, "3.0.0-beta.1", {
           versions: ["2.0.0", "3.0.0-beta.1"],
-        },
-        {
-          spec: `${spec}@2.0.0`,
-          npmRoot,
+        }),
+        npmPackage(`${spec}@2.0.0`, "2.0.0", {
           packageName: spec,
           pluginId: "voice-call",
-          version: "2.0.0",
           expectedDependencySpec: "2.0.0",
-        },
+        }),
       ]);
       const warn = vi.fn();
       const result = await installPluginFromNpmSpec({
@@ -128,11 +127,8 @@ export function registerNpmUpdateMetadataTests({
         npmResolution: { name: spec, version: "2.0.0" },
       });
       expect(
-        runCommandWithTimeoutMock.mock.calls.filter(([argv]) => {
-          const args = npmCommandArgs(argv);
-          return args?.[0] === "view" && args[1] === spec && args[2] === "name";
-        }),
-      ).toHaveLength(changed === "spec" ? 1 : 0);
+        metadataCommands().filter((args) => args[1] === spec && args[2] === "name"),
+      ).toHaveLength(1);
     },
   );
 
@@ -169,128 +165,90 @@ export function registerNpmUpdateMetadataTests({
     expect(metadataSpecs()).toEqual([`${packageName}@beta`, `${packageName}@latest`]);
   });
 
-  it.each(["stable"] as const)(
-    "reuses the %s update selection without another npm metadata command",
-    async (channel) => {
+  it.each<[string, string, string, string | undefined]>([
+    ["stable", "1.0.0", "2.0.0", undefined],
+    ["newest prerelease", "2.0.0-beta.1", "3.0.0-beta.1", "using newest prerelease"],
+    ["allowed current prerelease", "3.0.0-beta.1", "3.0.0-beta.1", "allowing it"],
+  ])(
+    "reuses successful update metadata for %s",
+    async (_label, initialVersion, selectedVersion, warning) => {
+      const official = warning !== undefined;
+      if (official) {
+        vi.stubEnv("OPENCLAW_DISABLE_BUNDLED_PLUGINS", "1");
+      }
       const npmRoot = getNpmRoot();
-      const packageName = "update-metadata-fixture";
-      const pluginId = "metadata-fixture";
+      const packageName = official ? "@openclaw/voice-call" : "update-metadata-fixture";
+      const pluginId = official ? "voice-call" : "metadata-fixture";
+      const available = { npmRoot, packageName, pluginId };
       const installPath = writeInstalledNpmPlugin({
+        ...available,
         npmRoot: path.join(npmRoot, "previous"),
-        packageName,
-        pluginId,
-        version: "1.0.0",
+        version: initialVersion,
       });
-      const available = {
-        npmRoot,
-        packageName,
-        pluginId,
-        version: "2.0.0",
-        expectedDependencySpec: "2.0.0",
-      };
       mockNpmViewAndInstallMany([
-        { ...available, spec: packageName },
-        { ...available, spec: `${packageName}@2.0.0` },
+        {
+          ...available,
+          spec: packageName,
+          version: official ? initialVersion : selectedVersion,
+          ...(official
+            ? { versions: ["2.0.0-beta.1", "3.0.0-beta.1"] }
+            : { expectedDependencySpec: selectedVersion }),
+        },
+        {
+          ...available,
+          spec: `${packageName}@${selectedVersion}`,
+          version: selectedVersion,
+          expectedDependencySpec: selectedVersion,
+        },
       ]);
+      const warnings: string[] = [];
       const result = await updateInstalled({
         config: installedConfig(pluginId, {
           source: "npm",
           spec: packageName,
           installPath,
-          version: "1.0.0",
+          version: initialVersion,
+          ...(official
+            ? {
+                resolvedName: packageName,
+                resolvedSpec: `${packageName}@${initialVersion}`,
+                resolvedVersion: initialVersion,
+                integrity: "sha512-plugin-test",
+              }
+            : {}),
         }),
-        updateChannel: channel,
+        ...(official
+          ? { logger: { info: () => {}, warn: (message: string) => warnings.push(message) } }
+          : { updateChannel: "stable" as const }),
       });
       expect(result.outcomes, JSON.stringify(result.outcomes)).toMatchObject([
-        { pluginId, status: "updated", currentVersion: "1.0.0", nextVersion: "2.0.0" },
+        {
+          pluginId,
+          status: initialVersion === selectedVersion ? "unchanged" : "updated",
+          currentVersion: initialVersion,
+          nextVersion: selectedVersion,
+        },
       ]);
       const record = result.config.plugins?.installs?.[pluginId];
-      expect(record?.spec).toBe(packageName);
-      expectInstalled(record, packageName, "2.0.0");
-      expect(metadataSpecs()).toEqual([packageName]);
+      expectInstalled(record, packageName, selectedVersion);
+      if (!official) {
+        expect(record?.spec).toBe(packageName);
+        expect(metadataSpecs()).toEqual([packageName]);
+        return;
+      }
+      const commands = metadataCommands();
+      expect(commands.filter((args) => args[2] === "versions")).toHaveLength(1);
+      expect(
+        commands.filter((args) => args[1] === `${packageName}@${selectedVersion}`),
+      ).toHaveLength(initialVersion === selectedVersion ? 0 : 1);
+      expect(
+        runCommandWithTimeoutMock.mock.calls.some(([argv]) => isManagedNpmInstallCommand(argv)),
+      ).toBe(true);
+      expect(
+        warnings.filter((message) => message.startsWith(`Resolved ${packageName} to `)),
+      ).toEqual([expect.stringContaining(warning)]);
     },
   );
-
-  it.each([
-    {
-      label: "newest prerelease",
-      initialVersion: "2.0.0-beta.1",
-      versions: ["2.0.0-beta.1", "3.0.0-beta.1"],
-      selectedVersion: "3.0.0-beta.1",
-      warning: "using newest prerelease",
-    },
-    {
-      label: "allowed current prerelease",
-      initialVersion: "3.0.0-beta.1",
-      versions: ["2.0.0-beta.1", "3.0.0-beta.1"],
-      selectedVersion: "3.0.0-beta.1",
-      warning: "allowing it",
-    },
-  ])("reuses successful official update metadata for $label", async (scenario) => {
-    vi.stubEnv("OPENCLAW_DISABLE_BUNDLED_PLUGINS", "1");
-    const npmRoot = getNpmRoot();
-    const packageName = "@openclaw/voice-call";
-    const pluginId = "voice-call";
-    const installPath = writeInstalledNpmPlugin({
-      npmRoot: path.join(npmRoot, "previous"),
-      packageName,
-      pluginId,
-      version: scenario.initialVersion,
-    });
-    mockNpmViewAndInstallMany([
-      {
-        spec: packageName,
-        npmRoot,
-        packageName,
-        pluginId,
-        version: scenario.initialVersion,
-        versions: scenario.versions,
-      },
-      {
-        spec: `${packageName}@${scenario.selectedVersion}`,
-        npmRoot,
-        packageName,
-        pluginId,
-        version: scenario.selectedVersion,
-        expectedDependencySpec: scenario.selectedVersion,
-      },
-    ]);
-    const warnings: string[] = [];
-    const result = await updateInstalled({
-      config: installedConfig(pluginId, {
-        source: "npm",
-        spec: packageName,
-        installPath,
-        version: scenario.initialVersion,
-        resolvedName: packageName,
-        resolvedSpec: `${packageName}@${scenario.initialVersion}`,
-        resolvedVersion: scenario.initialVersion,
-        integrity: "sha512-plugin-test",
-      }),
-      logger: { info: () => {}, warn: (message) => warnings.push(message) },
-    });
-    expect(result.outcomes, JSON.stringify(result.outcomes)).toMatchObject([
-      {
-        pluginId,
-        status: scenario.initialVersion === scenario.selectedVersion ? "unchanged" : "updated",
-        currentVersion: scenario.initialVersion,
-        nextVersion: scenario.selectedVersion,
-      },
-    ]);
-    const record = result.config.plugins?.installs?.[pluginId];
-    expectInstalled(record, packageName, scenario.selectedVersion);
-    const commands = metadataCommands();
-    expect(commands.filter((args) => args[2] === "versions")).toHaveLength(1);
-    expect(
-      commands.filter((args) => args[1] === `${packageName}@${scenario.selectedVersion}`),
-    ).toHaveLength(scenario.initialVersion === scenario.selectedVersion ? 0 : 1);
-    expect(
-      runCommandWithTimeoutMock.mock.calls.some(([argv]) => isManagedNpmInstallCommand(argv)),
-    ).toBe(true);
-    expect(warnings.filter((message) => message.startsWith(`Resolved ${packageName} to `))).toEqual(
-      [expect.stringContaining(scenario.warning)],
-    );
-  });
 
   it("checks integrity with prepared fallback npm metadata", async () => {
     const onIntegrityDrift = vi.fn(async () => false);

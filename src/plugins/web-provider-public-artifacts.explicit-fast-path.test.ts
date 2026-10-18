@@ -1,4 +1,4 @@
-// Verifies explicit web-provider artifact fast paths avoid runtime loading.
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const warn = vi.hoisted(() => vi.fn());
@@ -51,13 +51,7 @@ const { loadCandidates, loadArtifact } = vi.hoisted(() => {
   };
   const lowLevelLoaderMock = vi.fn(
     ({ dirName, artifactBasename }: { dirName: string; artifactBasename: string }) => {
-      const module = modules[`${dirName}/${artifactBasename}`];
-      if (module) {
-        return module;
-      }
-      throw new Error(
-        `Unable to resolve bundled plugin public surface ${dirName}/${artifactBasename}`,
-      );
+      return expectDefined(modules[`${dirName}/${artifactBasename}`], "Unexpected fixture module");
     },
   );
   return {
@@ -70,20 +64,10 @@ const { loadCandidates, loadArtifact } = vi.hoisted(() => {
         dirName: string;
         artifactCandidates: readonly string[];
       }) => {
-        for (const artifactBasename of artifactCandidates) {
-          try {
-            return lowLevelLoaderMock({ dirName, artifactBasename });
-          } catch (error) {
-            if (
-              error instanceof Error &&
-              error.message.startsWith("Unable to resolve bundled plugin public surface ")
-            ) {
-              continue;
-            }
-            throw error;
-          }
-        }
-        return null;
+        const artifactBasename = artifactCandidates.find((name) =>
+          Object.hasOwn(modules, `${dirName}/${name}`),
+        );
+        return artifactBasename ? lowLevelLoaderMock({ dirName, artifactBasename }) : null;
       },
     ),
   };
@@ -100,10 +84,10 @@ vi.mock("./public-surface-loader.js", async (importOriginal) => ({
   loadBundledPluginPublicArtifactModuleSync: loadArtifact,
 }));
 
-import { resolveBundledExplicitRuntimeWebFetchProvidersFromPublicArtifacts } from "./web-provider-public-artifacts.explicit.js";
+import { resolveBundledExplicitRuntimeWebFetchProvidersFromPublicArtifacts as resolveRuntimeFetch } from "./web-provider-public-artifacts.explicit.js";
 import {
-  resolveBundledWebFetchProvidersFromPublicArtifacts,
-  resolveBundledWebSearchProvidersFromPublicArtifacts,
+  resolveBundledWebFetchProvidersFromPublicArtifacts as resolveFetch,
+  resolveBundledWebSearchProvidersFromPublicArtifacts as resolveSearch,
 } from "./web-provider-public-artifacts.js";
 
 function expectSingleProvider<T extends { pluginId: string }>(
@@ -113,10 +97,7 @@ function expectSingleProvider<T extends { pluginId: string }>(
 ): T {
   const providers = resolve({ onlyPluginIds: [pluginId] });
   expect(providers).toHaveLength(1);
-  const provider = providers?.[0];
-  if (provider === undefined) {
-    throw new Error("Expected one web provider");
-  }
+  const provider = expectDefined(providers?.[0], "Expected one web provider");
   expect(provider.pluginId).toBe(pluginId);
   expectArtifact(pluginId, artifactBasename);
   return provider;
@@ -137,7 +118,7 @@ describe("web provider public artifacts explicit fast path", () => {
 
   it("skips throwing bundled web provider factories while preserving healthy siblings", () => {
     const provider = expectSingleProvider(
-      resolveBundledWebSearchProvidersFromPublicArtifacts,
+      resolveSearch,
       "mockplugin",
       "web-search-contract-api.js",
     );
@@ -152,7 +133,7 @@ describe("web provider public artifacts explicit fast path", () => {
 
   it("throws when every matching bundled web provider factory fails", () => {
     expect(() =>
-      resolveBundledWebSearchProvidersFromPublicArtifacts({
+      resolveSearch({
         onlyPluginIds: ["fuzzplugin"],
       }),
     ).toThrow("Unable to initialize web providers for plugin fuzzplugin");
@@ -161,24 +142,17 @@ describe("web provider public artifacts explicit fast path", () => {
     expectArtifact("fuzzplugin", "web-search-contract-api.js");
   });
 
-  it("resolves bundled web fetch providers by explicit plugin id without manifest scans", () => {
-    const provider = expectSingleProvider(
-      resolveBundledWebFetchProvidersFromPublicArtifacts,
-      "firecrawl",
-      "web-fetch-contract-api.js",
-    );
-
-    expect(provider.createTool({ config: {} as never })).toBeNull();
-  });
-
-  it("loads executable web fetch runtime artifacts instead of contract-only facades", () => {
-    const provider = expectSingleProvider(
-      resolveBundledExplicitRuntimeWebFetchProvidersFromPublicArtifacts,
-      "firecrawl",
-      "web-fetch-provider.js",
-    );
-
-    expect(provider.createTool({ config: {} as never })).not.toBeNull();
+  it.each([
+    { resolve: resolveFetch, artifact: "web-fetch-contract-api.js", executable: false },
+    { resolve: resolveRuntimeFetch, artifact: "web-fetch-provider.js", executable: true },
+  ])("resolves explicit $artifact without manifest scans", ({ resolve, artifact, executable }) => {
+    const provider = expectSingleProvider(resolve, "firecrawl", artifact);
+    const tool = provider.createTool({ config: {} as never });
+    if (!executable) {
+      expect(tool).toBeNull();
+      return;
+    }
+    expect(tool).not.toBeNull();
     expect(loadArtifact).not.toHaveBeenCalledWith({
       dirName: "firecrawl",
       artifactBasename: "web-fetch-contract-api.js",

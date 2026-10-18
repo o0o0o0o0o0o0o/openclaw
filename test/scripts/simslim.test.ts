@@ -169,11 +169,7 @@ describe.skipIf(process.platform === "win32")("iOS simulator preparation", () =>
     { options: { args: ["booted"] }, enabled: true },
   ])("makes no tool calls without valid opt-in admission: %j", ({ options, enabled }) => {
     const { result, commands } = runFixture("ios-simulator-prepare.sh", options);
-    if (enabled) {
-      expect(result.status).not.toBe(0);
-    } else {
-      expect(result.status).toBe(0);
-    }
+    expect(result.status === 0).toBe(!enabled);
     expect(commands).toEqual([]);
   });
 

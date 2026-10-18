@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
@@ -25,13 +25,18 @@ function runDownload(root: string, lines: string[], env: NodeJS.ProcessEnv = {},
   );
 }
 
-function writeFakeNode(binDir: string, version: string) {
+function writeExecutable(binDir: string, name: string, body: string) {
   mkdirSync(binDir, { recursive: true });
-  const nodePath = join(binDir, "node");
-  writeFileSync(
-    nodePath,
-    `#!/usr/bin/env bash
-if [[ "$1" == "-p" ]]; then
+  const file = join(binDir, name);
+  writeFileSync(file, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
+  return file;
+}
+
+function writeFakeNode(binDir: string, version: string) {
+  return writeExecutable(
+    binDir,
+    "node",
+    `if [[ "$1" == "-p" ]]; then
   echo "${version}"
   exit 0
 fi
@@ -42,17 +47,13 @@ fi
 exit 0
 `,
   );
-  chmodSync(nodePath, 0o755);
-  return nodePath;
 }
 
 function writeFakeCurl(binDir: string) {
-  mkdirSync(binDir, { recursive: true });
-  const curlPath = join(binDir, "curl");
-  writeFileSync(
-    curlPath,
-    `#!/usr/bin/env bash
-set -euo pipefail
+  writeExecutable(
+    binDir,
+    "curl",
+    `set -euo pipefail
 printf '%s\\n' "$*" >> "$OPENCLAW_FAKE_CURL_LOG"
 output=""
 url=""
@@ -86,7 +87,6 @@ else
 fi
 `,
   );
-  chmodSync(curlPath, 0o755);
 }
 
 function runEnsureNode(root: string, requested: string, extraEnv: NodeJS.ProcessEnv = {}) {
@@ -142,12 +142,10 @@ describe("setup-pnpm-store-cache ensure-node", () => {
     const toolcacheBin = join(root, "toolcache", "node", "24.16.0", "x64");
     const toolcacheNode = writeFakeNode(toolcacheBin, "24.16.0");
     const helperBin = join(root, "helpers");
-    mkdirSync(helperBin, { recursive: true });
-    const cygpath = join(helperBin, "cygpath");
-    writeFileSync(
-      cygpath,
-      `#!/usr/bin/env bash
-if [[ "$1" == "-u" ]]; then
+    writeExecutable(
+      helperBin,
+      "cygpath",
+      `if [[ "$1" == "-u" ]]; then
   echo "${toolcacheBin}"
   exit 0
 fi
@@ -158,7 +156,6 @@ fi
 exit 1
 `,
     );
-    chmodSync(cygpath, 0o755);
     const githubPath = join(root, "github-path");
     const result = runShell([
       "set -e",

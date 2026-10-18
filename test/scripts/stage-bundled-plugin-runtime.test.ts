@@ -24,6 +24,14 @@ function write(file: string, content: string) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, content);
 }
+function rejectWindowsSymlinks(reject: (target: string, type: string | undefined) => boolean) {
+  vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+  return vi.spyOn(fs, "symlinkSync").mockImplementation((_target, target, type) => {
+    if (reject(String(target), type)) {
+      throw Object.assign(new Error("no symlink privilege"), { code: "EPERM" });
+    }
+  });
+}
 beforeEach(async () => {
   repoRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "openclaw-stage-runtime-"));
   runtimeRoot = path.join(repoRoot, "dist-runtime");
@@ -38,18 +46,10 @@ afterEach(async () => {
 describe("stageBundledPluginRuntime", () => {
   it("copies files when Windows rejects runtime overlay symlinks", async () => {
     write(path.join(repoRoot, "dist/extensions/acpx/assets/fixture.txt"), "asset-body\n");
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    const symlinkSpy = vi
-      .spyOn(fs, "symlinkSync")
-      .mockImplementation((_target, targetPath, type) => {
-        if (
-          String(targetPath).includes(`${path.sep}dist-runtime${path.sep}`) &&
-          type !== "junction"
-        ) {
-          throw Object.assign(new Error("no symlink privilege"), { code: "EPERM" });
-        }
-        return undefined;
-      });
+    const symlinkSpy = rejectWindowsSymlinks(
+      (target, type) =>
+        target.includes(`${path.sep}dist-runtime${path.sep}`) && type !== "junction",
+    );
 
     stageBundledPluginRuntime({ repoRoot });
     const output = path.join(runtimeRoot, "extensions/acpx/assets/fixture.txt");
@@ -76,11 +76,8 @@ describe("stageBundledPluginRuntime", () => {
 
 function writeRuntimeFixture() {
   const files = {
-    "package.json": JSON.stringify({
-      name: "openclaw",
-      type: "module",
-      exports: { "./plugin-sdk/demo": "./dist/plugin-sdk/demo.js" },
-    }),
+    "package.json":
+      '{"name":"openclaw","type":"module","exports":{"./plugin-sdk/demo":"./dist/plugin-sdk/demo.js"}}',
     "dist/plugin-sdk/demo.js": "export const generation = 'candidate';\n",
     "dist/extensions/demo/index.js": "export const generation = 'candidate';\n",
     "dist/extensions/demo/package.json": '{"name":"demo","type":"module"}\n',
@@ -113,12 +110,7 @@ describe("prepareBundledPluginRuntime", () => {
       const owner = pathToFileURL(
         path.join(sourceRoot, "scripts/lib/source-update-artifact-preflight.mts"),
       ).href;
-      const result = await command.run(
-        resolveTestNodeExecPath(),
-        [
-          "--input-type=module",
-          "--eval",
-          `import assert from "node:assert/strict";
+      const script = `import assert from "node:assert/strict";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import { inspectSourceUpdateArtifacts } from ${JSON.stringify(owner)};
@@ -130,8 +122,10 @@ try {
   assert.equal(admission.sourceRuntimePrepared, true);
 } finally {
   await admission.lock?.release();
-}`,
-        ],
+}`;
+      const result = await command.run(
+        resolveTestNodeExecPath(),
+        ["--input-type=module", "--eval", script],
         { cwd: coldRoot, env: { ...process.env, NODE_OPTIONS: "" } },
       );
       expect(result.status, result.stderr).toBe(0);
@@ -285,10 +279,7 @@ try {
   });
 
   it("keeps supported Windows copy fallbacks unchanged", async () => {
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-    const symbolicLink = vi.spyOn(fs, "symlinkSync").mockImplementation(() => {
-      throw Object.assign(new Error("no symlink privilege"), { code: "EPERM" });
-    });
+    const symbolicLink = rejectWindowsSymlinks(() => true);
     stageBundledPluginRuntime({ repoRoot });
     const copied = prepare(false);
     await copied.cleanup();

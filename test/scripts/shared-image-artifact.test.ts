@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it } from "vitest";
@@ -23,14 +23,9 @@ function imageId(ref: string): string {
 }
 
 // Docker config IDs are fixture data; the production archive digest stays independently checked.
-const imageIdCases = IMAGE_REFS.flatMap((ref) => [ref, `mismatch:${ref}`])
-  .map((ref) => `    '${ref}') printf '%s' '${imageId(ref)}' ;;`)
-  .join("\n");
-
-function writeExecutable(path: string, contents: string): void {
-  writeFileSync(path, contents);
-  chmodSync(path, 0o755);
-}
+const imageIds = Object.fromEntries(
+  IMAGE_REFS.flatMap((ref) => [ref, `mismatch:${ref}`]).map((ref) => [ref, imageId(ref)]),
+);
 
 function runHelper(
   fixture: ReturnType<typeof createFixture>,
@@ -53,10 +48,7 @@ function verifyUploadedArtifact(
   fixture: ReturnType<typeof createFixture>,
   params: {
     artifactDigest?: string;
-    artifactName?: string;
     env?: NodeJS.ProcessEnv;
-    runAttempt?: string;
-    runId?: string;
   } = {},
 ) {
   return spawnSync(
@@ -66,10 +58,10 @@ function verifyUploadedArtifact(
       "verify-upload",
       "Docker E2E image",
       ARTIFACT_ID,
-      params.artifactName ?? ARTIFACT_NAME,
+      ARTIFACT_NAME,
       params.artifactDigest ?? ARTIFACT_DIGEST,
-      params.runId ?? ARTIFACT_RUN_ID,
-      params.runAttempt ?? ARTIFACT_RUN_ATTEMPT,
+      ARTIFACT_RUN_ID,
+      ARTIFACT_RUN_ATTEMPT,
     ],
     {
       encoding: "utf8",
@@ -117,174 +109,78 @@ function createFixture() {
   writeFileSync(ghLog, "");
   writeFileSync(sleepLog, "");
 
-  writeExecutable(
-    join(bin, "docker"),
-    `#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
-
-image_id() {
-  case "$1" in
-${imageIdCases}
-    *) echo "unexpected fixture image ref: $1" >&2; return 2 ;;
-  esac
+  const runner = join(root, "tools.cjs");
+  writeFileSync(
+    runner,
+    `
+const fs = require("node:fs");
+const path = require("node:path");
+const [tool, ...args] = process.argv.slice(2);
+const env = process.env;
+const ids = ${JSON.stringify(imageIds)};
+const emit = (value) => process.stdout.write(value);
+const fail = (message) => { console.error(message); process.exit(2); };
+if (tool !== "zstd") fs.appendFileSync(env["FAKE_" + tool.toUpperCase() + "_LOG"], args.join(" ") + "\\n");
+if (tool === "docker") {
+  const id = (ref) => ids[ref] ?? fail("unexpected fixture image ref: " + ref);
+  if (args[0] !== "image") fail("unexpected docker invocation");
+  if (args[1] === "inspect") {
+    emit(id((env.FAKE_DOCKER_FORCE_ID_MISMATCH === "1" ? "mismatch:" : "") + args[4]) + "\\n");
+  } else if (args[1] === "save") {
+    const refs = args.slice(2);
+    const index = refs.indexOf("--output");
+    if (index < 0) fail("missing image output");
+    const [, output] = refs.splice(index, 2);
+    fs.writeFileSync(output, refs.map((ref) => ref + "\\t" + id(ref) + "\\n").join(""));
+  } else if (args[1] === "load") {
+    fs.readFileSync(0);
+  } else fail("unexpected docker invocation");
+} else if (tool === "zstd") {
+  if (args[0] === "-t") {
+    if (!fs.statSync(args[1]).size) process.exit(1);
+  } else if (args[0] === "-d" && args[1] === "--stdout") {
+    emit(fs.readFileSync(args[2]));
+  } else {
+    fs.copyFileSync(args[args.indexOf("-f") + 1], args[args.indexOf("-o") + 1]);
+  }
+} else if (tool === "gh") {
+  if (args.shift() !== "api") fail("unexpected gh invocation");
+  let method, endpoint;
+  while (args.length) {
+    const arg = args.shift();
+    if (arg === "--method") method = args.shift();
+    else if (endpoint) fail("unexpected gh api argument: " + arg);
+    else endpoint = arg;
+  }
+  if (method !== "GET") fail("unexpected gh api method: " + method);
+  const base = "repos/" + env.GITHUB_REPOSITORY + "/actions/";
+  const kind = endpoint === base + "artifacts/${ARTIFACT_ID}" ? "artifact"
+    : endpoint === base + "runs/${ARTIFACT_RUN_ID}/attempts/${ARTIFACT_RUN_ATTEMPT}" ? "attempt" : null;
+  if (!kind) fail("unexpected gh api path: " + endpoint);
+  const counter = path.join(env.FAKE_GH_STATE, kind);
+  const count = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0) + 1;
+  fs.writeFileSync(counter, count + "\\n");
+  if (count <= Number(env["FAKE_GH_" + kind.toUpperCase() + "_FAILURES"] || 0)) {
+    emit("partial " + kind + " response\\n");
+    console.error(env["FAKE_GH_" + kind.toUpperCase() + "_ERROR"] || "gh: request failed");
+    process.exit(1);
+  }
+  const value = kind === "artifact" ? {
+    id: Number(env.FAKE_ARTIFACT_ID), name: env.FAKE_ARTIFACT_NAME,
+    expired: env.FAKE_ARTIFACT_EXPIRED === "true", digest: "sha256:" + env.FAKE_ARTIFACT_DIGEST,
+    workflow_run: { id: Number(env.FAKE_ARTIFACT_RUN_ID) },
+  } : { id: Number(env.FAKE_ATTEMPT_RUN_ID), run_attempt: Number(env.FAKE_ARTIFACT_RUN_ATTEMPT) };
+  emit((kind === "artifact" && env.FAKE_ARTIFACT_JSON || JSON.stringify(value)) + "\\n");
 }
-
-if [[ "$1" == "image" && "$2" == "inspect" ]]; then
-  ref="\${5:?image ref required}"
-  id="$(image_id "$ref")"
-  if [[ "\${FAKE_DOCKER_FORCE_ID_MISMATCH:-0}" == "1" ]]; then
-    id="$(image_id "mismatch:$ref")"
-  fi
-  printf '%s\\n' "$id"
-  exit 0
-fi
-
-if [[ "$1" == "image" && "$2" == "save" ]]; then
-  shift 2
-  output=""
-  refs=()
-  while [[ "$#" -gt 0 ]]; do
-    case "$1" in
-      --output)
-        output="\${2:?output path required}"
-        shift 2
-        ;;
-      *)
-        refs+=("$1")
-        shift
-        ;;
-    esac
-  done
-  : > "$output"
-  for ref in "\${refs[@]}"; do
-    printf '%s\\t%s\\n' "$ref" "$(image_id "$ref")" >> "$output"
-  done
-  exit 0
-fi
-
-if [[ "$1" == "image" && "$2" == "load" ]]; then
-  cat >/dev/null
-  exit 0
-fi
-
-echo "unexpected docker invocation: $*" >&2
-exit 2
 `,
   );
-
-  writeExecutable(
-    join(bin, "zstd"),
-    `#!/usr/bin/env bash
-set -euo pipefail
-if [[ "$1" == "-t" ]]; then
-  test -s "$2"
-  exit 0
-fi
-if [[ "$1" == "-d" && "$2" == "--stdout" ]]; then
-  cat "$3"
-  exit 0
-fi
-
-source_path=""
-output_path=""
-while [[ "$#" -gt 0 ]]; do
-  case "$1" in
-    -f)
-      source_path="\${2:?source path required}"
-      shift 2
-      ;;
-    -o)
-      output_path="\${2:?output path required}"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-cp "$source_path" "$output_path"
-`,
-  );
-
-  writeExecutable(
-    join(bin, "gh"),
-    `#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
-[[ "$1" == "api" ]] || {
-  echo "unexpected gh invocation: $*" >&2
-  exit 2
-}
-shift
-method=""
-path=""
-while [[ "$#" -gt 0 ]]; do
-  case "$1" in
-    --method)
-      method="\${2:?method required}"
-      shift 2
-      ;;
-    *)
-      [[ -z "$path" ]] || {
-        echo "unexpected gh api argument: $1" >&2
-        exit 2
-      }
-      path="$1"
-      shift
-      ;;
-  esac
-done
-[[ "$method" == "GET" ]] || {
-  echo "unexpected gh api method: $method" >&2
-  exit 2
-}
-
-case "$path" in
-  "repos/\${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}")
-    count_file="$FAKE_GH_STATE/artifact"
-    count="$(( $(cat "$count_file" 2>/dev/null || printf 0) + 1 ))"
-    printf '%s\\n' "$count" > "$count_file"
-    if [[ "$count" -le "\${FAKE_GH_ARTIFACT_FAILURES:-0}" ]]; then
-      printf 'partial artifact response\\n'
-      printf '%s\\n' "\${FAKE_GH_ARTIFACT_ERROR:-gh: request failed}" >&2
-      exit 1
-    fi
-    if [[ -n "\${FAKE_ARTIFACT_JSON:-}" ]]; then
-      printf '%s\\n' "$FAKE_ARTIFACT_JSON"
-      exit 0
-    fi
-    printf '{"id":%s,"name":"%s","expired":%s,"digest":"sha256:%s","workflow_run":{"id":%s}}\\n' \
-      "$FAKE_ARTIFACT_ID" "$FAKE_ARTIFACT_NAME" "$FAKE_ARTIFACT_EXPIRED" \
-      "$FAKE_ARTIFACT_DIGEST" "$FAKE_ARTIFACT_RUN_ID"
-    ;;
-  "repos/\${GITHUB_REPOSITORY}/actions/runs/${ARTIFACT_RUN_ID}/attempts/${ARTIFACT_RUN_ATTEMPT}")
-    count_file="$FAKE_GH_STATE/attempt"
-    count="$(( $(cat "$count_file" 2>/dev/null || printf 0) + 1 ))"
-    printf '%s\\n' "$count" > "$count_file"
-    if [[ "$count" -le "\${FAKE_GH_ATTEMPT_FAILURES:-0}" ]]; then
-      printf 'partial attempt response\\n'
-      printf '%s\\n' "\${FAKE_GH_ATTEMPT_ERROR:-gh: request failed}" >&2
-      exit 1
-    fi
-    printf '{"id":%s,"run_attempt":%s}\\n' \
-      "$FAKE_ATTEMPT_RUN_ID" "$FAKE_ARTIFACT_RUN_ATTEMPT"
-    ;;
-  *)
-    echo "unexpected gh api path: $path" >&2
-    exit 2
-    ;;
-esac
-`,
-  );
-
-  writeExecutable(
-    join(bin, "sleep"),
-    `#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\\n' "$*" >> "$FAKE_SLEEP_LOG"
-`,
-  );
+  for (const tool of ["docker", "zstd", "gh", "sleep"]) {
+    writeFileSync(
+      join(bin, tool),
+      `#!/bin/sh\nexec '${process.execPath}' '${runner}' '${tool}' "$@"\n`,
+      { mode: 0o755 },
+    );
+  }
 
   const env = {
     ...process.env,

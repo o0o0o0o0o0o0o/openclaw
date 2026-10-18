@@ -114,7 +114,6 @@ fi`,
   const log = (path: string) => (fs.existsSync(path) ? fs.readFileSync(path, "utf8").trim() : "");
   function runAction() {
     prepareHelper();
-    const additions: string[] = [];
     const jobEnv: Record<string, string> = { ...env };
     const runs = new Set<string>();
     const githubPath = join(root, "github-path");
@@ -133,23 +132,15 @@ fi`,
       }
       fs.writeFileSync(githubPath, "");
       fs.writeFileSync(githubEnv, "");
+      const body = entry.name === "Setup Bun" ? `${entry.run}\n${probe}` : entry.run;
       const result = spawnSync(
         "/bin/bash",
-        [
-          "--noprofile",
-          "--norc",
-          "-e",
-          "-o",
-          "pipefail",
-          "-c",
-          entry.name === "Setup Bun" ? `${entry.run}\n${probe}` : entry.run,
-        ],
+        ["--noprofile", "--norc", "-eo", "pipefail", "-c", body],
         {
           cwd: root,
           encoding: "utf8",
           env: {
             ...jobEnv,
-            PATH: [...additions.toReversed(), env.PATH].join(":"),
             GITHUB_PATH: githubPath,
             GITHUB_ENV: githubEnv,
           },
@@ -159,13 +150,13 @@ fi`,
       if (result.status !== 0 || entry.name === "next") {
         return { result, runs };
       }
-      for (const line of fs.readFileSync(githubPath, "utf8").split("\n").filter(Boolean)) {
-        const old = additions.indexOf(line);
-        if (old !== -1) {
-          additions.splice(old, 1);
-        }
-        additions.push(line);
-      }
+      const added = fs
+        .readFileSync(githubPath, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .toReversed();
+      jobEnv.PATH = [...new Set([...added, ...jobEnv.PATH.split(":")])].join(":");
       for (const line of fs.readFileSync(githubEnv, "utf8").split("\n").filter(Boolean)) {
         const equals = line.indexOf("=");
         jobEnv[line.slice(0, equals)] = line.slice(equals + 1);

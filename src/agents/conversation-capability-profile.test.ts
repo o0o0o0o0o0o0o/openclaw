@@ -23,6 +23,20 @@ import { resolveWebSearchToolPolicy } from "./web-search-tool-policy.js";
 
 const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-capability-profile-");
 
+function project(
+  capabilityProfile: ReturnType<typeof resolveConversationCapabilityProfile>,
+  toolNames: string[],
+) {
+  return projectConversationToolNames({ capabilityProfile, toolNames, warn: () => undefined });
+}
+
+function groupConfig(
+  toolsBySender: Record<string, { allow?: string[]; deny?: string[] }>,
+  allow = ["read"],
+): OpenClawConfig {
+  return { channels: { whatsapp: { groups: { team: { tools: { allow }, toolsBySender } } } } };
+}
+
 describe("resolveConversationCapabilityProfile", () => {
   it.each(["fixture-reader", "group:plugins"])(
     "uses registered ownership for %s without granting name-only callers",
@@ -84,13 +98,7 @@ describe("resolveConversationCapabilityProfile", () => {
       } as never,
     });
 
-    expect(
-      projectConversationToolNames({
-        capabilityProfile: profile,
-        toolNames: ["coding_only", "messaging_only", "shared"],
-        warn: () => undefined,
-      }),
-    ).toEqual(["shared"]);
+    expect(project(profile, ["coding_only", "messaging_only", "shared"])).toEqual(["shared"]);
   });
 
   it("intersects a prepared direct policy with existing tool policy", () => {
@@ -104,45 +112,25 @@ describe("resolveConversationCapabilityProfile", () => {
       deny: ["exec"],
     });
     expect(profile.policy.inheritancePolicies).toContain(profile.policy.groupPolicy);
-    expect(
-      projectConversationToolNames({
-        capabilityProfile: profile,
-        toolNames: ["read", "write", "exec", "process"],
-        warn: () => undefined,
-      }),
-    ).toEqual(["read"]);
+    expect(project(profile, ["read", "write", "exec", "process"])).toEqual(["read"]);
   });
 
   it("does not add a requester restriction without a conversation policy", () => {
     const profile = resolveConversationCapabilityProfile({});
 
     expect(profile.policy.groupPolicy).toBeUndefined();
-    expect(
-      projectConversationToolNames({
-        capabilityProfile: profile,
-        toolNames: ["read", "write", "exec"],
-        warn: () => undefined,
-      }),
-    ).toEqual(["read", "write", "exec"]);
+    expect(project(profile, ["read", "write", "exec"])).toEqual(["read", "write", "exec"]);
   });
 
   it.each([
-    {
-      name: "exempts owner WebChat identified through the message channel",
-      params: { messageChannel: INTERNAL_MESSAGE_CHANNEL, senderIsOwner: true },
-      restricted: false,
-    },
-    {
-      name: "keeps wildcard sender tool restrictions for non-owner WebChat",
-      params: { messageProvider: INTERNAL_MESSAGE_CHANNEL, senderIsOwner: false },
-      restricted: true,
-    },
-    {
-      name: "keeps wildcard sender tool restrictions for owners on external channels",
-      params: { messageProvider: "discord", senderIsOwner: true },
-      restricted: true,
-    },
-  ])("$name", ({ params, restricted }) => {
+    ["owner WebChat", { messageChannel: INTERNAL_MESSAGE_CHANNEL, senderIsOwner: true }, false],
+    [
+      "non-owner WebChat",
+      { messageProvider: INTERNAL_MESSAGE_CHANNEL, senderIsOwner: false },
+      true,
+    ],
+    ["external owner", { messageProvider: "discord", senderIsOwner: true }, true],
+  ] as const)("applies sender restrictions for %s", (_name, params, restricted) => {
     const deny = ["exec", "process"];
     const profile = resolveConversationCapabilityProfile({
       config: { tools: { toolsBySender: { "*": { deny } } } },
@@ -156,23 +144,8 @@ describe("resolveConversationCapabilityProfile", () => {
   });
 
   it("prepares a shared conversation profile with group per-sender restrictions", () => {
-    const cfg: OpenClawConfig = {
-      channels: {
-        whatsapp: {
-          groups: {
-            team: {
-              tools: { allow: ["read"] },
-              toolsBySender: {
-                "id:alice": { allow: ["read", "exec"] },
-              },
-            },
-          },
-        },
-      },
-    };
-
     const profile = resolveConversationCapabilityProfile({
-      config: cfg,
+      config: groupConfig({ "id:alice": { allow: ["read", "exec"] } }),
       sessionKey: "agent:main:whatsapp:group:team",
       agentId: "main",
       messageProvider: "whatsapp",
@@ -190,19 +163,10 @@ describe("resolveConversationCapabilityProfile", () => {
 
   it("uses a scheduled owner group without reapplying sender wildcard policy", () => {
     const cfg: OpenClawConfig = {
+      ...groupConfig({ "*": { deny: ["write"] } }, ["read", "write"]),
       tools: {
         deny: ["exec"],
         toolsBySender: { "*": { deny: ["write"] } },
-      },
-      channels: {
-        whatsapp: {
-          groups: {
-            team: {
-              tools: { allow: ["read", "write"] },
-              toolsBySender: { "*": { deny: ["write"] } },
-            },
-          },
-        },
       },
     };
     const baseParams = {
@@ -333,9 +297,11 @@ describe("resolveConversationCapabilityProfile", () => {
     });
 
     expect(profile.policy.trustedGroup).toEqual({ groupId: null, dropped: true });
-    expect(profile.conversation.groupId).toBeNull();
-    expect(profile.conversation.groupChannel).toBeNull();
-    expect(profile.conversation.groupSpace).toBeNull();
+    expect(profile.conversation).toMatchObject({
+      groupId: null,
+      groupChannel: null,
+      groupSpace: null,
+    });
   });
 });
 
@@ -356,23 +322,13 @@ describe("resolveConversationCapabilityProfile scheduled account authority", () 
     );
   });
 
-  it.each<{
-    name: string;
-    origin: CronScheduledToolCallerOrigin["kind"];
-    configured: boolean;
-    delivery: string;
-  }>([
-    { name: "configured creator", origin: "external", configured: true, delivery: "telegram" },
-    { name: "unknown creator origin", origin: "unknown", configured: true, delivery: "whatsapp" },
-    {
-      name: "removed local resource account",
-      origin: "local",
-      configured: false,
-      delivery: "whatsapp",
-    },
-  ])(
-    "preserves scheduled creator authority for $name across tool consumers",
-    async ({ origin, configured, delivery }) => {
+  it.each([
+    ["external", true, "telegram"],
+    ["unknown", true, "whatsapp"],
+    ["local", false, "whatsapp"],
+  ] satisfies Array<[CronScheduledToolCallerOrigin["kind"], boolean, string]>)(
+    "preserves scheduled %s creator authority (configured=%s, delivery=%s)",
+    async (origin, configured, delivery) => {
       const config: OpenClawConfig = {
         channels: { whatsapp: { accounts: configured ? { work: {} } : {} } },
       };
@@ -394,14 +350,13 @@ describe("resolveConversationCapabilityProfile scheduled account authority", () 
         } satisfies ScheduledToolPolicyContext,
       };
       const conversationTools = () =>
-        projectConversationToolNames({
-          capabilityProfile: resolveConversationCapabilityProfile({
+        project(
+          resolveConversationCapabilityProfile({
             ...params,
             config: { ...params.config, tools: { allow: ["read"] } },
           }),
-          toolNames: ["read", "write"],
-          warn: () => undefined,
-        });
+          ["read", "write"],
+        );
       const webSearch = () =>
         resolveWebSearchToolPolicy({ ...params, runtimeToolAllowlist: ["web_search"] });
       const harnessTools = () =>

@@ -1,4 +1,3 @@
-// Covers sanitized provider-error observation fields for embedded-agent runs.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as loggingConfigModule from "../logging/config.js";
 import { sanitizeForConsole } from "./console-sanitize.js";
@@ -7,29 +6,33 @@ import {
   buildTextObservationFields,
 } from "./embedded-agent-error-observation.js";
 
-const OBSERVATION_BEARER_TOKEN = "sk-redact-test-token";
-const OBSERVATION_COOKIE_VALUE = "session-cookie-token";
-
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function expectRequestRedacted(raw: string, requestId: string, preview: string) {
+  const observed = buildApiErrorObservationFields(raw);
+  expect(observed.rawErrorPreview).toContain(preview);
+  expect(observed.rawErrorPreview).not.toContain(requestId);
+  expect(observed.rawErrorFingerprint?.startsWith("sha256:")).toBe(true);
+  expect(observed.requestIdHash?.startsWith("sha256:")).toBe(true);
+  return observed;
+}
+
 describe("buildApiErrorObservationFields", () => {
   it("redacts request ids and exposes stable hashes instead of raw payloads", () => {
-    // Raw request ids are sensitive trace handles; diagnostics use hashes so
-    // equivalent failures can still be correlated safely.
-    const observed = buildApiErrorObservationFields(
+    const observed = expectRequestRedacted(
       '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_overload"}',
+      "req_overload",
+      '"request_id":"sha256:',
     );
 
-    expect(observed.rawErrorPreview).toContain('"request_id":"sha256:');
     expect(observed.rawErrorHash?.startsWith("sha256:")).toBe(true);
-    expect(observed.rawErrorFingerprint?.startsWith("sha256:")).toBe(true);
-    expect(observed.providerRuntimeFailureKind).toBe("timeout");
-    expect(observed.providerErrorType).toBe("overloaded_error");
-    expect(observed.providerErrorMessagePreview).toBe("Overloaded");
-    expect(observed.requestIdHash?.startsWith("sha256:")).toBe(true);
-    expect(observed.rawErrorPreview).not.toContain("req_overload");
+    expect(observed).toMatchObject({
+      providerRuntimeFailureKind: "timeout",
+      providerErrorType: "overloaded_error",
+      providerErrorMessagePreview: "Overloaded",
+    });
   });
 
   it("forces token redaction for observation previews", () => {
@@ -53,25 +56,21 @@ describe("buildApiErrorObservationFields", () => {
 
   it("masks a bare pass: credential in the provider message preview", () => {
     const observed = buildApiErrorObservationFields(
-      JSON.stringify({
-        error: { type: "invalid_request", message: "pass: opaque-pass-secret-1234567890 rejected" },
-      }),
+      '{"error":{"type":"invalid_request","message":"pass: opaque-pass-secret-1234567890 rejected"}}',
     );
     expect(observed.providerErrorMessagePreview).toBe("pass: opaque…7890 rejected");
   });
 
   it("redacts provider error types as well as message previews", () => {
     const observed = buildApiErrorObservationFields(
-      JSON.stringify({
-        error: { type: `x-api-key: ${OBSERVATION_BEARER_TOKEN}`, message: "Request failed" },
-      }),
+      '{"error":{"type":"x-api-key: sk-redact-test-token","message":"Request failed"}}',
     );
     expect(observed.providerErrorType).toBe("x-api-key: ***");
   });
 
   it("does not let cookie redaction consume unrelated fields on the same line", () => {
     const observed = buildApiErrorObservationFields(
-      `Cookie: session=${OBSERVATION_COOKIE_VALUE} status=503 request_id=req_cookie`,
+      "Cookie: session=session-cookie-token status=503 request_id=req_cookie",
     );
 
     expect(observed.rawErrorPreview).toContain("Cookie: session=");
@@ -95,14 +94,11 @@ describe("buildApiErrorObservationFields", () => {
   });
 
   it("redacts request ids in formatted plain-text errors", () => {
-    const observed = buildApiErrorObservationFields(
+    expectRequestRedacted(
       "LLM error overloaded_error: Overloaded (request_id: req_plaintext_123)",
+      "req_plaintext_123",
+      "request_id: sha256:",
     );
-
-    expect(observed.rawErrorPreview).toContain("request_id: sha256:");
-    expect(observed.rawErrorFingerprint?.startsWith("sha256:")).toBe(true);
-    expect(observed.requestIdHash?.startsWith("sha256:")).toBe(true);
-    expect(observed.rawErrorPreview).not.toContain("req_plaintext_123");
   });
 
   it("keeps fingerprints stable across request ids for equivalent errors", () => {
@@ -133,12 +129,8 @@ describe("buildApiErrorObservationFields", () => {
   });
 
   it("caps oversized raw inputs before hashing and fingerprinting", () => {
-    // Hashing a bounded prefix keeps diagnostic work predictable for huge
-    // provider payloads.
-    const oversized = `${"X".repeat(63_999)}🚀tail`;
     const bounded = "X".repeat(63_999);
-
-    const observed = buildApiErrorObservationFields(oversized);
+    const observed = buildApiErrorObservationFields(`${bounded}🚀tail`);
     const boundedObserved = buildApiErrorObservationFields(bounded);
     expect(observed.rawErrorHash).toBe(boundedObserved.rawErrorHash);
     expect(observed.rawErrorFingerprint).toBe(boundedObserved.rawErrorFingerprint);
@@ -181,8 +173,6 @@ describe("buildApiErrorObservationFields", () => {
   });
 
   it("fails closed when observation sanitization throws", () => {
-    // Observation helpers run on error paths; sanitization failures should drop
-    // metadata rather than leak raw provider text.
     vi.spyOn(loggingConfigModule, "readLoggingConfig").mockImplementation(() => {
       throw new Error("boom");
     });

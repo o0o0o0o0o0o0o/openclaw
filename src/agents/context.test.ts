@@ -24,26 +24,18 @@ function modelConfig(
   id: string,
   limits: Partial<Pick<ModelDefinitionConfig, "contextWindow" | "contextTokens">>,
 ): OpenClawConfig {
+  const model: ModelDefinitionConfig = {
+    id,
+    name: id,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200_000,
+    maxTokens: 4096,
+    ...limits,
+  };
   return {
-    models: {
-      providers: {
-        [provider]: {
-          baseUrl: "https://example.invalid",
-          models: [
-            {
-              id,
-              name: id,
-              reasoning: false,
-              input: ["text"],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 200_000,
-              maxTokens: 4096,
-              ...limits,
-            },
-          ],
-        },
-      },
-    },
+    models: { providers: { [provider]: { baseUrl: "https://example.invalid", models: [model] } } },
   };
 }
 
@@ -91,24 +83,21 @@ describe("context cache projection", () => {
 });
 
 describe("context token resolution", () => {
-  it.each(["configuredTokenCache"] as const)(
-    "keeps captured reporting independent of a stale %s without changing execution lookup",
-    (cacheName) => {
-      const caches = getContextWindowCaches();
-      const key = providerContextTokenCacheKey("custom", "large");
-      caches[cacheName].set(key, 128_000);
-      const selected = {
-        cfg: {},
-        provider: "custom",
-        model: "large",
-        modelContextTokens: 922_000,
-        modelContextWindow: 1_050_000,
-      };
-      expect(resolve(selected)).toBe(128_000);
-      expect(resolve({ ...selected, allowCacheLookup: false })).toBe(922_000);
-      expect(caches[cacheName].get(key)).toBe(128_000);
-    },
-  );
+  it("keeps captured reporting independent of stale configured cache without changing execution lookup", () => {
+    const caches = getContextWindowCaches();
+    const key = providerContextTokenCacheKey("custom", "large");
+    caches.configuredTokenCache.set(key, 128_000);
+    const selected = {
+      cfg: {},
+      provider: "custom",
+      model: "large",
+      modelContextTokens: 922_000,
+      modelContextWindow: 1_050_000,
+    };
+    expect(resolve(selected)).toBe(128_000);
+    expect(resolve({ ...selected, allowCacheLookup: false })).toBe(922_000);
+    expect(caches.configuredTokenCache.get(key)).toBe(128_000);
+  });
 
   it("does not replace unknown captured capacity with a sibling's bare cache", async () => {
     await discover([{ provider: "other", id: "shared-model", contextTokens: 128_000 }]);

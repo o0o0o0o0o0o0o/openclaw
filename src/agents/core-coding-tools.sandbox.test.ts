@@ -60,6 +60,32 @@ function createSandboxCodingTools(
   });
 }
 
+function mountSandbox(workspaceDir: string, binds: string[] = [], tmpfs?: string[]) {
+  const sandbox = createSandbox({
+    workspaceDir,
+    agentWorkspaceDir: workspaceDir,
+    workspaceAccess: "rw",
+    docker: { ...createSandbox().docker, binds, ...(tmpfs ? { tmpfs } : {}) },
+  });
+  const bridge = createSandboxFsBridge({ sandbox });
+  sandbox.fsBridge = bridge;
+  return { sandbox, bridge };
+}
+
+const expectFile = async (root: string, file: string, text: string) => {
+  expect(await fs.readFile(path.join(root, file), "utf8")).toBe(text);
+};
+const updatePatch = (file: string, before: string, after: string, moveTo?: string) =>
+  [
+    "*** Begin Patch",
+    `*** Update File: ${file}`,
+    ...(moveTo ? [`*** Move to: ${moveTo}`] : []),
+    "@@",
+    `-${before}`,
+    `+${after}`,
+    "*** End Patch",
+  ].join("\n");
+
 describe("workspace-only coding tools with effective sandbox mounts", () => {
   installFsBridgeTestHarness();
 
@@ -70,13 +96,7 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
         await fs.mkdir(path.join(workspaceDir, "a"));
         await fs.writeFile(path.join(workspaceDir, "a\\b"), "LITERAL_ORIGINAL\n");
         await fs.writeFile(path.join(workspaceDir, "a/b"), "SLASH_DECOY\n");
-        const sandbox = createSandbox({
-          workspaceDir,
-          agentWorkspaceDir: workspaceDir,
-          workspaceAccess: "rw",
-        });
-        const bridge = createSandboxFsBridge({ sandbox });
-        sandbox.fsBridge = bridge;
+        const { sandbox, bridge } = mountSandbox(workspaceDir);
         installLocalTransport(bridge);
         const tools = createSandboxCodingTools(sandbox, {
           shellTools: "full",
@@ -101,13 +121,10 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
           edits: [{ oldText: "LITERAL_WRITTEN", newText: "LITERAL_EDITED" }],
         });
         await tool("apply_patch").execute("patch-literal", {
-          input:
-            "*** Begin Patch\n*** Update File: a\\b\n@@\n-LITERAL_EDITED\n+LITERAL_PATCHED\n*** End Patch",
+          input: updatePatch("a\\b", "LITERAL_EDITED", "LITERAL_PATCHED"),
         });
-        expect(await fs.readFile(path.join(workspaceDir, "a\\b"), "utf8")).toBe(
-          "LITERAL_PATCHED\n",
-        );
-        expect(await fs.readFile(path.join(workspaceDir, "a/b"), "utf8")).toBe("SLASH_DECOY\n");
+        await expectFile(workspaceDir, "a\\b", "LITERAL_PATCHED\n");
+        await expectFile(workspaceDir, "a/b", "SLASH_DECOY\n");
         expect(await resolveSandboxFileIdentity({ bridge, filePath: "a\\b" })).not.toBe(
           await resolveSandboxFileIdentity({ bridge, filePath: "a/b" }),
         );
@@ -130,17 +147,10 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
         await fs.symlink("cache/hop", path.join(workspaceDir, "alias"));
         await fs.symlink("/data/hop", path.join(workspaceDir, "absolute-alias"));
         await fs.writeFile(path.join(replacement, "hop"), visibleContent);
-        const sandbox = createSandbox({
-          workspaceDir,
-          agentWorkspaceDir: workspaceDir,
-          workspaceAccess: "rw",
-          docker: {
-            ...createSandbox().docker,
-            binds: [`${replacement}:/workspace/cache:rw`, `${replacement}:/data:rw`],
-          },
-        });
-        const bridge = createSandboxFsBridge({ sandbox });
-        sandbox.fsBridge = bridge;
+        const { sandbox, bridge } = mountSandbox(workspaceDir, [
+          `${replacement}:/workspace/cache:rw`,
+          `${replacement}:/data:rw`,
+        ]);
         mockContainerCanonicalPaths({
           "/workspace/alias": "/workspace/cache/hop",
           "/workspace/absolute-alias": "/data/hop",
@@ -169,10 +179,8 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
             ).rejects.toThrow("Path escapes sandbox root");
           }
         }
-        expect(await fs.readFile(path.join(workspaceDir, "visible.txt"), "utf8")).toBe(
-          hiddenContent,
-        );
-        expect(await fs.readFile(path.join(replacement, "hop"), "utf8")).toBe(visibleContent);
+        await expectFile(workspaceDir, "visible.txt", hiddenContent);
+        await expectFile(replacement, "hop", visibleContent);
       });
     },
   );
@@ -209,22 +217,15 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
           path.join(replacement, "escape"),
           process.platform === "win32" ? "junction" : "dir",
         );
-        const sandbox = createSandbox({
+        const { sandbox, bridge } = mountSandbox(
           workspaceDir,
-          agentWorkspaceDir: workspaceDir,
-          workspaceAccess: "rw",
-          docker: {
-            ...createSandbox().docker,
-            binds: [
-              `${replacement}:/workspace:rw`,
-              `${data}:/data:rw`,
-              ...(process.platform === "win32" ? [] : [`${data}:${workspaceDir}:rw`]),
-            ],
-            tmpfs: ["/workspace/cache"],
-          },
-        });
-        const bridge = createSandboxFsBridge({ sandbox });
-        sandbox.fsBridge = bridge;
+          [
+            `${replacement}:/workspace:rw`,
+            `${data}:/data:rw`,
+            ...(process.platform === "win32" ? [] : [`${data}:${workspaceDir}:rw`]),
+          ],
+          ["/workspace/cache"],
+        );
         const { write, list } = installLocalTransport(bridge);
         const tools = createSandboxCodingTools(sandbox, { workspaceOnly });
         const tool = (name: string) => {
@@ -249,7 +250,7 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
             path: filePath,
             edits: [{ oldText: "changed", newText: "edited" }],
           });
-          expect(await fs.readFile(path.join(replacement, "sub/marker"), "utf8")).toBe("edited");
+          await expectFile(replacement, "sub/marker", "edited");
         }
         expect(write).toHaveBeenCalledTimes(4);
         for (const [request] of write.mock.calls) {
@@ -261,7 +262,7 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
           path: "@literal",
           edits: [{ oldText: "new-at", newText: "edited-at" }],
         });
-        expect(await fs.readFile(path.join(replacement, "@literal"), "utf8")).toBe("edited-at");
+        await expectFile(replacement, "@literal", "edited-at");
         expect(write).toHaveBeenLastCalledWith(
           expect.objectContaining({ filePath: "/workspace/@literal" }),
         );
@@ -278,10 +279,8 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
           path: "@@literal",
           edits: [{ oldText: "original", newText: "edited" }],
         });
-        expect(await fs.readFile(path.join(replacement, "@literal"), "utf8")).toBe(
-          "reference edited",
-        );
-        expect(await fs.readFile(path.join(replacement, "literal"), "utf8")).toBe("DECOY");
+        await expectFile(replacement, "@literal", "reference edited");
+        await expectFile(replacement, "literal", "DECOY");
         const mentionedDirectory = getTextContent(
           await tool("ls").execute("list-reference-literal", { path: "@@directory" }),
         );
@@ -340,8 +339,8 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
         ).rejects.toThrow();
         expect(write).toHaveBeenCalledTimes(8);
         expect(list).toHaveBeenCalledTimes(6);
-        expect(await fs.readFile(path.join(outside, "marker"), "utf8")).toBe("HIDDEN");
-        expect(await fs.readFile(path.join(data, "marker"), "utf8")).toBe("EXTRA");
+        await expectFile(outside, "marker", "HIDDEN");
+        await expectFile(data, "marker", "EXTRA");
       });
     },
   );
@@ -366,23 +365,13 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
         path.join(workspaceDir, "sub"),
         process.platform === "win32" ? "junction" : "dir",
       );
-      const sandbox = createSandbox({
-        workspaceDir,
-        agentWorkspaceDir: workspaceDir,
-        workspaceAccess: "rw",
-        docker: {
-          ...createSandbox().docker,
-          binds: [
-            `${replacement}:/workspace:rw`,
-            `${nested}:/data:ro`,
-            `${nested}:/workspace/nested:rw`,
-            `${nested}:/workspace/alias:rw`,
-            `${outside}:/extra:rw`,
-          ],
-        },
-      });
-      const bridge = createSandboxFsBridge({ sandbox });
-      sandbox.fsBridge = bridge;
+      const { sandbox, bridge } = mountSandbox(workspaceDir, [
+        `${replacement}:/workspace:rw`,
+        `${nested}:/data:ro`,
+        `${nested}:/workspace/nested:rw`,
+        `${nested}:/workspace/alias:rw`,
+        `${outside}:/extra:rw`,
+      ]);
       const { write, create, remove } = installLocalTransport(bridge);
       const patchTool = (workspaceOnly: boolean) => {
         const tool = createSandboxCodingTools(sandbox, {
@@ -404,14 +393,7 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
         ["nested/marker", "NESTED", "changed"],
       ] as const) {
         await patch.execute("patch-visible", {
-          input: [
-            "*** Begin Patch",
-            `*** Update File: ${filePath}`,
-            "@@",
-            `-${before}`,
-            `+${after}`,
-            "*** End Patch",
-          ].join("\n"),
+          input: updatePatch(filePath, before, after),
         });
         expect(await bridge.readFile({ filePath })).toEqual(Buffer.from(`${after}\n`));
       }
@@ -421,31 +403,16 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
         "/workspace/nested/marker",
       ]);
       await patch.execute("patch-reference-literal", {
-        input: [
-          "*** Begin Patch",
-          "*** Update File: @@patch",
-          "@@",
-          "-LITERAL",
-          "+referenced",
-          "*** End Patch",
-        ].join("\n"),
+        input: updatePatch("@@patch", "LITERAL", "referenced"),
       });
-      expect(await fs.readFile(path.join(replacement, "@patch"), "utf8")).toBe("referenced\n");
-      expect(await fs.readFile(path.join(replacement, "patch"), "utf8")).toBe("DECOY\n");
+      await expectFile(replacement, "@patch", "referenced\n");
+      await expectFile(replacement, "patch", "DECOY\n");
       const move = (to: string, before: string, after: string) =>
-        [
-          "*** Begin Patch",
-          "*** Update File: nested/marker",
-          `*** Move to: ${to}`,
-          "@@",
-          `-${before}`,
-          `+${after}`,
-          "*** End Patch",
-        ].join("\n");
+        updatePatch("nested/marker", before, after, to);
       await patch.execute("patch-same-file-move", {
         input: move("alias/marker", "changed", "moved"),
       });
-      expect(await fs.readFile(path.join(nested, "marker"), "utf8")).toBe("moved\n");
+      await expectFile(nested, "marker", "moved\n");
       expect(
         getTextContent(
           await patch.execute("patch-same-file-noop", {
@@ -459,8 +426,8 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
           input: move("alias/occupied", "moved", "lost"),
         }),
       ).rejects.toThrow("already exists");
-      expect(await fs.readFile(path.join(nested, "marker"), "utf8")).toBe("moved\n");
-      expect(await fs.readFile(path.join(nested, "occupied"), "utf8")).toBe("KEEP\n");
+      await expectFile(nested, "marker", "moved\n");
+      await expectFile(nested, "occupied", "KEEP\n");
       const add = (filePath: string) =>
         ["*** Begin Patch", `*** Add File: ${filePath}`, "+new", "*** End Patch"].join("\n");
       await patch.execute("patch-add", { input: add("sub/new") });
@@ -494,7 +461,7 @@ describe("workspace-only coding tools with effective sandbox mounts", () => {
       });
       expect(await observer.classifies("/workspace/memory/2026-09-14.md")).toBe(true);
       expect(await observer.classifies("/data/memory/2026-09-14.md")).toBe(false);
-      expect(await fs.readFile(path.join(outside, "marker"), "utf8")).toBe("HIDDEN\n");
+      await expectFile(outside, "marker", "HIDDEN\n");
     });
   });
 });

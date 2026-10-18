@@ -68,6 +68,46 @@ function resolve(cfg = config(), patch: Partial<ReturnType<typeof entry>> = {}) 
   });
 }
 
+function select(overrides: Partial<Parameters<typeof selectDelegatedToolPolicy>[0]> = {}) {
+  return selectDelegatedToolPolicy({
+    config: config(),
+    requesterAgentId: "front",
+    requesterSessionKey: requester,
+    targetAgentId: "worker",
+    ...overrides,
+  });
+}
+
+function completionPolicy(
+  cfg: OpenClawConfig,
+  source: string,
+  target: string,
+  sessionId: string,
+  store: Parameters<typeof resolveRequesterToolPolicies>[0]["preparedSessionCapabilityStore"],
+) {
+  return resolveRequesterToolPolicies({
+    config: cfg,
+    sessionKey: target,
+    sessionId,
+    modelProvider: "test",
+    modelId: "model",
+    preparedSessionCapabilityStore: store,
+    inputProvenance: {
+      kind: "inter_session",
+      sourceSessionKey: source,
+      sourceTool: "subagent_announce",
+    },
+    trustedInternalHandoff: {
+      kind: "subagent-completion",
+      sourceSessionKey: source,
+      targetSessionKey: target,
+      targetSessionId: sessionId,
+      provider: "test",
+      model: "model",
+    },
+  });
+}
+
 describe("deny-only native tool delegation", () => {
   afterEach(() => clearRuntimeConfigSnapshot());
   it("prepares a floor without changing the requester's callable tools", () => {
@@ -80,15 +120,7 @@ describe("deny-only native tool delegation", () => {
         warn: () => {},
       }),
     ).toEqual(["read"]);
-    expect(
-      selectDelegatedToolPolicy({
-        config: config(),
-        requesterAgentId: "front",
-        requesterSessionKey: requester,
-        targetAgentId: "worker",
-        floor: { policyAgentId: "front", deny: [] },
-      }),
-    ).toEqual({
+    expect(select({ floor: { policyAgentId: "front", deny: [] } })).toEqual({
       requesterSessionKey: requester,
       targetAgentId: "worker",
       deny: [],
@@ -102,11 +134,10 @@ describe("deny-only native tool delegation", () => {
       subagents: { allowAgents: ["worker"], delegateToolsTo: ["worker"] },
     };
     expect(() =>
-      selectDelegatedToolPolicy({
+      select({
         config: cfg,
         requesterAgentId: "runner",
         requesterSessionKey: "agent:runner:main",
-        targetAgentId: "worker",
         floor: prepareDelegatedToolDenyFloor(profile(cfg, { runSessionKey: "agent:runner:main" })),
       }),
     ).toThrow("policy owner differs");
@@ -194,10 +225,8 @@ describe("deny-only native tool delegation", () => {
         delete cfg.agents!.entries!.worker;
       }
       expect(
-        selectDelegatedToolPolicy({
+        select({
           config: cfg,
-          requesterAgentId: "front",
-          requesterSessionKey: requester,
           targetAgentId: kind === "same agent" ? "front" : "worker",
           floor: { policyAgentId: "front", deny: [] },
         }),
@@ -209,8 +238,7 @@ describe("deny-only native tool delegation", () => {
     const result = resolve();
     expect(result.inheritedToolPolicy).toEqual({ deny: ["browser"] });
     expect(result.inheritedToolPolicyForSpawn).toEqual({ deny: fullDeny });
-    const p = resolveConversationCapabilityProfile({
-      config: config(),
+    const p = profile(config(), {
       agentId: "worker",
       sessionKey: child,
       preparedSessionCapabilityStore: { [child]: entry() },
@@ -240,27 +268,7 @@ describe("deny-only native tool delegation", () => {
   it("completion restores the full requester snapshot even after its local policy changes", () => {
     const cfg = config();
     cfg.agents!.entries!.front!.tools = {};
-    const result = resolveRequesterToolPolicies({
-      config: cfg,
-      sessionKey: requester,
-      sessionId: "parent-id",
-      modelProvider: "test",
-      modelId: "model",
-      preparedSessionCapabilityStore: { [child]: entry() },
-      inputProvenance: {
-        kind: "inter_session",
-        sourceSessionKey: child,
-        sourceTool: "subagent_announce",
-      },
-      trustedInternalHandoff: {
-        kind: "subagent-completion",
-        sourceSessionKey: child,
-        targetSessionKey: requester,
-        targetSessionId: "parent-id",
-        provider: "test",
-        model: "model",
-      },
-    });
+    const result = completionPolicy(cfg, child, requester, "parent-id", { [child]: entry() });
     expect(result.requesterPolicySource).toBe("completion-handoff");
     expect(result.inheritedToolPolicy).toEqual({ deny: fullDeny });
   });
@@ -302,18 +310,16 @@ describe("deny-only native tool delegation", () => {
   it("propagates only within the grantee and revokes the whole native descendant chain", () => {
     const cfg = config();
     const grandchild = "agent:worker:subagent:grandchild";
-    const p = resolveConversationCapabilityProfile({
-      config: cfg,
+    const p = profile(cfg, {
       agentId: "worker",
       sessionKey: child,
       preparedSessionCapabilityStore: { [child]: entry() },
     });
     const floor = prepareDelegatedToolDenyFloor(p);
-    const delegatedToolPolicy = selectDelegatedToolPolicy({
+    const delegatedToolPolicy = select({
       config: cfg,
       requesterSessionKey: child,
       requesterAgentId: "worker",
-      targetAgentId: "worker",
       floor,
       requesterToolDenylist: ["browser", "message"],
     });
@@ -323,7 +329,7 @@ describe("deny-only native tool delegation", () => {
       requesterDeny: ["browser", "message"],
     });
     expect(
-      selectDelegatedToolPolicy({
+      select({
         config: cfg,
         requesterSessionKey: child,
         requesterAgentId: "worker",
@@ -342,28 +348,7 @@ describe("deny-only native tool delegation", () => {
         preparedSessionCapabilityStore: store,
       });
     expect(childPolicy().inheritedToolPolicy?.deny).not.toContain("exec");
-    const completion = () =>
-      resolveRequesterToolPolicies({
-        config: cfg,
-        sessionKey: child,
-        sessionId: "child-id",
-        modelProvider: "test",
-        modelId: "model",
-        preparedSessionCapabilityStore: store,
-        inputProvenance: {
-          kind: "inter_session",
-          sourceSessionKey: grandchild,
-          sourceTool: "subagent_announce",
-        },
-        trustedInternalHandoff: {
-          kind: "subagent-completion",
-          sourceSessionKey: grandchild,
-          targetSessionKey: child,
-          targetSessionId: "child-id",
-          provider: "test",
-          model: "model",
-        },
-      });
+    const completion = () => completionPolicy(cfg, grandchild, child, "child-id", store);
     expect(completion().inheritedToolPolicy?.deny).not.toContain("exec");
     cfg.agents!.entries!.front!.subagents!.delegateToolsTo = [];
     expect(childPolicy().inheritedToolPolicy?.deny).toContain("exec");
@@ -373,8 +358,7 @@ describe("deny-only native tool delegation", () => {
   it("keeps a grantee helper's new allow ceiling while preserving its root exception", () => {
     const cfg = config();
     const grandchild = "agent:worker:subagent:capped";
-    const p = resolveConversationCapabilityProfile({
-      config: cfg,
+    const p = profile(cfg, {
       agentId: "worker",
       sessionKey: child,
       runtimeToolAllowlist: ["sessions_spawn", "read", "exec"],
@@ -382,11 +366,10 @@ describe("deny-only native tool delegation", () => {
       preparedSessionCapabilityStore: { [child]: entry() },
     });
     const floor = prepareDelegatedToolDenyFloor(p);
-    const delegatedToolPolicy = selectDelegatedToolPolicy({
+    const delegatedToolPolicy = select({
       config: cfg,
       requesterSessionKey: child,
       requesterAgentId: "worker",
-      targetAgentId: "worker",
       floor,
       inheritedToolAllowlist: ["sessions_spawn", "read", "exec"],
       requesterToolDenylist: ["browser"],
@@ -410,14 +393,7 @@ describe("deny-only native tool delegation", () => {
   });
 
   it("refuses an explicit target when its producer cannot safely project the floor", () => {
-    expect(() =>
-      selectDelegatedToolPolicy({
-        config: config(),
-        requesterSessionKey: requester,
-        requesterAgentId: "front",
-        targetAgentId: "worker",
-      }),
-    ).toThrow("host-prepared deny-only policy");
+    expect(() => select()).toThrow("host-prepared deny-only policy");
   });
 
   it("rechecks runtime-owned configuration after asynchronous preparation", async () => {

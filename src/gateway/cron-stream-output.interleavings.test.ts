@@ -18,6 +18,58 @@ import {
   settle,
 } from "./cron-stream-watchers.test-helpers.js";
 
+const batchArgs = (text: string) => [
+  expect.any(Object),
+  text,
+  expect.any(String),
+  expect.any(String),
+];
+const coalescedArgs = [
+  "stream-job",
+  expect.objectContaining({ streamCoalescedBatches: 1 }),
+  expect.any(String),
+  expect.any(String),
+];
+const blockedFire = (gate: Promise<void>) =>
+  vi.fn(async () => {
+    await gate;
+    return "fired" as const;
+  });
+function pausedOutput(coalesced: number, once = false) {
+  const payload = createDeferred();
+  const counter = createDeferred();
+  const entered = createDeferred();
+  const fireBatch = blockedFire(payload.promise);
+  if (once) {
+    fireBatch.mockResolvedValue("fired").mockImplementationOnce(async () => {
+      await payload.promise;
+      return "fired";
+    });
+  }
+  const fixture = createCronStreamWatcherFixture({
+    minIntervalMs: 1,
+    retryBackoffMs: once ? [1] : undefined,
+    fireBatch,
+    updateState: vi.fn(async (_jobId: string, patch: Partial<CronJob["state"]>) => {
+      if (patch.streamCoalescedBatches === coalesced) {
+        entered.resolve();
+        await counter.promise;
+      }
+    }),
+  });
+  return { ...fixture, payload, counter, entered: entered.promise };
+}
+async function advance(ms: number) {
+  await vi.advanceTimersByTimeAsync(ms);
+  await settle();
+}
+async function queueTwoBatches(fake: ReturnType<typeof createCronStreamWatcherFixture>["fake"]) {
+  fake.inputs[0]?.onStdout?.("first\n");
+  await vi.advanceTimersByTimeAsync(50);
+  fake.inputs[0]?.onStdout?.("second\n");
+  await advance(50);
+}
+
 describe("cron stream output", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -41,23 +93,13 @@ describe("cron stream output", () => {
         clock.setTime(5_000);
         await clock.wake();
         await settle();
-        expect(fireBatch).toHaveBeenCalledExactlyOnceWith(
-          expect.any(Object),
-          "first",
-          expect.any(String),
-          expect.any(String),
-        );
+        expect(fireBatch).toHaveBeenCalledExactlyOnceWith(...batchArgs("first"));
 
         clock.setTime(10_000);
         await clock.wake();
         await settle();
         expect(fireBatch).toHaveBeenCalledTimes(2);
-        expect(fireBatch).toHaveBeenLastCalledWith(
-          expect.any(Object),
-          "first",
-          expect.any(String),
-          expect.any(String),
-        );
+        expect(fireBatch).toHaveBeenLastCalledWith(...batchArgs("first"));
         await watchers.stop("stream-job", "disabled");
         expect(scheduler.nextWakeAtMs).toBeNull();
 
@@ -66,12 +108,7 @@ describe("cron stream output", () => {
         await settle();
         await clock.advanceBy(100);
         expect(fireBatch).toHaveBeenCalledTimes(3);
-        expect(fireBatch).toHaveBeenLastCalledWith(
-          expect.any(Object),
-          "resumed",
-          expect.any(String),
-          expect.any(String),
-        );
+        expect(fireBatch).toHaveBeenLastCalledWith(...batchArgs("resumed"));
       } finally {
         await watchers.stopAll("shutdown");
         await scheduler.stop();
@@ -150,12 +187,7 @@ describe("cron stream output", () => {
         await vi.advanceTimersByTimeAsync(49);
         expect(fireBatch).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(1);
-        expect(fireBatch).toHaveBeenCalledExactlyOnceWith(
-          expect.any(Object),
-          "keep first\nkeep second",
-          expect.any(String),
-          expect.any(String),
-        );
+        expect(fireBatch).toHaveBeenCalledExactlyOnceWith(...batchArgs("keep first\nkeep second"));
         expect(watchers.inspect("stream-job")).toMatchObject({
           droppedBatches: 0,
           coalescedBatches: 0,
@@ -213,8 +245,7 @@ describe("cron stream output", () => {
       await settle();
       expect(watchers.inspect("stream-job")?.droppedBatches).toBe(0);
 
-      await vi.advanceTimersByTimeAsync(10);
-      await settle();
+      await advance(10);
       expect(fake.spawn).toHaveBeenCalledTimes(2);
 
       obsoleteOutput?.("late after replacement\n");
@@ -238,8 +269,7 @@ describe("cron stream output", () => {
       const initialOwner = watchers.inspect("stream-job");
       expect(initialOwner?.sourceIdentity).toBe("source:stream-job");
       fake.inputs[0]?.onStdout?.("first\n");
-      await vi.advanceTimersByTimeAsync(50);
-      await settle();
+      await advance(50);
       fake.inputs[0]?.onStdout?.("pending\n");
       await vi.advanceTimersByTimeAsync(50);
       fake.exits[0]?.(exitResult());
@@ -252,8 +282,7 @@ describe("cron stream output", () => {
         droppedBatches: 0,
       });
 
-      await vi.advanceTimersByTimeAsync(150);
-      await settle();
+      await advance(150);
       await vi.advanceTimersByTimeAsync(1);
       expect(fake.spawn).toHaveBeenCalledTimes(2);
       expect(watchers.inspect("stream-job")).toMatchObject({
@@ -297,11 +326,9 @@ describe("cron stream output", () => {
       });
       await watchers.start(job());
       fake.inputs[0]?.onStdout?.("first\n");
-      await vi.advanceTimersByTimeAsync(50);
-      await settle();
+      await advance(50);
       fake.inputs[0]?.onStdout?.("pending\n");
-      await vi.advanceTimersByTimeAsync(50);
-      await settle();
+      await advance(50);
 
       vi.advanceTimersByTime(50);
       await watchers.stop("stream-job", "disabled");
@@ -315,89 +342,36 @@ describe("cron stream output", () => {
 
     it("drains output accepted behind a slow owner write before entering backoff", async () => {
       vi.useFakeTimers();
-      const { promise: payload, resolve: releasePayload } = createDeferred();
-      const { promise: counter, resolve: releaseCounter } = createDeferred();
-      const updateState = vi.fn(async (_jobId: string, patch: Partial<CronJob["state"]>) => {
-        if (patch.streamCoalescedBatches === 1) {
-          await counter;
-        }
-      });
-      const fireBatch = vi
-        .fn()
-        .mockImplementationOnce(async () => {
-          await payload;
-          return "fired" as const;
-        })
-        .mockResolvedValue("fired" as const);
-      const { fake, watchers } = createCronStreamWatcherFixture({
-        minIntervalMs: 1,
-        retryBackoffMs: [1],
-        updateState,
-        fireBatch,
-      });
+      const { fake, watchers, fireBatch, updateState, counter, payload } = pausedOutput(1, true);
       await watchers.start(job());
-      fake.inputs[0]?.onStdout?.("first\n");
-      await vi.advanceTimersByTimeAsync(50);
-      fake.inputs[0]?.onStdout?.("second\n");
-      await vi.advanceTimersByTimeAsync(50);
-      await settle();
-      expect(updateState).toHaveBeenCalledWith(
-        "stream-job",
-        expect.objectContaining({ streamCoalescedBatches: 1 }),
-        expect.any(String),
-        expect.any(String),
-      );
+      await queueTwoBatches(fake);
+      expect(updateState).toHaveBeenCalledWith(...coalescedArgs);
 
       fake.inputs[0]?.onStdout?.("accepted-before-exit\n");
       fake.exits[0]?.(exitResult());
-      releaseCounter();
+      counter.resolve();
       await settle();
       expect(watchers.inspect("stream-job")?.droppedBatches).toBe(0);
 
-      releasePayload();
+      payload.resolve();
       await settle();
       await vi.advanceTimersByTimeAsync(2);
-      expect(fireBatch).toHaveBeenLastCalledWith(
-        expect.any(Object),
-        "second\naccepted-before-exit",
-        expect.any(String),
-        expect.any(String),
-      );
+      expect(fireBatch).toHaveBeenLastCalledWith(...batchArgs("second\naccepted-before-exit"));
       await watchers.stopAll("shutdown");
     });
 
     it("lets a stop requested during exit draining own teardown without counting failure", async () => {
       vi.useFakeTimers();
-      const { promise: payload, resolve: releasePayload } = createDeferred();
-      const { promise: drainEntered, resolve: markDrainEntered } = createDeferred();
-      const { promise: drain, resolve: releaseDrain } = createDeferred();
-      const updateState = vi.fn(async (_jobId: string, patch: Partial<CronJob["state"]>) => {
-        if (patch.streamCoalescedBatches === 2) {
-          markDrainEntered();
-          await drain;
-        }
-      });
-      const { fake, recordFailure, watchers } = createCronStreamWatcherFixture({
-        minIntervalMs: 1,
-        updateState,
-        fireBatch: vi.fn(async () => {
-          await payload;
-          return "fired" as const;
-        }),
-      });
+      const { fake, recordFailure, watchers, payload, counter, entered } = pausedOutput(2);
       await watchers.start(job({ state: { streamConsecutiveFailures: 4 } }));
-      fake.inputs[0]?.onStdout?.("first\n");
-      await vi.advanceTimersByTimeAsync(50);
-      fake.inputs[0]?.onStdout?.("second\n");
-      await vi.advanceTimersByTimeAsync(50);
-      await settle();
+      await queueTwoBatches(fake);
 
       fake.inputs[0]?.onStdout?.("accepted-before-exit\n");
       fake.exits[0]?.(exitResult());
-      await drainEntered;
+      await entered;
       const stopping = watchers.stop("stream-job", "disabled");
-      releasePayload();
-      releaseDrain();
+      payload.resolve();
+      counter.resolve();
       await settle();
       await stopping;
 
@@ -410,21 +384,7 @@ describe("cron stream output", () => {
 
     it("bounds raw output while a serialized counter write is slow", async () => {
       vi.useFakeTimers();
-      const { promise: payload, resolve: releasePayload } = createDeferred();
-      const { promise: counter, resolve: releaseCounter } = createDeferred();
-      const updateState = vi.fn(async (_jobId: string, patch: Partial<CronJob["state"]>) => {
-        if (patch.streamCoalescedBatches === 1) {
-          await counter;
-        }
-      });
-      const { fake, watchers } = createCronStreamWatcherFixture({
-        minIntervalMs: 1,
-        updateState,
-        fireBatch: vi.fn(async () => {
-          await payload;
-          return "fired" as const;
-        }),
-      });
+      const { fake, watchers, updateState, counter, payload } = pausedOutput(1);
       await watchers.start(
         job({
           schedule: {
@@ -440,14 +400,8 @@ describe("cron stream output", () => {
       await vi.advanceTimersByTimeAsync(50);
       fake.inputs[0]?.onStdout?.("second\n");
       await settle();
-      await vi.advanceTimersByTimeAsync(50);
-      await settle();
-      expect(updateState).toHaveBeenCalledWith(
-        "stream-job",
-        expect.objectContaining({ streamCoalescedBatches: 1 }),
-        expect.any(String),
-        expect.any(String),
-      );
+      await advance(50);
+      expect(updateState).toHaveBeenCalledWith(...coalescedArgs);
 
       for (let index = 0; index < 1_000; index += 1) {
         fake.inputs[0]?.onStdout?.(`${"x".repeat(100)}\n`);
@@ -458,10 +412,9 @@ describe("cron stream output", () => {
         bufferedOutputSegments: 1,
       });
 
-      releaseCounter();
-      releasePayload();
-      await vi.advanceTimersByTimeAsync(100);
-      await settle();
+      counter.resolve();
+      payload.resolve();
+      await advance(100);
       await watchers.stopAll("shutdown");
     });
 
@@ -470,10 +423,7 @@ describe("cron stream output", () => {
       const { promise: payload, resolve: releasePayload } = createDeferred();
       const { fake, updateState, watchers } = createCronStreamWatcherFixture({
         minIntervalMs: 1,
-        fireBatch: vi.fn(async () => {
-          await payload;
-          return "fired" as const;
-        }),
+        fireBatch: blockedFire(payload),
       });
       await watchers.start(job());
       fake.inputs[0]?.onStdout?.("in flight\n");

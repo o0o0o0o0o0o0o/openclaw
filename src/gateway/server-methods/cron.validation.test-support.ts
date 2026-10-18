@@ -15,7 +15,7 @@ import {
 } from "../../test-utils/channel-plugins.js";
 import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
 import type { CronCreatorAuthorityGrant } from "../cron-creator-authority-grant.types.js";
-import type { GatewayClient, GatewayRequestContext } from "./types.js";
+import type { GatewayClient, GatewayRequestContext, RespondFn } from "./types.js";
 
 type MutationOptions = {
   commitGuard?: () => void;
@@ -272,18 +272,18 @@ export function createCronTestInvoker(
       currentJob?: CronJob;
       context?: ReturnType<typeof createCronTestContext>;
       client?: GatewayClient;
-      respond?: ReturnType<typeof vi.fn>;
+      respond?: ReturnType<typeof vi.fn<RespondFn>>;
       sessionMutationCommitGuard?: () => void;
       hasCurrentClientAuthority?: () => boolean;
     } = {},
   ) {
     const context = options.context ?? createCronTestContext(options.currentJob, getRuntimeConfig);
-    const respond = options.respond ?? vi.fn();
+    const respond = options.respond ?? vi.fn<RespondFn>();
     const handler = expectDefined(handlers[method], "cron handler");
     await handler({
       req: {} as never,
       params,
-      respond: (...args) => respond(...args),
+      respond,
       context: context as never,
       client: options.client ?? null,
       sessionMutationCommitGuard: options.sessionMutationCommitGuard,

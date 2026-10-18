@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { joinClawHubPluginCatalog } from "./catalog-discovery.js";
-import { recordInstalledPluginIndexInstallOwner } from "./installed-plugin-index-install-owner.js";
-import { recordPluginManifestInstallOwner } from "./manifest-install-owner.js";
+import { managementMetadata as metadataSnapshot } from "./management-service.test-support.js";
 import type { OfficialExternalPluginCatalogEntry } from "./official-external-plugin-catalog.js";
 
 const mocks = vi.hoisted(() => ({
@@ -30,64 +29,6 @@ const { clearManagedPluginCatalogCache } = await import("./management-catalog.js
 const { listManagedPlugins, resolveManagedPluginIconSources } =
   await import("./management-service.js");
 
-function metadataSnapshot(params: {
-  id?: string;
-  name?: string;
-  origin?: "bundled" | "global";
-  packageName?: string | null;
-  installRecord?: Record<string, unknown>;
-  featured?: boolean;
-  description?: string;
-}) {
-  const id = params.id ?? "workboard";
-  const packageName =
-    params.packageName === null ? undefined : (params.packageName ?? `@openclaw/${id}`);
-  const rootDir = `/tmp/${id}`;
-  const installOwner = params.installRecord ? id : undefined;
-  const manifest = recordPluginManifestInstallOwner(
-    {
-      id,
-      name: params.name ?? "Workboard",
-      description: params.description ?? "Coordinate agent work in a shared board.",
-      catalog: { featured: params.featured ?? true, order: 10 },
-      channels: [],
-      providers: [],
-      cliBackends: [],
-      skills: [],
-      hooks: [],
-      origin: params.origin ?? "bundled",
-      rootDir,
-      source: `${rootDir}/index.ts`,
-      manifestPath: `${rootDir}/openclaw.plugin.json`,
-    },
-    installOwner,
-  );
-  const installRecord = params.installRecord
-    ? { ...params.installRecord, installPath: rootDir }
-    : undefined;
-  return {
-    index: {
-      plugins: [
-        recordInstalledPluginIndexInstallOwner(
-          {
-            pluginId: id,
-            ...(packageName ? { packageName } : {}),
-            origin: params.origin ?? "bundled",
-            rootDir,
-            enabled: true,
-          },
-          installOwner,
-        ),
-      ],
-      installRecords: installRecord ? { [id]: installRecord } : {},
-    },
-    byPluginId: new Map([[id, manifest]]),
-    plugins: [manifest],
-    diagnostics: [],
-    normalizePluginId: (pluginId: string) => pluginId,
-  };
-}
-
 function emptyMetadataSnapshot() {
   return {
     index: { plugins: [], installRecords: {} },
@@ -102,8 +43,6 @@ function hostedCatalog(entries: unknown[]) {
   return {
     source: "hosted",
     entries,
-    feed: { schemaVersion: 1, id: "test", generatedAt: "now", sequence: 1, entries: [] },
-    metadata: { url: "https://clawhub.ai/feed", status: 200, checksum: "hash" },
   };
 }
 
@@ -189,11 +128,6 @@ function compositionEntry(
   };
 }
 
-const hostedFeedDiffsEntry = hostedFeedEntry({
-  packageName: "@openclaw/diffs",
-  title: "Diffs",
-  featured: true,
-});
 const hostedImpostorEntry = hostedFeedEntry({
   packageName: "@community/impostor",
   title: "Impostor",
@@ -238,11 +172,12 @@ describe("plugin management Featured authority", () => {
           intent: "all",
           query: id,
         });
-        expect(items).toHaveLength(1);
-        expect(items[0]).toMatchObject({
-          catalog: { packageName, official: true, author: "openclaw" },
-          local: { pluginId: id, installed: true, action: "manage" },
-        });
+        expect(items).toMatchObject([
+          {
+            catalog: { packageName, official: true, author: "openclaw" },
+            local: { pluginId: id, installed: true, action: "manage" },
+          },
+        ]);
       }
     },
   );
@@ -255,40 +190,19 @@ describe("plugin management Featured authority", () => {
     mocks.officialCatalog.mockResolvedValue(hostedCatalog([]));
   });
 
-  it("treats a legacy hosted row without featured as unfeatured", async () => {
-    setCatalog(undefined, [hostedFeedEntry({ packageName: "@openclaw/diffs", title: "Diffs" })]);
-
-    const catalog = await list();
-
-    expect(catalog.plugins[0]).toMatchObject({
-      id: "diffs",
-      featured: false,
-      install: { source: "official", pluginId: "diffs" },
-    });
-  });
-
   it("orders live featured packages by when they were featured", async () => {
+    const entry = (name: string, title: string, order: number, featuredAt?: number) =>
+      hostedFeedEntry({
+        packageName: `@openclaw/${name}`,
+        title,
+        featured: true,
+        order,
+        featuredAt,
+      });
     setCatalog(undefined, [
-      hostedFeedEntry({
-        packageName: "@openclaw/older-popular",
-        title: "Older Popular",
-        featured: true,
-        featuredAt: 100,
-        order: 1,
-      }),
-      hostedFeedEntry({
-        packageName: "@openclaw/newest-featured",
-        title: "Newest Featured",
-        featured: true,
-        featuredAt: 200,
-        order: 99,
-      }),
-      hostedFeedEntry({
-        packageName: "@openclaw/legacy-featured",
-        title: "Legacy Featured",
-        featured: true,
-        order: 0,
-      }),
+      entry("older-popular", "Older Popular", 1, 100),
+      entry("newest-featured", "Newest Featured", 99, 200),
+      entry("legacy-featured", "Legacy Featured", 0),
     ]);
 
     const catalog = await list();
@@ -301,33 +215,49 @@ describe("plugin management Featured authority", () => {
     expect(catalog.plugins.map((plugin) => plugin.featuredAt)).toEqual([200, 100, undefined]);
   });
 
-  it("clears stale embedded curation on an unmatched live official package", async () => {
-    setCatalog(undefined, [
-      hostedFeedEntry({
+  it.each([
+    {
+      name: "legacy hosted row without featured",
+      local: undefined,
+      feed: { packageName: "@openclaw/diffs", title: "Diffs" },
+      expected: {
+        id: "diffs",
+        featured: false,
+        install: { source: "official", pluginId: "diffs" },
+      },
+    },
+    {
+      name: "stale embedded curation on an unmatched live package",
+      local: undefined,
+      feed: {
         packageName: "@openclaw/new-tool",
         title: "New Tool",
         featured: false,
         pluginId: "new-tool",
         catalogFeatured: true,
         order: 80,
-      }),
-    ]);
-
-    expectOnlyPlugin(await list(), { id: "new-tool", featured: false, order: 80 });
-  });
-
-  it("lets a live unfeature override an installed published plugin manifest", async () => {
-    setCatalog(
-      {
+      },
+      expected: { id: "new-tool", featured: false, order: 80 },
+    },
+    {
+      name: "live unfeature overriding an installed manifest",
+      local: {
         id: "diffs",
         name: "Diffs",
         origin: "global",
         installRecord: { source: "npm", spec: "@openclaw/diffs" },
       },
-      [{ ...hostedFeedDiffsEntry, featured: false }],
-    );
-
-    expectOnlyPlugin(await list(), { id: "diffs", installed: true, featured: false, order: 40 });
+      feed: { packageName: "@openclaw/diffs", title: "Diffs", featured: false },
+      expected: { id: "diffs", installed: true, featured: false, order: 40 },
+    },
+  ] satisfies Array<{
+    name: string;
+    local: Parameters<typeof metadataSnapshot>[0] | undefined;
+    feed: Parameters<typeof hostedFeedEntry>[0];
+    expected: Record<string, unknown>;
+  }>)("uses hosted curation for $name", async ({ local, feed, expected }) => {
+    setCatalog(local, [hostedFeedEntry(feed)]);
+    expectOnlyPlugin(await list(), expected);
   });
 
   it("applies hosted curation to the exact published package for bundled FireCrawl", async () => {
@@ -574,9 +504,9 @@ describe("plugin management Featured authority", () => {
           installed: true,
           name: curated ? "Remote" : "Local",
           featured: curated,
+          hasIcon: true,
         }),
       ]);
-      expect(catalog.plugins.find((entry) => entry.id === "installed")?.hasIcon).toBe(true);
       expect(icon).toEqual([
         { kind: "clawhub", baseUrl: "https://clawhub.ai", packageName: "@acme/shared" },
       ]);
@@ -588,30 +518,21 @@ describe("plugin management Featured authority", () => {
     ["first missing icon", undefined, undefined],
     ["normalized manifest fallback", undefined, "https://cdn.example.test/normalized.png"],
   ])("retains normalized first-record selection for %s", async (_mode, firstIcon, fallbackIcon) => {
-    const first = metadataSnapshot({
-      id: "Alias",
-      name: "First",
-      origin: "global",
-      packageName: "@acme/first",
-      installRecord: {
-        source: "clawhub",
-        clawhubUrl: "https://clawhub.ai",
-        clawhubChannel: "official",
-        clawhubPackage: "@acme/first",
-      },
-    });
-    const second = metadataSnapshot({
-      id: "ALIAS",
-      name: "Second",
-      origin: "global",
-      packageName: "@acme/second",
-      installRecord: {
-        source: "clawhub",
-        clawhubUrl: "https://clawhub.ai",
-        clawhubChannel: "official",
-        clawhubPackage: "@acme/second",
-      },
-    });
+    const alias = (id: string, name: string, packageName: string) =>
+      metadataSnapshot({
+        id,
+        name,
+        packageName,
+        origin: "global",
+        installRecord: {
+          source: "clawhub",
+          clawhubUrl: "https://clawhub.ai",
+          clawhubChannel: "official",
+          clawhubPackage: packageName,
+        },
+      });
+    const first = alias("Alias", "First", "@acme/first");
+    const second = alias("ALIAS", "Second", "@acme/second");
     const normalizedManifest = {
       ...first.plugins[0]!,
       id: "alias",
@@ -643,10 +564,7 @@ describe("plugin management Featured authority", () => {
     const catalog = await listManagedPlugins({ config: {}, env: {}, officialCatalog });
     const icon = await icons("ALIAS");
 
-    expect(catalog.plugins).toHaveLength(2);
-    for (const plugin of catalog.plugins) {
-      expect(plugin.hasIcon).toBe(true);
-    }
+    expect(catalog.plugins).toMatchObject([{ hasIcon: true }, { hasIcon: true }]);
     expect(icon).toEqual([
       { kind: "clawhub", baseUrl: "https://clawhub.ai", packageName: "@acme/first" },
     ]);

@@ -6,6 +6,7 @@ import { resolveBundledPluginSources } from "./bundled-sources.js";
 import { listChannelCatalogEntries } from "./channel-catalog-registry.js";
 import { resolvePluginConfigContractsById } from "./config-contracts.js";
 import { setGatewayPluginMetadataSnapshot } from "./current-plugin-metadata-snapshot.js";
+import { makePluginMetadataIndex } from "./current-plugin-metadata.test-support.js";
 import { writePersistedInstalledPluginIndex } from "./installed-plugin-index-store-write.js";
 import { listOpenClawPluginManifestMetadata } from "./manifest-metadata-scan.js";
 import { loadPluginManifest } from "./manifest.js";
@@ -46,10 +47,14 @@ function writeJson(filePath: string, value: unknown): void {
   fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
 }
 
-function createGlobalPluginFixture(pluginName: string, contents?: unknown) {
+function createPluginFixture(pluginName: string, contents?: unknown, bundled?: string) {
   const root = createTempRoot();
   const home = path.join(root, "home");
-  const pluginDir = path.join(home, ".openclaw", "extensions", pluginName);
+  const bundledRoot = path.join(root, bundled ?? "empty-bundled");
+  const pluginDir = path.join(
+    bundled ? bundledRoot : path.join(home, ".openclaw", "extensions"),
+    pluginName,
+  );
   const manifestPath = path.join(pluginDir, "openclaw.plugin.json");
   fs.mkdirSync(pluginDir, { recursive: true });
   if (contents !== undefined) {
@@ -59,11 +64,14 @@ function createGlobalPluginFixture(pluginName: string, contents?: unknown) {
     );
   }
   return {
+    root,
+    home,
+    bundledRoot,
     pluginDir,
     manifestPath,
     env: {
       OPENCLAW_HOME: home,
-      OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(root, "empty-bundled"),
+      OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
     },
   };
 }
@@ -103,13 +111,11 @@ describe("listOpenClawPluginManifestMetadata", () => {
   it.each(["manifest", "channel", "source", "contract"] as const)(
     "keeps %s readers on startup metadata after package files change",
     (reader) => {
-      const root = createTempRoot();
-      const bundledRoot = path.join(root, "bundled");
-      const pluginDir = path.join(bundledRoot, "startup-owner");
-      const env = {
-        OPENCLAW_HOME: path.join(root, "home"),
-        OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
-      };
+      const { bundledRoot, pluginDir, env } = createPluginFixture(
+        "startup-owner",
+        undefined,
+        "bundled",
+      );
       const writePackage = (generation: string, pluginId = "startup-owner") => {
         const targetDir = path.join(bundledRoot, pluginId);
         writeJson(path.join(targetDir, "package.json"), {
@@ -145,26 +151,19 @@ describe("listOpenClawPluginManifestMetadata", () => {
 
       const readdirSpy = vi.spyOn(fs, "readdirSync");
       const readFileSpy = vi.spyOn(fs, "readFileSync");
-      const readGeneration = (pluginId = "startup-owner") => {
-        switch (reader) {
-          case "manifest":
-            return listOpenClawPluginManifestMetadata(env).find(
-              (entry) => entry.manifest.id === pluginId,
-            )?.manifest.version;
-          case "channel":
-            return listChannelCatalogEntries({ env }).find((entry) => entry.pluginId === pluginId)
-              ?.channel.label;
-          case "source":
-            return resolveBundledPluginSources({ env }).get(pluginId)?.version;
-          case "contract":
-            return resolvePluginConfigContractsById({
-              env,
-              pluginIds: [pluginId],
-              fallbackToBundledMetadataForResolvedBundled: true,
-            }).get(pluginId)?.configContracts.secretInputs?.paths[0]?.path;
-        }
-        throw new Error("Unhandled metadata reader");
+      const readers = {
+        manifest: (id: string) => scanPlugin(env, id)?.manifest.version,
+        channel: (id: string) =>
+          listChannelCatalogEntries({ env }).find((entry) => entry.pluginId === id)?.channel.label,
+        source: (id: string) => resolveBundledPluginSources({ env }).get(id)?.version,
+        contract: (id: string) =>
+          resolvePluginConfigContractsById({
+            env,
+            pluginIds: [id],
+            fallbackToBundledMetadataForResolvedBundled: true,
+          }).get(id)?.configContracts.secretInputs?.paths[0]?.path,
       };
+      const readGeneration = (id = "startup-owner") => readers[reader](id);
       expect(readGeneration()).toBe("1.0.0");
       expect(readGeneration()).toBe("1.0.0");
       expect(readGeneration("added-after-startup")).toBeUndefined();
@@ -176,16 +175,9 @@ describe("listOpenClawPluginManifestMetadata", () => {
   );
 
   it("keeps manifest metadata stable until explicit lifecycle invalidation", () => {
-    const root = createTempRoot();
-    const home = path.join(root, "home");
-    const bundledRoot = path.join(root, "extensions");
-    const pluginDir = path.join(bundledRoot, "lifecycle-catalog");
-    const manifestPath = path.join(pluginDir, "openclaw.plugin.json");
-    const env = {
-      HOME: home,
-      OPENCLAW_HOME: home,
-      OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
-    };
+    const fixture = createPluginFixture("lifecycle-catalog", undefined, "extensions");
+    const { manifestPath } = fixture;
+    const env = { ...fixture.env, HOME: fixture.home };
     const writeManifest = (generation: string) =>
       writeJson(manifestPath, { id: "lifecycle-catalog", generation });
 
@@ -211,9 +203,7 @@ describe("listOpenClawPluginManifestMetadata", () => {
   });
 
   it("prefers the active bundled manifest over stale persisted bundled installs", async () => {
-    const root = createTempRoot();
-    const home = path.join(root, "home");
-    const bundledRoot = path.join(root, "extensions");
+    const { root, home, bundledRoot, env } = createPluginFixture("openai", undefined, "extensions");
     const staleBundledRoot = path.join(root, "stale", "extensions");
 
     writeJson(path.join(bundledRoot, "openai", "openclaw.plugin.json"), {
@@ -224,42 +214,16 @@ describe("listOpenClawPluginManifestMetadata", () => {
       id: "openai",
       providers: ["openai"],
     });
-    await writePersistedInstalledPluginIndex(
-      {
-        version: 1,
-        hostContractVersion: "test",
-        compatRegistryVersion: "test",
-        migrationVersion: 1,
-        policyHash: "test",
-        generatedAtMs: 1,
-        installRecords: {},
-        plugins: [
-          {
-            pluginId: "openai",
-            manifestPath: path.join(staleBundledRoot, "openai", "openclaw.plugin.json"),
-            manifestHash: "stale-openai",
-            rootDir: path.join(staleBundledRoot, "openai"),
-            origin: "bundled",
-            enabled: true,
-            startup: {
-              sidecar: false,
-              memory: false,
-              agentHarnesses: [],
-            },
-            compat: [],
-          },
-        ],
-        diagnostics: [],
-      },
-      { stateDir: path.join(home, ".openclaw") },
-    );
-
-    const records = listOpenClawPluginManifestMetadata({
-      OPENCLAW_HOME: home,
-      OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
+    const index = makePluginMetadataIndex("openai");
+    Object.assign(index.plugins[0]!, {
+      manifestPath: path.join(staleBundledRoot, "openai", "openclaw.plugin.json"),
+      manifestHash: "stale-openai",
+      rootDir: path.join(staleBundledRoot, "openai"),
+      origin: "bundled",
     });
+    await writePersistedInstalledPluginIndex(index, { stateDir: path.join(home, ".openclaw") });
 
-    const openai = records.find((record) => record.manifest.id === "openai");
+    const openai = scanPlugin(env, "openai");
     expect(openai?.pluginDir).toBe(path.join(bundledRoot, "openai"));
     expect(openai?.manifest.providerEndpoints).toEqual([
       { endpointClass: "openai-public", hosts: ["api.openai.com"] },
@@ -267,21 +231,15 @@ describe("listOpenClawPluginManifestMetadata", () => {
   });
 
   it("keeps source manifest metadata when the active bundled tree is partial", () => {
-    const root = createTempRoot();
-    const home = path.join(root, "home");
-    const partialBundledRoot = path.join(root, "dist", "extensions");
-
-    writeJson(path.join(partialBundledRoot, "qa-lab", "openclaw.plugin.json"), {
-      id: "qa-lab",
-      providers: ["qa-lab"],
-    });
-
-    const records = listOpenClawPluginManifestMetadata({
-      OPENCLAW_HOME: home,
-      OPENCLAW_BUNDLED_PLUGINS_DIR: partialBundledRoot,
-    });
-
-    const openai = records.find((record) => record.manifest.id === "openai");
+    const { env } = createPluginFixture(
+      "qa-lab",
+      {
+        id: "qa-lab",
+        providers: ["qa-lab"],
+      },
+      path.join("dist", "extensions"),
+    );
+    const openai = scanPlugin(env, "openai");
     expect(openai?.origin).toBe("source");
     expect(openai?.pluginDir).toBe(path.join(process.cwd(), "extensions", "openai"));
     expect(openai?.manifest.providerEndpoints).toContainEqual({
@@ -296,7 +254,7 @@ describe("listOpenClawPluginManifestMetadata", () => {
       pluginDir: oversizedDir,
       manifestPath: oversizedPath,
       env,
-    } = createGlobalPluginFixture("big-plugin", { id: "big-plugin", pad: "x".repeat(256 * 1024) });
+    } = createPluginFixture("big-plugin", { id: "big-plugin", pad: "x".repeat(256 * 1024) });
     const goodPluginDir = path.join(path.dirname(oversizedDir), "good-plugin");
     writeJson(path.join(goodPluginDir, "openclaw.plugin.json"), { id: "good-plugin" });
     expect(fs.statSync(oversizedPath).size).toBeGreaterThan(256 * 1024);
@@ -312,48 +270,33 @@ describe("listOpenClawPluginManifestMetadata", () => {
   });
 
   it.each([
-    {
-      name: "malformed JSON and JSON5",
-      contents: "{invalid",
-      error: "failed to parse plugin manifest: JSON5: invalid end of input at 1:9",
-    },
-    {
-      name: "valid non-object JSON",
-      contents: "[]",
-      error: "plugin manifest must be an object",
-    },
-  ])("skips $name and warns once across cache hits", ({ contents, error }) => {
-    const { pluginDir, manifestPath, env } = createGlobalPluginFixture("invalid-plugin", contents);
-
-    const canonicalResult = loadPluginManifest(pluginDir, false);
-    assert(!canonicalResult.ok);
-
+    [
+      "malformed JSON/JSON5",
+      "{invalid",
+      "invalid",
+      "failed to parse plugin manifest: JSON5: invalid end of input at 1:9",
+    ],
+    ["non-object JSON", "[]", "invalid", "plugin manifest must be an object"],
+    ["non-regular file", undefined, "unreadable", "path does not have the required file type"],
+    ["missing file", undefined, undefined, undefined],
+  ])("skips %s with at most one warning across cache hits", (name, contents, kind, error) => {
+    const { pluginDir, manifestPath, env } = createPluginFixture("invalid-plugin", contents);
+    if (name === "non-regular file") {
+      fs.mkdirSync(manifestPath);
+    }
+    if (contents !== undefined) {
+      const result = loadPluginManifest(pluginDir, false);
+      assert(!result.ok);
+    }
     expectPluginAbsentAcrossTwoScans(pluginDir, env);
-    expect(warningMessagesForPath(manifestPath)).toEqual([
-      `Ignoring invalid plugin manifest at ${manifestPath}: ${error}`,
-    ]);
-  });
-
-  it("warns once for a present non-regular manifest across cache hits", () => {
-    const { pluginDir, manifestPath, env } = createGlobalPluginFixture("non-regular-plugin");
-    fs.mkdirSync(manifestPath);
-
-    expectPluginAbsentAcrossTwoScans(pluginDir, env);
-    expect(warningMessagesForPath(manifestPath)).toEqual([
-      `Ignoring unreadable plugin manifest at ${manifestPath}: path does not have the required file type`,
-    ]);
-  });
-
-  it("silently skips a child plugin directory with no manifest across cache hits", () => {
-    const { pluginDir, manifestPath, env } = createGlobalPluginFixture("missing-manifest-plugin");
-
-    expectPluginAbsentAcrossTwoScans(pluginDir, env);
-    expect(warningMessagesForPath(manifestPath)).toEqual([]);
+    expect(warningMessagesForPath(manifestPath)).toEqual(
+      kind ? [`Ignoring ${kind} plugin manifest at ${manifestPath}: ${error}`] : [],
+    );
   });
 
   it("accepts JSON5 manifests without warning when strict JSON parsing fails", () => {
     const contents = "{ id: 'json5-plugin', }";
-    const { pluginDir, manifestPath, env } = createGlobalPluginFixture("json5-plugin", contents);
+    const { pluginDir, manifestPath, env } = createPluginFixture("json5-plugin", contents);
     expect(() => JSON.parse(contents)).toThrow();
 
     const records = listOpenClawPluginManifestMetadata(env);
@@ -371,10 +314,7 @@ describe("listOpenClawPluginManifestMetadata", () => {
     const compactJson = JSON.stringify(exactManifest);
     const requiredPadding = 256 * 1024 - Buffer.byteLength(compactJson, "utf8");
     exactManifest.pad = "x".repeat(requiredPadding);
-    const { manifestPath: exactPath, env } = createGlobalPluginFixture(
-      "exact-plugin",
-      exactManifest,
-    );
+    const { manifestPath: exactPath, env } = createPluginFixture("exact-plugin", exactManifest);
     expect(Buffer.byteLength(fs.readFileSync(exactPath), "utf8")).toBe(256 * 1024);
 
     expect(scanPlugin(env, "exact-plugin")).toBeTruthy();

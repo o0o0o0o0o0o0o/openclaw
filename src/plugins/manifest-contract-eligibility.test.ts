@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import "../test-utils/prepare-compiled-subprocesses.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizePluginsConfig } from "./config-state.js";
 
 const mocks = vi.hoisted(() => ({
@@ -8,24 +9,13 @@ const mocks = vi.hoisted(() => ({
   readBundledDiscoveryMode: vi.fn<() => "compat" | "allowlist" | undefined>(() => "allowlist"),
 }));
 
-vi.mock("./bundled-discovery-state.js", async () => {
-  const { registerPluginMetadataProcessMemoLifecycleClear } =
-    await import("./plugin-metadata-lifecycle.js");
-  // Mirror the real single-slot memo over the mocked raw reader so the
-  // read-once-per-lifecycle assertions keep exercising the memoized seam.
-  let memo: { value: "compat" | "allowlist" | undefined } | undefined;
-  registerPluginMetadataProcessMemoLifecycleClear(() => {
-    memo = undefined;
-  });
+vi.mock("./bundled-discovery-state.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./bundled-discovery-state.js")>();
   return {
+    ...actual,
     readBundledDiscoveryMode: mocks.readBundledDiscoveryMode,
-    readBundledDiscoveryModeMemoized: () => {
-      memo ??= { value: mocks.readBundledDiscoveryMode() };
-      return memo.value;
-    },
-    clearBundledDiscoveryModeMemo: () => {
-      memo = undefined;
-    },
+    readBundledDiscoveryModeMemoized: (env?: NodeJS.ProcessEnv) =>
+      actual.readBundledDiscoveryModeMemoized(env, {}, mocks.readBundledDiscoveryMode),
   };
 });
 
@@ -34,10 +24,11 @@ vi.mock("./plugin-metadata-snapshot.js", () => ({
   resolvePluginMetadataSnapshot: mocks.resolvePluginMetadataSnapshot,
 }));
 
-let isManifestPluginAvailableForControlPlane: typeof import("./manifest-contract-eligibility.js").isManifestPluginAvailableForControlPlane;
-let listAvailableManifestContractPlugins: typeof import("./manifest-contract-eligibility.js").listAvailableManifestContractPlugins;
-let listAvailableManifestContractValues: typeof import("./manifest-contract-eligibility.js").listAvailableManifestContractValues;
-let loadManifestContractSnapshot: typeof import("./manifest-contract-eligibility.js").loadManifestContractSnapshot;
+type Eligibility = typeof import("./manifest-contract-eligibility.js");
+let isAvailable: Eligibility["isManifestPluginAvailableForControlPlane"];
+let listPlugins: Eligibility["listAvailableManifestContractPlugins"];
+let listValues: Eligibility["listAvailableManifestContractValues"];
+let loadSnapshot: Eligibility["loadManifestContractSnapshot"];
 let clearPluginMetadataLifecycleCaches: typeof import("./plugin-metadata-lifecycle.js").clearPluginMetadataLifecycleCaches;
 let makePluginMetadataIndex: typeof import("./current-plugin-metadata.test-support.js").makePluginMetadataIndex;
 let makePluginMetadataManifestRegistry: typeof import("./current-plugin-metadata.test-support.js").makePluginMetadataManifestRegistry;
@@ -48,10 +39,10 @@ beforeAll(async () => {
   // after the hoisted mocks so an earlier production import cannot bypass them.
   vi.resetModules();
   ({
-    isManifestPluginAvailableForControlPlane,
-    listAvailableManifestContractPlugins,
-    listAvailableManifestContractValues,
-    loadManifestContractSnapshot,
+    isManifestPluginAvailableForControlPlane: isAvailable,
+    listAvailableManifestContractPlugins: listPlugins,
+    listAvailableManifestContractValues: listValues,
+    loadManifestContractSnapshot: loadSnapshot,
   } = await import("./manifest-contract-eligibility.js"));
   ({ clearPluginMetadataLifecycleCaches } = await import("./plugin-metadata-lifecycle.js"));
   ({ makePluginMetadataIndex, makePluginMetadataManifestRegistry } =
@@ -70,11 +61,10 @@ describe("bundled manifest contract availability", () => {
     index,
     plugins: [plugin],
   } as never;
-  const available = (
-    params: Partial<Parameters<typeof isManifestPluginAvailableForControlPlane>[0]>,
-  ) => isManifestPluginAvailableForControlPlane({ snapshot, plugin, ...params });
-  const values = (config: Parameters<typeof listAvailableManifestContractValues>[0]["config"]) =>
-    listAvailableManifestContractValues({ snapshot, contract: "imageGenerationProviders", config });
+  const available = (params: Partial<Parameters<typeof isAvailable>[0]>) =>
+    isAvailable({ snapshot, plugin, ...params });
+  const values = (config: OpenClawConfig) =>
+    listValues({ snapshot, contract: "imageGenerationProviders", config });
 
   beforeEach(() => {
     clearPluginMetadataLifecycleCaches();
@@ -88,45 +78,39 @@ describe("bundled manifest contract availability", () => {
     expect(values(config)).toEqual([]);
   });
 
-  it("preserves explicitly configured custom channel ids distinct from their plugin owner", () => {
+  it.each([
+    ["custom-owner", "private-channel", { enabled: true }, {}, true],
+    ["discord-owner", "discord", { enabled: false, token: "configured" }, {}, false],
+    ["discord-owner", "discord", { token: "configured" }, { deny: ["discord-owner"] }, false],
+    [
+      "discord-owner",
+      "discord",
+      { token: "configured" },
+      { entries: { "discord-owner": { enabled: false } } },
+      false,
+    ],
+  ] satisfies Array<
+    [
+      string,
+      string,
+      { enabled?: boolean; token?: string },
+      NonNullable<OpenClawConfig["plugins"]>,
+      boolean,
+    ]
+  >)("honors %s / %s: channel=%j policy=%j -> %s", (id, channel, config, policy, expected) => {
     expect(
       available({
-        plugin: { ...plugin, id: "custom-owner", channels: ["private-channel"] },
+        plugin: { ...plugin, id, channels: [channel] },
         config: {
-          plugins: { allow: ["another-plugin"] },
-          channels: { "private-channel": { enabled: true } },
-        } as never,
+          plugins: { allow: ["another-plugin"], ...policy },
+          channels: { [channel]: config },
+        },
       }),
-    ).toBe(true);
-    expect(mocks.readBundledDiscoveryMode).not.toHaveBeenCalled();
+    ).toBe(expected);
+    if (expected) {
+      expect(mocks.readBundledDiscoveryMode).not.toHaveBeenCalled();
+    }
   });
-
-  it("does not let disabled channel configuration bypass a restrictive allowlist", () => {
-    expect(
-      available({
-        plugin: { ...plugin, id: "discord-owner", channels: ["discord"] },
-        config: {
-          plugins: { allow: ["another-plugin"] },
-          channels: { discord: { enabled: false, token: "configured" } },
-        } as never,
-      }),
-    ).toBe(false);
-  });
-
-  it.each([{ deny: ["discord-owner"] }, { entries: { "discord-owner": { enabled: false } } }])(
-    "does not let channel configuration override explicit plugin prohibition",
-    (plugins) => {
-      expect(
-        available({
-          plugin: { ...plugin, id: "discord-owner", channels: ["discord"] },
-          config: {
-            plugins: { allow: ["another-plugin"], ...plugins },
-            channels: { discord: { token: "configured" } },
-          } as never,
-        }),
-      ).toBe(false);
-    },
-  );
 
   it("preserves globally disabled bundled metadata for the named speech compatibility path", () => {
     const config = { plugins: { enabled: false } };
@@ -168,7 +152,7 @@ describe("bundled manifest contract availability", () => {
       contracts: { documentExtractors: ["document"] },
     };
     expect(
-      listAvailableManifestContractValues({
+      listValues({
         snapshot: { index, plugins: [nonProviderPlugin] } as never,
         contract: "documentExtractors",
         config: { plugins: { allow: ["another-plugin"] } },
@@ -238,12 +222,14 @@ describe("prepared installed-plugin eligibility", () => {
       config,
       normalizedConfig: normalizePluginsConfig(config?.plugins),
     };
-    expect(
-      plugins.map((plugin) => isManifestPluginAvailableForControlPlane({ ...params, plugin })),
-    ).toEqual(expected);
+    expect(plugins.map((plugin) => isAvailable({ ...params, plugin }))).toEqual(expected);
     expect(
       plugins.map((plugin) =>
-        isManifestPluginAvailableForControlPlane({ ...params, plugin, isInstalledPluginEnabled }),
+        isAvailable({
+          ...params,
+          plugin,
+          isInstalledPluginEnabled,
+        }),
       ),
     ).toEqual(expected);
     const manifestPlugins = plugins.flatMap(({ id, origin }) =>
@@ -252,7 +238,7 @@ describe("prepared installed-plugin eligibility", () => {
       ),
     );
     const expectedPlugins = manifestPlugins.filter((_plugin, position) => expected[position]);
-    const available = listAvailableManifestContractPlugins({
+    const available = listPlugins({
       snapshot: { index, plugins: manifestPlugins },
       config,
       contract: "imageGenerationProviders",
@@ -276,49 +262,29 @@ describe("loadManifestContractSnapshot", () => {
     );
   });
 
-  it("resolves metadata with env and workspace scope", () => {
-    const env = { HOME: "/home/snapshot" } as NodeJS.ProcessEnv;
-    const snapshot = {
-      index: { plugins: [] },
-      plugins: [],
-      byPluginId: new Map(),
-    };
-    mocks.resolvePluginMetadataSnapshot.mockReturnValue(snapshot);
-
-    expect(loadManifestContractSnapshot({ config: {}, workspaceDir: "/workspace", env })).toEqual(
-      snapshot,
-    );
-
-    expect(mocks.resolvePluginMetadataSnapshot).toHaveBeenCalledWith({
-      config: {},
-      env,
-      workspaceDir: "/workspace",
-      allowWorkspaceScopedCurrent: false,
-    });
-    expect(mocks.loadPluginMetadataSnapshot).not.toHaveBeenCalled();
-  });
-
-  it("preserves configless default-discovery snapshot compatibility", () => {
-    const env = { HOME: "/home/default-config" } as NodeJS.ProcessEnv;
-    const plugin = { id: "demo" };
-    const snapshot = {
-      index: { plugins: [{ pluginId: "demo" }] },
-      plugins: [plugin],
-      byPluginId: new Map([[plugin.id, plugin]]),
-    };
-    mocks.loadPluginMetadataSnapshot.mockReturnValue(snapshot);
-
-    expect(loadManifestContractSnapshot({ env })).toEqual(snapshot);
-
-    expect(mocks.resolvePluginMetadataSnapshot).toHaveBeenCalledWith({
-      config: undefined,
-      env,
-      allowWorkspaceScopedCurrent: true,
-    });
-    expect(mocks.loadPluginMetadataSnapshot).toHaveBeenCalledWith({
-      config: undefined,
-      env,
-      allowWorkspaceScopedCurrent: true,
-    });
-  });
+  it.each([false, true])(
+    "resolves scoped or default-discovery metadata (configless=%s)",
+    (configless) => {
+      const env = { HOME: configless ? "/home/default-config" : "/home/snapshot" };
+      const plugins = configless ? [{ id: "demo" }] : [];
+      const snapshot = {
+        index: { plugins: plugins.map(({ id }) => ({ pluginId: id })) },
+        plugins,
+        byPluginId: new Map(plugins.map((plugin) => [plugin.id, plugin])),
+      };
+      const reader = configless
+        ? mocks.loadPluginMetadataSnapshot
+        : mocks.resolvePluginMetadataSnapshot;
+      reader.mockReturnValue(snapshot);
+      const request = configless ? { env } : { config: {}, workspaceDir: "/workspace", env };
+      expect(loadSnapshot(request)).toEqual(snapshot);
+      const expected = { config: undefined, ...request, allowWorkspaceScopedCurrent: configless };
+      expect(mocks.resolvePluginMetadataSnapshot).toHaveBeenCalledWith(expected);
+      if (configless) {
+        expect(mocks.loadPluginMetadataSnapshot).toHaveBeenCalledWith(expected);
+      } else {
+        expect(mocks.loadPluginMetadataSnapshot).not.toHaveBeenCalled();
+      }
+    },
+  );
 });

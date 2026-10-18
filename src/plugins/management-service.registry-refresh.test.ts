@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { buildPluginCapabilitySummary, computeDeclaredSurfaceHash } from "./capability-summary.js";
-import { recordInstalledPluginIndexInstallOwner } from "./installed-plugin-index-install-owner.js";
-import { recordPluginManifestInstallOwner } from "./manifest-install-owner.js";
+import { managementMetadata } from "./management-service.test-support.js";
 import { clearPluginMetadataLifecycleCaches } from "./plugin-metadata-lifecycle.js";
 import { createColdPluginFixture } from "./test-helpers/cold-plugin-fixtures.js";
 import { cleanupTrackedTempDirs, makeTrackedTempDir } from "./test-helpers/fs-fixtures.js";
@@ -83,6 +83,19 @@ const installSnapshot = {
   writeOptions: { expectedConfigPath: "/tmp/openclaw.json" },
 };
 
+function readConfig(config: OpenClawConfig, parsed = config) {
+  mocks.readConfig.mockResolvedValue({
+    snapshot: {
+      valid: true,
+      parsed,
+      path: "/tmp/openclaw.json",
+      sourceConfig: config,
+      hash: "base-hash",
+    },
+    writeOptions: installSnapshot.writeOptions,
+  });
+}
+
 const trackedArtifactDirs: string[] = [];
 const emptyArtifactAcknowledgment = {
   reviewToken: computeDeclaredSurfaceHash(
@@ -122,52 +135,13 @@ function mockClawHubWorkboardInstall() {
 }
 
 function metadataSnapshot(enabled: boolean, installed = false) {
-  const installOwner = installed ? "workboard" : undefined;
-  const manifest = recordPluginManifestInstallOwner(
-    {
-      id: "workboard",
-      name: "Workboard",
-      channels: [],
-      providers: [],
-      cliBackends: [],
-      skills: [],
-      hooks: [],
-      origin: "bundled",
-      rootDir: "/tmp/workboard",
-      source: "/tmp/workboard/index.ts",
-      manifestPath: "/tmp/workboard/openclaw.plugin.json",
-    },
-    installOwner,
-  );
-  return {
-    index: {
-      plugins: [
-        recordInstalledPluginIndexInstallOwner(
-          {
-            pluginId: "workboard",
-            packageName: "@openclaw/workboard",
-            origin: "bundled",
-            rootDir: "/tmp/workboard",
-            enabled,
-          },
-          installOwner,
-        ),
-      ],
-      installRecords: installed
-        ? {
-            workboard: {
-              source: "clawhub",
-              spec: "clawhub:community/workboard",
-              installPath: "/tmp/workboard",
-            },
-          }
-        : {},
-    },
-    byPluginId: new Map([["workboard", manifest]]),
-    plugins: [manifest],
-    diagnostics: [],
-    normalizePluginId: (pluginId: string) => pluginId,
-  };
+  return managementMetadata({
+    enabled,
+    curated: false,
+    installRecord: installed
+      ? { source: "clawhub", spec: "clawhub:community/workboard" }
+      : undefined,
+  });
 }
 
 describe("plugin management registry refresh", () => {
@@ -184,16 +158,7 @@ describe("plugin management registry refresh", () => {
 
   it("reports registry refresh warnings after committed enablement", async () => {
     const enabled = true;
-    mocks.readConfig.mockResolvedValue({
-      snapshot: {
-        valid: true,
-        parsed: {},
-        path: "/tmp/openclaw.json",
-        sourceConfig: { plugins: { entries: { workboard: { enabled: !enabled } } } },
-        hash: "base-hash",
-      },
-      writeOptions: { expectedConfigPath: "/tmp/openclaw.json" },
-    });
+    readConfig({ plugins: { entries: { workboard: { enabled: !enabled } } } }, {});
     mocks.replaceConfig.mockResolvedValue({});
     mocks.metadata
       .mockReturnValueOnce(metadataSnapshot(!enabled))
@@ -222,16 +187,7 @@ describe("plugin management registry refresh", () => {
       },
     };
     mockClawHubWorkboardInstall();
-    mocks.readConfig.mockResolvedValue({
-      snapshot: {
-        valid: true,
-        parsed: config,
-        path: "/tmp/openclaw.json",
-        sourceConfig: config,
-        hash: "base-hash",
-      },
-      writeOptions: installSnapshot.writeOptions,
-    });
+    readConfig(config);
     mocks.persistInstall.mockResolvedValue(config);
     mocks.metadata.mockReturnValue(metadataSnapshot(false, true));
 

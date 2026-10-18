@@ -300,6 +300,10 @@ describe("host-owned workspace access", () => {
 
 describe("workspace attachment preparation", () => {
   const turn = { timeoutMs: 1_000, media: [{ path: "media://inbound/report.pdf" }] };
+  const prepareAttachments = (
+    workspaceDir: string,
+    overrides: Partial<Parameters<typeof prepareAgentWorkspaceAttachments>[0]> = {},
+  ) => prepareAgentWorkspaceAttachments({ workspaceDir, turn, assertCurrent() {}, ...overrides });
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   afterEach(() => {
     vi.restoreAllMocks();
@@ -367,8 +371,7 @@ describe("workspace attachment preparation", () => {
       const root = workspace();
       const controller = new AbortController();
       let active = true;
-      const pending = prepareAgentWorkspaceAttachments({
-        workspaceDir: root,
+      const pending = prepareAttachments(root, {
         localExecution: { readAllowed: true, maxChars: 60_000 },
         turn: { ...turn, abortSignal: controller.signal },
         assertCurrent: () => {
@@ -412,11 +415,8 @@ describe("workspace attachment preparation", () => {
         release?.();
       }
       await expect(
-        prepareAgentWorkspaceAttachments({
-          workspaceDir: root,
+        prepareAttachments(root, {
           localExecution: { readAllowed: true, maxChars: 60_000 },
-          turn,
-          assertCurrent: () => {},
         }),
       ).resolves.toBeUndefined();
       expect(prepare).not.toHaveBeenCalled();
@@ -435,14 +435,7 @@ describe("workspace attachment preparation", () => {
             : {}),
         });
       }
-      await expect(
-        prepareAgentWorkspaceAttachments({
-          workspaceDir: root,
-          turn,
-          assertCurrent: () => {},
-          requirePreparation: true,
-        }),
-      ).rejects.toThrow(
+      await expect(prepareAttachments(root, { requirePreparation: true })).rejects.toThrow(
         host === "empty-note" || host === "blank-note"
           ? "Workspace attachment 1 could not be prepared; check that every attachment is available to the registered attachment provider before retrying"
           : "Workspace attachments require a registered attachment provider; configure one for this execution environment before retrying",
@@ -471,10 +464,8 @@ describe("workspace attachment preparation", () => {
       });
 
       await expect(
-        prepareAgentWorkspaceAttachments({
-          workspaceDir: root,
+        prepareAttachments(root, {
           turn: { ...turn, userTurnTranscriptRecorder: recorder },
-          assertCurrent: () => {},
           requirePreparation,
         }),
       ).resolves.toBe(
@@ -494,8 +485,7 @@ describe("workspace attachment preparation", () => {
         bindWorkspace(root, { ...provider(), prepareTurnAttachments: prepare });
       }
       await expect(
-        prepareAgentWorkspaceAttachments({
-          workspaceDir: root,
+        prepareAttachments(root, {
           turn: {
             timeoutMs: turn.timeoutMs,
             ...(input === "deferred"
@@ -504,7 +494,6 @@ describe("workspace attachment preparation", () => {
                 }
               : {}),
           },
-          assertCurrent: () => {},
           requirePreparation: input === "deferred",
         }),
       ).resolves.toBeUndefined();
@@ -518,8 +507,7 @@ describe("workspace attachment preparation", () => {
     const release = bindWorkspace(root, host);
     const recorder = createDeferredRecorder({ text: "Read the attachment", media: turn.media });
     await expect(
-      prepareAgentWorkspaceAttachments({
-        workspaceDir: root,
+      prepareAttachments(root, {
         turn: {
           timeoutMs: turn.timeoutMs,
           userTurnTranscriptRecorder: {
@@ -531,7 +519,6 @@ describe("workspace attachment preparation", () => {
             },
           },
         },
-        assertCurrent: () => {},
         requirePreparation: true,
       }),
     ).rejects.toThrow("Workspace access changed during attachment preparation");
@@ -548,9 +535,7 @@ describe("workspace attachment preparation", () => {
           prepareTurnAttachments: vi.fn(async () => undefined),
         })();
       }
-      await expect(
-        prepareAgentWorkspaceAttachments({ workspaceDir: root, turn, assertCurrent: () => {} }),
-      ).rejects.toThrow("stopped or not ready");
+      await expect(prepareAttachments(root)).rejects.toThrow("stopped or not ready");
     },
   );
 
@@ -587,8 +572,7 @@ describe("workspace attachment preparation", () => {
     const preparation =
       closure === "binding"
         ? retained(turn, () => {})
-        : prepareAgentWorkspaceAttachments({
-            workspaceDir: root,
+        : prepareAttachments(root, {
             turn: { ...turn, abortSignal: controller.signal },
             assertCurrent: () => {
               if (!active) {

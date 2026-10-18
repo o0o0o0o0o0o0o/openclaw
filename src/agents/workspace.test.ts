@@ -58,6 +58,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   closeOpenClawStateDatabaseForTest();
   resetLegacyWorkspaceStateCheckForTest();
   await testState?.cleanup();
@@ -76,6 +77,15 @@ function workspacePath(...parts: string[]) {
 }
 async function writeWorkspaceFile(name: string, content: string) {
   await fs.writeFile(workspacePath(name), content);
+}
+
+async function replaceWorkspace(files: Record<string, string> = {}) {
+  await fs.rm(tempDir, { recursive: true, force: true });
+  await fs.mkdir(tempDir, { recursive: true });
+  for (const [name, content] of Object.entries(files)) {
+    await fs.mkdir(path.dirname(workspacePath(name)), { recursive: true });
+    await writeWorkspaceFile(name, content);
+  }
 }
 
 function ensureWorkspace(ensureBootstrapFiles = true) {
@@ -153,9 +163,7 @@ describe("ensureAgentWorkspace", () => {
       generatedHashes: snapshot.attestation!.generatedHashes,
     });
 
-    await fs.rm(tempDir, { recursive: true, force: true });
-    await fs.mkdir(tempDir, { recursive: true });
-    await fs.writeFile(workspacePath(DEFAULT_AGENTS_FILENAME), generatedAgents);
+    await replaceWorkspace({ [DEFAULT_AGENTS_FILENAME]: generatedAgents });
 
     await expectWorkspaceVanished(ensureWorkspace());
     await expectPathMissing(workspacePath(DEFAULT_BOOTSTRAP_FILENAME));
@@ -184,10 +192,7 @@ describe("ensureAgentWorkspace", () => {
   it("accepts a recently attested workspace when only custom skills survive", async () => {
     await ensureWorkspace();
 
-    await fs.rm(tempDir, { recursive: true, force: true });
-    await fs.mkdir(workspacePath("skills", "local-skill"), { recursive: true });
-    await fs.writeFile(workspacePath("skills", ".DS_Store"), "");
-    await fs.writeFile(workspacePath("skills", "local-skill", "SKILL.md"), "---\n");
+    await replaceWorkspace({ "skills/.DS_Store": "", "skills/local-skill/SKILL.md": "---\n" });
 
     await expect(ensureWorkspace()).resolves.toMatchObject({ dir: tempDir });
     await expectPathMissing(workspacePath(DEFAULT_BOOTSTRAP_FILENAME));
@@ -267,27 +272,23 @@ describe("ensureAgentWorkspace", () => {
   it("does not read setup state for an absent bootstrap file and refreshes after a setup wait", async () => {
     const actual = workspaceState.readWorkspaceStateSnapshot;
     const read = vi.spyOn(workspaceState, "readWorkspaceStateSnapshot");
-    try {
-      await expect(isWorkspaceBootstrapPending(tempDir)).resolves.toBe(false);
-      expect(read).not.toHaveBeenCalled();
-      await writeWorkspaceFile(DEFAULT_BOOTSTRAP_FILENAME, "# Bootstrap\n");
-      read.mockImplementationOnce(async (...args) => {
-        const snapshot = await actual(...args);
-        await fs.unlink(workspacePath(DEFAULT_BOOTSTRAP_FILENAME));
-        return snapshot;
-      });
-      await expect(isWorkspaceBootstrapPending(tempDir)).resolves.toBe(false);
-      expect(read).toHaveBeenCalledTimes(1);
-    } finally {
-      read.mockRestore();
-    }
+    await expect(isWorkspaceBootstrapPending(tempDir)).resolves.toBe(false);
+    expect(read).not.toHaveBeenCalled();
+    await writeWorkspaceFile(DEFAULT_BOOTSTRAP_FILENAME, "# Bootstrap\n");
+    read.mockImplementationOnce(async (...args) => {
+      const snapshot = await actual(...args);
+      await fs.unlink(workspacePath(DEFAULT_BOOTSTRAP_FILENAME));
+      return snapshot;
+    });
+    await expect(isWorkspaceBootstrapPending(tempDir)).resolves.toBe(false);
+    expect(read).toHaveBeenCalledTimes(1);
   });
 
   it("propagates a transient profile read after the retry budget is exhausted", async () => {
     await ensureWorkspace();
     const identityPath = workspacePath(DEFAULT_IDENTITY_FILENAME);
     const originalReadFile = fs.readFile.bind(fs);
-    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (filePath, options) => {
+    vi.spyOn(fs, "readFile").mockImplementation(async (filePath, options) => {
       if (filePath === identityPath) {
         throw Object.assign(new Error("Unknown system error -11, read"), {
           code: "EAGAIN",
@@ -297,11 +298,7 @@ describe("ensureAgentWorkspace", () => {
       return await originalReadFile(filePath, options);
     });
 
-    try {
-      await expect(ensureWorkspace()).rejects.toMatchObject({ code: "EAGAIN" });
-    } finally {
-      readSpy.mockRestore();
-    }
+    await expect(ensureWorkspace()).rejects.toMatchObject({ code: "EAGAIN" });
   });
 
   it("records stale bootstrap completion when BOOTSTRAP.md cleanup fails", async () => {
@@ -309,21 +306,17 @@ describe("ensureAgentWorkspace", () => {
     await writeWorkspaceFile(DEFAULT_IDENTITY_FILENAME, "# IDENTITY.md\n\n- **Name:** Example\n");
     const bootstrapPath = workspacePath(DEFAULT_BOOTSTRAP_FILENAME);
     const originalRm = fs.rm.bind(fs);
-    const rmSpy = vi.spyOn(fs, "rm").mockImplementation(async (filePath, options) => {
+    vi.spyOn(fs, "rm").mockImplementation(async (filePath, options) => {
       if (filePath === bootstrapPath) {
         throw Object.assign(new Error("not a directory"), { code: "ENOTDIR" });
       }
       await originalRm(filePath, options);
     });
 
-    try {
-      await ensureWorkspace();
-      await fs.access(bootstrapPath);
-      const state = await readWorkspaceState(tempDir);
-      expect(state.setupCompletedAt).toMatch(/\d{4}-\d{2}-\d{2}T/);
-    } finally {
-      rmSpy.mockRestore();
-    }
+    await ensureWorkspace();
+    await fs.access(bootstrapPath);
+    const state = await readWorkspaceState(tempDir);
+    expect(state.setupCompletedAt).toMatch(/\d{4}-\d{2}-\d{2}T/);
   });
 
   it("observes setup completed concurrently before writing optional bootstrap files", async () => {
@@ -692,10 +685,8 @@ describe.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
     it("rejects setup under an unlistable root without changing surviving skills", async () => {
       await ensureWorkspace();
       const before = (await readWorkspaceStateSnapshot(tempDir)).setup;
-      await fs.rm(tempDir, { recursive: true });
       const skill = path.join(tempDir, "skills", "local-skill", "SKILL.md");
-      await fs.mkdir(path.dirname(skill), { recursive: true });
-      await fs.writeFile(skill, "custom skill");
+      await replaceWorkspace({ "skills/local-skill/SKILL.md": "custom skill" });
       await fs.chmod(tempDir, 0o300);
       await expect(ensureWorkspace()).rejects.toMatchObject({ code: "EACCES" });
       expect(await fs.readFile(skill, "utf8")).toBe("custom skill");

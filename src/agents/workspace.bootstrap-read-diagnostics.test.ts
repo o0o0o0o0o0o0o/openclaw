@@ -25,6 +25,26 @@ import {
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
+async function withAccess(
+  dir: string,
+  bridge: AgentWorkspaceAccess["bridge"],
+  run: () => Promise<void>,
+) {
+  const release = registerAgentWorkspaceAccess(dir, { bridge });
+  try {
+    await run();
+  } finally {
+    release();
+  }
+}
+
+function bootstrapFile(
+  name: WorkspaceBootstrapFile["name"],
+  filePath = `/w/${name}`,
+): WorkspaceBootstrapFile {
+  return { name, path: filePath, content: "", missing: false };
+}
+
 afterEach(() => {
   setLoggerOverride(null);
   loggingState.rawConsole = null;
@@ -65,8 +85,7 @@ describe("workspace bootstrap read diagnostics", () => {
           runRemoteShellScript: createLocalRemoteShellScriptRunner(),
         },
       });
-      const release = registerAgentWorkspaceAccess(workspace, { bridge });
-      try {
+      await withAccess(workspace, bridge, async () => {
         const [file] = await loadWorkspaceBootstrapFiles(workspace, [DEFAULT_AGENTS_FILENAME]);
         expect(file?.missing).toBe(false);
         if (kind === "oversized") {
@@ -80,9 +99,7 @@ describe("workspace bootstrap read diagnostics", () => {
           expect(file?.content).toBe(bytes.toString("utf8"));
         }
         expect(file?.content).not.toContain("stale local document");
-      } finally {
-        release();
-      }
+      });
     },
   );
 
@@ -121,21 +138,15 @@ describe("workspace bootstrap read diagnostics", () => {
           isDirectory: entry.isDirectory(),
         })),
     };
-    const release = registerAgentWorkspaceAccess(workspace, { bridge });
-    try {
+    await withAccess(workspace, bridge, async () => {
       const { files, diagnostics } = await loadExtraBootstrapFilesWithDiagnostics(workspace, [
         "AGENTS.md",
         "packages/*/AGENTS.md",
       ]);
       expect(diagnostics).toEqual([]);
       expect(files.map((file) => file.content)).toEqual(["remote root", "remote project"]);
-    } finally {
-      release();
-    }
-    const releaseWithoutListing = registerAgentWorkspaceAccess(workspace, {
-      bridge: { ...bridge, readDirectory: undefined },
     });
-    try {
+    await withAccess(workspace, { ...bridge, readDirectory: undefined }, async () => {
       const unavailable = await loadExtraBootstrapFilesWithDiagnostics(workspace, [
         "packages/*/AGENTS.md",
       ]);
@@ -146,9 +157,7 @@ describe("workspace bootstrap read diagnostics", () => {
           detail: expect.stringContaining("listing is unavailable"),
         }),
       ]);
-    } finally {
-      releaseWithoutListing();
-    }
+    });
   });
 
   it("omits missing remote MEMORY.md and USER.md even when Gateway copies exist", async () => {
@@ -157,8 +166,9 @@ describe("workspace bootstrap read diagnostics", () => {
     for (const name of names) {
       await fs.writeFile(path.join(workspace, name), "Gateway decoy");
     }
-    const release = registerAgentWorkspaceAccess(workspace, {
-      bridge: {
+    await withAccess(
+      workspace,
+      {
         readFile: vi.fn(),
         writeFile: vi.fn(),
         stat: vi.fn(),
@@ -166,12 +176,10 @@ describe("workspace bootstrap read diagnostics", () => {
           throw Object.assign(new Error("Remote file does not exist"), { code: "ENOENT" });
         },
       },
-    });
-    try {
-      await expect(loadWorkspaceBootstrapFiles(workspace, names)).resolves.toEqual([]);
-    } finally {
-      release();
-    }
+      async () => {
+        await expect(loadWorkspaceBootstrapFiles(workspace, names)).resolves.toEqual([]);
+      },
+    );
   });
 
   it("does not split surrogate pairs when bounding unreadable reasons", async () => {
@@ -257,14 +265,9 @@ describe("workspace bootstrap read diagnostics", () => {
   });
 });
 
-const mockFiles: WorkspaceBootstrapFile[] = [
-  { name: "AGENTS.md", path: "/w/AGENTS.md", content: "", missing: false },
-  { name: "SOUL.md", path: "/w/SOUL.md", content: "", missing: false },
-  { name: "IDENTITY.md", path: "/w/IDENTITY.md", content: "", missing: false },
-  { name: "USER.md", path: "/w/USER.md", content: "", missing: false },
-  { name: "BOOTSTRAP.md", path: "/w/BOOTSTRAP.md", content: "", missing: false },
-  { name: "MEMORY.md", path: "/w/MEMORY.md", content: "", missing: false },
-];
+const mockFiles = (
+  ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "BOOTSTRAP.md", "MEMORY.md"] as const
+).map((name) => bootstrapFile(name));
 
 describe("workspace bootstrap source identity", () => {
   it("carries canonical source identity through extra-file conversion", async () => {
@@ -312,18 +315,8 @@ describe("filterBootstrapFilesForSession privacy", () => {
   });
 
   it("drops root memory path aliases while preserving nested memory in shared sessions", () => {
-    const rootMemoryAlias: WorkspaceBootstrapFile = {
-      name: "SOUL.md",
-      path: "/w/private/../MEMORY.md",
-      content: "",
-      missing: false,
-    };
-    const nestedMemory: WorkspaceBootstrapFile = {
-      name: "MEMORY.md",
-      path: "/w/packages/core/MEMORY.md",
-      content: "",
-      missing: false,
-    };
+    const rootMemoryAlias = bootstrapFile("SOUL.md", "/w/private/../MEMORY.md");
+    const nestedMemory = bootstrapFile("MEMORY.md", "/w/packages/core/MEMORY.md");
 
     const result = filterBootstrapFilesForSession([rootMemoryAlias, nestedMemory], {
       sessionKey: "agent:default:opaque:binding",
@@ -341,12 +334,7 @@ describe("filterBootstrapFilesForSession privacy", () => {
     "drops root memory path aliases before the %s allowlist",
     (_mode, sessionKey, name) => {
       const allowedFile = mockFiles.find((file) => file.name === name)!;
-      const rootMemoryAlias: WorkspaceBootstrapFile = {
-        name,
-        path: "/w/MEMORY.md",
-        content: "",
-        missing: false,
-      };
+      const rootMemoryAlias = bootstrapFile(name, "/w/MEMORY.md");
 
       const result = filterBootstrapFilesForSession([allowedFile, rootMemoryAlias], {
         sessionKey,

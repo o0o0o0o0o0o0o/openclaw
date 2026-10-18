@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { afterEach, expect, it, vi } from "vitest";
+import type { ModelDefinitionConfig } from "../config/types.models.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { reserveTestPortListener } from "../test-utils/port-claims.js";
@@ -12,6 +13,19 @@ import { prepareFullCatalogFacts } from "./prepared-model-runtime.full-catalog.j
 import { closePreparedModelRuntimeSnapshots } from "./prepared-model-runtime.lifecycle.js";
 import { discardPreparedPluginGeneration } from "./prepared-model-runtime.plugin-lifetime.js";
 import { prepareAgentCatalogSource } from "./prepared-model-runtime.scoped-catalog.js";
+
+function model(id: string, overrides: Partial<ModelDefinitionConfig> = {}): ModelDefinitionConfig {
+  return {
+    id,
+    name: id,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    maxTokens: 8192,
+    contextWindow: 131_072,
+    ...overrides,
+  };
+}
 
 // Real registered provider, guarded HTTP, prepared catalog and inference policy.
 // This does not exercise a GPU or claim that vLLM itself can serve this model.
@@ -54,12 +68,6 @@ it("keeps observed serving limits through authored overrides and catalog refresh
   vi.stubEnv("NODE_ENV", "production");
   const baseUrl = "http://127.0.0.1:" + server.claim.port + "/v1";
   try {
-    const defaults = {
-      reasoning: false,
-      input: ["text"] as ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      maxTokens: 8192,
-    };
     const config: OpenClawConfig = {
       plugins: { allow: ["vllm"], entries: { vllm: { enabled: true } }, slots: { memory: "none" } },
       agents: { defaults: { model: "vllm/upper", models: { "vllm/*": {} } } },
@@ -70,32 +78,12 @@ it("keeps observed serving limits through authored overrides and catalog refresh
             apiKey: "vllm-local",
             baseUrl,
             models: [
-              { ...defaults, id: "upper", name: "upper", contextWindow: 131_072 },
-              { ...defaults, id: "lower", name: "lower", contextWindow: 32_768 },
-              {
-                ...defaults,
-                id: "prompt-cap",
-                name: "prompt-cap",
-                contextWindow: 131_072,
-                contextTokens: 32_768,
-              },
-              {
-                ...defaults,
-                id: "other-route",
-                name: "other-route",
-                baseUrl: baseUrl + "/other",
-                contextWindow: 131_072,
-              },
-              {
-                ...defaults,
-                id: "other-api",
-                name: "other-api",
-                api: "openai-responses",
-                contextWindow: 131_072,
-              },
-              ...["missing", "invalid", "zero", "fractional"].map((id) =>
-                Object.assign({}, defaults, { id, name: id, contextWindow: 131_072 }),
-              ),
+              model("upper"),
+              model("lower", { contextWindow: 32_768 }),
+              model("prompt-cap", { contextTokens: 32_768 }),
+              model("other-route", { baseUrl: baseUrl + "/other" }),
+              model("other-api", { api: "openai-responses" }),
+              ...["missing", "invalid", "zero", "fractional"].map((id) => model(id)),
             ],
           },
         },
@@ -134,9 +122,9 @@ it("keeps observed serving limits through authored overrides and catalog refresh
       const budget = (catalog: Awaited<ReturnType<typeof acquire>>, id: string, cfg = config) => {
         // A request fork is the same projection used after worker publication.
         const registry = catalog.templateModelRegistry.fork(facts.templateAuthStorage);
+        const selection = { provider: "vllm", modelId: id };
         const resolved = resolveExplicitModelWithRegistry({
-          provider: "vllm",
-          modelId: id,
+          ...selection,
           cfg,
           modelRegistry: registry,
           manifestAlias: { provider: "vllm" },
@@ -145,17 +133,15 @@ it("keeps observed serving limits through authored overrides and catalog refresh
           throw new Error("vLLM model not resolved: " + id);
         }
         const policy = resolveEmbeddedRuntimeModelPolicy({
+          ...selection,
           cfg,
-          provider: "vllm",
-          modelId: id,
           runtimeModel: resolved.model,
           nativeModelOwned: false,
         });
         expect(
           resolveCompactionContextTokenBudget({
             config: cfg,
-            provider: "vllm",
-            modelId: id,
+            ...selection,
             model: resolved.model,
           }),
         ).toBe(policy.contextTokenBudget);

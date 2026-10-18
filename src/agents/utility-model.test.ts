@@ -8,6 +8,12 @@ import {
   resolveUtilityModelRefForAgent,
 } from "./utility-model.js";
 
+type Defaults = NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]>;
+type Entries = NonNullable<OpenClawConfig["agents"]>["entries"];
+const config = (defaults: Defaults, entries?: Entries): OpenClawConfig => ({
+  agents: { defaults, ...(entries ? { entries } : {}) },
+});
+
 function snapshotWithDefaults(defaults: Record<string, string>) {
   return createPluginMetadataSnapshotFixture({
     plugins: Object.entries(defaults).map(([provider, defaultUtilityModel], index) => ({
@@ -55,17 +61,10 @@ describe("resolveConfiguredSetupModelForAgent", () => {
   it.each([false, true])(
     "keeps the native primary for setup unless utility is selected (ACP=%s)",
     (acp) => {
-      const cfg: OpenClawConfig = {
-        agents: {
-          defaults: {
-            model: "openai/gpt-5.5@openai:primary",
-            utilityModel: "local-utility/tiny",
-          },
-          entries: {
-            main: acp ? { model: "harness-only", runtime: { type: "acp" } } : {},
-          },
-        },
-      };
+      const cfg = config(
+        { model: "openai/gpt-5.5@openai:primary", utilityModel: "local-utility/tiny" },
+        { main: acp ? { model: "harness-only", runtime: { type: "acp" } } : {} },
+      );
 
       expect(resolveConfiguredSetupModelForAgent({ cfg, agentId: "main" })).toEqual({
         modelRef: "openai/gpt-5.5@openai:primary",
@@ -80,12 +79,7 @@ describe("resolveConfiguredSetupModelForAgent", () => {
     "keeps the legacy implicit primary for setup alongside utility ref %s",
     (utilityModel) => {
       const cfg: OpenClawConfig = {
-        agents: {
-          defaults: {
-            utilityModel,
-            models: { "local-utility/tiny": { alias: "helper" } },
-          },
-        },
+        ...config({ utilityModel, models: { "local-utility/tiny": { alias: "helper" } } }),
         models: {
           providers: {
             "local-utility": {
@@ -121,71 +115,47 @@ describe("resolveUtilityModelRefForAgent", () => {
     openai: "gpt-5.6-luna",
     anthropic: "claude-haiku-4-5",
   });
-  type Scenario = {
-    name: string;
-    cfg: OpenClawConfig;
-    agentId?: string;
-    primaryProvider?: string;
-    primaryModelRef?: string;
-    expected?: string;
-  };
+  type Scenario = [
+    name: string,
+    cfg: OpenClawConfig,
+    expected?: string,
+    overrides?: Partial<Parameters<typeof resolveUtilityModelRefForAgent>[0]>,
+  ];
+  const primary = config({ model: "openai/gpt-5.5@work" }, { main: {} });
+  const optOut = config({ utilityModel: "openai/gpt-5.4-mini" }, { ops: { utilityModel: "" } });
   it.each<Scenario>([
-    {
-      name: "trimmed explicit reference",
-      cfg: { agents: { defaults: { utilityModel: " openrouter/mistralai/mistral-small " } } },
-      expected: "openrouter/mistralai/mistral-small",
-    },
-    { name: "disabled", cfg: { agents: { defaults: { utilityModel: "   " } } } },
-    {
-      name: "provider default",
-      cfg: { agents: { defaults: { model: "anthropic/claude-fable-5" } } },
-      expected: "anthropic/claude-haiku-4-5",
-    },
-    {
-      name: "native auth profile",
-      cfg: { agents: { defaults: { model: "openai/gpt-5.5@work" }, entries: { main: {} } } },
-      expected: "openai/gpt-5.6-luna@work",
-    },
-    {
-      name: "ACP preserves native auth profile",
-      cfg: {
-        agents: {
-          defaults: { model: "openai/gpt-5.5@work" },
-          entries: { main: { model: "harness-only@harness-profile", runtime: { type: "acp" } } },
-        },
-      },
-      expected: "openai/gpt-5.6-luna@work",
-    },
-    {
-      name: "session auth overrides primary",
-      cfg: { agents: { defaults: { model: "anthropic/claude-fable-5@personal" } } },
-      primaryProvider: "OpenAI",
-      primaryModelRef: "openai/gpt-5.5@work",
-      expected: "openai/gpt-5.6-luna@work",
-    },
-    { name: "no provider default", cfg: { agents: { defaults: { model: "ollama/llama-4-70b" } } } },
-    {
-      name: "agent opt-out",
-      cfg: {
-        agents: {
-          defaults: { utilityModel: "openai/gpt-5.4-mini" },
-          entries: { ops: { utilityModel: "" } },
-        },
-      },
-      agentId: "ops",
-    },
-    {
-      name: "other agent retains shared model",
-      cfg: {
-        agents: {
-          defaults: { utilityModel: "openai/gpt-5.4-mini" },
-          entries: { ops: { utilityModel: "" } },
-        },
-      },
-      expected: "openai/gpt-5.4-mini",
-    },
-  ])("resolves $name", ({ expected, agentId = "main", ...params }) => {
-    expect(resolveUtilityModelRefForAgent({ ...params, agentId, metadataSnapshot })).toBe(expected);
+    [
+      "trimmed explicit reference",
+      config({ utilityModel: " openrouter/mistralai/mistral-small " }),
+      "openrouter/mistralai/mistral-small",
+    ],
+    ["disabled", config({ utilityModel: "   " })],
+    [
+      "provider default",
+      config({ model: "anthropic/claude-fable-5" }),
+      "anthropic/claude-haiku-4-5",
+    ],
+    ["native auth profile", primary, "openai/gpt-5.6-luna@work"],
+    [
+      "ACP preserves native auth profile",
+      config(primary.agents!.defaults!, {
+        main: { model: "harness-only@harness-profile", runtime: { type: "acp" } },
+      }),
+      "openai/gpt-5.6-luna@work",
+    ],
+    [
+      "session auth overrides primary",
+      config({ model: "anthropic/claude-fable-5@personal" }),
+      "openai/gpt-5.6-luna@work",
+      { primaryProvider: "OpenAI", primaryModelRef: "openai/gpt-5.5@work" },
+    ],
+    ["no provider default", config({ model: "ollama/llama-4-70b" })],
+    ["agent opt-out", optOut, undefined, { agentId: "ops" }],
+    ["other agent retains shared model", optOut, "openai/gpt-5.4-mini"],
+  ])("resolves %s", (_name, cfg, expected, overrides) => {
+    expect(
+      resolveUtilityModelRefForAgent({ cfg, agentId: "main", metadataSnapshot, ...overrides }),
+    ).toBe(expected);
   });
 });
 
@@ -194,7 +164,6 @@ describe("resolveAutomaticUtilityRuntimeOverride", () => {
   const utility = "anthropic/claude-haiku-4-5";
   const cliEntry = { agentRuntime: { id: "claude-cli" } };
   const metadataSnapshot = snapshotWithDefaults({ anthropic: "claude-haiku-4-5" });
-  type Defaults = NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]>;
   type Scenario = {
     name: string;
     defaults?: Defaults;

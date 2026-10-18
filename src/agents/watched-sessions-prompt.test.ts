@@ -25,13 +25,13 @@ import {
   prepareWatchedSessionsPromptAsync,
 } from "./watched-sessions-prompt.js";
 
-const prepareWatchedSessionsPrompt = (
-  params: Parameters<typeof prepareWatchedSessionsPromptSync>[0],
-) => prepareWatchedSessionsPromptAsync({ ...params, assertCurrent: () => {} });
-
 const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-watched-sessions-");
 const mainSessionKey = "agent:main:main";
 const sessionReadTools = ["sessions_history", "sessions_search", "sessions_list"];
+const promptInput = { enabled: true, sessionKey: mainSessionKey, toolNames: sessionReadTools };
+const prepareWatchedSessionsPrompt = (
+  params: Partial<Parameters<typeof prepareWatchedSessionsPromptSync>[0]> = {},
+) => prepareWatchedSessionsPromptAsync({ ...promptInput, ...params, assertCurrent: () => {} });
 
 function stubStateDir() {
   const stateDir = sessionDirs.make();
@@ -63,11 +63,7 @@ describe("prepareWatchedSessionsPrompt", () => {
       { sessionId: "session-beta", displayName: "Family group", updatedAt: 1 },
     );
 
-    const prepared = await prepareWatchedSessionsPrompt({
-      enabled: true,
-      sessionKey: mainSessionKey,
-      toolNames: sessionReadTools,
-    });
+    const prepared = await prepareWatchedSessionsPrompt();
 
     expect(prepared).toEqual({
       sessions: [
@@ -108,27 +104,24 @@ describe("prepareWatchedSessionsPrompt", () => {
     }
 
     expect(prepared?.sessions).toHaveLength(20);
-    expect(prepared?.sessions[0]?.title).toBe("A".repeat(79));
-    expect(prepared?.hiddenCount).toBe(3);
-    expect(prepared?.sessions[0]?.key).toBe("agent:main:telegram:group:room-00");
-    expect(prepared?.readToolNames).toEqual(["sessions_history"]);
-    expect(prepared?.listToolAvailable).toBe(false);
+    expect(prepared?.sessions[0]).toEqual({
+      title: "A".repeat(79),
+      key: "agent:main:telegram:group:room-00",
+    });
+    expect(prepared).toMatchObject({
+      hiddenCount: 3,
+      readToolNames: ["sessions_history"],
+      listToolAvailable: false,
+    });
   });
 
   it("keeps the section for sandboxed sessions only when the clamp allows non-spawned reads", async () => {
     await watchGroup("agent:main:telegram:group:beta");
-    const base = {
-      enabled: true,
-      sessionKey: mainSessionKey,
-      sandboxed: true,
-      toolNames: sessionReadTools,
-    };
-
-    expect(await prepareWatchedSessionsPrompt({ ...base, config: {} })).toBe(undefined);
+    expect(await prepareWatchedSessionsPrompt({ sandboxed: true, config: {} })).toBe(undefined);
     expect(
       (
         await prepareWatchedSessionsPrompt({
-          ...base,
+          sandboxed: true,
           config: { agents: { defaults: { sandbox: { sessionToolsVisibility: "all" } } } },
         })
       )?.sessions,
@@ -137,22 +130,16 @@ describe("prepareWatchedSessionsPrompt", () => {
 
   it("returns undefined when disabled, keyless, non-main, toolless, or unwatched", async () => {
     await watchGroup("agent:main:telegram:group:beta");
-    const base = { enabled: true, sessionKey: mainSessionKey, toolNames: sessionReadTools };
-
-    expect(await prepareWatchedSessionsPrompt({ ...base, enabled: false })).toBe(undefined);
-    expect(await prepareWatchedSessionsPrompt({ ...base, sessionKey: undefined })).toBe(undefined);
-    expect(
-      await prepareWatchedSessionsPrompt({ ...base, sessionKey: "agent:main:subagent:worker" }),
-    ).toBe(undefined);
-    expect(
-      await prepareWatchedSessionsPrompt({ ...base, sessionKey: "agent:main:telegram:group:beta" }),
-    ).toBe(undefined);
-    expect(await prepareWatchedSessionsPrompt({ ...base, toolNames: ["sessions_list"] })).toBe(
+    expect(await prepareWatchedSessionsPrompt({ enabled: false })).toBe(undefined);
+    expect(await prepareWatchedSessionsPrompt({ sessionKey: undefined })).toBe(undefined);
+    expect(await prepareWatchedSessionsPrompt({ sessionKey: "agent:main:subagent:worker" })).toBe(
       undefined,
     );
-    expect(await prepareWatchedSessionsPrompt({ ...base, sessionKey: "agent:other:main" })).toBe(
-      undefined,
-    );
+    expect(
+      await prepareWatchedSessionsPrompt({ sessionKey: "agent:main:telegram:group:beta" }),
+    ).toBe(undefined);
+    expect(await prepareWatchedSessionsPrompt({ toolNames: ["sessions_list"] })).toBe(undefined);
+    expect(await prepareWatchedSessionsPrompt({ sessionKey: "agent:other:main" })).toBe(undefined);
   });
 
   it.each(["authority", "watch", "watch-final", "sandbox", "sandbox-cleanup", "store"] as const)(
@@ -202,11 +189,9 @@ describe("prepareWatchedSessionsPrompt", () => {
         },
       );
       const pending = prepareWatchedSessionsPromptAsync({
-        enabled: true,
+        ...promptInput,
         config,
-        sessionKey: mainSessionKey,
         sandboxed: true,
-        toolNames: sessionReadTools,
         assertCurrent: () => {
           if (!active) {
             throw new Error("caller revoked");
@@ -244,13 +229,9 @@ describe("prepareWatchedSessionsPrompt", () => {
       return result;
     });
     try {
-      await expect(
-        prepareWatchedSessionsPrompt({
-          enabled: true,
-          sessionKey: mainSessionKey,
-          toolNames: sessionReadTools,
-        }),
-      ).rejects.toThrow("Watched-session title store changed");
+      await expect(prepareWatchedSessionsPrompt()).rejects.toThrow(
+        "Watched-session title store changed",
+      );
     } finally {
       if (replaced) {
         fs.unlinkSync(storePath);

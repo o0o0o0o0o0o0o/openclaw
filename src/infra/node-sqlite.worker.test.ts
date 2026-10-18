@@ -7,7 +7,7 @@ it("admits the loaded SQLite library once before sibling workers open databases"
 }) => {
   const preload = fileURLToPath(new URL("../../scripts/tsx.mjs", import.meta.url));
   const sqliteUrl = new URL("./node-sqlite.ts", import.meta.url).href;
-  const libraryUrl = new URL("./bun-sqlite-library.ts", import.meta.url).href;
+  const runtimeUrl = new URL("./sqlite-runtime-initialize.ts", import.meta.url).href;
   const workerSource = `
     const { parentPort } = require("node:worker_threads");
     const { DatabaseSync } = require("node:sqlite");
@@ -40,8 +40,8 @@ it("admits the loaded SQLite library once before sibling workers open databases"
           if (sql.includes("sqlite_version()")) probes++;
           return prepare.call(this, sql);
         };
-        const { initializeSqliteRuntimeCapabilities } = await import(${JSON.stringify(libraryUrl)});
-        await initializeSqliteRuntimeCapabilities();
+        const { initializeSqliteRuntime } = await import(${JSON.stringify(runtimeUrl)});
+        await initializeSqliteRuntime();
         const workers = [0, 1].map(() => new Worker(${JSON.stringify(workerSource)}, {
           eval: true, execArgv: ["--import", ${JSON.stringify(preload)}],
         }));

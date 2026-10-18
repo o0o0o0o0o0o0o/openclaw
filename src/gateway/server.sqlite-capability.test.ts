@@ -7,9 +7,8 @@ const admission = vi.hoisted(() => ({
   initialize: vi.fn<() => Promise<void>>(),
   acquireLock: vi.fn(),
 }));
-vi.mock("../infra/bun-sqlite-library.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../infra/bun-sqlite-library.js")>()),
-  initializeSqliteRuntimeCapabilities: admission.initialize,
+vi.mock("../infra/sqlite-runtime-initialize.js", () => ({
+  initializeSqliteRuntime: admission.initialize,
 }));
 vi.mock("../infra/gateway-lock.js", () => ({ acquireGatewayLock: admission.acquireLock }));
 

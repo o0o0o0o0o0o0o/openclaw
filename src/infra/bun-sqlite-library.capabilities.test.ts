@@ -75,17 +75,14 @@ describe("SQLite native-close admission", () => {
     const first = initializeSqliteRuntimeCapabilities();
     expect(initializeSqliteRuntimeCapabilities()).toBe(first);
     await probeStarted.promise;
-    expect(order[0]).toBe("select");
-    expect(order.at(-1)).toBe("probe");
+    expect(order).toEqual(["select", "probe"]);
     expect(getSqliteRuntimeCapabilities()).toBe(chosen);
-    expect(options.publish).not.toHaveBeenCalledWith(sqliteCapabilitiesKey, expect.anything());
+    expect(options.publish).not.toHaveBeenCalled();
     pending.resolve({ ...positive });
     const decision = await first;
     expect(decision).toEqual(positive);
     expect(Object.isFrozen(decision)).toBe(true);
-    expect(options.publish.mock.calls.filter(([key]) => key === sqliteCapabilitiesKey)).toEqual([
-      [sqliteCapabilitiesKey, decision],
-    ]);
+    expect(options.publish).toHaveBeenCalledExactlyOnceWith(sqliteCapabilitiesKey, decision);
     expect(getSqliteRuntimeCapabilities()).toBe(decision);
     expect(initializeSqliteRuntimeCapabilities()).toBe(first);
     expect(chosen.explicitSqliteCloseReleasesNativeResources).toBe(false);

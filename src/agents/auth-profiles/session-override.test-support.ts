@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import { afterEach, vi } from "vitest";
 import type { SessionEntry } from "../../config/sessions/types.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type {
   ProviderModelRouteAuthRequirement,
   ProviderModelRouteCandidate,
@@ -17,7 +16,7 @@ import type { AuthProfileStore } from "./types.js";
 export const TEST_PRIMARY_PROFILE_ID = "openai:primary@example.test";
 export const TEST_SECONDARY_PROFILE_ID = "openai:secondary@example.test";
 
-const authStoreMocks = vi.hoisted(() => {
+export const authStoreMocks = vi.hoisted(() => {
   const emptyStore = (): AuthProfileStore => ({ version: 1, profiles: {} });
   const state = {
     hasSource: false,
@@ -41,6 +40,7 @@ const authStoreMocks = vi.hoisted(() => {
       state.routeResolutions.clear();
       state.store = emptyStore();
       Object.values(calls).forEach((mock) => mock.mockReset());
+      vi.clearAllMocks();
     },
   };
 });
@@ -61,9 +61,7 @@ vi.mock("./store-runtime.js", () => ({
   loadAuthProfileStoreForRuntimeAsync: async () => authStoreMocks.state.store,
 }));
 
-vi.mock("./usage.js", () => ({
-  isProfileInCooldown: authStoreMocks.isProfileInCooldown,
-}));
+vi.mock("./usage.js", () => ({ isProfileInCooldown: authStoreMocks.isProfileInCooldown }));
 
 vi.mock("../../plugins/provider-model-routes.js", () => ({
   // Synthetic route IDs in this fixture are already canonical.
@@ -74,12 +72,7 @@ vi.mock("../../plugins/provider-model-routes.js", () => ({
 }));
 
 export const { resolveSessionAuthSelection } = await import("./session-override.js");
-export { authStoreMocks };
-
-afterEach(() => {
-  authStoreMocks.reset();
-  vi.clearAllMocks();
-});
+afterEach(authStoreMocks.reset);
 
 export async function withAuthState<T>(run: (state: OpenClawTestState) => Promise<T>): Promise<T> {
   return await withOpenClawTestState({ layout: "state-only", prefix: "openclaw-auth-" }, run);
@@ -96,21 +89,17 @@ export function configureProviderRoutes(
     requestTransportOverrides: "none",
   }));
   const first = routes[0];
-  if (!first) {
-    return;
+  if (first) {
+    authStoreMocks.state.routeResolutions.set(`openai\0${modelId}`, {
+      kind: "routes",
+      routes: [first, ...routes.slice(1)],
+    });
   }
-  authStoreMocks.state.routeResolutions.set(`openai\0${modelId}`, {
-    kind: "routes",
-    routes: [first, ...routes.slice(1)],
-  });
 }
 
 export async function prepareCooldownAuthState(
   state: OpenClawTestState,
-  options: {
-    profileIds?: string[];
-    usageStats?: AuthProfileStore["usageStats"];
-  } = {},
+  options: { profileIds?: string[] } & Pick<AuthProfileStore, "usageStats"> = {},
 ): Promise<string> {
   const agentDir = state.agentDir();
   await fs.mkdir(agentDir, { recursive: true });
@@ -128,29 +117,26 @@ export async function prepareCooldownAuthState(
   return agentDir;
 }
 
-export async function resolveSession(params: {
-  agentDir: string;
-  sessionEntry: SessionEntry;
-  sessionStore?: Record<string, SessionEntry>;
-  cfg?: OpenClawConfig;
-  provider?: string;
-  sessionKey?: string;
-  storePath?: string;
-  isNewSession?: boolean;
-}): Promise<string | undefined> {
-  const selection = await resolveSessionAuthSelection({
+type SelectionOptions = Partial<Parameters<typeof resolveSessionAuthSelection>[0]>;
+export function resolveSessionSelection(
+  params: SelectionOptions & { agentDir: string; sessionEntry: SessionEntry },
+) {
+  return resolveSessionAuthSelection({
     ...params,
     sessionStore: params.sessionStore ?? {
       [params.sessionKey ?? "agent:main:main"]: params.sessionEntry,
     },
-    agentId: "main",
+    agentId: params.agentId ?? "main",
     cfg: params.cfg ?? {},
     provider: params.provider ?? "openai",
-    modelId: params.sessionEntry.model ?? "model-x",
+    modelId: params.modelId ?? params.sessionEntry.model ?? "model-x",
     sessionKey: params.sessionKey ?? "agent:main:main",
     isNewSession: params.isNewSession ?? false,
   });
-  return selection?.profileId;
+}
+
+export async function resolveSession(params: Parameters<typeof resolveSessionSelection>[0]) {
+  return (await resolveSessionSelection(params))?.profileId;
 }
 
 export function createAutomaticSessionEntry(overrides: Partial<SessionEntry> = {}): SessionEntry {

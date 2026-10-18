@@ -58,13 +58,25 @@ async function expectSource(
   }
 }
 
-function withState(run: (state: State) => Promise<void>) {
-  return withOpenClawTestState({ label: "auth-source" }, run);
-}
-
-function writeDatabase(databasePath: string, sql: string) {
-  using database = new DatabaseSync(databasePath);
-  database.exec(sql);
+function withState(
+  run: (state: State, database: (name: string, sql?: string) => string) => Promise<void>,
+) {
+  return withOpenClawTestState({ label: "auth-source" }, async (state) => {
+    try {
+      await run(state, (name, sql) => {
+        const dir = state.agentDir(name);
+        fs.mkdirSync(dir, { recursive: true });
+        if (sql) {
+          using database = new DatabaseSync(resolveAuthProfileDatabasePath(dir));
+          database.exec(sql);
+        }
+        return dir;
+      });
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
+    }
+  });
 }
 
 function sourceRow(table: "store" | "state", json: string) {
@@ -75,31 +87,22 @@ function sourceRow(table: "store" | "state", json: string) {
 it("retains read failure classification when cleanup fails", () =>
   withState(async (state) => {
     const failure = new SqliteWorkerError("source read closed", "closed");
-    const prepare = vi.spyOn(readers, "prepareAgentAuthProfileRowsRead").mockReturnValue({
+    vi.spyOn(readers, "prepareAgentAuthProfileRowsRead").mockReturnValue({
       identity: undefined,
       captureCredentialAuthority: () => undefined,
       read: () => Promise.reject(failure),
       assertCurrent: () => {},
       dispose: () => Promise.reject(new Error("source cleanup failed")),
     });
-    try {
-      await expect(hasSource(state.agentDir("source"))).rejects.toMatchObject({
-        code: "closed",
-        cause: failure,
-      });
-    } finally {
-      prepare.mockRestore();
-    }
+    await expect(hasSource(state.agentDir("source"))).rejects.toMatchObject({
+      code: "closed",
+      cause: failure,
+    });
   }));
 
 it("detects an existing auth source without caller-thread SQLite", () =>
-  withState(async (state) => {
-    const agentDir = state.agentDir("source");
-    fs.mkdirSync(agentDir, { recursive: true });
-    writeDatabase(
-      resolveAuthProfileDatabasePath(agentDir),
-      sourceRow("store", '{"version":1,"profiles":{}}'),
-    );
+  withState(async (_state, database) => {
+    const agentDir = database("source", sourceRow("store", '{"version":1,"profiles":{}}'));
     await expectSource(agentDir, true, undefined, true);
   }));
 
@@ -154,7 +157,7 @@ it("rejects cohort path, agent owner, and state root mismatches", () =>
   }));
 
 it("routes absent, missing-table, state-only, and unreadable sources", () =>
-  withState(async (state) => {
+  withState(async (state, database) => {
     noteCommittedSharedAuthStoreOwnership({ location: "legacy-main" }, state.env);
     const cases = [
       ["absent", false, ""],
@@ -171,13 +174,9 @@ it("routes absent, missing-table, state-only, and unreadable sources", () =>
       ["unreadable-database", true, ""],
     ] as const;
     for (const [name, expected, sql] of cases) {
-      const agentDir = state.agentDir(name);
-      fs.mkdirSync(agentDir, { recursive: true });
-      const databasePath = resolveAuthProfileDatabasePath(agentDir);
-      if (sql) {
-        writeDatabase(databasePath, sql);
-      } else if (name === "unreadable-database") {
-        fs.writeFileSync(databasePath, "not a SQLite database");
+      const agentDir = database(name, sql);
+      if (name === "unreadable-database") {
+        fs.writeFileSync(resolveAuthProfileDatabasePath(agentDir), "not a SQLite database");
       }
       await expectSource(agentDir, expected);
     }
@@ -191,23 +190,16 @@ it("keeps the captured shared root after a local read yields", () =>
     const shared = openOpenClawStateDatabase();
     writeAuthProfileJsonCell(shared.db, "store", "shared-state", { version: 1, profiles: {} });
     const original = readers.prepareAgentAuthProfileRowsRead;
-    const prepare = vi
-      .spyOn(readers, "prepareAgentAuthProfileRowsRead")
-      .mockImplementation((input) => {
-        const reader = original(input);
-        return {
-          ...reader,
-          read: async () => {
-            const rows = await reader.read();
-            vi.stubEnv("OPENCLAW_STATE_DIR", state.path("replacement-root"));
-            return rows;
-          },
-        };
-      });
-    try {
-      await expectSource(state.agentDir("absent"), true);
-    } finally {
-      prepare.mockRestore();
-      vi.unstubAllEnvs();
-    }
+    vi.spyOn(readers, "prepareAgentAuthProfileRowsRead").mockImplementation((input) => {
+      const reader = original(input);
+      return {
+        ...reader,
+        read: async () => {
+          const rows = await reader.read();
+          vi.stubEnv("OPENCLAW_STATE_DIR", state.path("replacement-root"));
+          return rows;
+        },
+      };
+    });
+    await expectSource(state.agentDir("absent"), true);
   }));

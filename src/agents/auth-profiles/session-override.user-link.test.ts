@@ -56,9 +56,7 @@ function personal(label: string) {
 function writeSharedAuth(state: OpenClawTestState) {
   return state.writeAuthProfiles({
     version: 1,
-    profiles: {
-      [SHARED]: createApiKeyCredential("openai", "synthetic-shared-key"),
-    },
+    profiles: { [SHARED]: createApiKeyCredential("openai", "synthetic-shared-key") },
   });
 }
 

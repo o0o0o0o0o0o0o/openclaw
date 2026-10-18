@@ -89,6 +89,8 @@ describe("prepared auth profile row reads", () => {
   it.each(["agent", "shared"] as const)(
     "reuses %s rows and installs an owner write without another worker request",
     async (source) => {
+      const isAgent = source === "agent";
+      const kind = isAgent ? "agent" : "shared-state";
       fs.unlinkSync(databasePath);
       using database = openTrackedStateDatabase(databasePath);
       database.exec(
@@ -101,38 +103,38 @@ describe("prepared auth profile row reads", () => {
       const sharedRead = vi
         .spyOn(sharedWorker, "runOpenClawStateWorkerOperation")
         .mockImplementation(async (_context, operation, options) => {
-          const binding = expectDefined(
+          const { admission } = expectDefined(
             options?.createAdmission?.({ settled: Promise.resolve({ kind: "completed" }) }),
             "shared auth read admission",
           );
-          const transfer = new MessageChannel();
+          const { port1: sender, port2: receiver } = new MessageChannel();
           try {
             return await operation({
               execute: vi.fn().mockImplementation(async () => {
-                sendAuthProfileUpdateValue(transfer.port1, rows);
-                binding.admission.port.postMessage(
+                sendAuthProfileUpdateValue(sender, rows);
+                admission.port.postMessage(
                   {
                     stage: "prepare",
-                    facts: { kind: "auth-store-read", port: transfer.port2 },
+                    facts: { kind: "auth-store-read", port: receiver },
                     decision: new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
                   },
-                  [transfer.port2],
+                  [receiver],
                 );
-                binding.admission.service();
-                if (binding.admission.failure) {
-                  throw toErrorObject(binding.admission.failure, "Auth read admission failed");
+                admission.service();
+                if (admission.failure) {
+                  throw toErrorObject(admission.failure, "Auth read admission failed");
                 }
               }),
             });
           } finally {
-            binding.admission.finish();
-            transfer.port1.close();
-            transfer.port2.close();
+            admission.finish();
+            sender.close();
+            receiver.close();
           }
         });
-      const agentReader = source === "agent" ? prepare() : undefined;
+      const agentReader = isAgent ? prepare() : undefined;
       const read = () => (agentReader ? agentReader.read() : readSharedAuthProfileRows(context));
-      const workerRead = source === "agent" ? child.read : sharedRead;
+      const workerRead = isAgent ? child.read : sharedRead;
       await expect(read()).resolves.toEqual(rows);
       await expect(read()).resolves.toEqual(rows);
       expect(workerRead).toHaveBeenCalledOnce();
@@ -141,14 +143,9 @@ describe("prepared auth profile row reads", () => {
         version: 1,
         profiles: { fixture: { type: "api_key", provider: "fixture", key: "updated-fixture" } },
       };
-      writeAuthProfileJsonCell(
-        database,
-        "store",
-        source === "agent" ? "agent" : "shared-state",
-        committed,
-      );
+      writeAuthProfileJsonCell(database, "store", kind, committed);
       noteRuntimeAuthProfileStorePersistedMutation(
-        source === "agent" ? path.dirname(databasePath) : undefined,
+        isAgent ? path.dirname(databasePath) : undefined,
         {
           credentialsChanged: true,
           profileSetChanged: true,
@@ -158,7 +155,7 @@ describe("prepared auth profile row reads", () => {
         {
           databasePath,
           sharedDatabasePath: databasePath,
-          location: source === "agent" ? "legacy-main" : "state-db",
+          location: isAgent ? "legacy-main" : "state-db",
         },
         undefined,
         { store: committed, env: context.environment },

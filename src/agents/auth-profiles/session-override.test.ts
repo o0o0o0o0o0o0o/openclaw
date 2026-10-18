@@ -383,9 +383,7 @@ describe("session auth-profile rotation", () => {
   it("retries preferred OAuth after cooldown when compaction also advanced", () =>
     withAuthState(async (state) => {
       const agentDir = await prepareMixedAuth(state);
-      const cfg = {
-        auth: { order: { openai: [OAUTH, API_PRIMARY] } },
-      };
+      const cfg = { auth: { order: { openai: [OAUTH, API_PRIMARY] } } };
       configureProviderRoutes(["subscription", "api-key"]);
       authStoreMocks.state.store.usageStats = {
         [OAUTH]: {
@@ -394,11 +392,7 @@ describe("session auth-profile rotation", () => {
           failureCounts: { rate_limit: 1 },
         },
       };
-      const sessionEntry: SessionEntry = {
-        sessionId: "s1",
-        updatedAt: 1,
-        model: MODEL,
-      };
+      const sessionEntry: SessionEntry = { sessionId: "s1", updatedAt: 1, model: MODEL };
       const sessionStore = { "agent:main:main": sessionEntry };
 
       expect(await resolveSession({ agentDir, sessionEntry, sessionStore, cfg })).toBe(API_PRIMARY);
@@ -432,15 +426,10 @@ describe("session auth-profile rotation", () => {
   it("rotates a cooled multi-route OpenAI session within its physical route", () =>
     withAuthState(async (state) => {
       const agentDir = await prepareMixedAuth(state);
-      authStoreMocks.state.store.order = {
-        openai: [OAUTH, API_PRIMARY, API_BACKUP],
-      };
+      authStoreMocks.state.store.order = { openai: [OAUTH, API_PRIMARY, API_BACKUP] };
       configureProviderRoutes(["api-key", "subscription"]);
       authStoreMocks.state.store.usageStats = {
-        [API_PRIMARY]: {
-          cooldownUntil: Date.now() + 60_000,
-          cooldownReason: "rate_limit",
-        },
+        [API_PRIMARY]: { cooldownUntil: Date.now() + 60_000, cooldownReason: "rate_limit" },
       };
       authStoreMocks.isProfileInCooldown.mockImplementation(
         (_store, profileId) => profileId === API_PRIMARY,

@@ -1,14 +1,4 @@
-// MSTeams delivery trace goldens: replayable wire-level lifecycle recordings.
-//
-// Drives the real createMSTeamsReplyDispatcher + createTeamsReplyStreamController
-// wiring (typing keepalive, append-only native stream, block batching) against a
-// mocked Bot Framework turn context. OUT events are the raw SDK surface calls:
-// context.sendActivity activities and stream.emit/update/close writes.
-//
-// msteams cancel has no inbound event: user Stop makes a background chunk POST
-// fail with HTTP 403. emit/update only queue work; the SDK then marks the stream
-// canceled. The scenario arms that wire fault and maps `cancel` to nothing.
-// Refresh goldens with OPENCLAW_TRACE_UPDATE=1 (see delivery-trace harness docs).
+// Real dispatcher/stream-controller wiring, recorded at the Bot Framework boundary.
 import {
   deliveryTraceScenarios,
   expectDeliveryTraceMatchesGolden,
@@ -27,16 +17,9 @@ import { createMSTeamsReplyDispatcher } from "./reply-dispatcher.js";
 import { setMSTeamsRuntime } from "./runtime.js";
 import type { MSTeamsTurnContext } from "./sdk-types.js";
 
-/**
- * Deterministic stream write fault. Writes are counted across emit/update/close;
- * the fault fires at `atWrite`; background writes publish cancellation after
- * returning, while close can reject its awaited send.
- */
 type StreamWriteFault = { atWrite: number };
 
 function createStreamCancelledError(): Error {
-  // The controller matches by err.name (the SDK class re-export is not
-  // resolvable), so the mock only needs the name to be contract-accurate.
   const err = new Error("stream cancelled by user Stop");
   err.name = "StreamCancelledError";
   return err;
@@ -61,19 +44,17 @@ function createRecordingStream(recorder: WireRecorder, fault?: StreamWriteFault)
     });
     return true;
   };
+  const write = (method: string, payload: unknown) => {
+    if (!applyFault(method, payload)) {
+      recorder.recordWireCall({ method, payload });
+    }
+  };
   return {
     emit(activity: unknown): void {
-      const payload = typeof activity === "string" ? { text: activity } : activity;
-      if (applyFault("stream.emit", payload)) {
-        return;
-      }
-      recorder.recordWireCall({ method: "stream.emit", payload });
+      write("stream.emit", typeof activity === "string" ? { text: activity } : activity);
     },
     update(text: string): void {
-      if (applyFault("stream.update", { text })) {
-        return;
-      }
-      recorder.recordWireCall({ method: "stream.update", payload: { text } });
+      write("stream.update", { text });
     },
     clearText(): void {},
     async close(): Promise<unknown> {
@@ -89,12 +70,11 @@ function createRecordingStream(recorder: WireRecorder, fault?: StreamWriteFault)
   };
 }
 
-function createRecordingTurnContext(params: {
-  recorder: WireRecorder;
-  conversationId: string;
-  conversationType: string;
-  stream: ReturnType<typeof createRecordingStream>;
-}): MSTeamsTurnContext {
+function createRecordingTurnContext(
+  recorder: WireRecorder,
+  { conversationId, conversationType }: MSTeamsTraceCase,
+  stream: ReturnType<typeof createRecordingStream>,
+): MSTeamsTurnContext {
   let activityCount = 0;
   const reject = (method: string) => async () => {
     throw new Error(`unexpected turn-context call: ${method}`);
@@ -102,14 +82,14 @@ function createRecordingTurnContext(params: {
   return {
     activity: {
       type: "message",
-      conversation: { id: params.conversationId, conversationType: params.conversationType },
+      conversation: { id: conversationId, conversationType },
     },
     sendActivity: async (activity) => {
       activityCount += 1;
       const id = `activity-${activityCount}`;
-      params.recorder.recordWireCall({
+      recorder.recordWireCall({
         method: "context.sendActivity",
-        target: params.conversationId,
+        target: conversationId,
         payload: typeof activity === "string" ? { text: activity } : activity,
         result: { id },
       });
@@ -118,14 +98,13 @@ function createRecordingTurnContext(params: {
     sendActivities: reject("sendActivities"),
     updateActivity: reject("updateActivity"),
     deleteActivity: reject("deleteActivity"),
-    stream: params.stream,
+    stream,
   };
 }
 
 function createTraceRuntimeStub(recorder: WireRecorder): PluginRuntime {
   return {
     channel: {
-      // Real text helpers: chunking behavior is part of the recorded lifecycle.
       text: {
         resolveChunkMode,
         chunkMarkdownTextWithMode,
@@ -134,8 +113,6 @@ function createTraceRuntimeStub(recorder: WireRecorder): PluginRuntime {
       },
     },
     system: {
-      // Delivery-failure escalation is agent-visible choreography; record it so
-      // goldens catch drift (none of the adopted scenarios should emit one).
       enqueueSystemEvent: (text: string, opts?: { contextKey?: string }) => {
         recorder.recordWireCall({
           method: "system.enqueueSystemEvent",
@@ -156,27 +133,18 @@ type MSTeamsTraceCase = {
 
 const MSTEAMS_TRACE_CASES: readonly MSTeamsTraceCase[] = [
   {
-    // Native append-sink streaming in a DM: cumulative pipeline text becomes
-    // delta emits; the AI-label chrome + feedback channelData merge into the
-    // closing activity at finalize.
     golden: "streaming-happy-dm",
     scenario: "streaming-happy",
     conversationType: "personal",
     conversationId: "a:1dm-trace-conversation",
   },
   {
-    // Same script in a channel: native streaming is DM-only and typing is
-    // unsupported for channel conversations, so everything batches as block
-    // sends that flush at settlement.
     golden: "block-fallback-channel",
     scenario: "streaming-happy",
     conversationType: "channel",
     conversationId: "19:channel-trace@thread.tacv2;messageid=1000",
   },
   {
-    // User Stop: the second background write publishes cancellation. Terminal
-    // state is canceled — no finalize chrome, no block redelivery, and typing
-    // pulses are suppressed for the rest of the turn.
     golden: "cancel-via-write-error",
     scenario: "cancel-mid-stream",
     conversationType: "personal",
@@ -188,12 +156,7 @@ const MSTEAMS_TRACE_CASES: readonly MSTeamsTraceCase[] = [
 function setupMSTeamsTrace(recorder: WireRecorder, traceCase: MSTeamsTraceCase) {
   setMSTeamsRuntime(createTraceRuntimeStub(recorder));
   const stream = createRecordingStream(recorder, traceCase.streamWriteFault);
-  const context = createRecordingTurnContext({
-    recorder,
-    conversationId: traceCase.conversationId,
-    conversationType: traceCase.conversationType,
-    stream,
-  });
+  const context = createRecordingTurnContext(recorder, traceCase, stream);
   const created = createMSTeamsReplyDispatcher({
     cfg: { channels: { msteams: {} } } as OpenClawConfig,
     agentId: "agent",
@@ -214,8 +177,6 @@ function setupMSTeamsTrace(recorder: WireRecorder, traceCase: MSTeamsTraceCase) 
       serviceUrl: "https://smba.trafficmanager.net/amer/",
     },
     context,
-    // Both the DM policy and the channel default (requireMention=true) resolve
-    // to "thread", which keeps sends on the live turn context.
     replyStyle: "thread",
     textLimit: 4000,
   });
@@ -230,16 +191,12 @@ function setupMSTeamsTrace(recorder: WireRecorder, traceCase: MSTeamsTraceCase) 
         await options.onReplyStart?.();
         break;
       case "partial":
-        // Only present when the controller owns a native stream (DM); the
-        // channel case has no onPartialReply and partials are dropped.
         created.replyOptions.onPartialReply?.({ text: step.text });
         break;
       case "block-final":
         await options.deliver({ text: step.text }, { kind: "block" });
         break;
       case "tool-progress":
-        // Progress lines only render in streaming.mode=progress; with the
-        // default partial mode this is a controller-side no-op.
         await created.replyOptions.onToolStart?.({ name: step.name, phase: step.phase });
         break;
       case "final":
@@ -253,16 +210,12 @@ function setupMSTeamsTrace(recorder: WireRecorder, traceCase: MSTeamsTraceCase) 
         );
         break;
       case "cancel":
-        // No cancel event exists on msteams: cancellation is detected via the
-        // armed background write fault, so this step maps to nothing.
+        // User Stop is observed asynchronously through the armed write fault.
         break;
       case "idle":
         await created.dispatcherOptions.onSettled?.();
         break;
       case "wire-fault":
-        // The shared write-error fault vocabulary covers this shape, but a
-        // scripted step records a new IN event and would change the committed
-        // goldens; write-count arming at setup replays the same wire bytes.
         throw new Error("msteams trace scenarios arm stream write faults at setup instead");
     }
   };

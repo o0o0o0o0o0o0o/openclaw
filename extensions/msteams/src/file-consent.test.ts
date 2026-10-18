@@ -1,4 +1,3 @@
-// Msteams tests cover file consent plugin behavior.
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { uploadToConsentUrl as uploadConsentFile } from "./file-consent.js";
@@ -10,16 +9,13 @@ vi.mock("node:dns/promises", () => ({ lookup: lookupMock }));
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   lookupMock.mockReset();
 });
 
-// Helper: a resolveFn that returns a public IP by default
 const publicResolve = async () => ({ address: "13.107.136.10" });
-// Helper: a resolveFn that returns a private IP
 const privateResolve = (ip: string) => async () => ({ address: ip });
-// Helper: a resolveFn that returns multiple addresses
 const multiResolve = (ips: string[]) => async () => ips.map((address) => ({ address }));
-// Helper: a resolveFn that fails
 const failingResolve = async () => {
   throw new Error("DNS failure");
 };
@@ -29,10 +25,12 @@ type ConsentValidationOptions = {
 };
 
 function uploadToConsentUrl({
+  url = "https://contoso.sharepoint.com/upload",
+  buffer = Buffer.from("test"),
   fetchFn = async () => new Response(null, { status: 200 }),
   validationOpts,
   ...params
-}: Parameters<typeof uploadConsentFile>[0] & {
+}: Partial<Parameters<typeof uploadConsentFile>[0]> & {
   fetchFn?: typeof fetch;
   validationOpts?: ConsentValidationOptions;
 }) {
@@ -41,16 +39,7 @@ function uploadToConsentUrl({
     const result = await (validationOpts?.resolveFn ?? publicResolve)(hostname);
     return Array.isArray(result) ? result : [result];
   });
-  return uploadConsentFile(params);
-}
-
-async function validateConsentUploadUrl(url: string, validationOpts?: ConsentValidationOptions) {
-  await uploadToConsentUrl({
-    url,
-    buffer: Buffer.from("test"),
-    fetchFn: async () => new Response(null, { status: 200 }),
-    validationOpts,
-  });
+  return uploadConsentFile({ url, buffer, ...params });
 }
 
 const responseWithCancel = (status: number, statusText?: string) => {
@@ -59,132 +48,95 @@ const responseWithCancel = (status: number, statusText?: string) => {
   return { response: new Response(body, { status, statusText }), cancel };
 };
 
-// ─── validateConsentUploadUrl ────────────────────────────────────────────────
+function timedFetch(completionMs?: number) {
+  let signal: AbortSignal | undefined;
+  const fetchFn = vi.fn<typeof fetch>(
+    (_url, init) =>
+      new Promise<Response>((resolve, reject) => {
+        signal = init?.signal ?? undefined;
+        signal?.addEventListener("abort", () => reject(signal?.reason), { once: true });
+        if (completionMs !== undefined) {
+          setTimeout(() => resolve(new Response(null, { status: 200 })), completionMs);
+        }
+      }),
+  );
+  return {
+    fetchFn,
+    get aborted() {
+      return signal?.aborted;
+    },
+  };
+}
 
 describe("validateConsentUploadUrl", () => {
-  it("rejects invalid URLs", async () => {
-    await expect(
-      validateConsentUploadUrl("not a url", { resolveFn: publicResolve }),
-    ).rejects.toThrow("not a valid URL");
-  });
-
-  it("rejects when DNS resolves to IPv6 loopback", async () => {
-    await expect(
-      validateConsentUploadUrl("https://evil.sharepoint.com/path", {
-        resolveFn: privateResolve("::1"),
-      }),
-    ).rejects.toThrow("private/reserved IP");
-  });
-
-  it("rejects when any DNS answer is private/reserved", async () => {
-    await expect(
-      validateConsentUploadUrl("https://evil.sharepoint.com/path", {
-        resolveFn: multiResolve(["13.107.136.10", "10.0.0.1"]),
-      }),
-    ).rejects.toThrow("private/reserved IP");
-  });
-
-  it("rejects when DNS resolution fails", async () => {
-    await expect(
-      validateConsentUploadUrl("https://nonexistent.sharepoint.com/path", {
-        resolveFn: failingResolve,
-      }),
-    ).rejects.toThrow("Failed to resolve");
-  });
-
-  it("rejects hosts that are suffix-tricked (e.g. notsharepoint.com)", async () => {
-    await expect(
-      validateConsentUploadUrl("https://notsharepoint.com/file", { resolveFn: publicResolve }),
-    ).rejects.toThrow("not in the allowed domains");
+  const dnsUrl = "https://evil.sharepoint.com/path";
+  it.each([
+    ["invalid URLs", "not a url", publicResolve, "not a valid URL"],
+    ["IPv6 loopback", dnsUrl, privateResolve("::1"), "private/reserved IP"],
+    [
+      "mixed DNS answers",
+      dnsUrl,
+      multiResolve(["13.107.136.10", "10.0.0.1"]),
+      "private/reserved IP",
+    ],
+    ["DNS failures", dnsUrl, failingResolve, "Failed to resolve"],
+    [
+      "suffix tricks",
+      "https://notsharepoint.com/file",
+      publicResolve,
+      "not in the allowed domains",
+    ],
+  ] as const)("rejects %s", async (_name, url, resolveFn, error) => {
+    await expect(uploadToConsentUrl({ url, validationOpts: { resolveFn } })).rejects.toThrow(error);
   });
 });
-
-// ─── uploadToConsentUrl (integration with validation) ────────────────────────
 
 describe("uploadToConsentUrl", () => {
   it("aborts consent uploads that do not finish before the request timeout", async () => {
     vi.useFakeTimers();
-    try {
-      let observedSignal: AbortSignal | undefined;
-      const fetchFn = vi.fn<typeof fetch>(
-        async (_url, init) =>
-          await new Promise<Response>((_resolve, reject) => {
-            observedSignal = init?.signal ?? undefined;
-            observedSignal?.addEventListener(
-              "abort",
-              () => {
-                const reason = observedSignal?.reason;
-                reject(reason instanceof Error ? reason : new Error("request aborted"));
-              },
-              { once: true },
-            );
-          }),
-      );
+    const request = timedFetch();
 
-      const uploadPromise = uploadToConsentUrl({
-        url: "https://contoso.sharepoint.com/upload",
-        buffer: Buffer.from("hello"),
-        fetchFn,
-        validationOpts: { resolveFn: publicResolve },
-      });
+    const uploadPromise = uploadToConsentUrl({
+      buffer: Buffer.from("hello"),
+      fetchFn: request.fetchFn,
+    });
 
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fetchFn).toHaveBeenCalledOnce();
-      expect(observedSignal?.aborted).toBe(false);
-      const uploadRejection = expect(uploadPromise).rejects.toMatchObject({
-        name: "TimeoutError",
-        message: "request timed out",
-      });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(request.fetchFn).toHaveBeenCalledOnce();
+    expect(request.aborted).toBe(false);
+    const uploadRejection = expect(uploadPromise).rejects.toMatchObject({
+      name: "TimeoutError",
+      message: "request timed out",
+    });
 
-      await vi.advanceTimersByTimeAsync(resolveMSTeamsSharePointUploadTimeoutMs(5));
-      await uploadRejection;
-      expect(observedSignal?.aborted).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    await vi.advanceTimersByTimeAsync(resolveMSTeamsSharePointUploadTimeoutMs(5));
+    await uploadRejection;
+    expect(request.aborted).toBe(true);
   });
 
   it("allows size-budgeted consent uploads that complete after the base upload deadline", async () => {
     vi.useFakeTimers();
-    try {
-      const buffer = Buffer.alloc(512 * 1024);
-      const resolvedTimeoutMs = resolveMSTeamsSharePointUploadTimeoutMs(buffer.length);
-      const baseTimeoutMs = resolveMSTeamsSharePointUploadTimeoutMs(0);
-      const completionMs = baseTimeoutMs + 1_000;
-      let observedSignal: AbortSignal | undefined;
-      const fetchFn = vi.fn<typeof fetch>(
-        async (_url, init) =>
-          await new Promise<Response>((resolve, reject) => {
-            observedSignal = init?.signal ?? undefined;
-            observedSignal?.addEventListener(
-              "abort",
-              () => reject(new DOMException("consent upload timed out", "AbortError")),
-              { once: true },
-            );
-            setTimeout(() => resolve(new Response(null, { status: 200 })), completionMs);
-          }),
-      );
+    const buffer = Buffer.alloc(512 * 1024);
+    const resolvedTimeoutMs = resolveMSTeamsSharePointUploadTimeoutMs(buffer.length);
+    const baseTimeoutMs = resolveMSTeamsSharePointUploadTimeoutMs(0);
+    const completionMs = baseTimeoutMs + 1_000;
+    const request = timedFetch(completionMs);
 
-      expect(completionMs).toBeGreaterThan(baseTimeoutMs);
-      expect(completionMs).toBeLessThan(resolvedTimeoutMs);
+    expect(completionMs).toBeGreaterThan(baseTimeoutMs);
+    expect(completionMs).toBeLessThan(resolvedTimeoutMs);
 
-      const uploadPromise = uploadToConsentUrl({
-        url: "https://contoso.sharepoint.com/upload",
-        buffer,
-        fetchFn,
-        validationOpts: { resolveFn: publicResolve },
-      });
+    const uploadPromise = uploadToConsentUrl({
+      buffer,
+      fetchFn: request.fetchFn,
+    });
 
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fetchFn).toHaveBeenCalledOnce();
-      expect(observedSignal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(request.fetchFn).toHaveBeenCalledOnce();
+    expect(request.aborted).toBe(false);
 
-      await vi.advanceTimersByTimeAsync(completionMs);
-      await expect(uploadPromise).resolves.toBeUndefined();
-      expect(observedSignal?.aborted).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
+    await vi.advanceTimersByTimeAsync(completionMs);
+    await expect(uploadPromise).resolves.toBeUndefined();
+    expect(request.aborted).toBe(false);
   });
 
   it("allows upload to a valid SharePoint URL and performs PUT", async () => {
@@ -239,10 +191,7 @@ describe("uploadToConsentUrl", () => {
 
     await expect(
       uploadToConsentUrl({
-        url: "https://contoso.sharepoint.com/sites/uploads/file.pdf",
-        buffer: Buffer.from("data"),
         fetchFn: mockFetch,
-        validationOpts: { resolveFn: publicResolve },
       }),
     ).rejects.toThrow("File upload to consent URL failed: 403 Forbidden");
     expect(cancel).toHaveBeenCalledOnce();
@@ -253,9 +202,7 @@ describe("uploadToConsentUrl", () => {
     await expect(
       uploadToConsentUrl({
         url: "http://contoso.sharepoint.com/upload",
-        buffer: Buffer.from("data"),
         fetchFn: mockFetch,
-        validationOpts: { resolveFn: publicResolve },
       }),
     ).rejects.toThrow("must use HTTPS");
 

@@ -51,21 +51,23 @@ function createResolution(params: {
             allowedDecisions: ["allow-once" as const, "deny" as const],
           },
   };
-  return decision === "deny"
-    ? {
-        applied: params.applied ?? true,
-        approval: { ...common, status: "denied", decision: "deny" },
-      }
-    : {
-        applied: params.applied ?? true,
-        approval: { ...common, status: "allowed", decision },
-      };
+  return {
+    applied: params.applied ?? true,
+    approval:
+      decision === "deny"
+        ? { ...common, status: "denied", decision: "deny" }
+        : { ...common, status: "allowed", decision },
+  };
 }
 
 function createDeps(): MSTeamsMessageHandlerDeps {
   return createMSTeamsMessageHandlerDeps({
     cfg: { channels: { msteams: { allowFrom: [APPROVER_ID] } } },
   });
+}
+
+function submit(context: MSTeamsTurnContext, deps = createDeps()) {
+  return maybeHandleMSTeamsApprovalCardSubmit({ context, deps });
 }
 
 function createContext(params: {
@@ -99,25 +101,24 @@ function createContext(params: {
   };
 }
 
-function registerBinding(params: {
-  token: string;
-  accountId?: string;
-  approvalKind?: ChannelApprovalKind;
-  decision?: ExecApprovalDecision;
-  allowedDecisions?: readonly ExecApprovalDecision[];
-  conversationId?: string;
-}): void {
-  testTokens.add(params.token);
+function registerBinding(
+  token: string,
+  overrides: Partial<
+    Pick<Parameters<typeof msTeamsApprovalControls.register>[0], "approvalKind" | "decision">
+  > = {},
+): void {
+  testTokens.add(token);
   msTeamsApprovalControls.register({
-    token: params.token,
-    accountId: params.accountId ?? "default",
-    approvalId: `approval-${params.token}`,
-    approvalKind: params.approvalKind ?? "exec",
-    decision: params.decision ?? "allow-once",
-    allowedDecisions: params.allowedDecisions ?? ["allow-once", "deny"],
-    conversationId: params.conversationId ?? CONVERSATION_ID,
+    token,
+    accountId: "default",
+    approvalId: `approval-${token}`,
+    approvalKind: "exec",
+    decision: "allow-once",
+    allowedDecisions: ["allow-once", "deny"],
+    conversationId: CONVERSATION_ID,
     activityId: ACTIVITY_ID,
     expiresAtMs: Date.now() + 60_000,
+    ...overrides,
   });
 }
 
@@ -125,12 +126,8 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
   beforeEach(() => {
     resolveApprovalOverGateway
       .mockReset()
-      .mockImplementation(
-        (params: {
-          approvalId: string;
-          approvalKind: ChannelApprovalKind;
-          decision: ExecApprovalDecision;
-        }) => Promise.resolve(createResolution(params)),
+      .mockImplementation(async (params: Parameters<typeof createResolution>[0]) =>
+        createResolution(params),
       );
   });
 
@@ -142,26 +139,15 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
   it("leaves unrelated Adaptive Card submits available to normal message dispatch", async () => {
     const context = createContext({ value: { intent: "deploy", environment: "prod" } });
 
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({ context, deps: createDeps() }),
-    ).resolves.toBe(false);
+    await expect(submit(context)).resolves.toBe(false);
 
     expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
   });
 
-  it.each([{ label: "missing", token: undefined }])(
-    "consumes approval submits with a $label token",
-    async ({ token }) => {
-      await expect(
-        maybeHandleMSTeamsApprovalCardSubmit({
-          context: createContext({ token }),
-          deps: createDeps(),
-        }),
-      ).resolves.toBe(true);
-
-      expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
-    },
-  );
+  it("consumes approval submits with a missing token", async () => {
+    await expect(submit(createContext({}))).resolves.toBe(true);
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+  });
 
   it.each([
     {
@@ -181,14 +167,9 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
     },
   ])("rejects a mismatched $label without consuming the token", async (scenario) => {
     const token = `mismatch-${scenario.label}`;
-    registerBinding({ token, ...scenario.binding });
+    registerBinding(token, scenario.binding);
 
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({
-        context: createContext({ token, ...scenario.context }),
-        deps: createDeps(),
-      }),
-    ).resolves.toBe(true);
+    await expect(submit(createContext({ token, ...scenario.context }))).resolves.toBe(true);
 
     expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
     expect(msTeamsApprovalControls.get(token)).not.toBeNull();
@@ -196,21 +177,16 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
 
   it("requires an allowlisted AAD identity and preserves tokens for the authorized approver", async () => {
     const token = "authorization";
-    registerBinding({ token, approvalKind: "plugin", decision: "deny" });
+    registerBinding(token, { approvalKind: "plugin", decision: "deny" });
     const deps = createDeps();
 
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({
-        context: createContext({ token, senderId: UNAUTHORIZED_ID }),
-        deps,
-      }),
-    ).resolves.toBe(true);
+    await expect(submit(createContext({ token, senderId: UNAUTHORIZED_ID }), deps)).resolves.toBe(
+      true,
+    );
     expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
 
     const authorizedContext = createContext({ token, nested: true });
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({ context: authorizedContext, deps }),
-    ).resolves.toBe(true);
+    await expect(submit(authorizedContext, deps)).resolves.toBe(true);
 
     expect(resolveApprovalOverGateway).toHaveBeenCalledWith({
       cfg: deps.cfg,
@@ -239,18 +215,13 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
 
   it("allows only one gateway resolution while simultaneous clicks are in flight", async () => {
     const token = "in-flight";
-    registerBinding({ token });
+    registerBinding(token);
     const deferred = createDeferred<ApprovalResolveResult>();
     resolveApprovalOverGateway.mockReturnValueOnce(deferred.promise);
     const deps = createDeps();
-    const first = maybeHandleMSTeamsApprovalCardSubmit({
-      context: createContext({ token }),
-      deps,
-    });
+    const first = submit(createContext({ token }), deps);
 
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({ context: createContext({ token }), deps }),
-    ).resolves.toBe(true);
+    await expect(submit(createContext({ token }), deps)).resolves.toBe(true);
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
 
     deferred.resolve(createResolution({ approvalId: `approval-${token}` }));
@@ -259,23 +230,19 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
 
   it("releases the token after a recoverable gateway failure", async () => {
     const token = "gateway-retry";
-    registerBinding({ token });
+    registerBinding(token);
     resolveApprovalOverGateway.mockRejectedValueOnce(new Error("gateway unavailable"));
     const deps = createDeps();
 
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({ context: createContext({ token }), deps }),
-    ).rejects.toThrow("gateway unavailable");
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({ context: createContext({ token }), deps }),
-    ).resolves.toBe(true);
+    await expect(submit(createContext({ token }), deps)).rejects.toThrow("gateway unavailable");
+    await expect(submit(createContext({ token }), deps)).resolves.toBe(true);
 
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(2);
   });
 
   it("retries a failed terminal card update with the canonical winning decision", async () => {
     const token = "update-retry";
-    registerBinding({ token });
+    registerBinding(token);
     resolveApprovalOverGateway.mockResolvedValue(
       createResolution({ approvalId: `approval-${token}`, decision: "deny", applied: false }),
     );
@@ -283,13 +250,9 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
     vi.mocked(failedContext.updateActivity).mockRejectedValueOnce(new Error("update failed"));
     const deps = createDeps();
 
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({ context: failedContext, deps }),
-    ).rejects.toThrow("update failed");
+    await expect(submit(failedContext, deps)).rejects.toThrow("update failed");
     const retriedContext = createContext({ token });
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({ context: retriedContext, deps }),
-    ).resolves.toBe(true);
+    await expect(submit(retriedContext, deps)).resolves.toBe(true);
 
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(2);
     const cardJson = JSON.stringify(vi.mocked(retriedContext.updateActivity).mock.calls[0]?.[0]);
@@ -301,7 +264,7 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
 
   it("retires permanently missing approvals and ignores subsequent clicks", async () => {
     const token = "not-found";
-    registerBinding({ token });
+    registerBinding(token);
     resolveApprovalOverGateway.mockRejectedValueOnce(
       Object.assign(new Error("approval no longer exists"), {
         gatewayCode: "APPROVAL_NOT_FOUND",
@@ -310,11 +273,11 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
     const deps = createDeps();
     const context = createContext({ token });
 
-    await expect(maybeHandleMSTeamsApprovalCardSubmit({ context, deps })).resolves.toBe(true);
+    await expect(submit(context, deps)).resolves.toBe(true);
     expect(msTeamsApprovalControls.get(token)).toBeNull();
     expect(context.updateActivity).not.toHaveBeenCalled();
 
-    await expect(maybeHandleMSTeamsApprovalCardSubmit({ context, deps })).resolves.toBe(true);
+    await expect(submit(context, deps)).resolves.toBe(true);
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,9 +1,6 @@
 import type { ApprovalResolveResult } from "openclaw/plugin-sdk/approval-gateway-runtime";
-import type {
-  ExecApprovalPendingView,
-  PendingApprovalView,
-} from "openclaw/plugin-sdk/approval-handler-runtime";
-import { describe, expect, it, vi } from "vitest";
+import type { PendingApprovalView } from "openclaw/plugin-sdk/approval-handler-runtime";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { msTeamsApprovalControls } from "./approval-card-actions.js";
 import {
   buildMSTeamsCanonicalApprovalTerminalCard,
@@ -12,138 +9,100 @@ import {
   buildMSTeamsResolvedApprovalCard,
 } from "./approval-card.js";
 
-function createExecPendingView() {
-  return {
-    approvalId: "approval-1",
-    approvalKind: "exec",
-    phase: "pending",
-    title: "Exec Approval Required",
-    metadata: [
-      { label: "Agent", value: "main" },
-      { label: "Host", value: "gateway" },
-    ],
-    commandText: "npm run deploy",
-    actions: [
-      {
-        decision: "allow-once",
-        label: "Approve once",
-        style: "success",
-        command: "/approve approval-1 allow-once",
-      },
-      {
-        decision: "deny",
-        label: "Deny",
-        style: "danger",
-        command: "/approve approval-1 deny",
-      },
-    ],
-    expiresAtMs: 61_000,
-  } satisfies ExecApprovalPendingView;
-}
+const view = {
+  approvalId: "system-agent:change-1",
+  approvalKind: "system-agent",
+  phase: "pending",
+  title: "OpenClaw change",
+  operationSummary: "restart the Gateway",
+  metadata: [
+    { label: "Agent", value: "main" },
+    { label: "Host", value: "gateway" },
+  ],
+  actions: (
+    [
+      ["allow-once", "Approve once", "success"],
+      ["deny", "Deny", "danger"],
+    ] as const
+  ).map(([decision, label, style]) => ({
+    decision,
+    label,
+    style,
+    command: `/approve approval-1 ${decision}`,
+  })),
+  expiresAtMs: 61_000,
+} satisfies PendingApprovalView;
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("Microsoft Teams approval Adaptive Cards", () => {
-  it.each([
-    {
-      view: {
-        ...createExecPendingView(),
-        approvalId: "system-agent:change-1",
-        approvalKind: "system-agent",
-        title: "OpenClaw change",
-        operationSummary: "restart the Gateway",
-      } satisfies PendingApprovalView,
-      label: "OpenClaw Change",
-      decision: "allow-once",
-      decisionLabel: "Allowed once",
-      subject: [
-        { type: "TextBlock", text: "Change", weight: "Bolder", wrap: true },
-        { type: "TextBlock", text: "restart the Gateway", wrap: true },
-      ],
-    },
-  ] as const)(
-    "preserves complete $label cards across phases",
-    ({ view, label, decision, decisionLabel, subject }) => {
-      const { actions, expiresAtMs, ...common } = view;
-      const tokens = actions.map((_, index) => `approval-token-${index}`);
-      const createToken = vi.spyOn(msTeamsApprovalControls, "createToken");
-      for (const token of tokens) {
-        createToken.mockReturnValueOnce(token);
-      }
-      const tail = [
-        ...subject,
-        {
-          type: "FactSet",
-          facts: [
-            { title: "Approval ID:", value: view.approvalId },
-            ...view.metadata.map(({ label: metadataLabel, value }) => ({
-              title: `${metadataLabel}:`,
-              value,
-            })),
-          ],
-        },
-      ];
-      const heading = { type: "TextBlock", weight: "Bolder", size: "Medium", wrap: true };
-      const subtitle = { type: "TextBlock", isSubtle: true, wrap: true };
-      try {
-        expect(buildMSTeamsPendingApprovalCard({ view, nowMs: 1_000 })).toEqual({
-          approvalId: view.approvalId,
-          approvalKind: view.approvalKind,
-          expiresAtMs,
-          card: {
-            type: "AdaptiveCard",
-            version: "1.5",
-            body: [
-              { ...heading, text: `${label} Approval Required` },
-              { ...subtitle, text: "Expires in 60s" },
-              ...tail,
-            ],
-            actions: actions.map(({ label: actionLabel }, index) => ({
-              type: "Action.Submit",
-              title: actionLabel,
-              data: { openclawAction: "approval", token: tokens[index] },
-            })),
-          },
-          actionTokens: actions.map(({ decision: actionDecision }, index) => ({
-            token: tokens[index],
-            decision: actionDecision,
+  it("preserves complete OpenClaw Change cards across phases", () => {
+    const { actions, expiresAtMs, ...common } = view;
+    const tokens = actions.map((_, index) => `approval-token-${index}`);
+    const createToken = vi.spyOn(msTeamsApprovalControls, "createToken");
+    for (const token of tokens) {
+      createToken.mockReturnValueOnce(token);
+    }
+    const tail = [
+      { type: "TextBlock", text: "Change", weight: "Bolder", wrap: true },
+      { type: "TextBlock", text: "restart the Gateway", wrap: true },
+      {
+        type: "FactSet",
+        facts: [
+          { title: "Approval ID:", value: view.approvalId },
+          ...view.metadata.map(({ label: metadataLabel, value }) => ({
+            title: `${metadataLabel}:`,
+            value,
           })),
-          allowedDecisions: ["allow-once", "deny"],
-        });
-        expect(createToken).toHaveBeenCalledTimes(actions.length);
-        for (const [resolvedBy, text] of [
-          ["  reviewer  ", "Resolved by reviewer"],
-          [" \t ", "Resolved"],
-        ]) {
-          expect(
-            buildMSTeamsResolvedApprovalCard({
-              ...common,
-              phase: "resolved",
-              decision,
-              resolvedBy,
-            }),
-          ).toEqual({
-            type: "AdaptiveCard",
-            version: "1.5",
-            body: [
-              { ...heading, text: `${label} Approval: ${decisionLabel}` },
-              { ...subtitle, text },
-              ...tail,
-            ],
-          });
-        }
-        expect(buildMSTeamsExpiredApprovalCard({ ...common, phase: "expired" })).toEqual({
-          type: "AdaptiveCard",
-          version: "1.5",
-          body: [
-            { ...heading, text: `${label} Approval Expired` },
-            { ...subtitle, text: "This approval request expired before it was resolved." },
-            ...tail,
-          ],
-        });
-      } finally {
-        createToken.mockRestore();
-      }
-    },
-  );
+        ],
+      },
+    ];
+    const heading = { type: "TextBlock", weight: "Bolder", size: "Medium", wrap: true };
+    const subtitle = { type: "TextBlock", isSubtle: true, wrap: true };
+    const card = (title: string, text: string) => ({
+      type: "AdaptiveCard",
+      version: "1.5",
+      body: [{ ...heading, text: title }, { ...subtitle, text }, ...tail],
+    });
+    expect(buildMSTeamsPendingApprovalCard({ view, nowMs: 1_000 })).toEqual({
+      approvalId: view.approvalId,
+      approvalKind: view.approvalKind,
+      expiresAtMs,
+      card: {
+        ...card("OpenClaw Change Approval Required", "Expires in 60s"),
+        actions: actions.map(({ label: actionLabel }, index) => ({
+          type: "Action.Submit",
+          title: actionLabel,
+          data: { openclawAction: "approval", token: tokens[index] },
+        })),
+      },
+      actionTokens: actions.map(({ decision: actionDecision }, index) => ({
+        token: tokens[index],
+        decision: actionDecision,
+      })),
+      allowedDecisions: ["allow-once", "deny"],
+    });
+    expect(createToken).toHaveBeenCalledTimes(actions.length);
+    for (const [resolvedBy, text] of [
+      ["  reviewer  ", "Resolved by reviewer"],
+      [" \t ", "Resolved"],
+    ]) {
+      expect(
+        buildMSTeamsResolvedApprovalCard({
+          ...common,
+          phase: "resolved",
+          decision: "allow-once",
+          resolvedBy,
+        }),
+      ).toEqual(card("OpenClaw Change Approval: Allowed once", text));
+    }
+    expect(buildMSTeamsExpiredApprovalCard({ ...common, phase: "expired" })).toEqual(
+      card(
+        "OpenClaw Change Approval Expired",
+        "This approval request expired before it was resolved.",
+      ),
+    );
+  });
 
   it("displays the canonical winning decision when another surface resolved the approval first", () => {
     const result: ApprovalResolveResult = {

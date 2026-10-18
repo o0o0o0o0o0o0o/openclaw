@@ -49,9 +49,19 @@ function withInvocation(
   run: (resources: CliPluginInvocationResources, cleanup: CliHarnessCleanup) => Promise<void>,
 ) {
   return withCliProcessScope(() =>
-    withCliCommandCleanup(false, (cleanup) => run(getCliPluginInvocationResources()!, cleanup!)),
+    withCliCommandCleanup(false, async (cleanup) => {
+      const resources = getCliPluginInvocationResources()!;
+      try {
+        await run(resources, cleanup!);
+      } finally {
+        await resources.release();
+      }
+    }),
   );
 }
+
+const expectClosed = (operation: Promise<unknown>) =>
+  expect(operation).rejects.toThrow("invocation is closed");
 
 function cleanupHarness(id: string, dispose: () => Promise<void>): AgentHarness {
   return {
@@ -197,13 +207,9 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       });
       try {
         expect(
-          acquisition.registry.plugins,
+          acquisition.registry.plugins.find((record) => record.id === id),
           JSON.stringify(acquisition.registry.diagnostics),
-        ).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({ id, source: plugin.file, status: "loaded" }),
-          ]),
-        );
+        ).toMatchObject({ source: plugin.file, status: "loaded" });
         expect(state.database).toBeDefined();
         return acquisition;
       } catch (error) {
@@ -261,7 +267,7 @@ it("joins the shipped eager registrar's real promise before releasing its native
       released = true;
     });
     try {
-      await expect(resources.run(() => undefined)).rejects.toThrow("invocation is closed");
+      await expectClosed(resources.run(() => undefined));
       expect(released).toBe(false);
       expect(fixture.state.database!.isOpen).toBe(true);
     } finally {
@@ -283,15 +289,11 @@ it("keeps closed command admission separate from retained cleanup authority", as
   const release = vi.fn(async () => {});
   resources.beginClose();
   try {
-    await expect(resources.acquire(load)).rejects.toThrow("invocation is closed");
-    await expect(foreign.track(() => resources.acquire(load))).rejects.toThrow(
-      "invocation is closed",
-    );
+    await expectClosed(resources.acquire(load));
+    await expectClosed(foreign.track(() => resources.acquire(load)));
     await resources.runCleanup(async () => {
-      await expect(runOutsideAsyncWorkScope(() => resources.acquire(load))).rejects.toThrow(
-        "invocation is closed",
-      );
-      await expect(resources.run(command)).rejects.toThrow("invocation is closed");
+      await expectClosed(runOutsideAsyncWorkScope(() => resources.acquire(load)));
+      await expectClosed(resources.run(command));
       expect(() => resources.adopt({ release })).toThrow("invocation is closed");
       resources.register(command);
       await expect(resources.waitForRegistrations()).rejects.toThrow(
@@ -370,7 +372,7 @@ it("seals acquisition before physical disposal even inside retained cleanup", as
     await resources.runCleanup(async () => {
       // A repeated close cannot reopen admission after the disposal snapshot was taken.
       resources.beginClose();
-      await expect(resources.acquire(load)).rejects.toThrow("invocation is closed");
+      await expectClosed(resources.acquire(load));
     });
     expect(load).not.toHaveBeenCalled();
   } finally {
@@ -378,7 +380,7 @@ it("seals acquisition before physical disposal even inside retained cleanup", as
     await closing;
   }
   resources.beginClose();
-  await expect(resources.acquire(load)).rejects.toThrow("invocation is closed");
+  await expectClosed(resources.acquire(load));
   expect(load).not.toHaveBeenCalled();
   expect(release).toHaveBeenCalledOnce();
 });
@@ -393,30 +395,23 @@ it("retains CLI SDK providers through their actual local Gateway context", async
     await withInvocation(async (resources) => {
       const registry = await resources.acquire(fixture.load);
       const resolveProviders = fixture.resolveProviders;
-      try {
-        const captured = await resources.run(() =>
-          withPluginRuntimeRegistryScope(registry, () =>
-            withLocalGatewayRequestScope(
-              { deps: {}, getRuntimeConfig: () => fixture.config },
-              () => {
-                const scope = getPluginRuntimeGatewayRequestScope();
-                if (!scope) {
-                  throw new Error("The local Gateway must retain its request scope");
-                }
-                return { scope, providers: resolveProviders() };
-              },
-            ),
-          ),
-        );
-        checkProvider(captured.providers, fixture.id);
-        await resources.release();
-        expectNative(fixture, false);
-        expect(() =>
-          foreign.run(() => withPluginRuntimeGatewayRequestScope(captured.scope, resolveProviders)),
-        ).toThrow("SDK resource host is closed");
-      } finally {
-        await resources.release();
-      }
+      const captured = await resources.run(() =>
+        withPluginRuntimeRegistryScope(registry, () =>
+          withLocalGatewayRequestScope({ deps: {}, getRuntimeConfig: () => fixture.config }, () => {
+            const scope = getPluginRuntimeGatewayRequestScope();
+            if (!scope) {
+              throw new Error("The local Gateway must retain its request scope");
+            }
+            return { scope, providers: resolveProviders() };
+          }),
+        ),
+      );
+      checkProvider(captured.providers, fixture.id);
+      await resources.release();
+      expectNative(fixture, false);
+      expect(() =>
+        foreign.run(() => withPluginRuntimeGatewayRequestScope(captured.scope, resolveProviders)),
+      ).toThrow("SDK resource host is closed");
     });
   } finally {
     await foreign.close();
@@ -493,11 +488,8 @@ it("releases the first native acquisition even when it is created only during cl
     };
     const harness = cleanupHarness("late-native-cleanup", dispose);
     cleanup.harnesses.set(harness, dispose);
-    try {
-      await closeCliResources(cleanup);
-    } finally {
-      await resources?.release();
-    }
+    await closeCliResources(cleanup);
+    await resources.release();
     expectNative(fixture, false, "afterCleanup");
   });
 });

@@ -61,14 +61,9 @@ it("unwinds the injected runtime with its requested code", () => {
   const exit = vi.fn();
   const runtime = { ...defaultRuntime, exit };
   const defaultExit = vi.spyOn(defaultRuntime, "exit").mockImplementation(() => {});
-  let thrown: unknown;
-  try {
-    exitCliAfterOutput(runtime, 7);
-  } catch (error) {
-    thrown = error;
-  }
-  expect(thrown).toBeInstanceOf(ExitError);
-  expect(thrown).toMatchObject({ code: 7 });
+  expect(() => exitCliAfterOutput(runtime, 7)).toThrow(
+    expect.objectContaining({ constructor: ExitError, code: 7 }),
+  );
   expect(defaultExit).not.toHaveBeenCalled();
   expect(exit).toHaveBeenCalledExactlyOnceWith(7);
 });
@@ -106,27 +101,42 @@ it.each([
   expect(process.exitCode).toBeUndefined();
 });
 
-it("does not finalize a long-lived command until its run settles", async () => {
-  const finish = createDeferred();
-  const finalize = vi.fn(async () => {});
-  const running = complete(() => finish.promise, finalize);
-  requestExitAfterOneShotOutput(defaultRuntime, 7);
-  await Promise.resolve();
-  expect(finalize).not.toHaveBeenCalled();
-  expect(process.exitCode).toBeUndefined();
-  finish.resolve();
-  await running;
-  expect(finalize).toHaveBeenCalledOnce();
-  expect(process.exitCode).toBe(7);
-});
+it.each(["run", "finalize"] as const)(
+  "waits for %s before publishing completion",
+  async (phase) => {
+    const entered = createDeferred();
+    const finish = createDeferred();
+    const wait = async () => {
+      entered.resolve();
+      await finish.promise;
+    };
+    const finalize = vi.fn(phase === "finalize" ? wait : successfulRun);
+    const running = complete(phase === "run" ? wait : reject(new ExitError(7)), finalize);
+    if (phase === "run") {
+      requestExitAfterOneShotOutput(defaultRuntime, 7);
+    }
+    try {
+      await entered.promise;
+      expect(process.exitCode).toBeUndefined();
+      if (phase === "run") {
+        expect(finalize).not.toHaveBeenCalled();
+      }
+    } finally {
+      finish.resolve();
+      await running;
+    }
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(7);
+  },
+);
 
-it.each([
-  { requested: 0, signal: "SIGTERM" as const, expected: 143 },
-  { requested: "0", signal: "SIGINT" as const, expected: 130 },
-  { requested: 7, signal: "SIGTERM" as const, expected: 7 },
+it.each<[number | string, "SIGINT" | "SIGTERM", number]>([
+  [0, "SIGTERM", 143],
+  ["0", "SIGINT", 130],
+  [7, "SIGTERM", 7],
 ])(
-  "retains an accepted signal over pending success ($requested, $signal)",
-  async ({ requested, signal, expected }) => {
+  "retains an accepted signal over pending success (%s, %s)",
+  async (requested, signal, expected) => {
     const cleanup = createDeferred();
     const unregister = registerSignalExitGate(cleanup.promise);
     const finalize = vi.fn(async () => {});
@@ -147,23 +157,6 @@ it.each([
     }
   },
 );
-
-it("joins caller-owned cleanup before publishing completion", async () => {
-  const closed = createDeferred();
-  const entered = createDeferred();
-  const running = complete(reject(new ExitError(7)), async () => {
-    entered.resolve();
-    await closed.promise;
-  });
-  try {
-    await entered.promise;
-    expect(process.exitCode).toBeUndefined();
-  } finally {
-    closed.resolve();
-    await running;
-  }
-  expect(process.exitCode).toBe(7);
-});
 
 it("reports failure before replacing a queued successful outcome", async () => {
   const order: string[] = [];
@@ -285,21 +278,31 @@ it("keeps the real proxy command exit truthful when --help is consumed as a prox
   });
 });
 
-it.each([
-  { name: "deferred hooks failure", exitCode: 1, explicitRequest: true },
-  {
-    name: "natural successful completion",
-    exitCode: 0,
-    explicitRequest: false,
-  },
-])("keeps real dual-TTY JSON clean for $name", ({ exitCode, explicitRequest }) => {
-  const script = `
-      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${moduleUrl("./one-shot-exit.ts")};
+it.each(["deferred hooks failure", "natural successful completion", "fatal rejection"] as const)(
+  "keeps real dual-TTY JSON clean for %s",
+  (mode) => {
+    const fatal = mode === "fatal rejection";
+    const explicitRequest = mode === "deferred hooks failure";
+    const exitCode = mode === "natural successful completion" ? 0 : 1;
+    const script = `
       import { defaultRuntime } from ${moduleUrl("../runtime.ts")};
       import { loggingState } from ${moduleUrl("../logging/state.ts")};
       Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
       Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });
       loggingState.forceConsoleToStderr = true;
+      ${
+        fatal
+          ? `
+      import { installUnhandledRejectionHandler } from ${moduleUrl("../infra/unhandled-rejections.ts")};
+      installUnhandledRejectionHandler();
+      defaultRuntime.writeJson({ ok: false });
+      const error = Object.assign(new Error("expected fatal test"), {
+        code: "ERR_OUT_OF_MEMORY",
+      });
+      process.emit("unhandledRejection", error, Promise.resolve());
+      `
+          : `
+      import { requestExitAfterOneShotOutput, runCliWithExitFinalization } from ${moduleUrl("./one-shot-exit.ts")};
       await runCliWithExitFinalization({
         run: async () => {
           defaultRuntime.writeStdout(JSON.stringify({ ok: ${exitCode === 0} }));
@@ -311,39 +314,19 @@ it.each([
         },
         onError: (error) => { throw error; },
       });
+      `
+      }
     `;
-
-  const result = runCliChild(script);
-
-  expectChildExit(result, exitCode);
-  expect(JSON.parse(result.stdout)).toEqual({ ok: exitCode === 0 });
-  expect(result.stderr.startsWith("finalized\n")).toBe(true);
-  if (explicitRequest) {
-    expect(result.stderr).toContain("\x1b[?25h");
-  } else {
-    expect(result.stderr).toBe("finalized\n");
-  }
-});
-
-it("keeps real dual-TTY JSON clean after a fatal unhandled rejection", () => {
-  const script = `
-      import { defaultRuntime } from ${moduleUrl("../runtime.ts")};
-      import { loggingState } from ${moduleUrl("../logging/state.ts")};
-      import { installUnhandledRejectionHandler } from ${moduleUrl("../infra/unhandled-rejections.ts")};
-      Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-      Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });
-      loggingState.forceConsoleToStderr = true;
-      installUnhandledRejectionHandler();
-      defaultRuntime.writeJson({ ok: false });
-      const error = Object.assign(new Error("expected fatal test"), {
-        code: "ERR_OUT_OF_MEMORY",
-      });
-      process.emit("unhandledRejection", error, Promise.resolve());
-    `;
-
-  const result = runCliChild(script);
-
-  expectChildExit(result, 1);
-  expect(JSON.parse(result.stdout)).toEqual({ ok: false });
-  expect(result.stderr).toContain("\x1b[?25h");
-});
+    const result = runCliChild(script);
+    expectChildExit(result, exitCode);
+    expect(JSON.parse(result.stdout)).toEqual({ ok: exitCode === 0 });
+    if (!fatal) {
+      expect(result.stderr.startsWith("finalized\n")).toBe(true);
+    }
+    if (explicitRequest || fatal) {
+      expect(result.stderr).toContain("\x1b[?25h");
+    } else {
+      expect(result.stderr).toBe("finalized\n");
+    }
+  },
+);

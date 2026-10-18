@@ -73,14 +73,8 @@ beforeEach(() => {
 });
 
 it("uses the resolved runtime load context for configured channel scope", async () => {
-  const baseConfig = {
-    channels: {
-      "demo-chat": {
-        botToken: "demo-bot-token",
-        appToken: "demo-app-token",
-      },
-    },
-  };
+  const baseConfig = { channels: { "demo-chat": {} } };
+  const autoEnabledReasons = { "demo-chat": ["demo-chat configured"] };
   const autoEnabledConfig = {
     ...baseConfig,
     plugins: { allow: ["demo-chat"], entries: { "demo-chat": { enabled: true } } },
@@ -90,9 +84,7 @@ it("uses the resolved runtime load context for configured channel scope", async 
     rawConfig: baseConfig,
     config: autoEnabledConfig,
     activationSourceConfig: baseConfig,
-    autoEnabledReasons: {
-      "demo-chat": ["demo-chat configured"],
-    },
+    autoEnabledReasons,
     workspaceDir: "/tmp/workspace",
     env: process.env,
     logger,
@@ -109,9 +101,7 @@ it("uses the resolved runtime load context for configured channel scope", async 
   expectLoadOpenClawPluginsCall(0, {
     config: autoEnabledConfig,
     activationSourceConfig: autoEnabledConfig,
-    autoEnabledReasons: {
-      "demo-chat": ["demo-chat configured"],
-    },
+    autoEnabledReasons,
     onlyPluginIds: ["demo-chat"],
     throwOnLoadError: true,
     workspaceDir: "/tmp/workspace",

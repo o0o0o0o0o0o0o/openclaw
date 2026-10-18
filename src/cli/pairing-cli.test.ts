@@ -33,6 +33,12 @@ const pairingIdLabels: Record<string, string> = {
   telegram: "telegramUserId",
   discord: "discordUserId",
 };
+const pairingRequest = {
+  id: "123",
+  code: "ABCDEFGH",
+  createdAt: "2026-01-08T00:00:00Z",
+  lastSeenAt: "2026-01-08T00:00:00Z",
+};
 
 function configSnapshot(ownerAllowFrom?: string[]) {
   const config = ownerAllowFrom ? { commands: { ownerAllowFrom } } : {};
@@ -92,15 +98,7 @@ beforeEach(() => {
     }),
   );
   listChannelPairingRequests.mockResolvedValue([]);
-  approveChannelPairingCode.mockResolvedValue({
-    id: "123",
-    entry: {
-      id: "123",
-      code: "ABCDEFGH",
-      createdAt: "2026-01-08T00:00:00Z",
-      lastSeenAt: "2026-01-08T00:00:00Z",
-    },
-  });
+  approveChannelPairingCode.mockResolvedValue({ id: "123", entry: pairingRequest });
   readConfigFileSnapshotForWrite.mockResolvedValue(configSnapshot());
   replaceConfigFile.mockResolvedValue(undefined);
   notifyPairingApproved.mockResolvedValue(undefined);
@@ -116,13 +114,7 @@ async function runPairing(command: "list" | "approve", ...args: string[]) {
 it("labels sender ids using the channel's pairing adapter", async () => {
   const log = vi.spyOn(console, "log").mockImplementation(() => {});
   listChannelPairingRequests.mockResolvedValueOnce([
-    {
-      id: "123",
-      code: "ABC123",
-      createdAt: "2026-01-08T00:00:00Z",
-      lastSeenAt: "2026-01-08T00:00:00Z",
-      meta: { username: "peter" },
-    },
+    { ...pairingRequest, code: "ABC123", meta: { username: "peter" } },
   ]);
 
   await runPairing("list", "--channel", "telegram");
